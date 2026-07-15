@@ -2,12 +2,14 @@
 //!
 //! Actions model *intent* (`MoveCursor(Right)`), never keystrokes (`Ctrl+Right`).
 //! Key->intent translation is the frontend's job, so a future GUI with different
-//! keys emits the same actions. M1 defines motion + edit + snapshot/quit; the
-//! rest of the vocabulary (selection ops, history, file lifecycle) lands M3+.
+//! keys emits the same actions. Motion + edit + snapshot/quit + file open/save
+//! are defined; the rest of the vocabulary (selection ops, history) lands M3+.
 //!
 //! `Action` derives `Serialize`/`Deserialize` from the start (SPEC §8.1): the
 //! action journal and the future remote-frontend wire both need it, and deriving
 //! it now means they ride along for free instead of forcing a later retrofit.
+
+use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
@@ -31,6 +33,18 @@ pub enum Action {
     DeleteForward,
     /// Request an immediate `ViewSnapshot` without changing state.
     RequestSnapshot,
+    /// Replace the buffer with the contents of `path` and remember it as the
+    /// buffer's file (SPEC §12.2 file lifecycle). A missing file is not an error:
+    /// it opens an empty buffer bound to `path`, created on the first `Save`
+    /// (Vim's behavior). The load is expressed as one `Delta` replacing the whole
+    /// buffer, so the delta/snapshot invariant (SPEC §5) still holds.
+    Open(PathBuf),
+    /// Write the buffer to its associated file (set by `Open`). Fails with a
+    /// `Notification` if no path is set - save-as (a target path) lands with the
+    /// prompt UI, not here. The write is atomic (temp file + rename, SPEC §8) so
+    /// a failed write never corrupts the existing file, and the buffer stays
+    /// dirty on failure so no work is lost.
+    Save,
     /// Shut the editor down cleanly. The core drains and stops its loop.
     Quit,
 }

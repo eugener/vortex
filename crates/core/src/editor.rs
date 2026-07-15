@@ -20,6 +20,7 @@
 //! - `notifications` (core -> frontend): bounded, discrete events.
 
 use std::future::Future;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use async_channel::{Receiver, Sender};
@@ -95,6 +96,12 @@ struct Editor {
     /// anchors and LSP `didChange` can key off it; a snapshot request does not
     /// change it.
     version: u64,
+    /// The file this buffer is bound to (`Open`/`Save`), or `None` if unnamed.
+    path: Option<PathBuf>,
+    /// Whether the buffer differs from its on-disk file. Set by any applied edit,
+    /// cleared by a successful save or a fresh open (SPEC §8, §10). Independent of
+    /// `version`, which never resets.
+    modified: bool,
 }
 
 impl Editor {
@@ -104,6 +111,8 @@ impl Editor {
             buffer: RopeBuffer::new(),
             selections: SelectionSet::at_origin(),
             version: 0,
+            path: None,
+            modified: false,
         }
     }
 
@@ -121,6 +130,8 @@ impl Editor {
             selections: Arc::from(self.selections.all()),
             primary: self.selections.primary_index(),
             dirty,
+            path: self.path.clone(),
+            modified: self.modified,
         }
     }
 
@@ -162,12 +173,14 @@ enum EditKind {
     DeleteForward,
 }
 
-/// What the actor loop must do for one action: apply a text edit, or just
-/// republish the current state (a motion or an explicit snapshot request).
-/// Both paths return "is the frontend still alive?"; `Quit` breaks before this.
+/// What the actor loop must do for one action: apply a text edit, republish the
+/// current state (a motion or snapshot request), or a file op (open/save). Each
+/// path returns "is the frontend still alive?"; `Quit` breaks before this.
 enum Step {
     Edit(EditKind),
     Republish,
+    Open(PathBuf),
+    Save,
 }
 
 /// The concrete `(range, new_text)` a single selection contributes for `kind`,
@@ -272,6 +285,8 @@ async fn run(
                 Step::Republish
             }
             Action::RequestSnapshot => Step::Republish,
+            Action::Open(path) => Step::Open(path),
+            Action::Save => Step::Save,
             Action::Quit => break,
         };
 
@@ -280,6 +295,10 @@ async fn run(
                 apply_edit(&mut editor, kind, &deltas, &snapshots, &notifications).await
             }
             Step::Republish => snapshots.publish(editor.snapshot(None)),
+            Step::Open(path) => {
+                open_file(&mut editor, path, &deltas, &snapshots, &notifications).await
+            }
+            Step::Save => save_file(&mut editor, &snapshots, &notifications).await,
         };
         if !alive {
             break;
@@ -362,7 +381,171 @@ async fn apply_edit(
     // set stays disjoint and sorted.
     editor.selections = selections_after_edits(&edits);
     editor.version += 1;
+    // The buffer now differs from its on-disk file (if any) until the next save.
+    editor.modified = true;
     snapshots.publish(editor.snapshot(dirty))
+}
+
+/// Load `path` into the buffer, replacing its contents (SPEC §12.2 file
+/// lifecycle). Expressed as one whole-buffer `Delta` so the delta stream still
+/// reproduces the snapshot (SPEC §5). A missing file is not an error: it binds
+/// the path to a fresh empty buffer, created on the first `Save` (Vim's
+/// behavior). Any other read failure (permissions, non-UTF-8) is surfaced as a
+/// `Notification` and leaves state unchanged (SPEC §8). Returns `false` if the
+/// frontend has hung up.
+///
+/// File I/O is blocking `std::fs` on the actor thread: acceptable for a discrete
+/// user action (not the per-keystroke hot path). Moving large loads off the
+/// critical path via a background read (SPEC §2.3) is an M5 refinement.
+async fn open_file(
+    editor: &mut Editor,
+    path: PathBuf,
+    deltas: &Sender<Delta>,
+    snapshots: &SnapshotSink,
+    notifications: &Sender<Notification>,
+) -> bool {
+    // `read_to_string` folds read + UTF-8 decode into one step: it errors with
+    // `InvalidData` ("stream did not contain valid UTF-8") on non-text input, so a
+    // single match covers missing / unreadable / non-UTF-8 without a nested one.
+    let (contents, existed) = match std::fs::read_to_string(&path) {
+        Ok(text) => (text, true),
+        // Missing file: open an empty buffer bound to the path (created on save).
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => (String::new(), false),
+        Err(err) => {
+            return report_file_error(
+                editor,
+                Some(path),
+                &err.to_string(),
+                snapshots,
+                notifications,
+            );
+        }
+    };
+
+    // Replace the whole buffer as one Delta. Skip the delta/version bump when
+    // nothing actually changes (empty buffer, empty file) so `version` still
+    // advances iff a delta was emitted - the invariant the property test guards.
+    // The load builds a fresh buffer rather than calling the fallible `replace`:
+    // a whole-buffer swap has no range to reject, so there is no error path to
+    // handle here (the delta still records the change for SPEC §5 replay).
+    let old_len = editor.buffer.byte_len();
+    if old_len != 0 || !contents.is_empty() {
+        let base_version = editor.version;
+        editor.buffer = RopeBuffer::from(contents.as_str());
+        let delta = Delta {
+            buffer_id: editor.id,
+            base_version,
+            range: 0..old_len,
+            new_text: contents,
+        };
+        if deltas.send(delta).await.is_err() {
+            return false; // frontend gone
+        }
+        editor.version += 1;
+    }
+
+    // A freshly opened buffer starts at the origin and matches disk.
+    editor.selections = SelectionSet::at_origin();
+    editor.path = Some(path.clone());
+    editor.modified = false;
+
+    let _ = notifications.try_send(Notification::FileOpened {
+        buffer_id: editor.id,
+        path,
+        existed,
+    });
+    snapshots.publish(editor.snapshot(Some(0..editor.buffer.byte_len())))
+}
+
+/// Write the buffer to its bound file atomically (SPEC §8). Fails with a
+/// `Notification` if no path is bound (save-as arrives with the prompt UI) or the
+/// write fails; on failure the buffer stays dirty so no work is lost. Returns
+/// `false` if the frontend has hung up.
+async fn save_file(
+    editor: &mut Editor,
+    snapshots: &SnapshotSink,
+    notifications: &Sender<Notification>,
+) -> bool {
+    let Some(path) = editor.path.clone() else {
+        return report_file_error(
+            editor,
+            None,
+            "no file name (save-as not available yet)",
+            snapshots,
+            notifications,
+        );
+    };
+
+    let contents = editor.buffer.text().to_string();
+    if let Err(message) = write_atomic(&path, contents.as_bytes()) {
+        return report_file_error(editor, Some(path), &message, snapshots, notifications);
+    }
+
+    editor.modified = false;
+    let _ = notifications.try_send(Notification::FileSaved {
+        buffer_id: editor.id,
+        path,
+    });
+    snapshots.publish(editor.snapshot(None))
+}
+
+/// Emit a `FileError` and republish current state, leaving the buffer untouched
+/// (SPEC §8: a failed file op never loses work). Returns the publish's liveness so
+/// callers can `return report_file_error(...)` directly.
+fn report_file_error(
+    editor: &Editor,
+    path: Option<PathBuf>,
+    message: &str,
+    snapshots: &SnapshotSink,
+    notifications: &Sender<Notification>,
+) -> bool {
+    let _ = notifications.try_send(Notification::FileError {
+        buffer_id: editor.id,
+        path,
+        message: message.to_string(),
+    });
+    snapshots.publish(editor.snapshot(None))
+}
+
+/// Write `bytes` to `path` atomically: write a sibling temp file, flush it, then
+/// rename it over the target (SPEC §8). A rename within a directory is atomic on
+/// POSIX, so a reader never sees a half-written file and a failed write leaves the
+/// original intact. The single-owner actor (SPEC §2.3) serializes saves, so the
+/// fixed temp name cannot race another save from this process. Returns a
+/// human-readable error string on any I/O failure.
+fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), String> {
+    use std::io::Write;
+
+    // Temp file must sit in the target's directory so the rename stays on one
+    // filesystem (a cross-device rename is not atomic and errors). A bare file
+    // name has an empty parent, meaning the current directory.
+    let dir = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let file_name = path
+        .file_name()
+        .ok_or_else(|| "path has no file name".to_string())?;
+    let mut tmp = dir.to_path_buf();
+    tmp.push(format!(".{}.vortex-tmp", file_name.to_string_lossy()));
+
+    // Write + flush, then rename over the target. The inner block drops the file
+    // handle before the rename (renaming an open file fails on Windows). Any
+    // failure in the chain shares one cleanup: remove the temp, leaving the
+    // original intact (SPEC §8).
+    let result = (|| -> std::io::Result<()> {
+        {
+            let mut f = std::fs::File::create(&tmp)?;
+            f.write_all(bytes)?;
+            f.sync_all()?;
+        }
+        std::fs::rename(&tmp, path)
+    })();
+    if let Err(err) = result {
+        let _ = std::fs::remove_file(&tmp); // best-effort cleanup
+        return Err(err.to_string());
+    }
+    Ok(())
 }
 
 /// Cursor positions after applying `edits` (sorted descending by start). Each edit

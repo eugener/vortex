@@ -15,6 +15,7 @@
 //! protocol essentially for free. `ViewSnapshot` carries the whole rope (`Text`),
 //! does NOT serialize cheaply, and never needs to: it is local-only.
 
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
@@ -76,6 +77,16 @@ pub struct ViewSnapshot {
     /// `RequestSnapshot`). A local frontend uses it as a partial-repaint hint
     /// (SPEC §5); painting the whole viewport is always correct if ignored.
     pub dirty: Option<std::ops::Range<usize>>,
+    /// The file this buffer is bound to (via `Open`), or `None` for an unnamed
+    /// buffer. The frontend shows it in the status/head bar (SPEC §10). Carried
+    /// on the snapshot rather than queried so a local frontend paints the name
+    /// with zero round-trips (SPEC §5).
+    pub path: Option<PathBuf>,
+    /// Whether the buffer has unsaved edits (differs from its on-disk file).
+    /// A distinct axis from `version` (buffer identity for anchors/LSP) and
+    /// `dirty` (the repaint hint): this is purely "is there unsaved work". The
+    /// frontend paints a modified marker from it (SPEC §8, §10).
+    pub modified: bool,
 }
 
 /// Discrete core -> frontend events (errors, status, prompts). Self-contained on
@@ -90,6 +101,25 @@ pub enum Notification {
     EditRejected {
         buffer_id: BufferId,
         version: u64,
+        message: String,
+    },
+    /// A file was loaded into `buffer_id` from `path`. `existed` is false when
+    /// the path did not exist (a fresh empty buffer bound to it, created on the
+    /// first save). Self-contained per SPEC §6: carries the path, not a promise
+    /// that a paired snapshot is present.
+    FileOpened {
+        buffer_id: BufferId,
+        path: PathBuf,
+        existed: bool,
+    },
+    /// The buffer was written to `path`. The buffer is now clean.
+    FileSaved { buffer_id: BufferId, path: PathBuf },
+    /// A file open or save failed; buffer state is unchanged and (for a failed
+    /// save) still dirty, so no work is lost (SPEC §8). Carries a human-readable
+    /// reason; `path` is `None` for "save with no file bound".
+    FileError {
+        buffer_id: BufferId,
+        path: Option<PathBuf>,
         message: String,
     },
     /// The core has stopped its loop and will send nothing further.

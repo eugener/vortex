@@ -10,9 +10,14 @@
 //! are computed here from the primary cursor and the terminal size, with **zero
 //! round-trips to the core** (the anti-Xi rule, SPEC §5).
 
+use std::path::Path;
+
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 use vortex_core::Text;
+
+/// Shown in the head bar when the buffer has no bound file (SPEC §10 lifecycle).
+pub const NO_NAME: &str = "[No Name]";
 
 /// Minimum digit field for the line-number gutter, so even a short file gets a
 /// tidy left margin instead of a cramped single column.
@@ -179,10 +184,31 @@ pub fn grapheme_column(line: &str, byte_col: usize) -> usize {
     line[..end].graphemes(true).count() + 1
 }
 
+/// The buffer's display name for the head bar: the file name of `path` (not the
+/// full path, to keep the bar short), or [`NO_NAME`] when unnamed. A modified
+/// buffer is prefixed with `● ` so unsaved work is visible at a glance (SPEC §8,
+/// §10). A path ending in `..`/`/` (no file name component) falls back to its
+/// lossy full form rather than the placeholder.
+pub fn buffer_display_name(path: Option<&Path>, modified: bool) -> String {
+    let name = match path {
+        None => NO_NAME.to_string(),
+        Some(p) => p
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| p.to_string_lossy().into_owned()),
+    };
+    if modified {
+        format!("● {name}")
+    } else {
+        name
+    }
+}
+
 /// Head-bar segments `(left, right)` = (buffer display name, line count). Composed
-/// to full width by [`fit_bar`] at paint time. `line_count` is the display count
-/// (see [`display_line_count`], always >= 1); the `.max(1)` is a defensive floor
-/// so a stray 0 still reads "1 line" rather than an empty count.
+/// to full width by [`fit_bar`] at paint time. `name` is [`buffer_display_name`]
+/// (already carries any modified marker); `line_count` is the display count (see
+/// [`display_line_count`], always >= 1); the `.max(1)` is a defensive floor so a
+/// stray 0 still reads "1 line" rather than an empty count.
 pub fn head_bar(name: &str, line_count: usize) -> (String, String) {
     let left = format!(" {name}");
     let right = match line_count.max(1) {
@@ -192,11 +218,45 @@ pub fn head_bar(name: &str, line_count: usize) -> (String, String) {
     (left, right)
 }
 
-/// Status-bar segments `(left, right)` = (cursor position, buffer metrics).
-/// `line`/`col` are 1-based for display; `bytes` is the buffer size and `version`
-/// the document version (SPEC §5), surfaced while the delta/version model is young.
-pub fn status_bar(line: usize, col: usize, bytes: usize, version: u64) -> (String, String) {
-    let left = format!(" Ln {line}, Col {col}");
+/// A short, human-readable status line for a file-lifecycle notification, or
+/// `None` for notifications the status bar does not surface (e.g. `ShuttingDown`).
+/// The frontend shows this transiently in place of the cursor position (SPEC §8:
+/// a save result - especially a failure - must be visible, not silent).
+pub fn notification_message(note: &vortex_core::Notification) -> Option<String> {
+    use vortex_core::Notification::*;
+    match note {
+        FileOpened { path, existed, .. } => {
+            let name = buffer_display_name(Some(path), false);
+            Some(if *existed {
+                format!("Opened {name}")
+            } else {
+                format!("{name} [New File]")
+            })
+        }
+        FileSaved { path, .. } => Some(format!("Saved {}", buffer_display_name(Some(path), false))),
+        FileError { message, .. } => Some(format!("Error: {message}")),
+        EditRejected { message, .. } => Some(format!("Edit rejected: {message}")),
+        // Non-exhaustive: unknown/silent notifications do not occupy the bar.
+        _ => None,
+    }
+}
+
+/// Status-bar segments `(left, right)` = (cursor position, buffer metrics). When a
+/// transient `message` is present (a file open/save result) it replaces the cursor
+/// position on the left so the result is visible (SPEC §8). `line`/`col` are
+/// 1-based for display; `bytes` is the buffer size and `version` the document
+/// version (SPEC §5), surfaced while the delta/version model is young.
+pub fn status_bar(
+    line: usize,
+    col: usize,
+    bytes: usize,
+    version: u64,
+    message: Option<&str>,
+) -> (String, String) {
+    let left = match message {
+        Some(m) => format!(" {m}"),
+        None => format!(" Ln {line}, Col {col}"),
+    };
     let right = format!("{bytes}B · v{version} ");
     (left, right)
 }
@@ -497,9 +557,95 @@ mod tests {
 
     #[test]
     fn status_bar_composes_position_and_metrics() {
-        let (left, right) = status_bar(2, 5, 38, 7);
+        let (left, right) = status_bar(2, 5, 38, 7, None);
         assert_eq!(left, " Ln 2, Col 5");
         assert_eq!(right, "38B · v7 ");
+    }
+
+    #[test]
+    fn status_bar_message_replaces_cursor_position() {
+        // A transient file message takes the left slot so the result is visible;
+        // metrics stay on the right (SPEC §8).
+        let (left, right) = status_bar(2, 5, 38, 7, Some("Saved f.rs"));
+        assert_eq!(left, " Saved f.rs");
+        assert_eq!(right, "38B · v7 ");
+    }
+
+    #[test]
+    fn buffer_display_name_uses_file_name_not_full_path() {
+        assert_eq!(
+            buffer_display_name(Some(Path::new("/home/user/src/main.rs")), false),
+            "main.rs"
+        );
+    }
+
+    #[test]
+    fn buffer_display_name_unnamed_buffer_is_placeholder() {
+        assert_eq!(buffer_display_name(None, false), NO_NAME);
+    }
+
+    #[test]
+    fn buffer_display_name_marks_modified_with_dot() {
+        assert_eq!(
+            buffer_display_name(Some(Path::new("a.txt")), true),
+            "● a.txt"
+        );
+        assert_eq!(buffer_display_name(None, true), "● [No Name]");
+    }
+
+    #[test]
+    fn buffer_display_name_falls_back_when_no_file_name_component() {
+        // A path ending in "/" or ".." has no file_name; use the lossy full form
+        // rather than the unnamed placeholder.
+        assert_eq!(buffer_display_name(Some(Path::new("..")), false), "..");
+    }
+
+    #[test]
+    fn notification_message_renders_file_events() {
+        use std::path::PathBuf;
+        use vortex_core::{BufferId, Notification};
+        let id = BufferId(0);
+        assert_eq!(
+            notification_message(&Notification::FileOpened {
+                buffer_id: id,
+                path: PathBuf::from("dir/a.rs"),
+                existed: true,
+            })
+            .as_deref(),
+            Some("Opened a.rs")
+        );
+        assert_eq!(
+            notification_message(&Notification::FileOpened {
+                buffer_id: id,
+                path: PathBuf::from("new.rs"),
+                existed: false,
+            })
+            .as_deref(),
+            Some("new.rs [New File]")
+        );
+        assert_eq!(
+            notification_message(&Notification::FileSaved {
+                buffer_id: id,
+                path: PathBuf::from("dir/a.rs"),
+            })
+            .as_deref(),
+            Some("Saved a.rs")
+        );
+        assert_eq!(
+            notification_message(&Notification::FileError {
+                buffer_id: id,
+                path: None,
+                message: "disk full".into(),
+            })
+            .as_deref(),
+            Some("Error: disk full")
+        );
+    }
+
+    #[test]
+    fn notification_message_none_for_shutting_down() {
+        use vortex_core::Notification;
+        assert_eq!(notification_message(&Notification::ShuttingDown), None);
     }
 
     #[test]
