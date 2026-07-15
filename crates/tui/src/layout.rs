@@ -125,25 +125,57 @@ pub fn visible_lines(text: &Text, scroll: usize, height: usize, tab_width: usize
         .collect()
 }
 
-/// Scroll the vertical viewport so `cursor_line` stays visible within a window of
-/// `height` rows, given the current top line `scroll`. Returns the new top line.
-///
-/// Keeps the cursor inside the window with minimal movement: scroll up if the
-/// cursor is above the top, down if it is below the bottom, else stay. This is
-/// the whole "scroll = read a different range from the same snapshot, no core
-/// message" mechanism (SPEC §5) - the frontend adjusts `scroll` locally.
-pub fn scroll_to_show(cursor_line: usize, scroll: usize, height: usize) -> usize {
-    if height == 0 {
-        return scroll;
+/// Keep index `cursor` visible within a window of `size` starting at `offset`,
+/// returning the new offset. Generic 1-D scroll shared by both axes (SPEC §5):
+/// pass `(cursor_line, top, rows)` for vertical scroll or
+/// `(cursor_col, left, cols)` for horizontal. Scrolls toward the cursor by the
+/// minimum needed; a zero-size window never scrolls.
+pub fn scroll_to_show(cursor: usize, offset: usize, size: usize) -> usize {
+    if size == 0 {
+        return offset;
     }
-    if cursor_line < scroll {
-        cursor_line
-    } else if cursor_line >= scroll + height {
-        // Put the cursor on the last visible row.
-        cursor_line + 1 - height
+    if cursor < offset {
+        cursor
+    } else if cursor >= offset + size {
+        // Put the cursor on the last visible cell of the window.
+        cursor + 1 - size
     } else {
-        scroll
+        offset
     }
+}
+
+/// Slice `line` (already tab-expanded, so tabs are spaces) to the display-column
+/// window `[h_scroll, h_scroll + width)` for horizontal scrolling. Graphemes fully
+/// left of the window are dropped and everything past its right edge is cut. A
+/// wide grapheme (CJK/emoji) straddling either edge is replaced by spaces for just
+/// the cells that fall inside the window, so a half-scrolled double-width glyph
+/// keeps every following column aligned with the cursor instead of shifting by one
+/// (SPEC §4: display width != character count).
+pub fn clip_columns(line: &str, h_scroll: usize, width: usize) -> String {
+    if width == 0 {
+        return String::new();
+    }
+    let end = h_scroll + width;
+    let mut out = String::new();
+    let mut col = 0;
+    for g in line.graphemes(true) {
+        let w = g.width();
+        let g_end = col + w;
+        if g_end <= h_scroll {
+            // Entirely left of the window.
+        } else if col >= end {
+            break; // entirely right of the window; nothing further can fit
+        } else if col >= h_scroll && g_end <= end {
+            out.push_str(g); // fully inside
+        } else {
+            // Straddles an edge: emit a space per visible cell so a partially
+            // clipped wide glyph does not misalign the columns after it.
+            let visible = g_end.min(end) - col.max(h_scroll);
+            out.extend(std::iter::repeat_n(' ', visible));
+        }
+        col = g_end;
+    }
+    out
 }
 
 /// Columns the line-number gutter occupies: a right-aligned digit field (at least
@@ -378,6 +410,58 @@ mod tests {
     #[test]
     fn scroll_zero_height_is_noop() {
         assert_eq!(scroll_to_show(5, 2, 0), 2);
+    }
+
+    #[test]
+    fn scroll_to_show_works_for_horizontal_axis() {
+        // Same helper drives horizontal scroll: cursor col 20, window of 10 cols
+        // from left 0 -> scroll right so col 20 sits on the last cell (left 11).
+        assert_eq!(scroll_to_show(20, 0, 10), 11);
+        // Cursor col 3 left of a left=5 window -> scroll left to 3.
+        assert_eq!(scroll_to_show(3, 5, 10), 3);
+    }
+
+    #[test]
+    fn clip_columns_slices_ascii_window() {
+        // "abcdefgh", window [2, 2+3) -> "cde".
+        assert_eq!(clip_columns("abcdefgh", 2, 3), "cde");
+    }
+
+    #[test]
+    fn clip_columns_from_zero_is_left_aligned_prefix() {
+        assert_eq!(clip_columns("abcdefgh", 0, 4), "abcd");
+    }
+
+    #[test]
+    fn clip_columns_past_end_is_empty() {
+        assert_eq!(clip_columns("abc", 10, 5), "");
+    }
+
+    #[test]
+    fn clip_columns_zero_width_is_empty() {
+        assert_eq!(clip_columns("abc", 0, 0), "");
+    }
+
+    #[test]
+    fn clip_columns_keeps_wide_char_fully_inside() {
+        // "日本語" is 3 chars x 2 cells = 6 cells. Window [2, 2+2) is exactly the
+        // second char "本".
+        assert_eq!(clip_columns("日本語", 2, 2), "本");
+    }
+
+    #[test]
+    fn clip_columns_replaces_wide_char_straddling_left_edge_with_spaces() {
+        // Window starts at col 1, mid-"日" (cols 0..2). The 1 visible cell of that
+        // glyph becomes a space so "本" (cols 2..4) still lands at the right place.
+        // Window [1, 1+3): 1 space (half of 日) + "本" (2 cells) = " 本".
+        assert_eq!(clip_columns("日本語", 1, 3), " 本");
+    }
+
+    #[test]
+    fn clip_columns_replaces_wide_char_straddling_right_edge_with_spaces() {
+        // Window [0, 3): "日" (cols 0..2) fits, then "本" (cols 2..4) straddles the
+        // right edge -> 1 visible cell as a space. Result "日 ".
+        assert_eq!(clip_columns("日本語", 0, 3), "日 ");
     }
 
     #[test]

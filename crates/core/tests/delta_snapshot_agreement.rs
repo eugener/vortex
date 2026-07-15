@@ -77,6 +77,10 @@ fn action_strategy() -> impl Strategy<Value = Action> {
             Just(Motion::LineEnd),
             Just(Motion::BufferStart),
             Just(Motion::BufferEnd),
+            // Page motions carry a small line count so they exercise the
+            // clamp-to-edge path against short generated buffers too.
+            (1usize..4).prop_map(Motion::PageUp),
+            (1usize..4).prop_map(Motion::PageDown),
         ]
         .prop_flat_map(|motion| {
             any::<bool>().prop_map(move |extend| Action::MoveCursor { motion, extend })

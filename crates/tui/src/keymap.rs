@@ -18,7 +18,11 @@ use vortex_core::{Action, Motion};
 /// Only key **press** (and repeat) events map to actions; releases are ignored so
 /// the Kitty protocol's release reporting (SPEC §9) does not double-fire edits.
 /// `Shift` on a motion key produces the `extend` variant (grow the selection).
-pub fn action_for_key(key: KeyEvent) -> Option<Action> {
+///
+/// `page` is the current viewport's page size (lines), supplied by the caller for
+/// PageUp/PageDown: page size is the viewport height, which only the frontend
+/// knows (SPEC §5), so the keymap folds it into the motion here.
+pub fn action_for_key(key: KeyEvent, page: usize) -> Option<Action> {
     // With the Kitty protocol enabled we receive Release events too; act only on
     // Press/Repeat. (Classic terminals only ever send Press, so this is safe.)
     if key.kind == KeyEventKind::Release {
@@ -53,6 +57,10 @@ pub fn action_for_key(key: KeyEvent) -> Option<Action> {
         KeyCode::Down => motion(Motion::Down),
         KeyCode::Home => motion(Motion::LineStart),
         KeyCode::End => motion(Motion::LineEnd),
+        // Home/End reveal the line ends via horizontal scroll-follow (no special
+        // code); PageUp/PageDown move the cursor a viewport-page of lines.
+        KeyCode::PageUp => motion(Motion::PageUp(page)),
+        KeyCode::PageDown => motion(Motion::PageDown(page)),
 
         _ => None,
     }
@@ -62,6 +70,10 @@ pub fn action_for_key(key: KeyEvent) -> Option<Action> {
 mod tests {
     use super::*;
 
+    /// Page size used by the tests that do not exercise PageUp/PageDown; a fixed,
+    /// arbitrary value keeps the non-page assertions independent of it.
+    const PAGE: usize = 10;
+
     fn press(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::NONE)
     }
@@ -70,10 +82,15 @@ mod tests {
         KeyEvent::new(code, mods)
     }
 
+    /// Translate a key with the fixed test [`PAGE`], the common case.
+    fn act(key: KeyEvent) -> Option<Action> {
+        action_for_key(key, PAGE)
+    }
+
     #[test]
     fn plain_char_inserts() {
         assert_eq!(
-            action_for_key(press(KeyCode::Char('a'))),
+            act(press(KeyCode::Char('a'))),
             Some(Action::Insert("a".into()))
         );
     }
@@ -81,38 +98,29 @@ mod tests {
     #[test]
     fn enter_and_tab_insert_whitespace() {
         assert_eq!(
-            action_for_key(press(KeyCode::Enter)),
+            act(press(KeyCode::Enter)),
             Some(Action::Insert("\n".into()))
         );
-        assert_eq!(
-            action_for_key(press(KeyCode::Tab)),
-            Some(Action::Insert("\t".into()))
-        );
+        assert_eq!(act(press(KeyCode::Tab)), Some(Action::Insert("\t".into())));
     }
 
     #[test]
     fn backspace_and_delete() {
-        assert_eq!(
-            action_for_key(press(KeyCode::Backspace)),
-            Some(Action::DeleteBackward)
-        );
-        assert_eq!(
-            action_for_key(press(KeyCode::Delete)),
-            Some(Action::DeleteForward)
-        );
+        assert_eq!(act(press(KeyCode::Backspace)), Some(Action::DeleteBackward));
+        assert_eq!(act(press(KeyCode::Delete)), Some(Action::DeleteForward));
     }
 
     #[test]
     fn arrows_map_to_motions_without_extend() {
         assert_eq!(
-            action_for_key(press(KeyCode::Left)),
+            act(press(KeyCode::Left)),
             Some(Action::MoveCursor {
                 motion: Motion::Left,
                 extend: false
             })
         );
         assert_eq!(
-            action_for_key(press(KeyCode::Up)),
+            act(press(KeyCode::Up)),
             Some(Action::MoveCursor {
                 motion: Motion::Up,
                 extend: false
@@ -123,7 +131,7 @@ mod tests {
     #[test]
     fn shift_arrow_extends() {
         assert_eq!(
-            action_for_key(with_mods(KeyCode::Right, KeyModifiers::SHIFT)),
+            act(with_mods(KeyCode::Right, KeyModifiers::SHIFT)),
             Some(Action::MoveCursor {
                 motion: Motion::Right,
                 extend: true
@@ -134,14 +142,14 @@ mod tests {
     #[test]
     fn home_end_map_to_line_bounds() {
         assert_eq!(
-            action_for_key(press(KeyCode::Home)),
+            act(press(KeyCode::Home)),
             Some(Action::MoveCursor {
                 motion: Motion::LineStart,
                 extend: false
             })
         );
         assert_eq!(
-            action_for_key(press(KeyCode::End)),
+            act(press(KeyCode::End)),
             Some(Action::MoveCursor {
                 motion: Motion::LineEnd,
                 extend: false
@@ -150,13 +158,43 @@ mod tests {
     }
 
     #[test]
+    fn page_keys_carry_the_supplied_page_size() {
+        // The keymap folds the caller's page size into the motion (SPEC §5).
+        assert_eq!(
+            action_for_key(press(KeyCode::PageDown), 20),
+            Some(Action::MoveCursor {
+                motion: Motion::PageDown(20),
+                extend: false
+            })
+        );
+        assert_eq!(
+            action_for_key(press(KeyCode::PageUp), 20),
+            Some(Action::MoveCursor {
+                motion: Motion::PageUp(20),
+                extend: false
+            })
+        );
+    }
+
+    #[test]
+    fn shift_page_down_extends_selection() {
+        assert_eq!(
+            action_for_key(with_mods(KeyCode::PageDown, KeyModifiers::SHIFT), 15),
+            Some(Action::MoveCursor {
+                motion: Motion::PageDown(15),
+                extend: true
+            })
+        );
+    }
+
+    #[test]
     fn ctrl_q_and_ctrl_c_quit() {
         assert_eq!(
-            action_for_key(with_mods(KeyCode::Char('q'), KeyModifiers::CONTROL)),
+            act(with_mods(KeyCode::Char('q'), KeyModifiers::CONTROL)),
             Some(Action::Quit)
         );
         assert_eq!(
-            action_for_key(with_mods(KeyCode::Char('c'), KeyModifiers::CONTROL)),
+            act(with_mods(KeyCode::Char('c'), KeyModifiers::CONTROL)),
             Some(Action::Quit)
         );
     }
@@ -164,7 +202,7 @@ mod tests {
     #[test]
     fn ctrl_s_saves() {
         assert_eq!(
-            action_for_key(with_mods(KeyCode::Char('s'), KeyModifiers::CONTROL)),
+            act(with_mods(KeyCode::Char('s'), KeyModifiers::CONTROL)),
             Some(Action::Save)
         );
     }
@@ -174,7 +212,7 @@ mod tests {
         // Ctrl+a is not text and not a mapped command in M1 -> no action (rather
         // than inserting a literal 'a').
         assert_eq!(
-            action_for_key(with_mods(KeyCode::Char('a'), KeyModifiers::CONTROL)),
+            act(with_mods(KeyCode::Char('a'), KeyModifiers::CONTROL)),
             None
         );
     }
@@ -184,11 +222,11 @@ mod tests {
         // Kitty protocol reports releases; they must not re-fire the action.
         let mut ev = press(KeyCode::Char('a'));
         ev.kind = KeyEventKind::Release;
-        assert_eq!(action_for_key(ev), None);
+        assert_eq!(act(ev), None);
     }
 
     #[test]
     fn esc_is_unmapped_in_m1() {
-        assert_eq!(action_for_key(press(KeyCode::Esc)), None);
+        assert_eq!(act(press(KeyCode::Esc)), None);
     }
 }

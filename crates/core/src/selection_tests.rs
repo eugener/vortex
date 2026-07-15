@@ -177,6 +177,63 @@ fn vertical_moves_up_one_line() {
 }
 
 #[test]
+fn page_down_moves_n_lines_keeping_goal_column() {
+    // 5 lines "l0".."l4", each 3 bytes incl. newline. Cursor at col 1 of line 0.
+    let t = text("aa\nbb\ncc\ndd\nee");
+    let mut s = SelectionSet::single(Selection::cursor(1)); // "a|a" col 1, line 0
+    s.move_all(&t, Motion::PageDown(3), false);
+    // Down 3 lines -> line 3 "dd", col 1 -> byte 9 (line 3 starts at 9) + 1.
+    assert_eq!(s.primary().head, 10);
+}
+
+#[test]
+fn page_up_moves_n_lines_keeping_goal_column() {
+    let t = text("aa\nbb\ncc\ndd\nee");
+    let mut s = SelectionSet::single(Selection::cursor(13)); // line 4 "e|e" col 1
+    s.move_all(&t, Motion::PageUp(2), false);
+    // Up 2 lines -> line 2 "cc", col 1 -> byte 6 + 1.
+    assert_eq!(s.primary().head, 7);
+}
+
+#[test]
+fn page_motion_clamps_to_buffer_edges() {
+    // A page larger than the buffer lands on the first/last line, not past it.
+    let t = text("aa\nbb\ncc");
+    let mut down = SelectionSet::single(Selection::cursor(0));
+    down.move_all(&t, Motion::PageDown(100), false);
+    // Last line "cc" starts at byte 6; goal col 0 -> byte 6.
+    assert_eq!(down.primary().head, 6);
+
+    let mut up = SelectionSet::single(Selection::cursor(7)); // line 2 col 1
+    up.move_all(&t, Motion::PageUp(100), false);
+    // First line "aa", goal col 1 -> byte 1.
+    assert_eq!(up.primary().head, 1);
+}
+
+#[test]
+fn page_down_preserves_goal_through_a_short_line() {
+    // Goal column survives a page motion that lands on (or crosses) a short line,
+    // the same contract as single-step vertical motion.
+    let t = text("aaaaa\nbb\nccccc"); // line 1 "bb" is short
+    let mut s = SelectionSet::single(Selection::cursor(4)); // line 0 col 4
+    s.move_all(&t, Motion::PageDown(1), false); // -> line 1 "bb", clamped to col 2
+    assert_eq!(s.primary().head, 8); // byte 6 (line 1 start) + 2
+    s.move_all(&t, Motion::PageDown(1), false); // -> line 2, goal col 4 restored
+    assert_eq!(s.primary().head, 13); // byte 9 (line 2 start) + 4
+}
+
+#[test]
+fn page_down_extends_selection_when_asked() {
+    let t = text("aa\nbb\ncc\ndd");
+    let mut s = SelectionSet::single(Selection::cursor(0));
+    s.move_all(&t, Motion::PageDown(2), true); // extend
+    let sel = s.primary();
+    assert_eq!(sel.anchor, 0); // anchor held
+    assert_eq!(sel.head, 6); // moved to line 2 col 0
+    assert!(!sel.is_cursor());
+}
+
+#[test]
 fn overlapping_selections_merge() {
     // Directly exercise the disjoint invariant with two overlapping ranges.
     let mut set = SelectionSet {

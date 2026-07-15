@@ -98,6 +98,12 @@ pub enum Motion {
     LineStart,
     /// Last column of the current line (before its terminator).
     LineEnd,
+    /// Up by `n` lines (one screen page), keeping the goal column. The frontend
+    /// supplies `n` because page size is the viewport height, which only it knows
+    /// (SPEC §5, §12.2 "minimal view intent"); the core does the buffer math.
+    PageUp(usize),
+    /// Down by `n` lines (one screen page), keeping the goal column.
+    PageDown(usize),
     /// Start of the buffer.
     BufferStart,
     /// End of the buffer.
@@ -237,14 +243,13 @@ fn move_selection(text: &Text, sel: Selection, motion: Motion, extend: bool) -> 
         Motion::LineEnd => (line_end(text, sel.head), None),
         Motion::BufferStart => (0, None),
         Motion::BufferEnd => (text.byte_len(), None),
-        Motion::Up | Motion::Down => {
-            // Establish the goal column from the current head if none is carried.
-            let goal = sel
-                .goal_column
-                .unwrap_or_else(|| grapheme_column(text, sel.head));
-            let head = vertical(text, sel.head, motion == Motion::Up, goal);
-            (head, Some(goal))
-        }
+        // Vertical motions share one path parameterized by a signed line delta
+        // (single-step is ±1, a page is ±n lines). The goal column is established
+        // from the current head if none is carried, so it survives across them.
+        Motion::Up => vstep(text, sel, -1),
+        Motion::Down => vstep(text, sel, 1),
+        Motion::PageUp(n) => vstep(text, sel, -(n as isize)),
+        Motion::PageDown(n) => vstep(text, sel, n as isize),
     };
 
     let anchor = if extend { sel.anchor } else { new_head };
@@ -340,21 +345,30 @@ fn grapheme_column(text: &Text, offset: usize) -> usize {
         .count()
 }
 
-/// Move vertically to `goal` grapheme column on the adjacent line. Clamps to the
-/// target line's content length; at the buffer's top/bottom edge, stays put.
-fn vertical(text: &Text, offset: usize, up: bool, goal: usize) -> usize {
+/// The `(new_head, goal)` for a vertical motion of `delta` lines: establish the
+/// goal column from the current head if the selection is not already carrying one,
+/// move, and return the goal so it persists across consecutive vertical motions.
+/// Shared by Up/Down (±1) and PageUp/PageDown (±n).
+fn vstep(text: &Text, sel: Selection, delta: isize) -> (usize, Option<usize>) {
+    let goal = sel
+        .goal_column
+        .unwrap_or_else(|| grapheme_column(text, sel.head));
+    (vertical(text, sel.head, delta, goal), Some(goal))
+}
+
+/// Move `delta` lines (negative = up) to `goal` grapheme column. The target line
+/// is clamped to the buffer's line range, so a page motion past the top/bottom
+/// lands on the first/last line rather than overshooting; a single step off the
+/// edge stays put (clamp keeps it on the same line). Column is clamped to the
+/// target line's content length.
+fn vertical(text: &Text, offset: usize, delta: isize, goal: usize) -> usize {
+    let line_count = text.line_count();
+    if line_count == 0 {
+        return offset; // empty buffer: nowhere to go
+    }
     let (line, _) = line_col(text, offset);
-    let target_line = if up {
-        if line == 0 {
-            return offset; // already at the top edge
-        }
-        line - 1
-    } else {
-        if line + 1 >= text.line_count() {
-            return offset; // already at the bottom edge
-        }
-        line + 1
-    };
+    // Saturating signed add, then clamp into `0..line_count`.
+    let target_line = (line as isize + delta).clamp(0, line_count as isize - 1) as usize;
     let start = text.byte_of_line(target_line).unwrap_or(0);
     let line_text = text.line(target_line).unwrap_or_default();
     // Byte offset of the goal-th grapheme, clamped to the line's content end.
