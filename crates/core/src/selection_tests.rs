@@ -196,6 +196,63 @@ fn page_up_moves_n_lines_keeping_goal_column() {
 }
 
 #[test]
+fn down_on_the_virtual_trailing_line_stays_put() {
+    // A newline-terminated buffer has a virtual empty line below the last content
+    // line, reachable by Right at end-of-file (offset == byte_len). A Down there
+    // must not collapse the caret to a line above it (the clamp ceiling used to be
+    // `line_count - 1`, one short of that trailing line).
+    let t = text("a\n"); // line 0 "a", virtual line 1 at offset 2
+    let mut s = SelectionSet::single(Selection::cursor(2));
+    s.move_all(&t, Motion::Down, false);
+    assert_eq!(
+        s.primary().head,
+        2,
+        "Down on the trailing line should stay put"
+    );
+
+    let t = text("a\nb\n"); // virtual line 2 at offset 4
+    let mut s = SelectionSet::single(Selection::cursor(4));
+    s.move_all(&t, Motion::PageDown(3), false);
+    assert_eq!(
+        s.primary().head,
+        4,
+        "PageDown on the trailing line should stay put"
+    );
+}
+
+#[test]
+fn down_reaches_the_virtual_trailing_line_and_up_returns() {
+    // Down from the last content line lands on the trailing empty line; Up comes
+    // back. The trailing line is navigable, consistent with horizontal motion.
+    let t = text("a\n");
+    let mut s = SelectionSet::at_origin(); // caret at 0 on "a"
+    s.move_all(&t, Motion::Down, false);
+    assert_eq!(
+        s.primary().head,
+        2,
+        "Down should reach the trailing empty line"
+    );
+    s.move_all(&t, Motion::Up, false);
+    assert_eq!(s.primary().head, 0, "Up should return to the content line");
+}
+
+#[test]
+fn move_left_between_cr_and_lf_does_not_panic() {
+    // A caret can land between a CR and LF when an edit/paste inserts a lone CR next
+    // to an existing LF ("a\r\nb", caret at byte 2). crop treats "\r\n" as one line
+    // break, so the caret's byte column (2) exceeds line 0's content "a" (len 1);
+    // grapheme_before must clamp rather than slice out of bounds (SPEC §8).
+    let t = text("a\r\nb");
+    let mut s = SelectionSet::single(Selection::cursor(2)); // between \r and \n
+    s.move_all(&t, Motion::Left, false);
+    assert_eq!(
+        s.primary().head,
+        1,
+        "Left should step back over the CR to offset 1"
+    );
+}
+
+#[test]
 fn page_motion_clamps_to_buffer_edges() {
     // A page larger than the buffer lands on the first/last line, not past it.
     let t = text("aa\nbb\ncc");

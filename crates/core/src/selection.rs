@@ -295,8 +295,13 @@ pub(crate) fn grapheme_before(text: &Text, offset: usize) -> usize {
         return line_content_end(text, line - 1);
     }
     let line_text = text.line(line).unwrap_or_default();
-    // The previous grapheme boundary before `col` within this line.
-    let back = line_text[..col]
+    // `col` can exceed the line's content length when the caret sits inside a
+    // multi-byte terminator (a "\r\n" split by an edit/paste), so clamp before
+    // slicing - mirrors the guards in `grapheme_after`/`grapheme_column` and keeps
+    // this off the panic path (SPEC §8).
+    let end = col.min(line_text.len());
+    // The previous grapheme boundary before `end` within this line.
+    let back = line_text[..end]
         .graphemes(true)
         .next_back()
         .map(|g| g.len())
@@ -367,8 +372,14 @@ fn vertical(text: &Text, offset: usize, delta: isize, goal: usize) -> usize {
         return offset; // empty buffer: nowhere to go
     }
     let (line, _) = line_col(text, offset);
-    // Saturating signed add, then clamp into `0..line_count`.
-    let target_line = (line as isize + delta).clamp(0, line_count as isize - 1) as usize;
+    // The last navigable line, which for a newline-terminated buffer is the virtual
+    // empty line *after* the final terminator (index `line_count`, reachable by
+    // Right at end-of-file) - one past `line_count - 1`. Deriving the ceiling from
+    // the trailing byte's line index keeps it in step with `line_col`, so a Down on
+    // that trailing line stays put instead of collapsing to a line above it.
+    let max_line = text.line_of_byte(text.byte_len());
+    // Saturating signed add, then clamp into `0..=max_line`.
+    let target_line = (line as isize + delta).clamp(0, max_line as isize) as usize;
     let start = text.byte_of_line(target_line).unwrap_or(0);
     let line_text = text.line(target_line).unwrap_or_default();
     // Byte offset of the goal-th grapheme, clamped to the line's content end.
