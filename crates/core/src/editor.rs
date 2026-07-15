@@ -542,10 +542,32 @@ fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), String> {
     // the path as given (its parent dir must already exist to hold the temp).
     let existed = fs::symlink_metadata(path).is_ok();
     let target = if existed {
-        fs::canonicalize(path).map_err(|e| e.to_string())?
+        match fs::canonicalize(path) {
+            Ok(real) => real,
+            // `path` exists (symlink_metadata succeeded) but a component of the
+            // resolved path does not: a symlink whose target has not been created
+            // yet (e.g. `~/.vimrc -> dotfiles/vimrc` before the first save).
+            // Resolve the link by hand and write *through* it so the target is
+            // created and the link stays intact, matching vim's behavior.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                let link_target = fs::read_link(path).map_err(|e| e.to_string())?;
+                if link_target.is_absolute() {
+                    link_target
+                } else {
+                    // A relative link resolves against the link's own directory.
+                    path.parent()
+                        .unwrap_or_else(|| Path::new("."))
+                        .join(link_target)
+                }
+            }
+            Err(e) => return Err(e.to_string()),
+        }
     } else {
         path.to_path_buf()
     };
+    // Whether a real file exists at the resolved target (false for a first save
+    // through a dangling symlink): governs whether there is a mode to preserve.
+    let target_exists = fs::metadata(&target).is_ok();
 
     // Temp file must sit in the target's directory so the rename stays on one
     // filesystem (a cross-device rename is not atomic and errors). A bare file
@@ -574,16 +596,38 @@ fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), String> {
     // inner block drops the file handle before the rename (renaming an open file
     // fails on Windows). Any failure shares one cleanup: remove the temp, leaving
     // the original intact (SPEC §8).
+    // The target's current mode (if it exists), so the temp is *created* no wider
+    // than the destination - a 0600 file's contents must never touch disk in a
+    // 0644 temp, even briefly, before being narrowed (that window would expose
+    // e.g. an SSH key to any local user for the length of the write + fsync).
+    let target_mode = if target_exists {
+        fs::metadata(&target).ok().map(|m| m.permissions())
+    } else {
+        None
+    };
     let result = (|| -> std::io::Result<()> {
         {
-            let mut f = fs::File::create(&tmp)?;
+            let mut opts = fs::OpenOptions::new();
+            opts.write(true).create_new(true);
+            // On Unix, create the temp at the target's mode up front. umask can only
+            // *remove* bits, so the temp is always <= the target mode during the
+            // write; the explicit set_permissions below then restores the exact
+            // bits. A new file gets OpenOptions' default (0o666 & ~umask), matching
+            // the prior `File::create` behavior.
+            #[cfg(unix)]
+            if let Some(mode) = &target_mode {
+                use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+                opts.mode(mode.mode());
+            }
+            let mut f = opts.open(&tmp)?;
             f.write_all(bytes)?;
             f.sync_all()?;
         }
-        // Carry the target's permission bits onto the temp (best-effort: a failure
-        // here should not abort an otherwise-good save).
-        if existed && let Ok(meta) = fs::metadata(&target) {
-            let _ = fs::set_permissions(&tmp, meta.permissions());
+        // Restore the target's exact permission bits (best-effort: a failure here
+        // should not abort an otherwise-good save). Needed because umask may have
+        // stripped bits the target legitimately had at create time.
+        if let Some(mode) = &target_mode {
+            let _ = fs::set_permissions(&tmp, mode.clone());
         }
         fs::rename(&tmp, &target)
     })();
