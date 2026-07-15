@@ -15,6 +15,7 @@
 mod keymap;
 mod layout;
 
+use std::ffi::OsString;
 use std::io::{self, Stdout};
 use std::path::PathBuf;
 use std::time::Duration;
@@ -57,6 +58,30 @@ const GUTTER_CURRENT_STYLE: Style = Style::new().fg(Color::White).add_modifier(M
 const POLL: Duration = Duration::from_millis(16);
 
 fn main() -> io::Result<()> {
+    // Parse argv before touching the terminal: `--help`/`--version` and bad flags
+    // must print to normal stdout/stderr, not paint into the alternate screen.
+    let path = match parse_args(std::env::args_os().skip(1)) {
+        Args::Open(path) => path,
+        Args::Help => {
+            print!("{HELP}");
+            return Ok(());
+        }
+        Args::Version => {
+            println!("vortex {}", env!("CARGO_PKG_VERSION"));
+            return Ok(());
+        }
+        Args::Unknown(flag) => {
+            eprintln!(
+                "vortex: unknown option '{}'\n{USAGE}",
+                flag.to_string_lossy()
+            );
+            // Exit directly with the conventional "usage" code rather than
+            // returning Err, which would print a second, redundant Rust-formatted
+            // error line after our own message.
+            std::process::exit(2);
+        }
+    };
+
     // The core is a single-owner actor task (SPEC §2.3). It runs on its OWN thread
     // via `block_on`, and the frontend talks to it only over channels - never a
     // shared method call. This split is load-bearing, not incidental: the frontend
@@ -69,11 +94,6 @@ fn main() -> io::Result<()> {
         .name("vortex-core".into())
         .spawn(move || smol::block_on(run))?;
 
-    // First positional argument is the file to open (`vortex path`). A missing
-    // file is not an error - the core opens an empty buffer bound to it, created
-    // on the first save (SPEC §10). Extra args are ignored until multi-buffer.
-    let path = std::env::args_os().nth(1).map(PathBuf::from);
-
     // Terminal setup. On any error we still attempt teardown so we never leave the
     // user's terminal in raw mode (the Drop impl is the backstop).
     let mut term = TerminalGuard::enter()?;
@@ -85,6 +105,62 @@ fn main() -> io::Result<()> {
     drop(handle);
     let _ = core_thread.join();
     result
+}
+
+const USAGE: &str = "Usage: vortex [OPTIONS] [FILE]";
+const HELP: &str = "\
+Usage: vortex [OPTIONS] [FILE]
+
+A terminal text editor. Opens FILE, or an empty buffer if omitted.
+
+Options:
+  -h, --help       Print this help and exit
+  -V, --version    Print the version and exit
+      --           Treat every following argument as a file name
+
+Keys:
+  Ctrl+S           Save        Ctrl+Q / Ctrl+C   Quit
+";
+
+/// The outcome of parsing the command line - what `main` should do next.
+#[derive(Debug, PartialEq, Eq)]
+enum Args {
+    /// Open this file, or start an empty unnamed buffer (`None`).
+    Open(Option<PathBuf>),
+    Help,
+    Version,
+    /// An unrecognized `-`/`--` flag; report it rather than opening a file by
+    /// that name (so `vortex --version` prints a version, not a "--version" buffer).
+    Unknown(OsString),
+}
+
+/// Parse the argument list (already skipping argv[0]). The first positional
+/// argument is the file to open; recognized flags map to help/version; an
+/// unrecognized dashed argument is an error. `--` ends flag parsing so a file
+/// literally named `--foo` is still openable. Pure and `OsString`-based (paths
+/// need not be UTF-8) so it is unit-testable without a process (SPEC §13).
+fn parse_args(args: impl IntoIterator<Item = OsString>) -> Args {
+    let mut file: Option<PathBuf> = None;
+    let mut flags_done = false;
+    for arg in args {
+        if flags_done {
+            file.get_or_insert_with(|| PathBuf::from(&arg));
+            continue;
+        }
+        match arg.to_str() {
+            Some("--") => flags_done = true,
+            Some("-h" | "--help") => return Args::Help,
+            Some("-V" | "--version") => return Args::Version,
+            // A dashed token we do not recognize (but not a lone "-", which is a
+            // conventional stdin placeholder / valid-ish name, left as a path).
+            Some(s) if s.starts_with('-') && s != "-" => return Args::Unknown(arg),
+            // First positional wins; extra files are ignored until multi-buffer.
+            _ => {
+                file.get_or_insert_with(|| PathBuf::from(&arg));
+            }
+        }
+    }
+    Args::Open(file)
 }
 
 /// The render + input loop, run synchronously on the main thread. Returns when the
@@ -465,6 +541,67 @@ mod tests {
         (0..buf.area().width)
             .map(|x| buf.cell((x, y)).unwrap().symbol())
             .collect()
+    }
+
+    /// Parse a slice of string args (skipping argv[0]) the way `main` does.
+    fn args(list: &[&str]) -> Args {
+        parse_args(list.iter().map(OsString::from))
+    }
+
+    #[test]
+    fn parse_args_no_args_opens_empty_buffer() {
+        assert_eq!(args(&[]), Args::Open(None));
+    }
+
+    #[test]
+    fn parse_args_positional_is_the_file() {
+        assert_eq!(
+            args(&["notes.txt"]),
+            Args::Open(Some(PathBuf::from("notes.txt")))
+        );
+    }
+
+    #[test]
+    fn parse_args_recognizes_help_and_version() {
+        assert_eq!(args(&["--help"]), Args::Help);
+        assert_eq!(args(&["-h"]), Args::Help);
+        assert_eq!(args(&["--version"]), Args::Version);
+        assert_eq!(args(&["-V"]), Args::Version);
+    }
+
+    #[test]
+    fn parse_args_unknown_flag_is_not_opened_as_a_file() {
+        // Regression: `vortex --frobnicate` must error, not open a buffer named
+        // "--frobnicate" (and create that file on save).
+        assert_eq!(
+            args(&["--frobnicate"]),
+            Args::Unknown(OsString::from("--frobnicate"))
+        );
+        assert_eq!(args(&["-x"]), Args::Unknown(OsString::from("-x")));
+    }
+
+    #[test]
+    fn parse_args_double_dash_forces_following_arg_as_file() {
+        // `--` ends option parsing so a file literally named "--version" opens.
+        assert_eq!(
+            args(&["--", "--version"]),
+            Args::Open(Some(PathBuf::from("--version")))
+        );
+    }
+
+    #[test]
+    fn parse_args_lone_dash_is_treated_as_a_path() {
+        // A bare "-" is a conventional stdin placeholder, not an unknown flag;
+        // keep it as a path rather than erroring.
+        assert_eq!(args(&["-"]), Args::Open(Some(PathBuf::from("-"))));
+    }
+
+    #[test]
+    fn parse_args_first_positional_wins() {
+        assert_eq!(
+            args(&["a.txt", "b.txt"]),
+            Args::Open(Some(PathBuf::from("a.txt")))
+        );
     }
 
     #[test]
