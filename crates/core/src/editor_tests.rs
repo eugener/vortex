@@ -731,4 +731,110 @@ mod atomic_write {
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "second");
         assert!(!has_temp_file(&dir.path), "no temp file should leak");
     }
+
+    #[test]
+    fn save_through_a_dangling_symlink_creates_its_target() {
+        // A symlink whose target does not exist yet (a fresh dotfile: link -> real,
+        // real not created). canonicalize fails NotFound on it, so write_atomic must
+        // resolve the link by hand and write *through* it, creating the target while
+        // leaving the link a link - the way vim handles a first save of ~/.vimrc.
+        let dir = TempDir::new();
+        let real = dir.file("real.txt"); // does not exist yet
+        let link = dir.file("link.txt");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+
+        write_atomic(&link, b"first write").expect("save through dangling link succeeds");
+
+        assert_eq!(std::fs::read_to_string(&real).unwrap(), "first write");
+        assert!(
+            std::fs::symlink_metadata(&link)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "link should remain a symlink pointing at the created target"
+        );
+        assert!(!has_temp_file(&dir.path), "no temp file should leak");
+    }
+
+    #[test]
+    fn save_through_a_dangling_relative_symlink_resolves_against_the_link_dir() {
+        // A *relative* dangling link (`link -> real.txt`, the common dotfile shape)
+        // resolves its target against the link's own directory, not the process cwd,
+        // so the created file lands next to the link.
+        let dir = TempDir::new();
+        let link = dir.file("link.txt");
+        // Relative target: `read_link` returns "real.txt", joined with the link's dir.
+        std::os::unix::fs::symlink(Path::new("real.txt"), &link).unwrap();
+
+        write_atomic(&link, b"relative write").expect("save through relative link succeeds");
+
+        assert_eq!(
+            std::fs::read_to_string(dir.file("real.txt")).unwrap(),
+            "relative write",
+            "target should be created beside the link"
+        );
+        assert!(
+            std::fs::symlink_metadata(&link)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "link should remain a symlink"
+        );
+        assert!(!has_temp_file(&dir.path), "no temp file should leak");
+    }
+
+    #[test]
+    fn save_never_exposes_a_private_file_in_a_world_readable_temp() {
+        // A 0600 target's contents must never touch disk in a wider-mode temp, even
+        // for the write+fsync window (that window would expose e.g. an SSH key to any
+        // local user). A watcher thread records the widest mode any temp shows; a
+        // group/other-accessible temp fails the test. The watcher can only *tighten*
+        // the assertion, so correct code never flakes - at worst a very fast machine
+        // misses the window (a false negative, never a false positive).
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, AtomicU32};
+
+        let dir = TempDir::new();
+        let path = dir.file("private.txt");
+        std::fs::write(&path, "seed").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+        let done = Arc::new(AtomicBool::new(false));
+        let widest = Arc::new(AtomicU32::new(0));
+        let watch_dir = dir.path.clone();
+        let (w_done, w_widest) = (Arc::clone(&done), Arc::clone(&widest));
+        let watcher = std::thread::spawn(move || {
+            while !w_done.load(Ordering::Relaxed) {
+                if let Ok(entries) = std::fs::read_dir(&watch_dir) {
+                    for e in entries.flatten() {
+                        if e.file_name().to_string_lossy().contains(".vortex-tmp-")
+                            && let Ok(meta) = e.metadata()
+                        {
+                            w_widest
+                                .fetch_max(meta.permissions().mode() & 0o777, Ordering::Relaxed);
+                        }
+                    }
+                }
+            }
+        });
+
+        // A multi-megabyte payload widens the write+fsync window enough for the
+        // watcher to observe the temp before it is renamed.
+        let big = vec![b'x'; 8 * 1024 * 1024];
+        write_atomic(&path, &big).expect("save succeeds");
+        done.store(true, Ordering::Relaxed);
+        watcher.join().unwrap();
+
+        let seen = widest.load(Ordering::Relaxed);
+        assert_eq!(
+            seen & 0o077,
+            0,
+            "temp must never be group/other-accessible; saw mode {seen:o}"
+        );
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600,
+            "final file keeps its private mode"
+        );
+    }
 }
