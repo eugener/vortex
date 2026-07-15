@@ -9,6 +9,11 @@ repository.workspace = true
 
 [dependencies]
 async-channel = "2.5.0"
+crop = "0.4.3"
+serde = { version = "1.0.228", features = ["derive"] }
+thiserror = "2.0.18"
+unicode-segmentation = "1.13.3"
 
 [dev-dependencies]
+proptest = "1.11.0"
 smol = "2.0.2"

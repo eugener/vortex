@@ -11,5 +11,11 @@ name = "vortex"
 path = "src/main.rs"
 
 [dependencies]
+# crossterm is used via ratatui's re-export (ratatui::crossterm) so the KeyEvent
+# types the render loop and event reader share are guaranteed identical - a
+# separate crossterm dep risks version skew against ratatui's bundled 0.29.
+ratatui = "0.30.2"
 smol = "2.0.2"
+unicode-segmentation = "1.13.3"
+unicode-width = "0.2.2"
 vortex-core = { path = "../core" }
