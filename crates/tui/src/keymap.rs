@@ -33,6 +33,8 @@ pub fn action_for_key(key: KeyEvent) -> Option<Action> {
     match key.code {
         // Ctrl+Q / Ctrl+C: quit.
         KeyCode::Char('q' | 'c') if ctrl => Some(Action::Quit),
+        // Ctrl+S: save to the buffer's bound file (set from the CLI path).
+        KeyCode::Char('s') if ctrl => Some(Action::Save),
 
         // Text entry. A Ctrl-modified char is a command, not text, so it is not
         // inserted here (only the mappings above consume it).
@@ -156,6 +158,14 @@ mod tests {
         assert_eq!(
             action_for_key(with_mods(KeyCode::Char('c'), KeyModifiers::CONTROL)),
             Some(Action::Quit)
+        );
+    }
+
+    #[test]
+    fn ctrl_s_saves() {
+        assert_eq!(
+            action_for_key(with_mods(KeyCode::Char('s'), KeyModifiers::CONTROL)),
+            Some(Action::Save)
         );
     }
 

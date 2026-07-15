@@ -16,6 +16,7 @@ mod keymap;
 mod layout;
 
 use std::io::{self, Stdout};
+use std::path::PathBuf;
 use std::time::Duration;
 
 use ratatui::crossterm::event::{
@@ -36,8 +37,6 @@ use vortex_core::{Action, Core, ViewSnapshot};
 
 /// Default tab stop width for display-column layout (SPEC §4). Config in M5.
 const TAB_WIDTH: usize = 4;
-/// Placeholder buffer name until file handling (M5) gives buffers real paths.
-const NO_NAME: &str = "[No Name]";
 
 /// Chrome palette. Both bars paint a filled background row (the user asked for
 /// color, not divider lines); the gutter and current-line number are dimmed/bold
@@ -70,10 +69,15 @@ fn main() -> io::Result<()> {
         .name("vortex-core".into())
         .spawn(move || smol::block_on(run))?;
 
+    // First positional argument is the file to open (`vortex path`). A missing
+    // file is not an error - the core opens an empty buffer bound to it, created
+    // on the first save (SPEC §10). Extra args are ignored until multi-buffer.
+    let path = std::env::args_os().nth(1).map(PathBuf::from);
+
     // Terminal setup. On any error we still attempt teardown so we never leave the
     // user's terminal in raw mode (the Drop impl is the backstop).
     let mut term = TerminalGuard::enter()?;
-    let result = event_loop(&handle, &mut term.terminal);
+    let result = event_loop(&handle, &mut term.terminal, path);
     term.leave();
 
     // Dropping the handle closes the action channel, so the core loop ends; join
@@ -91,19 +95,25 @@ fn main() -> io::Result<()> {
 fn event_loop(
     handle: &vortex_core::CoreHandle,
     terminal: &mut Terminal<ratatui::backend::CrosstermBackend<Stdout>>,
+    path: Option<PathBuf>,
 ) -> io::Result<()> {
-    // Prime the view: ask the core for an initial snapshot to paint. Surface a
-    // failed prime (core thread never started) rather than sitting on a blank
-    // screen forever.
-    if handle
-        .actions
-        .send_blocking(Action::RequestSnapshot)
-        .is_err()
-    {
+    // Prime the view: open the CLI-given file, or just request a snapshot of the
+    // empty buffer when none was given. Either way a snapshot follows, so the
+    // first frame paints. Surface a failed prime (core thread never started)
+    // rather than sitting on a blank screen forever.
+    let prime = match path {
+        Some(p) => Action::Open(p),
+        None => Action::RequestSnapshot,
+    };
+    if handle.actions.send_blocking(prime).is_err() {
         return Ok(());
     }
     let mut latest: Option<ViewSnapshot> = None;
     let mut scroll: usize = 0;
+    // The latest file-lifecycle message (open/save result), shown transiently in
+    // the status bar until the next edit or motion snapshot clears it. A failed
+    // save must be visible, not silent (SPEC §8).
+    let mut message: Option<String> = None;
     // Repaint only when something changed - a new snapshot, a resize, or the
     // first frame. Redrawing every idle poll tick is wasted work (ratatui
     // cell-diffs, so it emits nothing, but it still rebuilds the frame ~60x/sec).
@@ -119,11 +129,20 @@ fn event_loop(
         // terminal frontend paints from the snapshot, using deltas only as a
         // future partial-repaint hint (SPEC §5, §6).
         while handle.deltas.try_recv().is_ok() {}
+        // Drain notifications: the bounded channel must not fill (every save emits
+        // one, SPEC §6), and a file open/save result is surfaced in the status bar
+        // (SPEC §8). Keep the latest message worth showing.
+        while let Ok(note) = handle.notifications.try_recv() {
+            if let Some(m) = layout::notification_message(&note) {
+                message = Some(m);
+                needs_redraw = true;
+            }
+        }
 
         if let Some(snap) = &latest
             && needs_redraw
         {
-            scroll = draw(terminal, snap, scroll)?;
+            scroll = draw(terminal, snap, scroll, message.as_deref())?;
             needs_redraw = false;
         }
 
@@ -134,6 +153,12 @@ fn event_loop(
                 Event::Key(key) => {
                     if let Some(action) = keymap::action_for_key(key) {
                         let quit = action == Action::Quit;
+                        // A new user action clears the transient file message so it
+                        // does not linger while the user keeps typing; Save keeps it
+                        // (its own result replaces it once the notification lands).
+                        if !matches!(action, Action::Save) && message.take().is_some() {
+                            needs_redraw = true;
+                        }
                         // If the core is gone, exit cleanly.
                         if handle.actions.send_blocking(action).is_err() || quit {
                             return Ok(());
@@ -156,11 +181,12 @@ fn draw(
     terminal: &mut Terminal<ratatui::backend::CrosstermBackend<Stdout>>,
     snapshot: &ViewSnapshot,
     scroll: usize,
+    message: Option<&str>,
 ) -> io::Result<usize> {
     let mut new_scroll = scroll;
     let mut out = io::stdout();
     queue!(out, BeginSynchronizedUpdate)?;
-    terminal.draw(|frame| new_scroll = paint(frame, snapshot, scroll))?;
+    terminal.draw(|frame| new_scroll = paint(frame, snapshot, scroll, message))?;
     execute!(out, EndSynchronizedUpdate)?;
     Ok(new_scroll)
 }
@@ -170,7 +196,12 @@ fn draw(
 /// the painted cells (SPEC §13). Returns the scroll offset it settled on so the
 /// caller can carry it forward. All measurement is delegated to the tested
 /// [`layout`] helpers; this function only positions widgets.
-fn paint(frame: &mut Frame, snapshot: &ViewSnapshot, scroll: usize) -> usize {
+fn paint(
+    frame: &mut Frame,
+    snapshot: &ViewSnapshot,
+    scroll: usize,
+    message: Option<&str>,
+) -> usize {
     let area = frame.area();
     // Head bar (1 row), text body (rest), status bar (1 row). `Min(0)` lets the
     // body shrink to nothing on a tiny terminal without the split failing.
@@ -203,6 +234,7 @@ fn paint(frame: &mut Frame, snapshot: &ViewSnapshot, scroll: usize) -> usize {
         cursor_line,
         &line_text,
         cursor_byte_col,
+        message,
     );
 
     // Place the terminal cursor at the primary caret, offset by the gutter and the
@@ -215,8 +247,11 @@ fn paint(frame: &mut Frame, snapshot: &ViewSnapshot, scroll: usize) -> usize {
 }
 
 /// Paint the top head bar (buffer name left, line count right) as one filled row.
+/// The name is the bound file's name plus a modified marker (SPEC §8, §10), read
+/// straight from the snapshot so painting needs no core round-trip (SPEC §5).
 fn paint_head_bar(frame: &mut Frame, area: Rect, snapshot: &ViewSnapshot) {
-    let (left, right) = layout::head_bar(NO_NAME, layout::display_line_count(&snapshot.text));
+    let name = layout::buffer_display_name(snapshot.path.as_deref(), snapshot.modified);
+    let (left, right) = layout::head_bar(&name, layout::display_line_count(&snapshot.text));
     let bar = layout::fit_bar(&left, &right, area.width as usize);
     frame.render_widget(Paragraph::new(bar).style(HEAD_STYLE), area);
 }
@@ -257,7 +292,10 @@ fn paint_body(
     gutter_width
 }
 
-/// Paint the bottom status bar (cursor position left, buffer metrics right).
+/// Paint the bottom status bar. Normally shows cursor position (left) and buffer
+/// metrics (right); when a transient file `message` is present it replaces the
+/// cursor position so an open/save result - especially a failure - is visible
+/// (SPEC §8).
 fn paint_status_bar(
     frame: &mut Frame,
     area: Rect,
@@ -265,6 +303,7 @@ fn paint_status_bar(
     cursor_line: usize,
     line_text: &str,
     cursor_byte_col: usize,
+    message: Option<&str>,
 ) {
     let col = layout::grapheme_column(line_text, cursor_byte_col);
     let (left, right) = layout::status_bar(
@@ -272,6 +311,7 @@ fn paint_status_bar(
         col,
         snapshot.text.byte_len(),
         snapshot.version,
+        message,
     );
     let bar = layout::fit_bar(&left, &right, area.width as usize);
     frame.render_widget(Paragraph::new(bar).style(STATUS_STYLE), area);
@@ -349,6 +389,32 @@ mod tests {
     use super::*;
     use ratatui::backend::TestBackend;
 
+    /// A temp directory removed on drop, so a test that opens a real file cleans
+    /// up even if an assertion panics first (a bare trailing `remove_dir_all`
+    /// would leak the dir on failure). Name mixes pid + a counter to avoid
+    /// collisions across parallel tests.
+    struct TempDir {
+        path: std::path::PathBuf,
+    }
+
+    impl TempDir {
+        fn new() -> Self {
+            use std::sync::atomic::{AtomicU64, Ordering};
+            static COUNTER: AtomicU64 = AtomicU64::new(0);
+            let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+            let path =
+                std::env::temp_dir().join(format!("vortex-tui-{}-{}", std::process::id(), n));
+            std::fs::create_dir_all(&path).unwrap();
+            Self { path }
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.path);
+        }
+    }
+
     /// Drive the real core through an action script and return the resulting
     /// snapshot - the same seam a frontend uses (SPEC §1), so the chrome is
     /// rendered from a genuine `ViewSnapshot`, not a hand-built one (which
@@ -374,10 +440,21 @@ mod tests {
     /// Render `snapshot` into an in-memory `TestBackend` of `w`x`h` cells via the
     /// real [`paint`] path, and hand back the painted buffer for cell assertions.
     fn render(snapshot: &ViewSnapshot, w: u16, h: u16) -> ratatui::buffer::Buffer {
+        render_with_message(snapshot, w, h, None)
+    }
+
+    /// As [`render`], but with a transient status-bar `message` (a file open/save
+    /// result) so its placement can be asserted.
+    fn render_with_message(
+        snapshot: &ViewSnapshot,
+        w: u16,
+        h: u16,
+        message: Option<&str>,
+    ) -> ratatui::buffer::Buffer {
         let mut terminal = Terminal::new(TestBackend::new(w, h)).unwrap();
         terminal
             .draw(|frame| {
-                paint(frame, snapshot, 0);
+                paint(frame, snapshot, 0, message);
             })
             .unwrap();
         terminal.backend().buffer().clone()
@@ -395,11 +472,52 @@ mod tests {
         let snap = snapshot_after(&[Action::Insert("a\nb\nc".into())]);
         let buf = render(&snap, 40, 10);
         let head = row_text(&buf, 0);
-        assert!(head.contains(NO_NAME), "head bar: {head:?}");
+        assert!(head.contains(layout::NO_NAME), "head bar: {head:?}");
         assert!(head.contains("3 lines"), "head bar: {head:?}");
         // The whole row is painted with the head background (color, not a border).
         assert_eq!(buf.cell((0, 0)).unwrap().bg, Color::Cyan);
         assert_eq!(buf.cell((39, 0)).unwrap().bg, Color::Cyan);
+    }
+
+    #[test]
+    fn head_bar_shows_file_name_after_open() {
+        // Open a real temp file; the head bar shows its file name (not full path).
+        let dir = TempDir::new();
+        let path = dir.path.join("greeting.txt");
+        std::fs::write(&path, "hello").unwrap();
+
+        let snap = snapshot_after(&[Action::Open(path.clone())]);
+        let buf = render(&snap, 40, 10);
+        let head = row_text(&buf, 0);
+        assert!(head.contains("greeting.txt"), "head bar: {head:?}");
+        // A freshly opened, unedited buffer is clean: no modified marker.
+        assert!(!head.contains('●'), "head bar: {head:?}");
+    }
+
+    #[test]
+    fn head_bar_shows_modified_marker_after_edit() {
+        // Editing marks the buffer dirty; the head bar prefixes the name with ●.
+        let snap = snapshot_after(&[Action::Insert("x".into())]);
+        let buf = render(&snap, 40, 10);
+        let head = row_text(&buf, 0);
+        assert!(
+            head.contains('●'),
+            "head bar should show modified: {head:?}"
+        );
+    }
+
+    #[test]
+    fn status_bar_shows_file_message_in_place_of_position() {
+        // With a transient file message the bottom bar shows it instead of the
+        // cursor position (SPEC §8: a save result must be visible).
+        let snap = snapshot_after(&[Action::Insert("hi".into())]);
+        let buf = render_with_message(&snap, 40, 10, Some("Saved out.txt"));
+        let status = row_text(&buf, 9);
+        assert!(status.contains("Saved out.txt"), "status: {status:?}");
+        assert!(
+            !status.contains("Ln 1"),
+            "position should be replaced: {status:?}"
+        );
     }
 
     #[test]
@@ -447,7 +565,7 @@ mod tests {
         let mut terminal = Terminal::new(TestBackend::new(40, 10)).unwrap();
         terminal
             .draw(|frame| {
-                paint(frame, &snap, 0);
+                paint(frame, &snap, 0, None);
             })
             .unwrap();
         let pos = terminal.backend().cursor_position();
