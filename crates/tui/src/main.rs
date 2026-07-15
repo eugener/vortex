@@ -71,9 +71,9 @@ impl ViewState {
 /// `Style::new()` and its setters are `const` in ratatui 0.30.
 const HEAD_STYLE: Style = Style::new()
     .fg(Color::Black)
-    .bg(Color::Cyan)
+    .bg(Color::Gray)
     .add_modifier(Modifier::BOLD);
-const STATUS_STYLE: Style = Style::new().fg(Color::Black).bg(Color::Cyan);
+const STATUS_STYLE: Style = Style::new().fg(Color::Black).bg(Color::Gray);
 /// Gutter line numbers: dim so they recede behind the text.
 const GUTTER_STYLE: Style = Style::new().fg(Color::DarkGray);
 /// The cursor's line number: bold + brighter so the active row stands out.
@@ -691,8 +691,8 @@ mod tests {
         assert!(head.contains(layout::NO_NAME), "head bar: {head:?}");
         assert!(head.contains("3 lines"), "head bar: {head:?}");
         // The whole row is painted with the head background (color, not a border).
-        assert_eq!(buf.cell((0, 0)).unwrap().bg, Color::Cyan);
-        assert_eq!(buf.cell((39, 0)).unwrap().bg, Color::Cyan);
+        assert_eq!(buf.cell((0, 0)).unwrap().bg, Color::Gray);
+        assert_eq!(buf.cell((39, 0)).unwrap().bg, Color::Gray);
     }
 
     #[test]
@@ -745,7 +745,7 @@ mod tests {
         assert!(status.contains("Ln 2, Col 4"), "status: {status:?}");
         assert!(status.contains("6B"), "status (byte count): {status:?}");
         assert!(status.contains("v1"), "status (version): {status:?}");
-        assert_eq!(buf.cell((0, 9)).unwrap().bg, Color::Cyan);
+        assert_eq!(buf.cell((0, 9)).unwrap().bg, Color::Gray);
     }
 
     #[test]
