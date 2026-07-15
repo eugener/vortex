@@ -38,10 +38,10 @@ struct Harness {
     delta_tx: Sender<Delta>,
     delta_rx: Receiver<Delta>,
     snapshots: SnapshotSink,
-    // Held only to keep the snapshot channel open: `publish` returns false (and
-    // the file ops bail as "frontend gone") if the receiver is dropped. Tests
-    // assert on state and notifications, not this, hence the underscore.
-    _snap_rx: Receiver<ViewSnapshot>,
+    // Kept so `publish` succeeds (it returns false / the file ops bail as
+    // "frontend gone" if the receiver is dropped) and so tests can read the
+    // published snapshot back via [`Harness::snapshot`].
+    snap_rx: Receiver<ViewSnapshot>,
     note_tx: Sender<Notification>,
     note_rx: Receiver<Notification>,
 }
@@ -55,10 +55,15 @@ impl Harness {
             delta_tx,
             delta_rx,
             snapshots: SnapshotSink { tx: snap_tx },
-            _snap_rx: snap_rx,
+            snap_rx,
             note_tx,
             note_rx,
         }
+    }
+
+    /// The last snapshot the file op published (latest-wins cell).
+    fn snapshot(&self) -> ViewSnapshot {
+        self.snap_rx.try_recv().expect("a snapshot was published")
     }
 }
 
@@ -298,10 +303,32 @@ fn open_missing_file_opens_empty_buffer_bound_to_path() {
     assert!(!e.modified);
     assert_eq!(e.version, 0); // empty->empty: no delta, no version bump
     assert!(h.delta_rx.is_empty());
+    // No edit happened, so the repaint hint is None (not a spurious Some(0..0)).
+    assert_eq!(h.snapshot().dirty, None);
     match h.note_rx.try_recv() {
         Ok(Notification::FileOpened { existed, .. }) => assert!(!existed),
         other => panic!("expected FileOpened, got {other:?}"),
     }
+}
+
+#[test]
+fn open_nonempty_file_reports_dirty_hint() {
+    // The complementary case: loading actual content emits a delta and the
+    // snapshot's repaint hint spans the whole new buffer.
+    let dir = TempDir::new();
+    let path = dir.file("has-text.txt");
+    std::fs::write(&path, "abcde").unwrap();
+
+    let mut e = Editor::new();
+    let h = Harness::new();
+    smol::block_on(open_file(
+        &mut e,
+        path,
+        &h.delta_tx,
+        &h.snapshots,
+        &h.note_tx,
+    ));
+    assert_eq!(h.snapshot().dirty, Some(0..5));
 }
 
 #[test]
@@ -354,8 +381,19 @@ fn save_writes_buffer_to_bound_file_and_clears_modified() {
         Ok(Notification::FileSaved { path: p, .. }) => assert_eq!(p, path),
         other => panic!("expected FileSaved, got {other:?}"),
     }
-    // No stray temp file left behind by the atomic write.
-    assert!(!dir.file(".out.txt.vortex-tmp").exists());
+    // No stray temp file left behind by the atomic write (the rename consumed it).
+    assert!(!has_temp_file(&dir.path), "leftover .vortex-tmp file");
+}
+
+/// Whether any `.<name>.vortex-tmp-*` scratch file remains in `dir`. The atomic
+/// write names its temp with a pid+counter suffix, so this scans by prefix rather
+/// than guessing the exact name.
+fn has_temp_file(dir: &std::path::Path) -> bool {
+    std::fs::read_dir(dir)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .any(|e| e.file_name().to_string_lossy().contains(".vortex-tmp-"))
 }
 
 #[test]
@@ -403,7 +441,7 @@ fn save_failure_keeps_buffer_dirty_and_does_not_corrupt_original() {
         other => panic!("expected FileError, got {other:?}"),
     }
     // The temp file was cleaned up on the failed rename.
-    assert!(!dir.file(".a-directory.vortex-tmp").exists());
+    assert!(!has_temp_file(&dir.path), "leftover .vortex-tmp file");
 }
 
 #[test]
@@ -600,4 +638,97 @@ fn open_then_save_through_the_actor_loop() {
             .iter()
             .any(|n| matches!(n, Notification::FileSaved { .. }))
     );
+}
+
+// Atomic-write hardening (SPEC §8). These are Unix-specific because they assert
+// on permission bits and symlink semantics that Windows models differently.
+#[cfg(unix)]
+mod atomic_write {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn save_preserves_existing_file_permissions() {
+        // A restrictive mode (0o600) must survive a save: the temp+rename must not
+        // reset it to File::create's default 0o644, which would silently widen a
+        // private file to world-readable.
+        let dir = TempDir::new();
+        let path = dir.file("private.txt");
+        std::fs::write(&path, "old").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+        write_atomic(&path, b"new contents").expect("save succeeds");
+
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "new contents");
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+        assert_eq!(
+            mode & 0o777,
+            0o600,
+            "mode should be preserved, got {mode:o}"
+        );
+    }
+
+    #[test]
+    fn save_preserves_executable_bit() {
+        let dir = TempDir::new();
+        let path = dir.file("script.sh");
+        std::fs::write(&path, "#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        write_atomic(&path, b"#!/bin/sh\necho hi\n").expect("save succeeds");
+
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+        assert_eq!(mode & 0o111, 0o111, "executable bits should survive");
+    }
+
+    #[test]
+    fn save_writes_through_a_symlink_instead_of_replacing_it() {
+        // A symlinked file (real dotfile setup: ~/.vimrc -> dotfiles/vimrc) must
+        // stay a symlink after save, with the *target* updated - not be replaced
+        // by a standalone regular file that detaches the link.
+        let dir = TempDir::new();
+        let real = dir.file("real.txt");
+        let link = dir.file("link.txt");
+        std::fs::write(&real, "before").unwrap();
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+
+        write_atomic(&link, b"after").expect("save succeeds");
+
+        // The link is still a link, and the real file behind it got the update.
+        assert!(
+            std::fs::symlink_metadata(&link)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "link.txt should still be a symlink"
+        );
+        assert_eq!(std::fs::read_to_string(&real).unwrap(), "after");
+    }
+
+    #[test]
+    fn save_creates_a_new_file_with_default_mode() {
+        // A brand-new file has no existing mode to copy; it just uses the default.
+        let dir = TempDir::new();
+        let path = dir.file("brand-new.txt");
+        write_atomic(&path, b"hello").expect("save succeeds");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "hello");
+        assert!(!has_temp_file(&dir.path));
+    }
+
+    #[test]
+    fn concurrent_saves_to_same_file_do_not_collide_on_temp_name() {
+        // Two saves of the same target use distinct temp names (pid + counter), so
+        // one never truncates the other's in-flight temp. Sequential here (the temp
+        // name is unique per call regardless of timing); the assertion is that both
+        // succeed and no temp leaks.
+        let dir = TempDir::new();
+        let path = dir.file("shared.txt");
+        std::fs::write(&path, "seed").unwrap();
+
+        write_atomic(&path, b"first").expect("first save");
+        write_atomic(&path, b"second").expect("second save");
+
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "second");
+        assert!(!has_temp_file(&dir.path), "no temp file should leak");
+    }
 }

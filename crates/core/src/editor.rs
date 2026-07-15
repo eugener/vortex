@@ -22,6 +22,7 @@
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use async_channel::{Receiver, Sender};
 
@@ -429,7 +430,8 @@ async fn open_file(
     // a whole-buffer swap has no range to reject, so there is no error path to
     // handle here (the delta still records the change for SPEC §5 replay).
     let old_len = editor.buffer.byte_len();
-    if old_len != 0 || !contents.is_empty() {
+    let changed = old_len != 0 || !contents.is_empty();
+    if changed {
         let base_version = editor.version;
         editor.buffer = RopeBuffer::from(contents.as_str());
         let delta = Delta {
@@ -454,7 +456,11 @@ async fn open_file(
         path,
         existed,
     });
-    snapshots.publish(editor.snapshot(Some(0..editor.buffer.byte_len())))
+    // `dirty` is a "what changed" repaint hint, so it is `None` when no delta was
+    // emitted (a missing/empty file); reporting a spurious `Some(0..0)` would tell
+    // a frontend an edit happened where none did (view.rs contract).
+    let dirty = changed.then(|| 0..editor.buffer.byte_len());
+    snapshots.publish(editor.snapshot(dirty))
 }
 
 /// Write the buffer to its bound file atomically (SPEC §8). Fails with a
@@ -510,40 +516,87 @@ fn report_file_error(
 /// Write `bytes` to `path` atomically: write a sibling temp file, flush it, then
 /// rename it over the target (SPEC §8). A rename within a directory is atomic on
 /// POSIX, so a reader never sees a half-written file and a failed write leaves the
-/// original intact. The single-owner actor (SPEC §2.3) serializes saves, so the
-/// fixed temp name cannot race another save from this process. Returns a
-/// human-readable error string on any I/O failure.
+/// original intact. Returns a human-readable error string on any I/O failure.
+///
+/// Preserving what a naive temp+rename would destroy:
+/// - **Symlinks:** if `path` exists it is `canonicalize`d first, so we write
+///   *through* a symlink to its real target and rename over that - a symlinked
+///   dotfile stays a symlink pointing at the updated file, rather than being
+///   replaced by a standalone regular file.
+/// - **Permissions:** the existing file's mode is copied onto the temp before the
+///   rename, so a save never silently widens a `0600` file to `0644` or drops an
+///   executable bit. A brand-new file keeps `File::create`'s default mode.
+/// - **Durability:** the containing directory is fsync'd after the rename so the
+///   directory-entry change survives a crash, not just the file's data.
+///
+/// **Known limitation (M5):** a *hard-linked* file is still detached by the rename
+/// (the other links stop reflecting edits). Truly preserving hard links needs
+/// in-place copy-write, which trades away the crash-atomicity above - a deliberate
+/// M5 `backupcopy`-style trade-off, not handled here.
 fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), String> {
+    use std::fs;
     use std::io::Write;
+
+    // Resolve symlinks so the write lands on the real file and the rename replaces
+    // *it*, not the link. A not-yet-existing file has no link to follow, so keep
+    // the path as given (its parent dir must already exist to hold the temp).
+    let existed = fs::symlink_metadata(path).is_ok();
+    let target = if existed {
+        fs::canonicalize(path).map_err(|e| e.to_string())?
+    } else {
+        path.to_path_buf()
+    };
 
     // Temp file must sit in the target's directory so the rename stays on one
     // filesystem (a cross-device rename is not atomic and errors). A bare file
     // name has an empty parent, meaning the current directory.
-    let dir = path
+    let dir = target
         .parent()
         .filter(|p| !p.as_os_str().is_empty())
         .unwrap_or_else(|| Path::new("."));
-    let file_name = path
+    let file_name = target
         .file_name()
         .ok_or_else(|| "path has no file name".to_string())?;
-    let mut tmp = dir.to_path_buf();
-    tmp.push(format!(".{}.vortex-tmp", file_name.to_string_lossy()));
 
-    // Write + flush, then rename over the target. The inner block drops the file
-    // handle before the rename (renaming an open file fails on Windows). Any
-    // failure in the chain shares one cleanup: remove the temp, leaving the
-    // original intact (SPEC §8).
+    // Unique temp name (pid + a per-process counter) so two vortex processes - or
+    // a stale temp from a crashed prior save - never collide on the same sibling.
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let mut tmp = dir.to_path_buf();
+    tmp.push(format!(
+        ".{}.vortex-tmp-{}-{}",
+        file_name.to_string_lossy(),
+        std::process::id(),
+        n
+    ));
+
+    // Write + flush, copy the existing mode, then rename over the target. The
+    // inner block drops the file handle before the rename (renaming an open file
+    // fails on Windows). Any failure shares one cleanup: remove the temp, leaving
+    // the original intact (SPEC §8).
     let result = (|| -> std::io::Result<()> {
         {
-            let mut f = std::fs::File::create(&tmp)?;
+            let mut f = fs::File::create(&tmp)?;
             f.write_all(bytes)?;
             f.sync_all()?;
         }
-        std::fs::rename(&tmp, path)
+        // Carry the target's permission bits onto the temp (best-effort: a failure
+        // here should not abort an otherwise-good save).
+        if existed && let Ok(meta) = fs::metadata(&target) {
+            let _ = fs::set_permissions(&tmp, meta.permissions());
+        }
+        fs::rename(&tmp, &target)
     })();
     if let Err(err) = result {
-        let _ = std::fs::remove_file(&tmp); // best-effort cleanup
+        let _ = fs::remove_file(&tmp); // best-effort cleanup
         return Err(err.to_string());
+    }
+
+    // fsync the directory so the rename is durable across a crash. Best-effort:
+    // opening a directory as a file is not portable (fails on Windows), and the
+    // save already succeeded logically once the rename returned.
+    if let Ok(d) = fs::File::open(dir) {
+        let _ = d.sync_all();
     }
     Ok(())
 }
