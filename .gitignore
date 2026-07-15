@@ -1,0 +1,18 @@
+# Rust build artifacts
+/target
+**/target
+
+# Coverage (cargo-llvm-cov / profraw)
+*.profraw
+*.profdata
+/lcov.info
+
+# Backup / temp files from editors
+*.swp
+*~
+
+# macOS
+.DS_Store
+
+# Note: Cargo.lock IS committed - this workspace builds a binary (`vortex`),
+# so a pinned lockfile gives reproducible builds. Do not ignore it.
