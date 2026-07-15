@@ -317,6 +317,7 @@ async fn apply_edit(
 
     let base_version = editor.version;
     let mut dirty: Option<std::ops::Range<usize>> = None;
+    let mut applied = 0usize;
 
     // Edits are sorted descending by start, so applying in order is offset-stable.
     for (range, new_text) in &edits {
@@ -341,10 +342,19 @@ async fn apply_edit(
         if deltas.send(delta).await.is_err() {
             return false; // frontend gone
         }
+        applied += 1;
         dirty = Some(match dirty {
             None => range.start..range.start + new_text.len(),
             Some(d) => d.start.min(range.start)..d.end.max(range.start + new_text.len()),
         });
+    }
+
+    // If every planned edit was rejected, nothing changed: do not bump the
+    // version or remap selections (a version bump with no delta would diverge a
+    // remote frontend replaying the delta stream, SPEC §5). Republish current
+    // state so the frontend's view stays current, matching the empty-plan case.
+    if applied == 0 {
+        return snapshots.publish(editor.snapshot(None));
     }
 
     // Remap selections to sit at the end of each applied edit (a cursor after the

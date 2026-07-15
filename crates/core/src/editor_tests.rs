@@ -64,3 +64,71 @@ fn snapshot_reflects_state() {
     assert_eq!(snap.dirty, Some(0..2));
     assert_eq!(snap.selections.as_ref(), &[Selection::cursor(2)]);
 }
+
+#[test]
+fn multi_cursor_insert_merges_dirty_range() {
+    // One action over TWO cursors fans into two edits; the snapshot's `dirty`
+    // hint must grow to span both (the merge arm), not report only the last
+    // edit applied. Reachable only via apply_edit with >1 selection - the path
+    // the single-selection message seam cannot exercise until M3 multi-cursor.
+    let set = SelectionSet::from_sorted_cursors(vec![Selection::cursor(1), Selection::cursor(4)]);
+    let mut e = editor_with("abcdef", set);
+    let (delta_tx, delta_rx) = async_channel::bounded::<Delta>(16);
+    let (snap_tx, snap_rx) = async_channel::bounded::<ViewSnapshot>(1);
+    let (note_tx, _note_rx) = async_channel::bounded::<Notification>(16);
+    let snapshots = SnapshotSink { tx: snap_tx };
+
+    let alive = smol::block_on(apply_edit(
+        &mut e,
+        EditKind::Insert("X".into()),
+        &delta_tx,
+        &snapshots,
+        &note_tx,
+    ));
+
+    assert!(alive);
+    assert_eq!(e.buffer.text().to_string(), "aXbcdXef");
+    assert_eq!(delta_rx.len(), 2); // one delta per cursor
+    let snap = snap_rx.try_recv().unwrap();
+    // Merged hint spans from the earliest edit's start to past the latest's.
+    // Endpoints are in base-buffer offsets (a repaint hint, not exact final
+    // coords) - painting the whole viewport is always correct if ignored.
+    assert_eq!(snap.dirty, Some(1..5));
+}
+
+#[test]
+fn rejected_edit_is_surfaced_and_leaves_state_unchanged() {
+    // Defensive path (SPEC §8): a planned edit whose range does not apply must
+    // emit EditRejected and skip, never panic. Not expected in M1 (ranges come
+    // from valid selections), so it is only reachable by handing apply_edit a
+    // cursor past the buffer end. When EVERY edit is rejected, nothing changed,
+    // so the version must NOT advance - a version bump with no delta would
+    // diverge a remote frontend replaying the delta stream (SPEC §5 invariant).
+    let mut e = editor_with("abc", SelectionSet::single(Selection::cursor(99)));
+    let (delta_tx, delta_rx) = async_channel::bounded::<Delta>(16);
+    let (snap_tx, _snap_rx) = async_channel::bounded::<ViewSnapshot>(1);
+    let (note_tx, note_rx) = async_channel::bounded::<Notification>(16);
+    let snapshots = SnapshotSink { tx: snap_tx };
+
+    let alive = smol::block_on(apply_edit(
+        &mut e,
+        EditKind::Insert("X".into()),
+        &delta_tx,
+        &snapshots,
+        &note_tx,
+    ));
+
+    assert!(alive);
+    assert_eq!(e.buffer.text().to_string(), "abc"); // untouched
+    assert!(delta_rx.is_empty()); // no delta for a rejected edit
+    assert_eq!(e.version, 0); // no applied edit => no version bump
+    match note_rx.try_recv() {
+        Ok(Notification::EditRejected {
+            buffer_id, message, ..
+        }) => {
+            assert_eq!(buffer_id, e.id);
+            assert!(message.contains("out of bounds"), "message: {message}");
+        }
+        other => panic!("expected EditRejected, got {other:?}"),
+    }
+}
