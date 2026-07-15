@@ -332,10 +332,20 @@ fn paint(
     // the body after it. Both scroll axes follow the cursor minimally (SPEC §5):
     // vertical by line, horizontal by display column within the text area.
     let text_height = body_area.height as usize;
-    let gutter_width = layout::gutter_width(layout::display_line_count(&snapshot.text));
+    let display_lines = layout::display_line_count(&snapshot.text);
+    let gutter_width = layout::gutter_width(display_lines);
     let text_width = (body_area.width as usize).saturating_sub(gutter_width);
-    let scroll = layout::scroll_to_show(cursor_line, viewport.scroll, text_height);
-    let h_scroll = layout::scroll_to_show(cursor_display_col, viewport.h_scroll, text_width);
+    // `scroll_to_show` only scrolls *toward* the cursor, never capping the offset at
+    // the content extent. A stale offset carried across a frame where the buffer (or
+    // line) shrank would then paint blank rows/columns and hide content that fits, so
+    // clamp each axis to its max useful offset. The `+ 1` on the horizontal extent
+    // leaves a cell for the caret sitting just past the line's last glyph.
+    let max_scroll = display_lines.saturating_sub(text_height);
+    let line_width = layout::display_column(&line_text, line_text.len(), TAB_WIDTH);
+    let max_h_scroll = (line_width + 1).saturating_sub(text_width);
+    let scroll = layout::scroll_to_show(cursor_line, viewport.scroll, text_height).min(max_scroll);
+    let h_scroll =
+        layout::scroll_to_show(cursor_display_col, viewport.h_scroll, text_width).min(max_h_scroll);
 
     paint_head_bar(frame, head_area, snapshot);
     paint_body(
@@ -882,6 +892,58 @@ mod tests {
             row_text(&buf, 0).contains("2 lines"),
             "head: {:?}",
             row_text(&buf, 0)
+        );
+    }
+
+    #[test]
+    fn stale_vertical_scroll_is_clamped_to_content_height() {
+        // A viewport carried from a taller buffer must not keep the top scrolled past
+        // the content after the buffer shrinks: `scroll_to_show` only pulls the offset
+        // down to the cursor line, not to a full screen of content, so without the
+        // clamp lines above the cursor that would fit stay hidden behind blank rows.
+        let snap = snapshot_after(&[Action::Insert("l0\nl1\nl2".into())]); // 3 lines
+        let mut settled = ViewState::default();
+        let mut terminal = Terminal::new(TestBackend::new(20, 6)).unwrap();
+        // Body = 6 - 2 bars = 4 rows; all 3 lines fit, so the only valid top is 0.
+        let stale = ViewState {
+            scroll: 50,
+            h_scroll: 0,
+            page_height: 4,
+        };
+        terminal
+            .draw(|frame| settled = paint(frame, &snap, stale, None))
+            .unwrap();
+        assert_eq!(settled.scroll, 0, "scroll must clamp to fit the content");
+        let buf = terminal.backend().buffer().clone();
+        assert!(
+            row_text(&buf, 1).contains("l0"),
+            "top line should be visible, not scrolled off: {:?}",
+            row_text(&buf, 1)
+        );
+    }
+
+    #[test]
+    fn stale_horizontal_scroll_is_clamped_to_line_width() {
+        // A horizontal offset carried from a long line must clamp to the current
+        // (short) line's width once the cursor moves onto it, so the line is shown
+        // from the left instead of scrolled off the right edge into blank cells.
+        let snap = snapshot_after(&[Action::Insert("hi".into())]); // 2-wide line, caret at col 2
+        let mut settled = ViewState::default();
+        let mut terminal = Terminal::new(TestBackend::new(20, 4)).unwrap();
+        let stale = ViewState {
+            scroll: 0,
+            h_scroll: 40,
+            page_height: 2,
+        };
+        terminal
+            .draw(|frame| settled = paint(frame, &snap, stale, None))
+            .unwrap();
+        assert_eq!(settled.h_scroll, 0, "h_scroll must clamp to the short line");
+        let buf = terminal.backend().buffer().clone();
+        assert!(
+            row_text(&buf, 1).contains("hi"),
+            "the line should be visible from the left: {:?}",
+            row_text(&buf, 1)
         );
     }
 }
