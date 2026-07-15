@@ -14,5 +14,8 @@
 # macOS
 .DS_Store
 
+# IDE / editor project files
+/.idea
+
 # Note: Cargo.lock IS committed - this workspace builds a binary (`vortex`),
 # so a pinned lockfile gives reproducible builds. Do not ignore it.
