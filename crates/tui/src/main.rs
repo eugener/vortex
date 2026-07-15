@@ -26,15 +26,32 @@ use ratatui::crossterm::terminal::{
     BeginSynchronizedUpdate, EndSynchronizedUpdate, supports_keyboard_enhancement,
 };
 use ratatui::crossterm::{execute, queue};
-use ratatui::layout::Position;
+use ratatui::layout::{Constraint, Layout, Position, Rect};
+use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
-use ratatui::{Terminal, TerminalOptions, Viewport};
+use ratatui::{Frame, Terminal, TerminalOptions, Viewport};
 
 use vortex_core::{Action, Core, ViewSnapshot};
 
 /// Default tab stop width for display-column layout (SPEC §4). Config in M5.
 const TAB_WIDTH: usize = 4;
+/// Placeholder buffer name until file handling (M5) gives buffers real paths.
+const NO_NAME: &str = "[No Name]";
+
+/// Chrome palette. Both bars paint a filled background row (the user asked for
+/// color, not divider lines); the gutter and current-line number are dimmed/bold
+/// to sit behind the text without competing with it. Kept as `const` because
+/// `Style::new()` and its setters are `const` in ratatui 0.30.
+const HEAD_STYLE: Style = Style::new()
+    .fg(Color::Black)
+    .bg(Color::Cyan)
+    .add_modifier(Modifier::BOLD);
+const STATUS_STYLE: Style = Style::new().fg(Color::Black).bg(Color::Cyan);
+/// Gutter line numbers: dim so they recede behind the text.
+const GUTTER_STYLE: Style = Style::new().fg(Color::DarkGray);
+/// The cursor's line number: bold + brighter so the active row stands out.
+const GUTTER_CURRENT_STYLE: Style = Style::new().fg(Color::White).add_modifier(Modifier::BOLD);
 /// How long the input poll blocks before we tick the render loop anyway, so a
 /// snapshot that arrives without a keystroke (e.g. a background restyle in M4)
 /// still gets painted promptly.
@@ -133,50 +150,131 @@ fn event_loop(
 
 /// Paint one frame from `snapshot`, wrapped in synchronized output (anti-tearing,
 /// SPEC §7). Returns the (possibly adjusted) vertical scroll offset so the primary
-/// cursor stays visible. All layout math is delegated to the tested [`layout`]
-/// module.
+/// cursor stays visible. The frame composition itself lives in [`paint`] so it can
+/// be rendered against a `TestBackend` and asserted cell-by-cell (SPEC §13).
 fn draw(
     terminal: &mut Terminal<ratatui::backend::CrosstermBackend<Stdout>>,
     snapshot: &ViewSnapshot,
     scroll: usize,
 ) -> io::Result<usize> {
-    let height = terminal.size()?.height as usize;
+    let mut new_scroll = scroll;
+    let mut out = io::stdout();
+    queue!(out, BeginSynchronizedUpdate)?;
+    terminal.draw(|frame| new_scroll = paint(frame, snapshot, scroll))?;
+    execute!(out, EndSynchronizedUpdate)?;
+    Ok(new_scroll)
+}
 
-    // Primary cursor position in line/grapheme-column space, from the snapshot.
-    // Follow the primary selection (SPEC §2.2), not a positional guess.
+/// Compose the whole frame: head bar, gutter + text, status bar, and the cursor.
+/// Backend-generic (takes a `&mut Frame`) so a `TestBackend` render can assert on
+/// the painted cells (SPEC §13). Returns the scroll offset it settled on so the
+/// caller can carry it forward. All measurement is delegated to the tested
+/// [`layout`] helpers; this function only positions widgets.
+fn paint(frame: &mut Frame, snapshot: &ViewSnapshot, scroll: usize) -> usize {
+    let area = frame.area();
+    // Head bar (1 row), text body (rest), status bar (1 row). `Min(0)` lets the
+    // body shrink to nothing on a tiny terminal without the split failing.
+    let [head_area, body_area, status_area] = Layout::vertical([
+        Constraint::Length(1),
+        Constraint::Min(0),
+        Constraint::Length(1),
+    ])
+    .areas(area);
+
+    // Primary cursor position in line/grapheme-column space (SPEC §2.2): follow
+    // the primary selection, not a positional guess.
     let head = snapshot
         .selections
         .get(snapshot.primary)
         .map(|s| s.head)
         .unwrap_or(0);
     let (cursor_line, cursor_byte_col, line_text) = layout::cursor_line_col(&snapshot.text, head);
-    let new_scroll = layout::scroll_to_show(cursor_line, scroll, height);
+
+    let text_height = body_area.height as usize;
+    let new_scroll = layout::scroll_to_show(cursor_line, scroll, text_height);
     let cursor_display_col = layout::display_column(&line_text, cursor_byte_col, TAB_WIDTH);
 
-    // Compute the visible-line slice outside the draw closure (tested in layout).
-    let lines = layout::visible_lines(&snapshot.text, new_scroll, height, TAB_WIDTH);
+    paint_head_bar(frame, head_area, snapshot);
+    let gutter_width = paint_body(frame, body_area, snapshot, new_scroll, cursor_line);
+    paint_status_bar(
+        frame,
+        status_area,
+        snapshot,
+        cursor_line,
+        &line_text,
+        cursor_byte_col,
+    );
 
-    let mut out = io::stdout();
-    queue!(out, BeginSynchronizedUpdate)?;
+    // Place the terminal cursor at the primary caret, offset by the gutter and the
+    // head row. `saturating_sub` guards a stale scroll after a zero-height resize -
+    // never underflow into a wild u16 row (SPEC §8: a resize must not crash).
+    let row = body_area.y + cursor_line.saturating_sub(new_scroll) as u16;
+    let col = body_area.x + (gutter_width + cursor_display_col) as u16;
+    frame.set_cursor_position(Position::new(col, row));
+    new_scroll
+}
 
-    terminal.draw(|frame| {
-        let area = frame.area();
-        let visible: Vec<Line> = lines
-            .into_iter()
-            .map(|l| Line::from(Span::raw(l)))
-            .collect();
-        frame.render_widget(Paragraph::new(visible), area);
+/// Paint the top head bar (buffer name left, line count right) as one filled row.
+fn paint_head_bar(frame: &mut Frame, area: Rect, snapshot: &ViewSnapshot) {
+    let (left, right) = layout::head_bar(NO_NAME, layout::display_line_count(&snapshot.text));
+    let bar = layout::fit_bar(&left, &right, area.width as usize);
+    frame.render_widget(Paragraph::new(bar).style(HEAD_STYLE), area);
+}
 
-        // Place the terminal cursor at the primary caret (screen-relative).
-        // `saturating_sub` guards the case where scroll sits below the cursor
-        // line (e.g. a zero-height resize left `new_scroll` stale) - never
-        // underflow into a wild u16 row (SPEC §8: a resize must not crash).
-        let row = cursor_line.saturating_sub(new_scroll) as u16;
-        frame.set_cursor_position(Position::new(cursor_display_col as u16, row));
-    })?;
+/// Paint the text body with a line-number gutter. Returns the gutter width (cells)
+/// so the caller can offset the cursor. Each visible row is a gutter span (dim, or
+/// bold for the cursor's line) followed by the tab-expanded line text.
+fn paint_body(
+    frame: &mut Frame,
+    area: Rect,
+    snapshot: &ViewSnapshot,
+    scroll: usize,
+    cursor_line: usize,
+) -> usize {
+    let text = &snapshot.text;
+    let gutter_width = layout::gutter_width(layout::display_line_count(text));
+    let height = area.height as usize;
+    let lines = layout::visible_lines(text, scroll, height, TAB_WIDTH);
 
-    execute!(out, EndSynchronizedUpdate)?;
-    Ok(new_scroll)
+    let rows: Vec<Line> = lines
+        .into_iter()
+        .enumerate()
+        .map(|(row, content)| {
+            let line_index = scroll + row;
+            let gutter_style = if line_index == cursor_line {
+                GUTTER_CURRENT_STYLE
+            } else {
+                GUTTER_STYLE
+            };
+            Line::from(vec![
+                Span::styled(layout::gutter_label(line_index, gutter_width), gutter_style),
+                Span::raw(content),
+            ])
+        })
+        .collect();
+
+    frame.render_widget(Paragraph::new(rows), area);
+    gutter_width
+}
+
+/// Paint the bottom status bar (cursor position left, buffer metrics right).
+fn paint_status_bar(
+    frame: &mut Frame,
+    area: Rect,
+    snapshot: &ViewSnapshot,
+    cursor_line: usize,
+    line_text: &str,
+    cursor_byte_col: usize,
+) {
+    let col = layout::grapheme_column(line_text, cursor_byte_col);
+    let (left, right) = layout::status_bar(
+        cursor_line + 1,
+        col,
+        snapshot.text.byte_len(),
+        snapshot.version,
+    );
+    let bar = layout::fit_bar(&left, &right, area.width as usize);
+    frame.render_widget(Paragraph::new(bar).style(STATUS_STYLE), area);
 }
 
 /// RAII terminal setup/teardown: raw mode, alternate screen, and Kitty keyboard
@@ -243,5 +341,167 @@ impl TerminalGuard {
 impl Drop for TerminalGuard {
     fn drop(&mut self) {
         self.leave();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ratatui::backend::TestBackend;
+
+    /// Drive the real core through an action script and return the resulting
+    /// snapshot - the same seam a frontend uses (SPEC §1), so the chrome is
+    /// rendered from a genuine `ViewSnapshot`, not a hand-built one (which
+    /// `#[non_exhaustive]` forbids anyway). Runs the actor on an executor and
+    /// awaits the final snapshot, exactly as the core's own interaction tests do.
+    fn snapshot_after(script: &[Action]) -> ViewSnapshot {
+        let ex = smol::Executor::new();
+        let Core { handle, run } = vortex_core::new(64);
+        ex.spawn(run).detach();
+        smol::block_on(ex.run(async move {
+            let mut snap = None;
+            for action in script {
+                handle.actions.send(action.clone()).await.unwrap();
+                // Edits emit a delta before the snapshot; drain so the bounded
+                // delta channel never blocks the actor across the script.
+                while handle.deltas.try_recv().is_ok() {}
+                snap = Some(handle.snapshots.recv().await.unwrap());
+            }
+            snap.expect("script must contain at least one action")
+        }))
+    }
+
+    /// Render `snapshot` into an in-memory `TestBackend` of `w`x`h` cells via the
+    /// real [`paint`] path, and hand back the painted buffer for cell assertions.
+    fn render(snapshot: &ViewSnapshot, w: u16, h: u16) -> ratatui::buffer::Buffer {
+        let mut terminal = Terminal::new(TestBackend::new(w, h)).unwrap();
+        terminal
+            .draw(|frame| {
+                paint(frame, snapshot, 0);
+            })
+            .unwrap();
+        terminal.backend().buffer().clone()
+    }
+
+    /// The concatenated symbols of row `y`, for substring assertions on a bar.
+    fn row_text(buf: &ratatui::buffer::Buffer, y: u16) -> String {
+        (0..buf.area().width)
+            .map(|x| buf.cell((x, y)).unwrap().symbol())
+            .collect()
+    }
+
+    #[test]
+    fn head_bar_shows_name_and_line_count_on_top_row() {
+        let snap = snapshot_after(&[Action::Insert("a\nb\nc".into())]);
+        let buf = render(&snap, 40, 10);
+        let head = row_text(&buf, 0);
+        assert!(head.contains(NO_NAME), "head bar: {head:?}");
+        assert!(head.contains("3 lines"), "head bar: {head:?}");
+        // The whole row is painted with the head background (color, not a border).
+        assert_eq!(buf.cell((0, 0)).unwrap().bg, Color::Cyan);
+        assert_eq!(buf.cell((39, 0)).unwrap().bg, Color::Cyan);
+    }
+
+    #[test]
+    fn status_bar_shows_cursor_position_on_bottom_row() {
+        // Insert two lines, leaving the cursor at the end of line 2 (Ln 2, Col 4).
+        let snap = snapshot_after(&[Action::Insert("ab\ncde".into())]);
+        let buf = render(&snap, 40, 10);
+        let status = row_text(&buf, 9); // bottom row
+        assert!(status.contains("Ln 2, Col 4"), "status: {status:?}");
+        assert!(status.contains("6B"), "status (byte count): {status:?}");
+        assert!(status.contains("v1"), "status (version): {status:?}");
+        assert_eq!(buf.cell((0, 9)).unwrap().bg, Color::Cyan);
+    }
+
+    #[test]
+    fn gutter_numbers_lines_from_one() {
+        let snap = snapshot_after(&[Action::Insert("first\nsecond".into())]);
+        let buf = render(&snap, 40, 10);
+        // Body starts at row 1 (row 0 is the head bar). Gutter is 3-digit field +
+        // space; line 1 renders "  1 " then the text.
+        let row1 = row_text(&buf, 1);
+        let row2 = row_text(&buf, 2);
+        assert!(row1.starts_with("  1 first"), "row1: {row1:?}");
+        assert!(row2.starts_with("  2 second"), "row2: {row2:?}");
+    }
+
+    #[test]
+    fn cursor_line_gutter_is_emphasized() {
+        // Cursor ends on line 2; its gutter number is bold+white, the other dim.
+        let snap = snapshot_after(&[Action::Insert("x\ny".into())]);
+        let buf = render(&snap, 40, 10);
+        // The '1' digit sits in column 2 of the 4-wide gutter ("  1 ").
+        let inactive = buf.cell((2, 1)).unwrap();
+        let active = buf.cell((2, 2)).unwrap();
+        assert_eq!(inactive.fg, Color::DarkGray);
+        assert_eq!(active.fg, Color::White);
+        assert!(active.modifier.contains(Modifier::BOLD));
+    }
+
+    #[test]
+    fn cursor_sits_after_the_gutter() {
+        // Fresh empty buffer: cursor at Ln 1 Col 1, painted just right of the
+        // 4-cell gutter on the first body row (row 1).
+        let snap = snapshot_after(&[Action::RequestSnapshot]);
+        let mut terminal = Terminal::new(TestBackend::new(40, 10)).unwrap();
+        terminal
+            .draw(|frame| {
+                paint(frame, &snap, 0);
+            })
+            .unwrap();
+        let pos = terminal.backend().cursor_position();
+        assert_eq!((pos.x, pos.y), (4, 1));
+    }
+
+    #[test]
+    fn tiny_terminal_does_not_panic() {
+        // A terminal too short for head + status + any body must still render
+        // (SPEC §8: a degenerate resize must never crash).
+        let snap = snapshot_after(&[Action::Insert("hello".into())]);
+        let _ = render(&snap, 4, 2);
+        let _ = render(&snap, 1, 1);
+    }
+
+    #[test]
+    fn empty_buffer_shows_line_one_in_gutter() {
+        // Regression: a fresh empty buffer must paint gutter number "1" and the
+        // head bar must read "1 line" - not a blank body with no numbers.
+        let snap = snapshot_after(&[Action::RequestSnapshot]);
+        let buf = render(&snap, 40, 10);
+        assert!(
+            row_text(&buf, 0).contains("1 line"),
+            "head: {:?}",
+            row_text(&buf, 0)
+        );
+        assert!(
+            row_text(&buf, 1).starts_with("  1 "),
+            "row1: {:?}",
+            row_text(&buf, 1)
+        );
+    }
+
+    #[test]
+    fn trailing_newline_gets_its_own_numbered_row() {
+        // Regression (user report): pressing Enter at end of file must show the new
+        // empty line with its own gutter number, not swallow it as a terminator.
+        let snap = snapshot_after(&[Action::Insert("hi\n".into())]);
+        let buf = render(&snap, 40, 10);
+        assert!(
+            row_text(&buf, 1).starts_with("  1 hi"),
+            "row1: {:?}",
+            row_text(&buf, 1)
+        );
+        // Line 2 is blank but still numbered "2".
+        assert!(
+            row_text(&buf, 2).starts_with("  2 "),
+            "row2: {:?}",
+            row_text(&buf, 2)
+        );
+        assert!(
+            row_text(&buf, 0).contains("2 lines"),
+            "head: {:?}",
+            row_text(&buf, 0)
+        );
     }
 }
