@@ -273,11 +273,31 @@ pub fn notification_message(note: &vortex_core::Notification) -> Option<String> 
     }
 }
 
+/// A byte count as a compact human-readable size: plain bytes under 1 KB, then
+/// `KB`/`MB`/`GB` (1024-based) with one decimal, so the status bar stays short for
+/// large buffers (`12_345_678` -> `11.8MB`). No space before the unit, matching the
+/// other status metrics. `GB` is the ceiling - a text buffer never realistically
+/// exceeds it, and Tier-3 huge-file handling is future work (SPEC §10.4).
+pub fn human_size(bytes: usize) -> String {
+    const UNITS: [&str; 3] = ["KB", "MB", "GB"];
+    if bytes < 1024 {
+        return format!("{bytes}B");
+    }
+    let mut size = bytes as f64 / 1024.0;
+    let mut unit = 0;
+    while size >= 1024.0 && unit < UNITS.len() - 1 {
+        size /= 1024.0;
+        unit += 1;
+    }
+    format!("{size:.1}{}", UNITS[unit])
+}
+
 /// Status-bar segments `(left, right)` = (cursor position, buffer metrics). When a
 /// transient `message` is present (a file open/save result) it replaces the cursor
 /// position on the left so the result is visible (SPEC §8). `line`/`col` are
-/// 1-based for display; `bytes` is the buffer size and `version` the document
-/// version (SPEC §5), surfaced while the delta/version model is young.
+/// 1-based for display; `bytes` is the buffer size (rendered via [`human_size`])
+/// and `version` the document version (SPEC §5), surfaced while the delta/version
+/// model is young.
 pub fn status_bar(
     line: usize,
     col: usize,
@@ -289,7 +309,7 @@ pub fn status_bar(
         Some(m) => format!(" {m}"),
         None => format!(" Ln {line}, Col {col}"),
     };
-    let right = format!("{bytes}B · v{version} ");
+    let right = format!("{} · v{version} ", human_size(bytes));
     (left, right)
 }
 
@@ -644,6 +664,26 @@ mod tests {
         let (left, right) = status_bar(2, 5, 38, 7, None);
         assert_eq!(left, " Ln 2, Col 5");
         assert_eq!(right, "38B · v7 ");
+    }
+
+    #[test]
+    fn human_size_scales_at_each_1024_mark() {
+        // Whole bytes below 1 KB, then KB/MB/GB with one decimal at each boundary.
+        assert_eq!(human_size(0), "0B");
+        assert_eq!(human_size(1023), "1023B");
+        assert_eq!(human_size(1024), "1.0KB");
+        assert_eq!(human_size(1536), "1.5KB");
+        assert_eq!(human_size(1024 * 1024 - 1), "1024.0KB"); // just under 1 MB
+        assert_eq!(human_size(1024 * 1024), "1.0MB");
+        assert_eq!(human_size(3 * 1024 * 1024 + 512 * 1024), "3.5MB");
+        assert_eq!(human_size(1024 * 1024 * 1024), "1.0GB");
+        assert_eq!(human_size(5 * 1024 * 1024 * 1024), "5.0GB"); // caps at GB
+    }
+
+    #[test]
+    fn status_bar_renders_large_sizes_in_scaled_units() {
+        let (_, right) = status_bar(1, 1, 2 * 1024 * 1024, 3, None);
+        assert_eq!(right, "2.0MB · v3 ");
     }
 
     #[test]
