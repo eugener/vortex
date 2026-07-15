@@ -5,4 +5,4 @@ members = ["crates/*"]
 [workspace.package]
 edition = "2024"
 license = "MIT OR Apache-2.0"
-repository = "https://github.com/EXR0BS5/vortex"
+repository = "https://github.com/eugener/vortex"

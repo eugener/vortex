@@ -39,6 +39,32 @@ use vortex_core::{Action, Core, ViewSnapshot};
 /// Default tab stop width for display-column layout (SPEC §4). Config in M5.
 const TAB_WIDTH: usize = 4;
 
+/// The frontend's view state: which window of the buffer is on screen. Both axes
+/// are pure frontend concerns (SPEC §5) - scrolling reads a different window of the
+/// same snapshot with no core round-trip. Carried as one struct (not a growing
+/// list of positional args) through the paint path, and updated by paint so the
+/// caller can carry it to the next frame. (Named `ViewState` to avoid colliding
+/// with ratatui's own `Viewport` type used in terminal setup.)
+#[derive(Debug, Clone, Copy, Default)]
+struct ViewState {
+    /// Index of the top visible line (vertical scroll).
+    scroll: usize,
+    /// Leftmost visible display column (horizontal scroll).
+    h_scroll: usize,
+    /// Text rows the last frame showed - the basis for the PageUp/PageDown step.
+    /// 0 before the first paint.
+    page_height: usize,
+}
+
+impl ViewState {
+    /// Lines a PageUp/PageDown moves the cursor: one screenful less a line of
+    /// context overlap, at least 1 so a tiny or not-yet-painted viewport still
+    /// moves.
+    fn page(&self) -> usize {
+        self.page_height.saturating_sub(1).max(1)
+    }
+}
+
 /// Chrome palette. Both bars paint a filled background row (the user asked for
 /// color, not divider lines); the gutter and current-line number are dimmed/bold
 /// to sit behind the text without competing with it. Kept as `const` because
@@ -185,7 +211,9 @@ fn event_loop(
         return Ok(());
     }
     let mut latest: Option<ViewSnapshot> = None;
-    let mut scroll: usize = 0;
+    // View state (scroll on both axes + last page height). Updated by `draw` each
+    // frame and carried forward; `page()` sizes PageUp/PageDown (SPEC §5).
+    let mut viewport = ViewState::default();
     // The latest file-lifecycle message (open/save result), shown transiently in
     // the status bar until the next edit or motion snapshot clears it. A failed
     // save must be visible, not silent (SPEC §8).
@@ -218,7 +246,7 @@ fn event_loop(
         if let Some(snap) = &latest
             && needs_redraw
         {
-            scroll = draw(terminal, snap, scroll, message.as_deref())?;
+            viewport = draw(terminal, snap, viewport, message.as_deref())?;
             needs_redraw = false;
         }
 
@@ -227,7 +255,9 @@ fn event_loop(
         if event::poll(POLL)? {
             match event::read()? {
                 Event::Key(key) => {
-                    if let Some(action) = keymap::action_for_key(key) {
+                    // Page motions need the viewport's page size, which only the
+                    // frontend knows (SPEC §5); the keymap folds it into the action.
+                    if let Some(action) = keymap::action_for_key(key, viewport.page()) {
                         let quit = action == Action::Quit;
                         // A new user action clears the transient file message so it
                         // does not linger while the user keeps typing; Save keeps it
@@ -250,21 +280,21 @@ fn event_loop(
 }
 
 /// Paint one frame from `snapshot`, wrapped in synchronized output (anti-tearing,
-/// SPEC §7). Returns the (possibly adjusted) vertical scroll offset so the primary
-/// cursor stays visible. The frame composition itself lives in [`paint`] so it can
+/// SPEC §7). Returns the (possibly adjusted) viewport so the primary cursor stays
+/// visible on both axes. The frame composition itself lives in [`paint`] so it can
 /// be rendered against a `TestBackend` and asserted cell-by-cell (SPEC §13).
 fn draw(
     terminal: &mut Terminal<ratatui::backend::CrosstermBackend<Stdout>>,
     snapshot: &ViewSnapshot,
-    scroll: usize,
+    viewport: ViewState,
     message: Option<&str>,
-) -> io::Result<usize> {
-    let mut new_scroll = scroll;
+) -> io::Result<ViewState> {
+    let mut new_viewport = viewport;
     let mut out = io::stdout();
     queue!(out, BeginSynchronizedUpdate)?;
-    terminal.draw(|frame| new_scroll = paint(frame, snapshot, scroll, message))?;
+    terminal.draw(|frame| new_viewport = paint(frame, snapshot, viewport, message))?;
     execute!(out, EndSynchronizedUpdate)?;
-    Ok(new_scroll)
+    Ok(new_viewport)
 }
 
 /// Compose the whole frame: head bar, gutter + text, status bar, and the cursor.
@@ -275,9 +305,9 @@ fn draw(
 fn paint(
     frame: &mut Frame,
     snapshot: &ViewSnapshot,
-    scroll: usize,
+    viewport: ViewState,
     message: Option<&str>,
-) -> usize {
+) -> ViewState {
     let area = frame.area();
     // Head bar (1 row), text body (rest), status bar (1 row). `Min(0)` lets the
     // body shrink to nothing on a tiny terminal without the split failing.
@@ -296,13 +326,30 @@ fn paint(
         .map(|s| s.head)
         .unwrap_or(0);
     let (cursor_line, cursor_byte_col, line_text) = layout::cursor_line_col(&snapshot.text, head);
-
-    let text_height = body_area.height as usize;
-    let new_scroll = layout::scroll_to_show(cursor_line, scroll, text_height);
     let cursor_display_col = layout::display_column(&line_text, cursor_byte_col, TAB_WIDTH);
 
+    // Gutter width is fixed for the frame; the text column budget is what's left of
+    // the body after it. Both scroll axes follow the cursor minimally (SPEC §5):
+    // vertical by line, horizontal by display column within the text area.
+    let text_height = body_area.height as usize;
+    let gutter_width = layout::gutter_width(layout::display_line_count(&snapshot.text));
+    let text_width = (body_area.width as usize).saturating_sub(gutter_width);
+    let scroll = layout::scroll_to_show(cursor_line, viewport.scroll, text_height);
+    let h_scroll = layout::scroll_to_show(cursor_display_col, viewport.h_scroll, text_width);
+
     paint_head_bar(frame, head_area, snapshot);
-    let gutter_width = paint_body(frame, body_area, snapshot, new_scroll, cursor_line);
+    paint_body(
+        frame,
+        body_area,
+        snapshot,
+        Body {
+            scroll,
+            h_scroll,
+            gutter_width,
+            text_width,
+            cursor_line,
+        },
+    );
     paint_status_bar(
         frame,
         status_area,
@@ -314,12 +361,18 @@ fn paint(
     );
 
     // Place the terminal cursor at the primary caret, offset by the gutter and the
-    // head row. `saturating_sub` guards a stale scroll after a zero-height resize -
-    // never underflow into a wild u16 row (SPEC §8: a resize must not crash).
-    let row = body_area.y + cursor_line.saturating_sub(new_scroll) as u16;
-    let col = body_area.x + (gutter_width + cursor_display_col) as u16;
+    // head row and pulled left by the horizontal scroll. `saturating_sub` guards a
+    // stale scroll after a resize - never underflow into a wild u16 (SPEC §8: a
+    // resize must not crash).
+    let row = body_area.y + cursor_line.saturating_sub(scroll) as u16;
+    let col = body_area.x + (gutter_width + cursor_display_col.saturating_sub(h_scroll)) as u16;
     frame.set_cursor_position(Position::new(col, row));
-    new_scroll
+
+    ViewState {
+        scroll,
+        h_scroll,
+        page_height: text_height,
+    }
 }
 
 /// Paint the top head bar (buffer name left, line count right) as one filled row.
@@ -332,40 +385,56 @@ fn paint_head_bar(frame: &mut Frame, area: Rect, snapshot: &ViewSnapshot) {
     frame.render_widget(Paragraph::new(bar).style(HEAD_STYLE), area);
 }
 
-/// Paint the text body with a line-number gutter. Returns the gutter width (cells)
-/// so the caller can offset the cursor. Each visible row is a gutter span (dim, or
-/// bold for the cursor's line) followed by the tab-expanded line text.
-fn paint_body(
-    frame: &mut Frame,
-    area: Rect,
-    snapshot: &ViewSnapshot,
+/// The resolved geometry for painting the text body, computed once in [`paint`]
+/// and handed to [`paint_body`] as one value instead of five positional args
+/// (the same consolidation as [`ViewState`], and it lets `text_width` be computed
+/// in one place rather than recomputed here).
+struct Body {
+    /// Top visible line (post-scroll).
     scroll: usize,
+    /// Leftmost visible display column (post-scroll).
+    h_scroll: usize,
+    /// Gutter width in cells (fixed; never scrolls horizontally).
+    gutter_width: usize,
+    /// Display-column budget for text, right of the gutter.
+    text_width: usize,
+    /// The cursor's line, so its gutter number can be emphasized.
     cursor_line: usize,
-) -> usize {
+}
+
+/// Paint the text body with a line-number gutter. Each visible row is a gutter
+/// span (dim, or bold for the cursor's line) followed by the tab-expanded line
+/// text clipped to the horizontal window `[h_scroll, h_scroll + text_width)`. The
+/// gutter is fixed (never scrolls horizontally); only the text slides under it.
+fn paint_body(frame: &mut Frame, area: Rect, snapshot: &ViewSnapshot, body: Body) {
     let text = &snapshot.text;
-    let gutter_width = layout::gutter_width(layout::display_line_count(text));
     let height = area.height as usize;
-    let lines = layout::visible_lines(text, scroll, height, TAB_WIDTH);
+    let lines = layout::visible_lines(text, body.scroll, height, TAB_WIDTH);
 
     let rows: Vec<Line> = lines
         .into_iter()
         .enumerate()
         .map(|(row, content)| {
-            let line_index = scroll + row;
-            let gutter_style = if line_index == cursor_line {
+            let line_index = body.scroll + row;
+            let gutter_style = if line_index == body.cursor_line {
                 GUTTER_CURRENT_STYLE
             } else {
                 GUTTER_STYLE
             };
+            // Clip the (tab-expanded) line to the horizontal window so long lines
+            // scroll instead of overflowing (SPEC §5, frontend-owned viewport).
+            let visible = layout::clip_columns(&content, body.h_scroll, body.text_width);
             Line::from(vec![
-                Span::styled(layout::gutter_label(line_index, gutter_width), gutter_style),
-                Span::raw(content),
+                Span::styled(
+                    layout::gutter_label(line_index, body.gutter_width),
+                    gutter_style,
+                ),
+                Span::raw(visible),
             ])
         })
         .collect();
 
     frame.render_widget(Paragraph::new(rows), area);
-    gutter_width
 }
 
 /// Paint the bottom status bar. Normally shows cursor position (left) and buffer
@@ -530,7 +599,7 @@ mod tests {
         let mut terminal = Terminal::new(TestBackend::new(w, h)).unwrap();
         terminal
             .draw(|frame| {
-                paint(frame, snapshot, 0, message);
+                paint(frame, snapshot, ViewState::default(), message);
             })
             .unwrap();
         terminal.backend().buffer().clone()
@@ -682,6 +751,62 @@ mod tests {
     }
 
     #[test]
+    fn long_line_scrolls_horizontally_to_follow_cursor() {
+        // A line wider than the viewport: after typing, the cursor is at the far
+        // right, so paint scrolls right - the leading characters are clipped and
+        // the cursor stays on screen. Width 12 = 4-cell gutter + 8 text cells.
+        let snap = snapshot_after(&[Action::Insert("abcdefghijklmnop".into())]);
+        let buf = render(&snap, 12, 4);
+        let row = row_text(&buf, 1); // first body row
+        // Gutter still shows line 1 (gutter never scrolls horizontally).
+        assert!(row.starts_with("  1 "), "gutter should be fixed: {row:?}");
+        // The start of the line ("abc") is scrolled off; the tail ("...nop") shows.
+        assert!(
+            !row.contains("abc"),
+            "leading text should be clipped: {row:?}"
+        );
+        assert!(row.contains("nop"), "cursor end should be visible: {row:?}");
+    }
+
+    #[test]
+    fn cursor_stays_within_viewport_on_a_long_line() {
+        // The terminal cursor must land inside the visible area, not off the right
+        // edge, once horizontal scroll follows it.
+        let snap = snapshot_after(&[Action::Insert("0123456789abcdef".into())]);
+        let mut terminal = Terminal::new(TestBackend::new(12, 4)).unwrap();
+        terminal
+            .draw(|frame| {
+                paint(frame, &snap, ViewState::default(), None);
+            })
+            .unwrap();
+        let pos = terminal.backend().cursor_position();
+        // x must be within [gutter, width): visible, not overflowing to column 12+.
+        assert!(pos.x < 12, "cursor x {} should be on screen", pos.x);
+        assert!(pos.x >= 4, "cursor x {} should be past the gutter", pos.x);
+    }
+
+    #[test]
+    fn home_scrolls_back_to_the_line_start() {
+        // End then Home on a long line: Home moves the cursor to col 0, and the
+        // horizontal scroll follows back so the line start is visible again.
+        // (End/Home need no dedicated code - scroll-follow does the work.)
+        let script = &[
+            Action::Insert("abcdefghijklmnop".into()),
+            Action::MoveCursor {
+                motion: vortex_core::Motion::LineStart,
+                extend: false,
+            },
+        ];
+        let snap = snapshot_after(script);
+        let buf = render(&snap, 12, 4);
+        let row = row_text(&buf, 1);
+        assert!(
+            row.starts_with("  1 abc"),
+            "line start should show: {row:?}"
+        );
+    }
+
+    #[test]
     fn cursor_line_gutter_is_emphasized() {
         // Cursor ends on line 2; its gutter number is bold+white, the other dim.
         let snap = snapshot_after(&[Action::Insert("x\ny".into())]);
@@ -702,7 +827,7 @@ mod tests {
         let mut terminal = Terminal::new(TestBackend::new(40, 10)).unwrap();
         terminal
             .draw(|frame| {
-                paint(frame, &snap, 0, None);
+                paint(frame, &snap, ViewState::default(), None);
             })
             .unwrap();
         let pos = terminal.backend().cursor_position();
