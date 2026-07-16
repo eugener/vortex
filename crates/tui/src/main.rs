@@ -82,7 +82,7 @@ fn main() -> io::Result<()> {
     let path = match parse_args(std::env::args_os().skip(1)) {
         Args::Open(path) => path,
         Args::Help => {
-            print!("{HELP}");
+            print!("{HELP}{UNDO_REDO_HELP}");
             return Ok(());
         }
         Args::Version => {
@@ -146,6 +146,14 @@ Options:
 Keys:
   Ctrl+S           Save        Ctrl+Q / Ctrl+C   Quit
 ";
+
+/// The undo/redo line of the help, on the platform's command modifier - Cmd on
+/// macOS, Ctrl elsewhere - to match [`keymap`]'s OS-conditional bindings. Split out
+/// because a `const` string cannot itself be built per-OS by concatenation.
+#[cfg(target_os = "macos")]
+const UNDO_REDO_HELP: &str = "  Cmd+Z            Undo        Cmd+Y             Redo\n";
+#[cfg(not(target_os = "macos"))]
+const UNDO_REDO_HELP: &str = "  Ctrl+Z           Undo        Ctrl+Y            Redo\n";
 
 /// The outcome of parsing the command line - what `main` should do next.
 #[derive(Debug, PartialEq, Eq)]

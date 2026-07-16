@@ -39,6 +39,14 @@ pub enum Action {
     /// Delete the grapheme after each cursor (Delete), or the selected text if
     /// the selection is non-empty.
     DeleteForward,
+    /// Undo the most recent edit (SPEC §2.4). Moves the buffer to the current
+    /// history node's parent, restoring the pre-edit text and selections. A no-op
+    /// at the root. Works for any edit action - insert, delete, paste, multi-cursor
+    /// - because history records buffer changes, not action kinds.
+    Undo,
+    /// Redo the edit undone most recently, following the newest branch of the undo
+    /// tree (SPEC §2.4). A no-op when there is nothing to redo on the current branch.
+    Redo,
     /// Request an immediate `ViewSnapshot` without changing state.
     RequestSnapshot,
     /// Replace the buffer with the contents of `path` and remember it as the

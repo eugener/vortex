@@ -173,6 +173,155 @@ fn insert_replaces_non_empty_selection() {
 }
 
 #[test]
+fn undo_reverts_an_insert_and_restores_the_cursor() {
+    drive(|h| async move {
+        step(&h, Action::Insert("hello".into())).await;
+        let snap = step(&h, Action::Undo).await;
+        assert_eq!(snap.text.to_string(), "");
+        // Undo is an edit on the wire: it bumps the version (Insert=1, Undo=2).
+        assert_eq!(snap.version, 2);
+        // The caret returns to where it was before the insert (buffer start).
+        assert_eq!(snap.selections.as_ref(), &[Selection::cursor(0)]);
+    });
+}
+
+#[test]
+fn undo_emits_a_delta_that_inverts_the_edit() {
+    drive(|h| async move {
+        h.actions.send(Action::Insert("hi".into())).await.unwrap();
+        let insert_delta = h.deltas.recv().await.unwrap();
+        assert_eq!(
+            (insert_delta.range.clone(), insert_delta.new_text.as_str()),
+            (0..0, "hi")
+        );
+        h.snapshots.recv().await.unwrap();
+
+        h.actions.send(Action::Undo).await.unwrap();
+        let undo_delta = h.deltas.recv().await.unwrap();
+        // The undo delta deletes the inserted "hi" span (0..2 -> "").
+        assert_eq!(undo_delta.range, 0..2);
+        assert_eq!(undo_delta.new_text, "");
+        assert_eq!(undo_delta.base_version, 1);
+    });
+}
+
+#[test]
+fn redo_reapplies_an_undone_edit() {
+    drive(|h| async move {
+        step(&h, Action::Insert("hi".into())).await;
+        step(&h, Action::Undo).await;
+        let snap = step(&h, Action::Redo).await;
+        assert_eq!(snap.text.to_string(), "hi");
+        // Caret restored to the post-edit position (past the reinserted text).
+        assert_eq!(snap.selections.as_ref(), &[Selection::cursor(2)]);
+    });
+}
+
+#[test]
+fn consecutive_typed_characters_undo_as_one_unit() {
+    // Three single-character inserts with no motion between them coalesce into one
+    // undo unit (SPEC §2.4), so a single Undo clears the whole run - the behavior
+    // that makes undo usable instead of one-char-at-a-time.
+    drive(|h| async move {
+        step(&h, Action::Insert("a".into())).await;
+        step(&h, Action::Insert("b".into())).await;
+        step(&h, Action::Insert("c".into())).await;
+        let snap = step(&h, Action::Undo).await;
+        assert_eq!(snap.text.to_string(), "");
+    });
+}
+
+#[test]
+fn a_cursor_motion_breaks_the_undo_coalescing_run() {
+    // A motion between two inserts starts a new undo unit, so Undo peels back only
+    // the second insert (SPEC §2.4 break rule (d)).
+    drive(|h| async move {
+        step(&h, Action::Insert("a".into())).await;
+        step(
+            &h,
+            Action::MoveCursor {
+                motion: Motion::Left,
+                extend: false,
+            },
+        )
+        .await;
+        // Caret now at 0; typing inserts before "a".
+        step(&h, Action::Insert("b".into())).await;
+        let snap = step(&h, Action::Undo).await;
+        assert_eq!(
+            snap.text.to_string(),
+            "a",
+            "only the post-motion insert is undone"
+        );
+    });
+}
+
+#[test]
+fn a_newline_insert_breaks_the_undo_coalescing_run() {
+    // Pressing Enter is its own undo unit (break rule (c)): Undo removes the text
+    // typed after the newline without swallowing the line break too.
+    drive(|h| async move {
+        step(&h, Action::Insert("a".into())).await;
+        step(&h, Action::Insert("\n".into())).await;
+        step(&h, Action::Insert("b".into())).await;
+        let snap = step(&h, Action::Undo).await;
+        assert_eq!(snap.text.to_string(), "a\n");
+    });
+}
+
+#[test]
+fn a_delete_undoes_independently_of_a_prior_insert() {
+    // Insert then delete: each is its own undo unit. Undo restores the deleted
+    // grapheme; a second undo removes the insert. Works because history records
+    // buffer changes, not action kinds - so delete is undoable with no delete-
+    // specific code.
+    drive(|h| async move {
+        step(&h, Action::Insert("hello".into())).await; // one Insert action = one unit
+        step(&h, Action::DeleteBackward).await; // "hell"
+        let after_first = step(&h, Action::Undo).await;
+        assert_eq!(after_first.text.to_string(), "hello", "delete undone");
+        let after_second = step(&h, Action::Undo).await;
+        assert_eq!(after_second.text.to_string(), "", "insert undone");
+    });
+}
+
+#[test]
+fn undo_at_the_root_is_a_no_op() {
+    // Nothing to undo on a fresh buffer: state is unchanged and the version does
+    // not advance (no delta was emitted, SPEC §5 invariant).
+    drive(|h| async move {
+        let snap = step(&h, Action::Undo).await;
+        assert_eq!(snap.text.to_string(), "");
+        assert_eq!(snap.version, 0);
+    });
+}
+
+#[test]
+fn redo_with_nothing_to_redo_is_a_no_op() {
+    drive(|h| async move {
+        step(&h, Action::Insert("x".into())).await; // version 1
+        let snap = step(&h, Action::Redo).await; // nothing undone, so nothing to redo
+        assert_eq!(snap.text.to_string(), "x");
+        assert_eq!(snap.version, 1, "a no-op redo does not bump the version");
+    });
+}
+
+#[test]
+fn typing_after_undo_redoes_onto_the_new_branch() {
+    // Undo then type: the old redo branch is preserved but redo follows the newest
+    // branch (SPEC §2.4 tree). Type "a", undo, type "b": redo after undoing "b"
+    // must restore "b", not the discarded "a".
+    drive(|h| async move {
+        step(&h, Action::Insert("a".into())).await;
+        step(&h, Action::Undo).await; // back to empty
+        step(&h, Action::Insert("b".into())).await; // new branch
+        step(&h, Action::Undo).await; // back to empty
+        let snap = step(&h, Action::Redo).await;
+        assert_eq!(snap.text.to_string(), "b", "redo takes the newest branch");
+    });
+}
+
+#[test]
 #[should_panic(expected = "action_capacity must be >= 1")]
 fn new_rejects_zero_capacity() {
     // A bounded channel needs capacity >= 1; guard it at our API boundary

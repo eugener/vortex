@@ -28,6 +28,7 @@ use async_channel::{Receiver, Sender};
 
 use crate::action::Action;
 use crate::buffer::{Buffer, RopeBuffer};
+use crate::history::{Change, History, Reverted};
 use crate::selection::{Selection, SelectionSet};
 use crate::view::{BufferId, Delta, Notification, ViewSnapshot};
 
@@ -99,10 +100,13 @@ struct Editor {
     version: u64,
     /// The file this buffer is bound to (`Open`/`Save`), or `None` if unnamed.
     path: Option<PathBuf>,
-    /// Whether the buffer differs from its on-disk file. Set by any applied edit,
-    /// cleared by a successful save or a fresh open (SPEC §8, §10). Independent of
-    /// `version`, which never resets.
+    /// Whether the buffer differs from its on-disk file. Derived from `history`'s
+    /// save point at each edit/undo/save/open (SPEC §8, §10), so undoing back to the
+    /// saved state clears it. Independent of `version`, which never resets.
     modified: bool,
+    /// The undo tree (SPEC §2.4). Owns the reversible change history and the
+    /// coalescing state; reset on a file open (undo does not cross a load).
+    history: History,
 }
 
 impl Editor {
@@ -114,6 +118,7 @@ impl Editor {
             version: 0,
             path: None,
             modified: false,
+            history: History::new(),
         }
     }
 
@@ -187,6 +192,8 @@ enum EditKind {
 /// path returns "is the frontend still alive?"; `Quit` breaks before this.
 enum Step {
     Edit(EditKind),
+    Undo,
+    Redo,
     Republish,
     Open(PathBuf),
     Save,
@@ -291,12 +298,18 @@ async fn run(
             Action::DeleteForward => Step::Edit(EditKind::DeleteForward),
             Action::MoveCursor { motion, extend } => {
                 editor.move_cursor(motion, extend);
+                // A cursor motion ends the insert-coalescing run (SPEC §2.4 break
+                // rule (d)): the next typed character starts a new undo unit.
+                editor.history.break_coalescing();
                 Step::Republish
             }
             Action::PlaceCursor { offset, extend } => {
                 editor.place_cursor(offset, extend);
+                editor.history.break_coalescing();
                 Step::Republish
             }
+            Action::Undo => Step::Undo,
+            Action::Redo => Step::Redo,
             Action::RequestSnapshot => Step::Republish,
             Action::Open(path) => Step::Open(path),
             Action::Save => Step::Save,
@@ -306,6 +319,14 @@ async fn run(
         let alive = match step {
             Step::Edit(kind) => {
                 apply_edit(&mut editor, kind, &deltas, &snapshots, &notifications).await
+            }
+            Step::Undo => {
+                let reverted = editor.history.undo();
+                reapply(&mut editor, reverted, &deltas, &snapshots, &notifications).await
+            }
+            Step::Redo => {
+                let reverted = editor.history.redo();
+                reapply(&mut editor, reverted, &deltas, &snapshots, &notifications).await
             }
             Step::Republish => snapshots.publish(editor.snapshot(None)),
             Step::Open(path) => {
@@ -324,8 +345,8 @@ async fn run(
     let _ = notifications.try_send(Notification::ShuttingDown);
 }
 
-/// Apply an edit action end to end: plan the per-selection edits, apply them
-/// back-to-front to the buffer, emit each as a `Delta`, remap selections, bump the
+/// Apply an edit action end to end: plan the per-selection edits, apply them,
+/// record the reversible revision for undo (SPEC §2.4), remap selections, bump the
 /// version, and publish a snapshot. Returns `false` if the frontend has hung up
 /// (caller then breaks the loop).
 ///
@@ -347,22 +368,107 @@ async fn apply_edit(
         return snapshots.publish(editor.snapshot(None));
     }
 
-    let base_version = editor.version;
-    let mut dirty: Option<std::ops::Range<usize>> = None;
-    let mut applied = 0usize;
+    // Snapshot the selections *before* the edit so undo can restore them.
+    let before = editor.selections.clone();
+    let Some((changes, dirty)) = apply_change_list(editor, &edits, deltas, notifications).await
+    else {
+        return false; // frontend gone mid-stream
+    };
 
-    // Edits are sorted descending by start, so applying in order is offset-stable.
-    for (range, new_text) in &edits {
-        if let Err(err) = editor.buffer.replace(range.clone(), new_text) {
-            // Surface and skip this one edit; keep the buffer intact (SPEC §8).
-            // The notification is self-contained (carries buffer + version).
-            let _ = notifications.try_send(Notification::EditRejected {
-                buffer_id: editor.id,
-                version: editor.version,
-                message: err.to_string(),
-            });
+    // If every planned edit was rejected (or was a true no-op), nothing changed:
+    // do not bump the version or record history (a version bump with no delta
+    // would diverge a remote frontend replaying the delta stream, SPEC §5).
+    if changes.is_empty() {
+        return snapshots.publish(editor.snapshot(None));
+    }
+
+    // Remap selections to sit at the end of each applied edit (a cursor after the
+    // inserted text / at the deletion point). Recomputed from the edits so the set
+    // stays disjoint and sorted.
+    editor.selections = selections_after_edits(&edits);
+    editor.version += 1;
+    // One user action is one undo unit, even when it fanned across N cursors
+    // (SPEC §2.4). Coalescing (single-caret typing) is decided inside `record`.
+    editor
+        .history
+        .record(changes, before, editor.selections.clone());
+    editor.modified = !editor.history.at_saved();
+    snapshots.publish(editor.snapshot(dirty))
+}
+
+/// Apply an undo or redo, sharing the "apply edits + restore selections + publish"
+/// tail. `reverted` is the move the history already produced (`History::undo` /
+/// `History::redo`): the edits to apply against the current buffer plus the
+/// selections to restore, or `None` at a branch end (nothing to undo/redo), a clean
+/// no-op. Undo/redo *are* edits on the wire: they emit deltas and bump the version
+/// like any change, so a remote frontend replaying the log converges (SPEC §5) - it
+/// has no notion of "undo", only more buffer edits moving forward in version time.
+async fn reapply(
+    editor: &mut Editor,
+    reverted: Option<Reverted>,
+    deltas: &Sender<Delta>,
+    snapshots: &SnapshotSink,
+    notifications: &Sender<Notification>,
+) -> bool {
+    let Some(reverted) = reverted else {
+        // Nothing to undo/redo: republish so the view stays current, no version bump.
+        return snapshots.publish(editor.snapshot(None));
+    };
+
+    let Some((changes, dirty)) =
+        apply_change_list(editor, &reverted.edits, deltas, notifications).await
+    else {
+        return false; // frontend gone
+    };
+    // Inverse/forward edits derived from a consistent history over this buffer
+    // always apply cleanly, so `changes` is non-empty here; guard the version bump
+    // anyway so a would-be no-op never advances the version without a delta.
+    if !changes.is_empty() {
+        editor.version += 1;
+    }
+    editor.selections = reverted.selections;
+    editor.modified = !editor.history.at_saved();
+    snapshots.publish(editor.snapshot(dirty))
+}
+
+/// Apply `edits` (each `(range, replacement)`, pre-sorted DESCENDING by start so
+/// back-to-front application is offset-stable) to the buffer, emitting one `Delta`
+/// per applied edit and capturing the removed text so the caller can build an undo
+/// revision. Returns the applied [`Change`]s and the merged dirty range, or `None`
+/// if the frontend hung up. A rejected edit is surfaced and skipped (SPEC §8); a
+/// true no-op edit (empty range and empty text) is dropped so it never produces a
+/// degenerate delta or revision. Version and selection updates are the caller's job
+/// - `apply_edit` remaps to the edit ends, undo/redo restore saved selections.
+async fn apply_change_list(
+    editor: &mut Editor,
+    edits: &[(std::ops::Range<usize>, String)],
+    deltas: &Sender<Delta>,
+    notifications: &Sender<Notification>,
+) -> Option<(Vec<Change>, Option<std::ops::Range<usize>>)> {
+    // Deltas are expressed against the pre-edit version; no edit here bumps it
+    // (the caller does, once, after this returns), so read it once up front.
+    let base_version = editor.version;
+    let mut changes: Vec<Change> = Vec::with_capacity(edits.len());
+    let mut dirty: Option<std::ops::Range<usize>> = None;
+
+    for (range, new_text) in edits {
+        // Drop a pure no-op (replace nothing with nothing): it would emit an empty
+        // delta and record an empty revision, both meaningless.
+        if range.is_empty() && new_text.is_empty() {
             continue;
         }
+        let removed = match editor.buffer.replace(range.clone(), new_text) {
+            Ok(removed) => removed,
+            Err(err) => {
+                // Surface and skip this one edit; keep the buffer intact (SPEC §8).
+                let _ = notifications.try_send(Notification::EditRejected {
+                    buffer_id: editor.id,
+                    version: editor.version,
+                    message: err.to_string(),
+                });
+                continue;
+            }
+        };
         // A Delta is expressed against the base (pre-edit) version. Emitting one
         // per sub-edit keeps the lossless log exact for a remote frontend.
         let delta = Delta {
@@ -372,31 +478,20 @@ async fn apply_edit(
             new_text: new_text.clone(),
         };
         if deltas.send(delta).await.is_err() {
-            return false; // frontend gone
+            return None; // frontend gone
         }
-        applied += 1;
+        changes.push(Change {
+            start: range.start,
+            removed,
+            inserted: new_text.clone(),
+        });
         dirty = Some(match dirty {
             None => range.start..range.start + new_text.len(),
             Some(d) => d.start.min(range.start)..d.end.max(range.start + new_text.len()),
         });
     }
 
-    // If every planned edit was rejected, nothing changed: do not bump the
-    // version or remap selections (a version bump with no delta would diverge a
-    // remote frontend replaying the delta stream, SPEC §5). Republish current
-    // state so the frontend's view stays current, matching the empty-plan case.
-    if applied == 0 {
-        return snapshots.publish(editor.snapshot(None));
-    }
-
-    // Remap selections to sit at the end of each applied edit (a cursor after the
-    // inserted text / at the deletion point). Recomputed from the edits so the
-    // set stays disjoint and sorted.
-    editor.selections = selections_after_edits(&edits);
-    editor.version += 1;
-    // The buffer now differs from its on-disk file (if any) until the next save.
-    editor.modified = true;
-    snapshots.publish(editor.snapshot(dirty))
+    Some((changes, dirty))
 }
 
 /// Load `path` into the buffer, replacing its contents (SPEC §12.2 file
@@ -458,9 +553,12 @@ async fn open_file(
         editor.version += 1;
     }
 
-    // A freshly opened buffer starts at the origin and matches disk.
+    // A freshly opened buffer starts at the origin and matches disk. Undo does not
+    // cross a load, so the history is reset to a fresh tree rooted at the loaded
+    // content, which is the saved state (SPEC §2.4).
     editor.selections = SelectionSet::at_origin();
     editor.path = Some(path.clone());
+    editor.history = History::new();
     editor.modified = false;
 
     let _ = notifications.try_send(Notification::FileOpened {
@@ -499,6 +597,9 @@ async fn save_file(
         return report_file_error(editor, Some(path), &message, snapshots, notifications);
     }
 
+    // Mark the current history node as the on-disk state, so undoing back to it
+    // later clears the modified marker (SPEC §2.4, §8).
+    editor.history.mark_saved();
     editor.modified = false;
     let _ = notifications.try_send(Notification::FileSaved {
         buffer_id: editor.id,

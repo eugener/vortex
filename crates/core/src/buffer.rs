@@ -128,10 +128,16 @@ pub trait Buffer {
     /// `text`, insert is an empty `range`. This is the shape of a `Delta`
     /// (SPEC §5).
     ///
+    /// Returns the text that was removed (the content of `range` before the
+    /// replacement). That is the inverse information an undo needs, captured at
+    /// the one layer that can slice it safely - the range is validated here, so
+    /// the endpoints are known code-point boundaries - and it later feeds LSP
+    /// `didChange`/the journal too (SPEC §5: one representation of change).
+    ///
     /// # Errors
     /// Returns [`EditError`] if the range is out of bounds or not on a UTF-8 code
     /// point boundary - never panics on bad input (SPEC §8).
-    fn replace(&mut self, range: ByteRange, text: &str) -> Result<(), EditError>;
+    fn replace(&mut self, range: ByteRange, text: &str) -> Result<String, EditError>;
 
     /// Convert a byte offset to a line/column position. Clamps offsets past the
     /// end to the buffer end rather than erroring (a derived read, SPEC §4).
@@ -269,8 +275,12 @@ impl Buffer for RopeBuffer {
         self.rope.byte_len()
     }
 
-    fn replace(&mut self, range: ByteRange, text: &str) -> Result<(), EditError> {
+    fn replace(&mut self, range: ByteRange, text: &str) -> Result<String, EditError> {
         self.validate(&range)?;
+        // `range` is validated (in bounds, on code-point boundaries), so slicing
+        // the removed text cannot panic. Capture it before mutating so undo can
+        // invert this edit (SPEC §2.4, §5).
+        let removed = self.rope.byte_slice(range.clone()).to_string();
         // crop has no atomic replace; delete-then-insert at the same offset is
         // equivalent and both endpoints are already validated.
         if !range.is_empty() {
@@ -279,7 +289,7 @@ impl Buffer for RopeBuffer {
         if !text.is_empty() {
             self.rope.insert(range.start, text);
         }
-        Ok(())
+        Ok(removed)
     }
 
     fn position_of_byte(&self, byte_offset: usize) -> Position {

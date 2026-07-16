@@ -672,6 +672,118 @@ fn open_then_save_through_the_actor_loop() {
     );
 }
 
+#[test]
+fn multi_cursor_undo_restores_every_cursor() {
+    // One Insert over two cursors is one undo unit (SPEC §2.4); undoing it must
+    // remove both inserted spans at their shifted offsets, not just one. Reachable
+    // only via apply_edit + reapply with >1 selection - the multi-cursor path the
+    // single-selection message seam cannot yet drive.
+    let set = SelectionSet::from_sorted_cursors(vec![Selection::cursor(1), Selection::cursor(4)]);
+    let mut e = editor_with("abcdef", set);
+    let h = Harness::new();
+
+    smol::block_on(apply_edit(
+        &mut e,
+        EditKind::Insert("X".into()),
+        &h.delta_tx,
+        &h.snapshots,
+        &h.note_tx,
+    ));
+    assert_eq!(e.buffer.text().to_string(), "aXbcdXef");
+
+    let reverted = e.history.undo();
+    let alive = smol::block_on(reapply(
+        &mut e,
+        reverted,
+        &h.delta_tx,
+        &h.snapshots,
+        &h.note_tx,
+    ));
+    assert!(alive);
+    assert_eq!(
+        e.buffer.text().to_string(),
+        "abcdef",
+        "both cursors' inserts undone"
+    );
+    // Selections restored to the two original carets.
+    assert_eq!(
+        e.selections.all(),
+        &[Selection::cursor(1), Selection::cursor(4)]
+    );
+}
+
+#[test]
+fn undo_reports_frontend_gone_when_the_delta_channel_is_closed() {
+    // Undo emits a delta (it is an edit on the wire); if the frontend dropped the
+    // lossless delta receiver, the send fails and `reapply` returns false so the
+    // actor loop can stop cleanly - the same contract as an ordinary edit.
+    let mut e = editor_with("abc", SelectionSet::single(Selection::cursor(3)));
+    let h = Harness::new();
+    // Record an edit so there is something to undo.
+    smol::block_on(apply_edit(
+        &mut e,
+        EditKind::Insert("d".into()),
+        &h.delta_tx,
+        &h.snapshots,
+        &h.note_tx,
+    ));
+    drop(h.delta_rx); // frontend hangs up the delta channel
+
+    let reverted = e.history.undo();
+    let alive = smol::block_on(reapply(
+        &mut e,
+        reverted,
+        &h.delta_tx,
+        &h.snapshots,
+        &h.note_tx,
+    ));
+    assert!(!alive);
+}
+
+#[test]
+fn undo_back_to_the_saved_state_clears_modified_through_the_loop() {
+    // Save point tracking (SPEC §8): after saving, edit again (dirty), then undo
+    // back to the saved node - the buffer is clean again even though the version
+    // kept advancing. Driven end-to-end through the real actor loop.
+    let dir = TempDir::new();
+    let path = dir.file("savepoint.txt");
+    std::fs::write(&path, "").unwrap();
+
+    let (snap, _notes) = run_seam(&[
+        Action::Open(path.clone()),
+        Action::Insert("x".into()),
+        Action::Save,               // saved state = "x"
+        Action::Insert("y".into()), // dirty: "xy"
+        Action::Undo,               // back to the saved node
+    ]);
+    assert_eq!(snap.text.to_string(), "x");
+    assert!(
+        !snap.modified,
+        "undo to the saved state clears the modified marker"
+    );
+}
+
+#[test]
+fn open_resets_undo_history() {
+    // Undo does not cross a file open (SPEC §2.4): after opening, there is nothing
+    // from before the load to undo. Type, open a file, then Undo - the buffer holds
+    // the file's content unchanged (the pre-open edit is not on this history).
+    let dir = TempDir::new();
+    let path = dir.file("reset.txt");
+    std::fs::write(&path, "loaded").unwrap();
+
+    let (snap, _notes) = run_seam(&[
+        Action::Insert("scratch".into()),
+        Action::Open(path.clone()),
+        Action::Undo,
+    ]);
+    assert_eq!(
+        snap.text.to_string(),
+        "loaded",
+        "undo cannot reach across the open"
+    );
+}
+
 // Atomic-write hardening (SPEC §8). These are Unix-specific because they assert
 // on permission bits and symlink semantics that Windows models differently.
 #[cfg(unix)]

@@ -38,6 +38,26 @@ fn replace_swaps_range_for_text() {
 }
 
 #[test]
+fn replace_returns_the_removed_text() {
+    // The removed text is the inverse info undo needs (SPEC §2.4, §5): a replace
+    // hands it back, sliced from the pre-edit content of the range.
+    let mut b = RopeBuffer::from("hello world");
+    assert_eq!(b.replace(6..11, "there").unwrap(), "world"); // replaced span
+    assert_eq!(b.replace(0..0, "X").unwrap(), ""); // pure insert removes nothing
+    assert_eq!(b.replace(0..1, "").unwrap(), "X"); // pure delete returns what it removed
+}
+
+#[test]
+fn replace_returns_removed_text_across_multibyte_graphemes() {
+    // Removed text is sliced on validated code-point boundaries, so a multibyte
+    // grapheme round-trips intact (SPEC §4).
+    let mut b = RopeBuffer::from("a語b");
+    // "語" is 3 bytes at offset 1..4.
+    assert_eq!(b.replace(1..4, "").unwrap(), "語");
+    assert_eq!(b.text().to_string(), "ab");
+}
+
+#[test]
 fn line_count_ignores_trailing_newline() {
     // crop: a final line break is not a separate empty line (verified §3).
     assert_eq!(RopeBuffer::from("a\nb\n").text().line_count(), 2);
