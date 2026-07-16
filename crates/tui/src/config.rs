@@ -13,14 +13,18 @@
 
 use ratatui::style::{Color, Modifier, Style};
 
+use crate::keymap::Keymap;
+
 /// All user-configurable frontend settings, resolved once at startup and threaded
-/// into the render path. Grows as configurable surfaces land - the keymap is the
-/// next field (SPEC §10.5) - so it is passed as a whole rather than field-by-field.
+/// into the render and input paths. Grows as configurable surfaces land, so it is
+/// passed as a whole rather than field-by-field (SPEC §10.5).
 #[derive(Debug, Clone, Default)]
 pub struct Config {
     /// Colors/attributes for the non-text chrome.
     pub theme: Theme,
-    // keymap: Keymap  - M1+, once the key→intent table is data rather than code.
+    /// Key -> intent bindings (`Default` is the built-in map; a config file's
+    /// `[keymap]` table will replace it via [`Keymap::from_pairs`]).
+    pub keymap: Keymap,
 }
 
 /// Chrome styling for the frontend's non-text UI: the head/status bars and the
@@ -66,6 +70,20 @@ mod tests {
         assert_eq!(config.theme.head_bar.bg, Some(Color::Gray));
         assert_eq!(config.theme.status_bar.bg, Some(Color::Gray));
         assert_eq!(config.theme.head_bar.fg, Some(Color::Black));
+    }
+
+    #[test]
+    fn default_config_carries_a_working_keymap() {
+        use crate::keymap::action_for_key;
+        use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        use vortex_core::Action;
+
+        let config = Config::default();
+        let ctrl_s = KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL);
+        assert_eq!(
+            action_for_key(&config.keymap, ctrl_s, 10),
+            Some(Action::Save)
+        );
     }
 
     #[test]
