@@ -22,8 +22,8 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use ratatui::crossterm::event::{
-    self, Event, KeyboardEnhancementFlags, PopKeyboardEnhancementFlags,
-    PushKeyboardEnhancementFlags,
+    self, DisableMouseCapture, EnableMouseCapture, Event, KeyModifiers, KeyboardEnhancementFlags,
+    MouseButton, MouseEventKind, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
 };
 use ratatui::crossterm::terminal::{
     BeginSynchronizedUpdate, EndSynchronizedUpdate, supports_keyboard_enhancement,
@@ -70,6 +70,11 @@ impl ViewState {
 /// snapshot that arrives without a keystroke (e.g. a background restyle in M4)
 /// still gets painted promptly.
 const POLL: Duration = Duration::from_millis(16);
+
+/// Lines the mouse wheel scrolls the viewport per notch. A few lines per notch is
+/// the common terminal feel; scrolling is a pure frontend viewport move (SPEC §5),
+/// so it never round-trips to the core.
+const SCROLL_STEP: usize = 3;
 
 fn main() -> io::Result<()> {
     // Parse argv before touching the terminal: `--help`/`--version` and bad flags
@@ -217,6 +222,11 @@ fn event_loop(
     // first frame. Redrawing every idle poll tick is wasted work (ratatui
     // cell-diffs, so it emits nothing, but it still rebuilds the frame ~60x/sec).
     let mut needs_redraw = true;
+    // Whether the next paint pulls the viewport to keep the caret visible. True for
+    // every paint except one driven by a wheel scroll, which moves the view *away*
+    // from the caret on purpose (SPEC §5, frontend-owned viewport); it resets to
+    // true after each frame so a later edit/motion re-centers the caret.
+    let mut follow = true;
 
     loop {
         // Take the newest snapshot if the core published one (latest-wins cell).
@@ -241,8 +251,18 @@ fn event_loop(
         if let Some(snap) = &latest
             && needs_redraw
         {
-            viewport = draw(terminal, snap, viewport, message.as_deref(), config.theme)?;
+            viewport = draw(
+                terminal,
+                snap,
+                viewport,
+                message.as_deref(),
+                config.theme,
+                follow,
+            )?;
             needs_redraw = false;
+            // Default back to caret-follow; only a wheel scroll opts out, and only
+            // for the single frame it triggered.
+            follow = true;
         }
 
         // Wait for input, but no longer than POLL so a snapshot arriving without a
@@ -268,12 +288,72 @@ fn event_loop(
                         }
                     }
                 }
+                Event::Mouse(mouse) => match mouse.kind {
+                    // Left press or drag places/extends the caret at the pointer.
+                    // A press is a plain click unless Shift is held (extend from the
+                    // current anchor); a drag always extends, so a press-then-drag
+                    // sweeps out a selection.
+                    MouseEventKind::Down(MouseButton::Left)
+                    | MouseEventKind::Drag(MouseButton::Left) => {
+                        if let Some(snap) = &latest {
+                            let extend = matches!(mouse.kind, MouseEventKind::Drag(_))
+                                || mouse.modifiers.contains(KeyModifiers::SHIFT);
+                            let offset = pointer_offset(snap, viewport, mouse.column, mouse.row);
+                            // A pointer action clears the transient file message,
+                            // like a keystroke does.
+                            if message.take().is_some() {
+                                needs_redraw = true;
+                            }
+                            if handle
+                                .actions
+                                .send_blocking(Action::PlaceCursor { offset, extend })
+                                .is_err()
+                            {
+                                return Ok(());
+                            }
+                        }
+                    }
+                    // Wheel scrolls the viewport without moving the caret (follow
+                    // off for this frame); clamping to content happens in `paint`.
+                    MouseEventKind::ScrollDown => {
+                        viewport.scroll = viewport.scroll.saturating_add(SCROLL_STEP);
+                        follow = false;
+                        needs_redraw = true;
+                    }
+                    MouseEventKind::ScrollUp => {
+                        viewport.scroll = viewport.scroll.saturating_sub(SCROLL_STEP);
+                        follow = false;
+                        needs_redraw = true;
+                    }
+                    _ => {}
+                },
                 // Repaint against the new terminal size.
                 Event::Resize(_, _) => needs_redraw = true,
                 _ => {}
             }
         }
     }
+}
+
+/// Resolve an absolute pointer cell to a buffer byte offset, using the last painted
+/// viewport (gutter width, scroll on both axes) so the lookup needs no core
+/// round-trip (SPEC §5). The head bar occupies screen row 0, so the body row is
+/// `row - 1`, clamped into the painted text rows: a click on the head bar maps to
+/// the top visible line and a drag below the body to the last one. Column and
+/// end-of-line clamping are handled by [`layout::offset_at_cell`].
+fn pointer_offset(snapshot: &ViewSnapshot, viewport: ViewState, column: u16, row: u16) -> usize {
+    let gutter_width = layout::gutter_width(layout::display_line_count(&snapshot.text));
+    let last_body_row = viewport.page_height.saturating_sub(1);
+    let body_row = (row.saturating_sub(1) as usize).min(last_body_row);
+    layout::offset_at_cell(
+        &snapshot.text,
+        viewport.scroll,
+        viewport.h_scroll,
+        gutter_width,
+        TAB_WIDTH,
+        body_row,
+        column as usize,
+    )
 }
 
 /// Paint one frame from `snapshot`, wrapped in synchronized output (anti-tearing,
@@ -286,11 +366,13 @@ fn draw(
     viewport: ViewState,
     message: Option<&str>,
     theme: config::Theme,
+    follow: bool,
 ) -> io::Result<ViewState> {
     let mut new_viewport = viewport;
     let mut out = io::stdout();
     queue!(out, BeginSynchronizedUpdate)?;
-    terminal.draw(|frame| new_viewport = paint(frame, snapshot, viewport, message, theme))?;
+    terminal
+        .draw(|frame| new_viewport = paint(frame, snapshot, viewport, message, theme, follow))?;
     execute!(out, EndSynchronizedUpdate)?;
     Ok(new_viewport)
 }
@@ -306,6 +388,7 @@ fn paint(
     viewport: ViewState,
     message: Option<&str>,
     theme: config::Theme,
+    follow: bool,
 ) -> ViewState {
     let area = frame.area();
     // Head bar (1 row), text body (rest), status bar (1 row). `Min(0)` lets the
@@ -342,9 +425,22 @@ fn paint(
     let max_scroll = display_lines.saturating_sub(text_height);
     let line_width = layout::display_column(&line_text, line_text.len(), TAB_WIDTH);
     let max_h_scroll = (line_width + 1).saturating_sub(text_width);
-    let scroll = layout::scroll_to_show(cursor_line, viewport.scroll, text_height).min(max_scroll);
-    let h_scroll =
-        layout::scroll_to_show(cursor_display_col, viewport.h_scroll, text_width).min(max_h_scroll);
+    // When following the caret (keys, clicks, edits) each axis scrolls the minimum
+    // to keep it visible; a wheel scroll turns follow off and paints the viewport's
+    // own offset instead, so the view can move away from the caret. Both are clamped
+    // to the content extent so a stale offset never paints blank rows/columns.
+    let scroll = if follow {
+        layout::scroll_to_show(cursor_line, viewport.scroll, text_height)
+    } else {
+        viewport.scroll
+    }
+    .min(max_scroll);
+    let h_scroll = if follow {
+        layout::scroll_to_show(cursor_display_col, viewport.h_scroll, text_width)
+    } else {
+        viewport.h_scroll
+    }
+    .min(max_h_scroll);
 
     paint_head_bar(frame, head_area, snapshot, theme.head_bar);
     paint_body(
@@ -377,12 +473,17 @@ fn paint(
     );
 
     // Place the terminal cursor at the primary caret, offset by the gutter and the
-    // head row and pulled left by the horizontal scroll. `saturating_sub` guards a
-    // stale scroll after a resize - never underflow into a wild u16 (SPEC §8: a
-    // resize must not crash).
-    let row = body_area.y + cursor_line.saturating_sub(scroll) as u16;
-    let col = body_area.x + (gutter_width + cursor_display_col.saturating_sub(h_scroll)) as u16;
-    frame.set_cursor_position(Position::new(col, row));
+    // head row. Only when the caret is within the visible window on both axes: a
+    // wheel scroll can push it out of view, and a cursor pinned to a screen edge
+    // then would be wrong - ratatui hides the cursor when `paint` sets no position.
+    let cursor_visible = text_height > 0
+        && (scroll..scroll + text_height).contains(&cursor_line)
+        && (h_scroll..h_scroll + text_width).contains(&cursor_display_col);
+    if cursor_visible {
+        let row = body_area.y + (cursor_line - scroll) as u16;
+        let col = body_area.x + (gutter_width + cursor_display_col - h_scroll) as u16;
+        frame.set_cursor_position(Position::new(col, row));
+    }
 
     ViewState {
         scroll,
@@ -547,7 +648,13 @@ impl TerminalGuard {
     fn enter() -> io::Result<Self> {
         ratatui::crossterm::terminal::enable_raw_mode()?;
         let mut out = io::stdout();
-        execute!(out, ratatui::crossterm::terminal::EnterAlternateScreen)?;
+        execute!(
+            out,
+            ratatui::crossterm::terminal::EnterAlternateScreen,
+            // Report mouse press/drag/scroll so clicks place the caret and drags
+            // select (SPEC §9 input). Disabled symmetrically on teardown.
+            EnableMouseCapture,
+        )?;
 
         // Negotiate the Kitty keyboard protocol where supported (SPEC §9). A
         // terminal without it silently ignores the push, so we only enable when
@@ -590,7 +697,11 @@ impl TerminalGuard {
         if self.kitty {
             let _ = execute!(out, PopKeyboardEnhancementFlags);
         }
-        let _ = execute!(out, ratatui::crossterm::terminal::LeaveAlternateScreen);
+        let _ = execute!(
+            out,
+            DisableMouseCapture,
+            ratatui::crossterm::terminal::LeaveAlternateScreen
+        );
         let _ = ratatui::crossterm::terminal::disable_raw_mode();
     }
 }
@@ -678,6 +789,7 @@ mod tests {
                     ViewState::default(),
                     message,
                     config::Theme::default(),
+                    true,
                 );
             })
             .unwrap();
@@ -861,6 +973,7 @@ mod tests {
                     ViewState::default(),
                     None,
                     config::Theme::default(),
+                    true,
                 );
             })
             .unwrap();
@@ -965,6 +1078,7 @@ mod tests {
                     ViewState::default(),
                     None,
                     config::Theme::default(),
+                    true,
                 );
             })
             .unwrap();
@@ -1039,7 +1153,9 @@ mod tests {
             page_height: 4,
         };
         terminal
-            .draw(|frame| settled = paint(frame, &snap, stale, None, config::Theme::default()))
+            .draw(|frame| {
+                settled = paint(frame, &snap, stale, None, config::Theme::default(), true)
+            })
             .unwrap();
         assert_eq!(settled.scroll, 0, "scroll must clamp to fit the content");
         let buf = terminal.backend().buffer().clone();
@@ -1064,7 +1180,9 @@ mod tests {
             page_height: 2,
         };
         terminal
-            .draw(|frame| settled = paint(frame, &snap, stale, None, config::Theme::default()))
+            .draw(|frame| {
+                settled = paint(frame, &snap, stale, None, config::Theme::default(), true)
+            })
             .unwrap();
         assert_eq!(settled.h_scroll, 0, "h_scroll must clamp to the short line");
         let buf = terminal.backend().buffer().clone();
@@ -1073,5 +1191,62 @@ mod tests {
             "the line should be visible from the left: {:?}",
             row_text(&buf, 1)
         );
+    }
+
+    #[test]
+    fn wheel_scroll_moves_view_without_following_the_caret() {
+        // Six lines, caret pinned to the top (line 0). With follow off (a wheel
+        // scroll) the view honors the given scroll offset instead of snapping back
+        // to the caret, so lower lines show and the caret scrolls out of sight.
+        let snap = snapshot_after(&[
+            Action::Insert("l0\nl1\nl2\nl3\nl4\nl5".into()),
+            Action::MoveCursor {
+                motion: vortex_core::Motion::BufferStart,
+                extend: false,
+            },
+        ]);
+        // 6 rows - 2 bars = 4 text rows; scroll down to line 2.
+        let scrolled = ViewState {
+            scroll: 2,
+            h_scroll: 0,
+            page_height: 4,
+        };
+        let mut settled = ViewState::default();
+        let mut terminal = Terminal::new(TestBackend::new(20, 6)).unwrap();
+        terminal
+            .draw(|frame| {
+                settled = paint(
+                    frame,
+                    &snap,
+                    scrolled,
+                    None,
+                    config::Theme::default(),
+                    false,
+                )
+            })
+            .unwrap();
+        // The view stayed scrolled (not pulled back to the caret on line 0).
+        assert_eq!(settled.scroll, 2);
+        let buf = terminal.backend().buffer().clone();
+        assert!(
+            row_text(&buf, 1).contains("l2"),
+            "top body row should be the scrolled line: {:?}",
+            row_text(&buf, 1)
+        );
+    }
+
+    #[test]
+    fn pointer_offset_subtracts_the_head_bar_row() {
+        let snap = snapshot_after(&[Action::Insert("ab\ncdef".into())]);
+        let vp = ViewState {
+            scroll: 0,
+            h_scroll: 0,
+            page_height: 8,
+        };
+        // Screen row 2 is body row 1 = line "cdef" (starts at byte 3); the gutter
+        // edge (column 4) maps to its first character.
+        assert_eq!(pointer_offset(&snap, vp, 4, 2), 3);
+        // A click on the head bar (screen row 0) clamps to the top line's start.
+        assert_eq!(pointer_offset(&snap, vp, 4, 0), 0);
     }
 }

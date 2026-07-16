@@ -22,6 +22,14 @@ pub enum Action {
     /// Move every selection by `motion`. `extend` grows selections (holding their
     /// anchor); otherwise each collapses to a cursor at the new head (SPEC §2.2).
     MoveCursor { motion: Motion, extend: bool },
+    /// Place the caret at absolute byte `offset`, collapsing to a single selection
+    /// (a pointer click). The frontend resolves the pointer's screen cell to a
+    /// buffer offset - it owns display<->buffer mapping (SPEC §4/§5), so the core
+    /// receives intent ("caret here"), not raw coordinates. `extend` keeps the
+    /// current primary anchor and moves only the head (drag / shift-click) so a
+    /// drag grows a selection; otherwise the set becomes a plain cursor at `offset`.
+    /// `offset` is clamped to the buffer defensively (SPEC §8).
+    PlaceCursor { offset: usize, extend: bool },
     /// Insert `text` at every selection, replacing any non-empty selection first.
     /// A bracketed paste is ONE such action, not a key-per-character (SPEC §6).
     Insert(String),

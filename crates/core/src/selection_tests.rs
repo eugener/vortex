@@ -32,6 +32,43 @@ fn equality_ignores_goal_column() {
 }
 
 #[test]
+fn place_sets_a_plain_cursor_at_offset() {
+    let t = text("hello world");
+    let mut s = SelectionSet::single(Selection::new(0, 3)); // a live selection
+    s.place(&t, 7, false);
+    assert_eq!(s.len(), 1);
+    assert_eq!(*s.primary(), Selection::cursor(7));
+}
+
+#[test]
+fn place_extends_from_the_existing_anchor() {
+    let t = text("hello world");
+    let mut s = SelectionSet::single(Selection::new(2, 2)); // cursor/anchor at 2
+    s.place(&t, 8, true);
+    // Anchor stays at 2, head moves to 8: a selection [2, 8).
+    assert_eq!(*s.primary(), Selection::new(2, 8));
+}
+
+#[test]
+fn place_clamps_offset_past_the_buffer_end() {
+    let t = text("hi"); // len 2
+    let mut s = SelectionSet::at_origin();
+    s.place(&t, 999, false);
+    assert_eq!(*s.primary(), Selection::cursor(2));
+}
+
+#[test]
+fn place_collapses_a_multi_selection_to_one() {
+    let t = text("abcdef");
+    // Two cursors; a plain click resets to a single caret.
+    let mut s = SelectionSet::from_sorted_cursors(vec![Selection::cursor(1), Selection::cursor(4)]);
+    assert_eq!(s.len(), 2);
+    s.place(&t, 3, false);
+    assert_eq!(s.len(), 1);
+    assert_eq!(*s.primary(), Selection::cursor(3));
+}
+
+#[test]
 fn set_is_never_empty() {
     let s = SelectionSet::at_origin();
     assert_eq!(s.len(), 1);

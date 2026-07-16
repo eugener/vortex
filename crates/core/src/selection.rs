@@ -198,6 +198,24 @@ impl SelectionSet {
         self.normalize(primary_head);
     }
 
+    /// Collapse the set to a single selection whose head sits at byte `offset` (a
+    /// pointer placement resolved by the frontend, SPEC §4). `extend` keeps the
+    /// current primary's anchor so a drag or shift-click grows the selection from
+    /// where it started; otherwise the set becomes a plain cursor at `offset`.
+    /// `offset` is clamped to the buffer so a pointer position from a concurrent
+    /// shrink never places out of range (SPEC §8). Multi-cursor collapses to one
+    /// here on purpose - a plain click resets to a single caret (M3 adds
+    /// modifier-clicks that add cursors instead).
+    pub fn place(&mut self, text: &Text, offset: usize, extend: bool) {
+        let offset = offset.min(text.byte_len());
+        let anchor = if extend {
+            self.primary().anchor
+        } else {
+            offset
+        };
+        *self = Self::single(Selection::new(anchor, offset));
+    }
+
     /// Sort by start and merge overlapping/touching selections, then point
     /// `primary` at whichever surviving selection covers `primary_head`.
     fn normalize(&mut self, primary_head: usize) {
