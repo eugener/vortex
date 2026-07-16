@@ -10,11 +10,14 @@
 //! are computed here from the primary cursor and the terminal size, with **zero
 //! round-trips to the core** (the anti-Xi rule, SPEC §5).
 
+use std::ops::Range;
 use std::path::Path;
 
+use ratatui::style::Style;
+use ratatui::text::Span;
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
-use vortex_core::Text;
+use vortex_core::{Selection, Text};
 
 /// Shown in the head bar when the buffer has no bound file (SPEC §10 lifecycle).
 pub const NO_NAME: &str = "[No Name]";
@@ -144,19 +147,30 @@ pub fn scroll_to_show(cursor: usize, offset: usize, size: usize) -> usize {
     }
 }
 
-/// Slice `line` (already tab-expanded, so tabs are spaces) to the display-column
-/// window `[h_scroll, h_scroll + width)` for horizontal scrolling. Graphemes fully
-/// left of the window are dropped and everything past its right edge is cut. A
-/// wide grapheme (CJK/emoji) straddling either edge is replaced by spaces for just
-/// the cells that fall inside the window, so a half-scrolled double-width glyph
-/// keeps every following column aligned with the cursor instead of shifting by one
-/// (SPEC §4: display width != character count).
-pub fn clip_columns(line: &str, h_scroll: usize, width: usize) -> String {
+/// Render the tab-expanded `line` into styled spans for the display-column window
+/// `[h_scroll, h_scroll + width)` - the frontend's one intra-line styling seam,
+/// shared by selection highlighting now and syntax highlighting (M4) later.
+///
+/// Every cell in the window is emitted: content graphemes, then padding spaces
+/// past the line's end, so `base` fills the *whole* width - the mechanism behind
+/// the current-line tint. Each `overlay` (a display-column range plus a [`Style`])
+/// patches `base` for the cells it covers, later overlays winning; a zero-overlay
+/// call is just the clipped line. A wide grapheme (CJK/emoji) straddling either
+/// edge is replaced by spaces for its visible cells so columns after it stay
+/// aligned with the cursor (SPEC §4: display width != character count). Consecutive
+/// equal-style cells coalesce into one span to keep the count low.
+pub fn render_line(
+    line: &str,
+    h_scroll: usize,
+    width: usize,
+    base: Style,
+    overlays: &[(Range<usize>, Style)],
+) -> Vec<Span<'static>> {
     if width == 0 {
-        return String::new();
+        return Vec::new();
     }
     let end = h_scroll + width;
-    let mut out = String::new();
+    let mut runs: Vec<(String, Style)> = Vec::new();
     let mut col = 0;
     for g in line.graphemes(true) {
         let w = g.width();
@@ -166,16 +180,112 @@ pub fn clip_columns(line: &str, h_scroll: usize, width: usize) -> String {
         } else if col >= end {
             break; // entirely right of the window; nothing further can fit
         } else if col >= h_scroll && g_end <= end {
-            out.push_str(g); // fully inside
+            push_run(&mut runs, g, style_at(col, base, overlays)); // fully inside
         } else {
-            // Straddles an edge: emit a space per visible cell so a partially
+            // Straddles an edge: one styled space per visible cell so a partially
             // clipped wide glyph does not misalign the columns after it.
-            let visible = g_end.min(end) - col.max(h_scroll);
-            out.extend(std::iter::repeat_n(' ', visible));
+            for c in col.max(h_scroll)..g_end.min(end) {
+                push_run(&mut runs, " ", style_at(c, base, overlays));
+            }
         }
         col = g_end;
     }
-    out
+    // Pad the window past the line's content so `base` (and any overlay covering
+    // these cells - e.g. a selection that consumed the trailing newline) fills the
+    // remaining width. An empty range (content already past the window) adds nothing.
+    for c in col.max(h_scroll)..end {
+        push_run(&mut runs, " ", style_at(c, base, overlays));
+    }
+    runs.into_iter()
+        .map(|(text, style)| Span::styled(text, style))
+        .collect()
+}
+
+/// Append `s` to the last run when it shares `style`, else start a new run. Keeps
+/// [`render_line`] emitting one span per style change rather than one per cell.
+fn push_run(runs: &mut Vec<(String, Style)>, s: &str, style: Style) {
+    match runs.last_mut() {
+        Some((buf, last)) if *last == style => buf.push_str(s),
+        _ => runs.push((s.to_string(), style)),
+    }
+}
+
+/// The style for display column `col`: `base` with every overlay whose range
+/// covers `col` patched over it in order (later overlays win).
+fn style_at(col: usize, base: Style, overlays: &[(Range<usize>, Style)]) -> Style {
+    let mut style = base;
+    for (range, overlay) in overlays {
+        if range.contains(&col) {
+            style = style.patch(*overlay);
+        }
+    }
+    style
+}
+
+/// The display-column range a selection covers on one buffer line, or `None` when
+/// the selection does not touch the line or is a zero-width cursor here (a cursor
+/// renders as the terminal caret, not a highlight). `line` is the line's raw text
+/// (tabs intact), `line_start` its first byte offset, and `line_end_excl` the next
+/// line's start (or buffer end) so the line's terminator bytes are included.
+///
+/// When the selection runs through this line's terminator (its end lies past the
+/// content), the range gets one extra cell so the consumed line break is visible
+/// and blank lines inside a multi-line selection still show a highlight.
+pub fn selection_columns(
+    line: &str,
+    line_start: usize,
+    line_end_excl: usize,
+    tab_width: usize,
+    sel_start: usize,
+    sel_end: usize,
+) -> Option<Range<usize>> {
+    let content_end = line_start + line.len();
+    let lo = sel_start.max(line_start);
+    let hi = sel_end.min(line_end_excl);
+    if lo >= hi {
+        return None;
+    }
+    let lo_col = display_column(line, (lo - line_start).min(line.len()), tab_width);
+    let hi_content = hi.min(content_end);
+    let hi_col = display_column(line, (hi_content - line_start).min(line.len()), tab_width);
+    // A selection reaching past the content consumed this line's newline.
+    let end_col = if hi > content_end { hi_col + 1 } else { hi_col };
+    (lo_col < end_col).then_some(lo_col..end_col)
+}
+
+/// Total grapheme clusters covered by `selections`, for the status readout when a
+/// selection is active. Counts user-perceived characters (not bytes), line
+/// terminators excluded; zero-width cursors contribute nothing. Bounded by the
+/// selected span, materializing only its lines (SPEC §10.4), so an idle cursor
+/// costs nothing and only a live selection pays.
+pub fn selected_grapheme_count(text: &Text, selections: &[Selection]) -> usize {
+    selections
+        .iter()
+        .map(|s| grapheme_count_in(text, s.start(), s.end()))
+        .sum()
+}
+
+/// Grapheme clusters in the byte range `[start, end)`, summed line by line so no
+/// slice wider than one line is ever materialized.
+fn grapheme_count_in(text: &Text, start: usize, end: usize) -> usize {
+    if start >= end {
+        return 0;
+    }
+    let mut count = 0;
+    for line_idx in text.line_of_byte(start)..=text.line_of_byte(end) {
+        let Some(line_start) = text.byte_of_line(line_idx) else {
+            break;
+        };
+        let content = text.line(line_idx).unwrap_or_default();
+        let lo = start.max(line_start);
+        let hi = end.min(line_start + content.len());
+        if lo < hi {
+            count += content[lo - line_start..hi - line_start]
+                .graphemes(true)
+                .count();
+        }
+    }
+    count
 }
 
 /// Columns the line-number gutter occupies: a right-aligned digit field (at least
@@ -295,18 +405,21 @@ pub fn human_size(bytes: usize) -> String {
 /// Status-bar segments `(left, right)` = (cursor position, buffer metrics). When a
 /// transient `message` is present (a file open/save result) it replaces the cursor
 /// position on the left so the result is visible (SPEC §8). `line`/`col` are
-/// 1-based for display; `bytes` is the buffer size (rendered via [`human_size`])
-/// and `version` the document version (SPEC §5), surfaced while the delta/version
-/// model is young.
+/// 1-based for display; a non-zero `selected` (grapheme count of the active
+/// selection) is appended so the size of a selection is visible while it is held.
+/// `bytes` is the buffer size (rendered via [`human_size`]) and `version` the
+/// document version (SPEC §5), surfaced while the delta/version model is young.
 pub fn status_bar(
     line: usize,
     col: usize,
+    selected: usize,
     bytes: usize,
     version: u64,
     message: Option<&str>,
 ) -> (String, String) {
     let left = match message {
         Some(m) => format!(" {m}"),
+        None if selected > 0 => format!(" Ln {line}, Col {col}  ({selected} selected)"),
         None => format!(" Ln {line}, Col {col}"),
     };
     let right = format!("{} · v{version} ", human_size(bytes));
@@ -441,47 +554,178 @@ mod tests {
         assert_eq!(scroll_to_show(3, 5, 10), 3);
     }
 
+    /// Concatenated text of an unstyled [`render_line`] over the window - the
+    /// clipping/padding behavior, ignoring styles.
+    fn rendered(line: &str, h_scroll: usize, width: usize) -> String {
+        render_line(line, h_scroll, width, Style::default(), &[])
+            .iter()
+            .map(|s| s.content.as_ref())
+            .collect()
+    }
+
+    /// The style [`render_line`] assigned to display column `col`, by walking the
+    /// spans and their widths.
+    fn style_at_col(spans: &[Span], col: usize) -> Style {
+        let mut c = 0;
+        for s in spans {
+            let w = s.width();
+            if col < c + w {
+                return s.style;
+            }
+            c += w;
+        }
+        Style::default()
+    }
+
     #[test]
-    fn clip_columns_slices_ascii_window() {
+    fn render_line_slices_ascii_window() {
         // "abcdefgh", window [2, 2+3) -> "cde".
-        assert_eq!(clip_columns("abcdefgh", 2, 3), "cde");
+        assert_eq!(rendered("abcdefgh", 2, 3), "cde");
     }
 
     #[test]
-    fn clip_columns_from_zero_is_left_aligned_prefix() {
-        assert_eq!(clip_columns("abcdefgh", 0, 4), "abcd");
+    fn render_line_from_zero_is_left_aligned_prefix() {
+        assert_eq!(rendered("abcdefgh", 0, 4), "abcd");
     }
 
     #[test]
-    fn clip_columns_past_end_is_empty() {
-        assert_eq!(clip_columns("abc", 10, 5), "");
+    fn render_line_pads_short_line_to_width() {
+        // The line ends before the window does: the remainder is padded with spaces
+        // so a row-wide base style (the current-line tint) fills the whole width.
+        assert_eq!(rendered("abc", 0, 5), "abc  ");
     }
 
     #[test]
-    fn clip_columns_zero_width_is_empty() {
-        assert_eq!(clip_columns("abc", 0, 0), "");
+    fn render_line_past_end_is_all_padding() {
+        // Scrolled entirely past the content: the window is all padding spaces.
+        assert_eq!(rendered("abc", 10, 5), "     ");
     }
 
     #[test]
-    fn clip_columns_keeps_wide_char_fully_inside() {
+    fn render_line_zero_width_is_empty() {
+        assert!(render_line("abc", 0, 0, Style::default(), &[]).is_empty());
+    }
+
+    #[test]
+    fn render_line_keeps_wide_char_fully_inside() {
         // "日本語" is 3 chars x 2 cells = 6 cells. Window [2, 2+2) is exactly the
         // second char "本".
-        assert_eq!(clip_columns("日本語", 2, 2), "本");
+        assert_eq!(rendered("日本語", 2, 2), "本");
     }
 
     #[test]
-    fn clip_columns_replaces_wide_char_straddling_left_edge_with_spaces() {
+    fn render_line_replaces_wide_char_straddling_left_edge_with_spaces() {
         // Window starts at col 1, mid-"日" (cols 0..2). The 1 visible cell of that
         // glyph becomes a space so "本" (cols 2..4) still lands at the right place.
-        // Window [1, 1+3): 1 space (half of 日) + "本" (2 cells) = " 本".
-        assert_eq!(clip_columns("日本語", 1, 3), " 本");
+        assert_eq!(rendered("日本語", 1, 3), " 本");
     }
 
     #[test]
-    fn clip_columns_replaces_wide_char_straddling_right_edge_with_spaces() {
-        // Window [0, 3): "日" (cols 0..2) fits, then "本" (cols 2..4) straddles the
-        // right edge -> 1 visible cell as a space. Result "日 ".
-        assert_eq!(clip_columns("日本語", 0, 3), "日 ");
+    fn render_line_replaces_wide_char_straddling_right_edge_with_spaces() {
+        // Window [0, 3): "日" fits, then "本" straddles the right edge -> 1 space.
+        assert_eq!(rendered("日本語", 0, 3), "日 ");
+    }
+
+    #[test]
+    fn render_line_overlay_styles_only_its_columns() {
+        use ratatui::style::Color;
+        let sel = Style::new().bg(Color::Blue);
+        let spans = render_line("hello", 0, 5, Style::default(), &[(1..3, sel)]);
+        assert_eq!(style_at_col(&spans, 0).bg, None);
+        assert_eq!(style_at_col(&spans, 1).bg, Some(Color::Blue));
+        assert_eq!(style_at_col(&spans, 2).bg, Some(Color::Blue));
+        assert_eq!(style_at_col(&spans, 3).bg, None);
+    }
+
+    #[test]
+    fn render_line_base_style_fills_padding() {
+        use ratatui::style::Color;
+        // The base (current-line tint) reaches the padded cells past the content.
+        let base = Style::new().bg(Color::Indexed(236));
+        let spans = render_line("ab", 0, 5, base, &[]);
+        assert_eq!(style_at_col(&spans, 1).bg, Some(Color::Indexed(236)));
+        assert_eq!(style_at_col(&spans, 4).bg, Some(Color::Indexed(236)));
+    }
+
+    #[test]
+    fn render_line_overlay_patches_over_base() {
+        use ratatui::style::Color;
+        // Selection over the current-line tint: the overlay bg wins on its columns,
+        // the base bg holds elsewhere (the layering used on the cursor's row).
+        let base = Style::new().bg(Color::Indexed(236));
+        let sel = Style::new().bg(Color::Blue);
+        let spans = render_line("abcd", 0, 4, base, &[(1..3, sel)]);
+        assert_eq!(style_at_col(&spans, 0).bg, Some(Color::Indexed(236)));
+        assert_eq!(style_at_col(&spans, 1).bg, Some(Color::Blue));
+        assert_eq!(style_at_col(&spans, 3).bg, Some(Color::Indexed(236)));
+    }
+
+    #[test]
+    fn selection_columns_partial_within_line() {
+        // "hello", select bytes 1..4 ("ell") -> display columns 1..4.
+        assert_eq!(selection_columns("hello", 0, 6, 4, 1, 4), Some(1..4));
+    }
+
+    #[test]
+    fn selection_columns_cursor_is_none() {
+        // A zero-width selection highlights nothing (the terminal caret shows it).
+        assert_eq!(selection_columns("hello", 0, 6, 4, 2, 2), None);
+    }
+
+    #[test]
+    fn selection_columns_outside_the_line_is_none() {
+        // Selection entirely before this line's byte span.
+        assert_eq!(selection_columns("hello", 10, 16, 4, 0, 5), None);
+    }
+
+    #[test]
+    fn selection_columns_through_newline_adds_a_cell() {
+        // "ab" + newline (line span [0, 3)); selecting through the break gives the
+        // 2 content columns plus one cell for the consumed newline.
+        assert_eq!(selection_columns("ab", 0, 3, 4, 0, 3), Some(0..3));
+    }
+
+    #[test]
+    fn selection_columns_empty_line_in_selection_shows_one_cell() {
+        // An empty line swept by a multi-line selection still shows a 1-cell mark.
+        assert_eq!(selection_columns("", 5, 6, 4, 0, 10), Some(0..1));
+    }
+
+    #[test]
+    fn selection_columns_expands_tabs() {
+        // "a\tb": selecting the tab (bytes 1..2) covers columns 1..4 (the tab spans
+        // to the next 4-stop), matching the painted glyphs.
+        assert_eq!(selection_columns("a\tb", 0, 4, 4, 1, 2), Some(1..4));
+    }
+
+    #[test]
+    fn selected_grapheme_count_counts_clusters_not_bytes() {
+        // "héllo": é is 2 bytes, so 6 bytes but 5 graphemes.
+        let t = text_of("héllo");
+        assert_eq!(
+            selected_grapheme_count(&t, &[vortex_core::Selection::new(0, 6)]),
+            5
+        );
+    }
+
+    #[test]
+    fn selected_grapheme_count_cursor_is_zero() {
+        let t = text_of("hello");
+        assert_eq!(
+            selected_grapheme_count(&t, &[vortex_core::Selection::cursor(3)]),
+            0
+        );
+    }
+
+    #[test]
+    fn selected_grapheme_count_spans_multiple_lines() {
+        // "ab\ncd", select bytes 1..5: "b" + "c" + "d" = 3 graphemes (newline
+        // excluded from the count).
+        let t = text_of("ab\ncd");
+        assert_eq!(
+            selected_grapheme_count(&t, &[vortex_core::Selection::new(1, 5)]),
+            3
+        );
     }
 
     #[test]
@@ -661,9 +905,17 @@ mod tests {
 
     #[test]
     fn status_bar_composes_position_and_metrics() {
-        let (left, right) = status_bar(2, 5, 38, 7, None);
+        let (left, right) = status_bar(2, 5, 0, 38, 7, None);
         assert_eq!(left, " Ln 2, Col 5");
         assert_eq!(right, "38B · v7 ");
+    }
+
+    #[test]
+    fn status_bar_appends_selection_count_when_active() {
+        // A held selection surfaces its size next to the position; an empty one
+        // (count 0) leaves the position untouched.
+        let (left, _) = status_bar(2, 5, 12, 38, 7, None);
+        assert_eq!(left, " Ln 2, Col 5  (12 selected)");
     }
 
     #[test]
@@ -682,7 +934,7 @@ mod tests {
 
     #[test]
     fn status_bar_renders_large_sizes_in_scaled_units() {
-        let (_, right) = status_bar(1, 1, 2 * 1024 * 1024, 3, None);
+        let (_, right) = status_bar(1, 1, 0, 2 * 1024 * 1024, 3, None);
         assert_eq!(right, "2.0MB · v3 ");
     }
 
@@ -690,7 +942,7 @@ mod tests {
     fn status_bar_message_replaces_cursor_position() {
         // A transient file message takes the left slot so the result is visible;
         // metrics stay on the right (SPEC §8).
-        let (left, right) = status_bar(2, 5, 38, 7, Some("Saved f.rs"));
+        let (left, right) = status_bar(2, 5, 0, 38, 7, Some("Saved f.rs"));
         assert_eq!(left, " Saved f.rs");
         assert_eq!(right, "38B · v7 ");
     }

@@ -359,6 +359,8 @@ fn paint(
             cursor_line,
             gutter: theme.gutter,
             gutter_current: theme.gutter_current,
+            selection: theme.selection,
+            current_line: theme.current_line,
         },
     );
     paint_status_bar(
@@ -418,12 +420,21 @@ struct Body {
     gutter: Style,
     /// Gutter style for the cursor's line (from the active theme).
     gutter_current: Style,
+    /// Background wash for selected text (from the active theme).
+    selection: Style,
+    /// Background tint filling the cursor's whole row (from the active theme).
+    current_line: Style,
 }
 
 /// Paint the text body with a line-number gutter. Each visible row is a gutter
 /// span (dim, or bold for the cursor's line) followed by the tab-expanded line
-/// text clipped to the horizontal window `[h_scroll, h_scroll + text_width)`. The
-/// gutter is fixed (never scrolls horizontally); only the text slides under it.
+/// rendered to styled spans over the horizontal window `[h_scroll, h_scroll +
+/// text_width)`. The gutter is fixed (never scrolls horizontally); only the text
+/// slides under it. Two overlays tint the text: the cursor's row gets a full-width
+/// [`Body::current_line`] wash (via the row's base style), and every selection
+/// paints [`Body::selection`] over the columns it covers (SPEC §2.2 - the primary
+/// caret still renders as the terminal cursor, so a zero-width selection shows
+/// nothing here).
 fn paint_body(frame: &mut Frame, area: Rect, snapshot: &ViewSnapshot, body: Body) {
     let text = &snapshot.text;
     let height = area.height as usize;
@@ -434,21 +445,53 @@ fn paint_body(frame: &mut Frame, area: Rect, snapshot: &ViewSnapshot, body: Body
         .enumerate()
         .map(|(row, content)| {
             let line_index = body.scroll + row;
-            let gutter_style = if line_index == body.cursor_line {
-                body.gutter_current
+            let is_current = line_index == body.cursor_line;
+            // The cursor row's tint fills the whole width, so it is the text's base
+            // style and is patched onto the gutter number too for a continuous row.
+            let (base, gutter_style) = if is_current {
+                (
+                    body.current_line,
+                    body.gutter_current.patch(body.current_line),
+                )
             } else {
-                body.gutter
+                (Style::default(), body.gutter)
             };
-            // Clip the (tab-expanded) line to the horizontal window so long lines
-            // scroll instead of overflowing (SPEC §5, frontend-owned viewport).
-            let visible = layout::clip_columns(&content, body.h_scroll, body.text_width);
-            Line::from(vec![
-                Span::styled(
-                    layout::gutter_label(line_index, body.gutter_width),
-                    gutter_style,
-                ),
-                Span::raw(visible),
-            ])
+            // Selection overlays for this line, in display columns. The raw line
+            // (tabs intact) and its byte span drive the byte->column mapping; the
+            // rendered text is the tab-expanded `content`.
+            let line_start = text.byte_of_line(line_index).unwrap_or(0);
+            let line_end_excl = text
+                .byte_of_line(line_index + 1)
+                .unwrap_or_else(|| text.byte_len());
+            let raw = text.line(line_index).unwrap_or_default();
+            let overlays: Vec<(std::ops::Range<usize>, Style)> = snapshot
+                .selections
+                .iter()
+                .filter_map(|s| {
+                    layout::selection_columns(
+                        &raw,
+                        line_start,
+                        line_end_excl,
+                        TAB_WIDTH,
+                        s.start(),
+                        s.end(),
+                    )
+                    .map(|range| (range, body.selection))
+                })
+                .collect();
+
+            let mut spans = vec![Span::styled(
+                layout::gutter_label(line_index, body.gutter_width),
+                gutter_style,
+            )];
+            spans.extend(layout::render_line(
+                &content,
+                body.h_scroll,
+                body.text_width,
+                base,
+                &overlays,
+            ));
+            Line::from(spans)
         })
         .collect();
 
@@ -478,9 +521,11 @@ struct StatusBar<'a> {
 
 fn paint_status_bar(frame: &mut Frame, area: Rect, snapshot: &ViewSnapshot, status: StatusBar) {
     let col = layout::grapheme_column(status.line_text, status.cursor_byte_col);
+    let selected = layout::selected_grapheme_count(&snapshot.text, &snapshot.selections);
     let (left, right) = layout::status_bar(
         status.cursor_line + 1,
         col,
+        selected,
         snapshot.text.byte_len(),
         snapshot.version,
         status.message,
@@ -857,6 +902,53 @@ mod tests {
         assert_eq!(inactive.fg, Color::DarkGray);
         assert_eq!(active.fg, Color::White);
         assert!(active.modifier.contains(Modifier::BOLD));
+    }
+
+    #[test]
+    fn selection_is_highlighted_across_its_span() {
+        // Type a word, then select it back to the line start (Shift+Home). The
+        // selected cells carry the selection background; cells past it do not.
+        let snap = snapshot_after(&[
+            Action::Insert("hello".into()),
+            Action::MoveCursor {
+                motion: vortex_core::Motion::LineStart,
+                extend: true,
+            },
+        ]);
+        let buf = render(&snap, 40, 10);
+        let sel = config::Theme::default().selection;
+        // Gutter is 4 cells; "hello" occupies text columns 4..9 on body row 1.
+        assert_eq!(buf.cell((4, 1)).unwrap().bg, sel.bg.unwrap());
+        assert_eq!(buf.cell((8, 1)).unwrap().bg, sel.bg.unwrap());
+        // Selected text carries the selection's contrasting foreground.
+        assert_eq!(buf.cell((4, 1)).unwrap().fg, sel.fg.unwrap());
+        // A cell past the selected text is not part of the selection.
+        assert_ne!(buf.cell((20, 1)).unwrap().bg, sel.bg.unwrap());
+    }
+
+    #[test]
+    fn cursor_line_is_tinted_full_width() {
+        // Two lines, cursor left on line 2: that whole row (including padding past
+        // the text) gets the current-line tint; the other line does not.
+        let snap = snapshot_after(&[Action::Insert("ab\ncd".into())]);
+        let buf = render(&snap, 40, 10);
+        // Body row 1 = line 1, row 2 = line 2 (the cursor line).
+        assert_eq!(buf.cell((30, 2)).unwrap().bg, Color::Indexed(236));
+        assert_ne!(buf.cell((30, 1)).unwrap().bg, Color::Indexed(236));
+    }
+
+    #[test]
+    fn status_bar_shows_selection_count_when_active() {
+        let snap = snapshot_after(&[
+            Action::Insert("hello".into()),
+            Action::MoveCursor {
+                motion: vortex_core::Motion::LineStart,
+                extend: true,
+            },
+        ]);
+        let buf = render(&snap, 40, 10);
+        let status = row_text(&buf, 9);
+        assert!(status.contains("(5 selected)"), "status: {status:?}");
     }
 
     #[test]
