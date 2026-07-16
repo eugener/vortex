@@ -143,6 +143,14 @@ impl Editor {
         self.selections.move_all(&text, motion, extend);
     }
 
+    /// Place the caret at byte `offset` (a pointer click). Like [`Self::move_cursor`]
+    /// this only moves the selection set - no text change, so no delta or version
+    /// bump.
+    fn place_cursor(&mut self, offset: usize, extend: bool) {
+        let text = self.buffer.text();
+        self.selections.place(&text, offset, extend);
+    }
+
     /// Compute the edits an `Insert`/`Delete` action produces over the selection
     /// set, as `(range, new_text)` pairs in the current buffer's coordinates.
     ///
@@ -283,6 +291,10 @@ async fn run(
             Action::DeleteForward => Step::Edit(EditKind::DeleteForward),
             Action::MoveCursor { motion, extend } => {
                 editor.move_cursor(motion, extend);
+                Step::Republish
+            }
+            Action::PlaceCursor { offset, extend } => {
+                editor.place_cursor(offset, extend);
                 Step::Republish
             }
             Action::RequestSnapshot => Step::Republish,

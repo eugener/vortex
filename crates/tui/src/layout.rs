@@ -66,6 +66,55 @@ pub fn display_column(line: &str, byte_col: usize, tab_width: usize) -> usize {
         .fold(0, |col, g| col + cells_for(g, col, tab_width))
 }
 
+/// Byte column within `line` nearest display column `target` - the inverse of
+/// [`display_column`], for mapping a pointer's cell back to a caret position. Walks
+/// graphemes accumulating cells; when `target` falls on a grapheme, the nearer edge
+/// wins (past the midpoint rounds to the following boundary) so a click on the right
+/// half of a wide glyph or a tab lands where the pointer visually is. Clamped to the
+/// line's content length (a click past the last glyph goes to end-of-line).
+pub fn byte_col_at_display(line: &str, target: usize, tab_width: usize) -> usize {
+    let mut col = 0;
+    for (byte_idx, g) in line.grapheme_indices(true) {
+        let w = cells_for(g, col, tab_width);
+        if target < col + w {
+            return if target - col >= w.div_ceil(2) {
+                byte_idx + g.len()
+            } else {
+                byte_idx
+            };
+        }
+        col += w;
+    }
+    line.len()
+}
+
+/// Buffer byte offset for a pointer at body-relative `(row, col)` cells - the
+/// inverse of the paint math, kept here so the pointer->position mapping is
+/// unit-testable without a terminal (SPEC §13). `row` is 0-based within the text
+/// body (the caller has already subtracted the head bar) and is clamped to the last
+/// line; `col` is an absolute body column, so a click in the gutter
+/// (`col < gutter_width`) lands at the line start. Both scroll offsets are the
+/// frontend's current viewport, so the lookup needs no core round-trip (SPEC §5).
+pub fn offset_at_cell(
+    text: &Text,
+    scroll: usize,
+    h_scroll: usize,
+    gutter_width: usize,
+    tab_width: usize,
+    row: usize,
+    col: usize,
+) -> usize {
+    let line = (scroll + row).min(display_line_count(text).saturating_sub(1));
+    let line_start = text.byte_of_line(line).unwrap_or(0);
+    let byte_col = if col < gutter_width {
+        0 // a click in the gutter selects the start of the line
+    } else {
+        let raw = text.line(line).unwrap_or_default();
+        byte_col_at_display(&raw, col - gutter_width + h_scroll, tab_width)
+    };
+    line_start + byte_col
+}
+
 /// Expand tabs in `line` to spaces at `tab_width` stops, so the painted glyphs
 /// occupy the same cells [`display_column`] computes for the cursor. Without this
 /// the terminal advances tabs to *its own* stops while the cursor uses ours, and
@@ -516,6 +565,65 @@ mod tests {
     #[test]
     fn byte_col_clamped_to_line_length() {
         assert_eq!(display_column("hi", 99, 4), 2);
+    }
+
+    #[test]
+    fn byte_col_at_display_is_inverse_of_display_column() {
+        // Round-trips on the boundaries of a plain ASCII line.
+        assert_eq!(byte_col_at_display("hello", 0, 4), 0);
+        assert_eq!(byte_col_at_display("hello", 3, 4), 3);
+        // Past the last glyph clamps to end-of-line.
+        assert_eq!(byte_col_at_display("hello", 99, 4), 5);
+    }
+
+    #[test]
+    fn byte_col_at_display_rounds_to_nearer_edge_of_a_wide_glyph() {
+        // "日本": each glyph is 2 cells. A click on the left cell of "本" (col 2)
+        // lands before it (byte 3); the right cell (col 3) lands after it (byte 6).
+        assert_eq!(byte_col_at_display("日本", 2, 4), 3);
+        assert_eq!(byte_col_at_display("日本", 3, 4), 6);
+    }
+
+    #[test]
+    fn byte_col_at_display_handles_tabs() {
+        // "a\tb": 'a' at col 0, tab spans cols 1..4, 'b' at col 4. A click at col 4
+        // rounds onto 'b' (byte 2); a click at col 1 stays before the tab (byte 1).
+        assert_eq!(byte_col_at_display("a\tb", 4, 4), 2);
+        assert_eq!(byte_col_at_display("a\tb", 1, 4), 1);
+    }
+
+    #[test]
+    fn offset_at_cell_maps_row_and_column_to_a_buffer_offset() {
+        let t = text_of("ab\ncdef");
+        // Gutter 4 wide, no scroll. Body row 1 is "cdef" (starts at byte 3); column
+        // 4 is the gutter edge -> 'c' (offset 3), column 6 -> 'e' (offset 5).
+        assert_eq!(offset_at_cell(&t, 0, 0, 4, 4, 1, 4), 3);
+        assert_eq!(offset_at_cell(&t, 0, 0, 4, 4, 1, 6), 5);
+    }
+
+    #[test]
+    fn offset_at_cell_click_in_gutter_is_line_start() {
+        let t = text_of("ab\ncdef");
+        // Any column inside the 4-wide gutter maps to the line's first byte.
+        assert_eq!(offset_at_cell(&t, 0, 0, 4, 4, 1, 1), 3);
+    }
+
+    #[test]
+    fn offset_at_cell_accounts_for_scroll() {
+        let t = text_of("l0\nl1\nl2\nl3");
+        // Scrolled down 2 lines: body row 0 is "l2" (byte 6); its start via a gutter
+        // click is offset 6.
+        assert_eq!(offset_at_cell(&t, 2, 0, 4, 4, 0, 0), 6);
+        // Horizontal scroll of 1 shifts the column mapping: on "l3" (starts byte 9),
+        // gutter edge col 4 + h_scroll 1 = display col 1 -> the '3' at offset 10.
+        assert_eq!(offset_at_cell(&t, 3, 1, 4, 4, 0, 4), 10);
+    }
+
+    #[test]
+    fn offset_at_cell_clamps_row_past_the_end() {
+        let t = text_of("only");
+        // A body row below the content clamps to the last line.
+        assert_eq!(offset_at_cell(&t, 0, 0, 4, 4, 50, 4), 0);
     }
 
     #[test]

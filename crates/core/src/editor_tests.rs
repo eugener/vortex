@@ -123,6 +123,17 @@ fn move_cursor_helper_maps_over_buffer() {
 }
 
 #[test]
+fn place_cursor_helper_sets_and_extends_caret() {
+    let mut e = editor_with("hello", SelectionSet::at_origin());
+    // A plain click places a cursor at the offset.
+    e.place_cursor(3, false);
+    assert_eq!(*e.selections.primary(), Selection::cursor(3));
+    // A drag/extend keeps the anchor and moves only the head.
+    e.place_cursor(5, true);
+    assert_eq!(*e.selections.primary(), Selection::new(3, 5));
+}
+
+#[test]
 fn snapshot_reflects_state() {
     let e = editor_with("hi", SelectionSet::single(Selection::cursor(2)));
     let snap = e.snapshot(Some(0..2));
@@ -608,6 +619,27 @@ fn open_with_delta_receiver_dropped_reports_frontend_gone() {
         &h.note_tx,
     ));
     assert!(!alive);
+}
+
+#[test]
+fn place_cursor_through_the_actor_loop() {
+    // End-to-end through the real loop: type text, then a click places the caret
+    // mid-buffer and a shift/drag extends the selection - no version bump, since
+    // placing the caret changes no text.
+    let (snap, _) = run_seam(&[
+        Action::Insert("hello".into()),
+        Action::PlaceCursor {
+            offset: 1,
+            extend: false,
+        },
+        Action::PlaceCursor {
+            offset: 4,
+            extend: true,
+        },
+    ]);
+    assert_eq!(snap.selections.as_ref(), &[Selection::new(1, 4)]);
+    assert_eq!(snap.primary, 0);
+    assert_eq!(snap.version, 1); // only the Insert bumped the version
 }
 
 #[test]
