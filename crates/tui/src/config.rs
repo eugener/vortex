@@ -41,6 +41,15 @@ pub struct Theme {
     pub gutter: Style,
     /// The cursor line's gutter number - brightened/bold so the active row stands out.
     pub gutter_current: Style,
+    /// Selected text. Uses explicit RGB (not named ANSI colors, which the terminal
+    /// remaps to its own palette and can render as low-contrast light-on-light):
+    /// a muted dark blue behind true white keeps a legible contrast on any theme.
+    /// Once syntax coloring lands (M4) this may soften to let those foregrounds
+    /// show through.
+    pub selection: Style,
+    /// The cursor line's background - a subtle tint filling the whole row so the
+    /// active line is easy to find without pulling the eye like a selection does.
+    pub current_line: Style,
 }
 
 impl Default for Theme {
@@ -56,6 +65,10 @@ impl Default for Theme {
             status_bar: Style::new().fg(Color::Black).bg(Color::Gray),
             gutter: Style::new().fg(Color::DarkGray),
             gutter_current: Style::new().fg(Color::White).add_modifier(Modifier::BOLD),
+            selection: Style::new()
+                .bg(Color::Rgb(38, 79, 120))
+                .fg(Color::Rgb(255, 255, 255)),
+            current_line: Style::new().bg(Color::Indexed(236)),
         }
     }
 }
@@ -93,5 +106,11 @@ mod tests {
         assert_eq!(t.gutter_current.fg, Some(Color::White));
         assert!(t.gutter_current.add_modifier.contains(Modifier::BOLD));
         assert!(t.head_bar.add_modifier.contains(Modifier::BOLD));
+        // Selection pairs an explicit-RGB background with a contrasting foreground
+        // so selected text stays legible on any terminal palette; the current-line
+        // tint is a background-only wash.
+        assert_eq!(t.selection.bg, Some(Color::Rgb(38, 79, 120)));
+        assert_eq!(t.selection.fg, Some(Color::Rgb(255, 255, 255)));
+        assert_eq!(t.current_line.bg, Some(Color::Indexed(236)));
     }
 }
