@@ -505,6 +505,30 @@ free random-access editing, and Tier 3 collides with the §5 render model (see �
 - **Tier 3 is a different buffer architecture** (piece table over mmap / paged virtual
   buffer), deliberately not built - see §11 for why it conflicts with §5.
 
+### 10.5 Configuration (styles + keymap)
+User configuration is **frontend-owned and file-loaded** (`toml` + `serde`, Helix-style;
+§3). The core stays config-free: chrome styling and key bindings are pure frontend
+concerns (§2.2, §5) and never cross the seam. Two surfaces are configurable from the
+start of the design, even though file loading itself lands at **M5**:
+
+- **Styles (theme).** Colors/attributes for the non-text chrome - head bar, status bar,
+  and the line-number gutter (active vs inactive line). A future syntax theme maps
+  tree-sitter capture names to styles (§5 `StyleMap`), but that is a separate table from
+  the chrome theme here.
+- **Keymap.** The key→intent table (§2.2, §12.2). Because `Action` models intent and the
+  frontend owns key translation, rebinding is data, not code: the config file maps chords
+  to `Action` names. Modal-vs-modeless and chord-sequence design is drafted alongside the
+  §12.2 `Action` vocabulary.
+
+**Seam, not yet a loader (current state).** The config lives behind a single resolved
+`Config` value built once at frontend startup (next to argv, before the first frame) and
+threaded into the render/input paths - **not** scattered constants. Today it is the
+built-in `Default`; M5 replaces that construction with `Config::load(path)` deserializing
+the user's file and falling back to the defaults for any unset field. Because every call
+site already reads from the `Config` value, adding file loading touches only that one
+construction point. A `--config <path>` flag rides the same argv parser. This mirrors the
+Tier-3 / CRDT move: build the swap-ready seam now, defer the feature.
+
 ---
 
 ## 11. Deferred (not silently skipped)
@@ -539,9 +563,10 @@ early milestones is a deliberate scope choice, not an oversight:
 - **Search + regex.** `select-all-matches` / `split-on-regex` (§12.2) imply a `regex`
   dependency and a search subsystem in `vortex-core`. Add the `regex` crate to the stack
   when this lands; incremental/streaming search over the rope. Target: M3 band.
-- **Keymap configuration.** §12.2 fixes key→intent as frontend-owned, but the *keymap file
-  format* (how users rebind) is its own design: modal vs modeless, chord sequences,
-  per-mode maps. Drafted alongside §12.2's `Action` vocabulary. Target: M1+.
+- **Keymap configuration.** §12.2 fixes key→intent as frontend-owned and §10.5 fixes it as
+  a config surface; the remaining open piece is the *keymap file format* (how users
+  rebind): modal vs modeless, chord sequences, per-mode maps. Drafted alongside §12.2's
+  `Action` vocabulary. Target: M1+.
 
 ---
 

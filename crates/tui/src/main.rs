@@ -12,6 +12,7 @@
 //! half-written frame (anti-tearing). The Kitty keyboard protocol is negotiated at
 //! startup for rich modifiers (SPEC §9), with graceful fallback where unsupported.
 
+mod config;
 mod keymap;
 mod layout;
 
@@ -29,7 +30,7 @@ use ratatui::crossterm::terminal::{
 };
 use ratatui::crossterm::{execute, queue};
 use ratatui::layout::{Constraint, Layout, Position, Rect};
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 use ratatui::{Frame, Terminal, TerminalOptions, Viewport};
@@ -65,19 +66,6 @@ impl ViewState {
     }
 }
 
-/// Chrome palette. Both bars paint a filled background row (the user asked for
-/// color, not divider lines); the gutter and current-line number are dimmed/bold
-/// to sit behind the text without competing with it. Kept as `const` because
-/// `Style::new()` and its setters are `const` in ratatui 0.30.
-const HEAD_STYLE: Style = Style::new()
-    .fg(Color::Black)
-    .bg(Color::Gray)
-    .add_modifier(Modifier::BOLD);
-const STATUS_STYLE: Style = Style::new().fg(Color::Black).bg(Color::Gray);
-/// Gutter line numbers: dim so they recede behind the text.
-const GUTTER_STYLE: Style = Style::new().fg(Color::DarkGray);
-/// The cursor's line number: bold + brighter so the active row stands out.
-const GUTTER_CURRENT_STYLE: Style = Style::new().fg(Color::White).add_modifier(Modifier::BOLD);
 /// How long the input poll blocks before we tick the render loop anyway, so a
 /// snapshot that arrives without a keystroke (e.g. a background restyle in M4)
 /// still gets painted promptly.
@@ -120,10 +108,16 @@ fn main() -> io::Result<()> {
         .name("vortex-core".into())
         .spawn(move || smol::block_on(run))?;
 
+    // Resolve frontend configuration once, up front. Today this is the built-in
+    // default; M5 swaps it for `Config::load` reading the user's file (SPEC §10.5).
+    // Parsed here, next to argv, because that is where a `--config <path>` flag will
+    // live and because config must be settled before the first frame paints.
+    let config = config::Config::default();
+
     // Terminal setup. On any error we still attempt teardown so we never leave the
     // user's terminal in raw mode (the Drop impl is the backstop).
     let mut term = TerminalGuard::enter()?;
-    let result = event_loop(&handle, &mut term.terminal, path);
+    let result = event_loop(&handle, &mut term.terminal, path, config.theme);
     term.leave();
 
     // Dropping the handle closes the action channel, so the core loop ends; join
@@ -198,6 +192,7 @@ fn event_loop(
     handle: &vortex_core::CoreHandle,
     terminal: &mut Terminal<ratatui::backend::CrosstermBackend<Stdout>>,
     path: Option<PathBuf>,
+    theme: config::Theme,
 ) -> io::Result<()> {
     // Prime the view: open the CLI-given file, or just request a snapshot of the
     // empty buffer when none was given. Either way a snapshot follows, so the
@@ -246,7 +241,7 @@ fn event_loop(
         if let Some(snap) = &latest
             && needs_redraw
         {
-            viewport = draw(terminal, snap, viewport, message.as_deref())?;
+            viewport = draw(terminal, snap, viewport, message.as_deref(), theme)?;
             needs_redraw = false;
         }
 
@@ -288,11 +283,12 @@ fn draw(
     snapshot: &ViewSnapshot,
     viewport: ViewState,
     message: Option<&str>,
+    theme: config::Theme,
 ) -> io::Result<ViewState> {
     let mut new_viewport = viewport;
     let mut out = io::stdout();
     queue!(out, BeginSynchronizedUpdate)?;
-    terminal.draw(|frame| new_viewport = paint(frame, snapshot, viewport, message))?;
+    terminal.draw(|frame| new_viewport = paint(frame, snapshot, viewport, message, theme))?;
     execute!(out, EndSynchronizedUpdate)?;
     Ok(new_viewport)
 }
@@ -307,6 +303,7 @@ fn paint(
     snapshot: &ViewSnapshot,
     viewport: ViewState,
     message: Option<&str>,
+    theme: config::Theme,
 ) -> ViewState {
     let area = frame.area();
     // Head bar (1 row), text body (rest), status bar (1 row). `Min(0)` lets the
@@ -347,7 +344,7 @@ fn paint(
     let h_scroll =
         layout::scroll_to_show(cursor_display_col, viewport.h_scroll, text_width).min(max_h_scroll);
 
-    paint_head_bar(frame, head_area, snapshot);
+    paint_head_bar(frame, head_area, snapshot, theme.head_bar);
     paint_body(
         frame,
         body_area,
@@ -358,16 +355,21 @@ fn paint(
             gutter_width,
             text_width,
             cursor_line,
+            gutter: theme.gutter,
+            gutter_current: theme.gutter_current,
         },
     );
     paint_status_bar(
         frame,
         status_area,
         snapshot,
-        cursor_line,
-        &line_text,
-        cursor_byte_col,
-        message,
+        StatusBar {
+            cursor_line,
+            line_text: &line_text,
+            cursor_byte_col,
+            message,
+            style: theme.status_bar,
+        },
     );
 
     // Place the terminal cursor at the primary caret, offset by the gutter and the
@@ -388,11 +390,11 @@ fn paint(
 /// Paint the top head bar (buffer name left, line count right) as one filled row.
 /// The name is the bound file's name plus a modified marker (SPEC §8, §10), read
 /// straight from the snapshot so painting needs no core round-trip (SPEC §5).
-fn paint_head_bar(frame: &mut Frame, area: Rect, snapshot: &ViewSnapshot) {
+fn paint_head_bar(frame: &mut Frame, area: Rect, snapshot: &ViewSnapshot, style: Style) {
     let name = layout::buffer_display_name(snapshot.path.as_deref(), snapshot.modified);
     let (left, right) = layout::head_bar(&name, layout::display_line_count(&snapshot.text));
     let bar = layout::fit_bar(&left, &right, area.width as usize);
-    frame.render_widget(Paragraph::new(bar).style(HEAD_STYLE), area);
+    frame.render_widget(Paragraph::new(bar).style(style), area);
 }
 
 /// The resolved geometry for painting the text body, computed once in [`paint`]
@@ -410,6 +412,10 @@ struct Body {
     text_width: usize,
     /// The cursor's line, so its gutter number can be emphasized.
     cursor_line: usize,
+    /// Gutter style for non-cursor lines (from the active theme).
+    gutter: Style,
+    /// Gutter style for the cursor's line (from the active theme).
+    gutter_current: Style,
 }
 
 /// Paint the text body with a line-number gutter. Each visible row is a gutter
@@ -427,9 +433,9 @@ fn paint_body(frame: &mut Frame, area: Rect, snapshot: &ViewSnapshot, body: Body
         .map(|(row, content)| {
             let line_index = body.scroll + row;
             let gutter_style = if line_index == body.cursor_line {
-                GUTTER_CURRENT_STYLE
+                body.gutter_current
             } else {
-                GUTTER_STYLE
+                body.gutter
             };
             // Clip the (tab-expanded) line to the horizontal window so long lines
             // scroll instead of overflowing (SPEC §5, frontend-owned viewport).
@@ -451,25 +457,34 @@ fn paint_body(frame: &mut Frame, area: Rect, snapshot: &ViewSnapshot, body: Body
 /// metrics (right); when a transient file `message` is present it replaces the
 /// cursor position so an open/save result - especially a failure - is visible
 /// (SPEC §8).
-fn paint_status_bar(
-    frame: &mut Frame,
-    area: Rect,
-    snapshot: &ViewSnapshot,
+/// The per-frame inputs [`paint_status_bar`] needs beyond the frame/area/snapshot:
+/// the cursor readout, any transient message, and the bar style (from the active
+/// theme). Bundled as one value so the painter stays within the argument budget,
+/// the same consolidation as [`Body`].
+struct StatusBar<'a> {
+    /// 0-based cursor line (displayed 1-based).
     cursor_line: usize,
-    line_text: &str,
+    /// The cursor's line text, for the grapheme-column readout.
+    line_text: &'a str,
+    /// Byte column of the cursor within `line_text`.
     cursor_byte_col: usize,
-    message: Option<&str>,
-) {
-    let col = layout::grapheme_column(line_text, cursor_byte_col);
+    /// A transient file open/save message that replaces the position (SPEC §8).
+    message: Option<&'a str>,
+    /// Bar fill style (from the active theme).
+    style: Style,
+}
+
+fn paint_status_bar(frame: &mut Frame, area: Rect, snapshot: &ViewSnapshot, status: StatusBar) {
+    let col = layout::grapheme_column(status.line_text, status.cursor_byte_col);
     let (left, right) = layout::status_bar(
-        cursor_line + 1,
+        status.cursor_line + 1,
         col,
         snapshot.text.byte_len(),
         snapshot.version,
-        message,
+        status.message,
     );
     let bar = layout::fit_bar(&left, &right, area.width as usize);
-    frame.render_widget(Paragraph::new(bar).style(STATUS_STYLE), area);
+    frame.render_widget(Paragraph::new(bar).style(status.style), area);
 }
 
 /// RAII terminal setup/teardown: raw mode, alternate screen, and Kitty keyboard
@@ -543,6 +558,7 @@ impl Drop for TerminalGuard {
 mod tests {
     use super::*;
     use ratatui::backend::TestBackend;
+    use ratatui::style::{Color, Modifier};
 
     /// A temp directory removed on drop, so a test that opens a real file cleans
     /// up even if an assertion panics first (a bare trailing `remove_dir_all`
@@ -609,7 +625,13 @@ mod tests {
         let mut terminal = Terminal::new(TestBackend::new(w, h)).unwrap();
         terminal
             .draw(|frame| {
-                paint(frame, snapshot, ViewState::default(), message);
+                paint(
+                    frame,
+                    snapshot,
+                    ViewState::default(),
+                    message,
+                    config::Theme::default(),
+                );
             })
             .unwrap();
         terminal.backend().buffer().clone()
@@ -786,7 +808,13 @@ mod tests {
         let mut terminal = Terminal::new(TestBackend::new(12, 4)).unwrap();
         terminal
             .draw(|frame| {
-                paint(frame, &snap, ViewState::default(), None);
+                paint(
+                    frame,
+                    &snap,
+                    ViewState::default(),
+                    None,
+                    config::Theme::default(),
+                );
             })
             .unwrap();
         let pos = terminal.backend().cursor_position();
@@ -837,7 +865,13 @@ mod tests {
         let mut terminal = Terminal::new(TestBackend::new(40, 10)).unwrap();
         terminal
             .draw(|frame| {
-                paint(frame, &snap, ViewState::default(), None);
+                paint(
+                    frame,
+                    &snap,
+                    ViewState::default(),
+                    None,
+                    config::Theme::default(),
+                );
             })
             .unwrap();
         let pos = terminal.backend().cursor_position();
@@ -911,7 +945,7 @@ mod tests {
             page_height: 4,
         };
         terminal
-            .draw(|frame| settled = paint(frame, &snap, stale, None))
+            .draw(|frame| settled = paint(frame, &snap, stale, None, config::Theme::default()))
             .unwrap();
         assert_eq!(settled.scroll, 0, "scroll must clamp to fit the content");
         let buf = terminal.backend().buffer().clone();
@@ -936,7 +970,7 @@ mod tests {
             page_height: 2,
         };
         terminal
-            .draw(|frame| settled = paint(frame, &snap, stale, None))
+            .draw(|frame| settled = paint(frame, &snap, stale, None, config::Theme::default()))
             .unwrap();
         assert_eq!(settled.h_scroll, 0, "h_scroll must clamp to the short line");
         let buf = terminal.backend().buffer().clone();
