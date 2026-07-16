@@ -515,10 +515,22 @@ start of the design, even though file loading itself lands at **M5**:
   and the line-number gutter (active vs inactive line). A future syntax theme maps
   tree-sitter capture names to styles (§5 `StyleMap`), but that is a separate table from
   the chrome theme here.
-- **Keymap.** The key→intent table (§2.2, §12.2). Because `Action` models intent and the
-  frontend owns key translation, rebinding is data, not code: the config file maps chords
-  to `Action` names. Modal-vs-modeless and chord-sequence design is drafted alongside the
-  §12.2 `Action` vocabulary.
+- **Keymap.** The key→intent table (§2.2, §12.2) is **data, not code**: a `Keymap` is a
+  set of `(chord → command)` bindings, and key translation is a pure lookup over it. Both
+  sides parse from strings, so the built-in defaults are expressed in the same form a
+  config file uses (`Keymap::from_pairs`), guaranteeing the format round-trips:
+  - **Chord grammar:** `mod+mod+key`, modifiers `ctrl`/`shift`/`alt` in any order,
+    case-insensitive (e.g. `ctrl+s`, `shift+right`, `pageup`). A single character is a
+    `Char` key; named keys cover the non-text keys.
+  - **Command names:** stable identifiers (`quit`, `save`, `delete_backward`,
+    `insert_newline`, …). Motions use a `move_<kind>` / `select_<kind>` scheme where
+    `select_` is the selection-extending variant (`move_line_start`, `select_page_down`),
+    so **`extend` is part of the binding, not a runtime modifier** - `right` and
+    `shift+right` are distinct entries.
+  - **Text entry is a fallback, not a binding:** an unbound printable char with no Ctrl
+    inserts itself, so the map never enumerates every letter.
+  - **Open:** modal-vs-modeless, chord *sequences* (multi-key), and per-mode maps are the
+    remaining design, drafted alongside the §12.2 `Action` vocabulary.
 
 **Seam, not yet a loader (current state).** The config lives behind a single resolved
 `Config` value built once at frontend startup (next to argv, before the first frame) and
@@ -563,10 +575,10 @@ early milestones is a deliberate scope choice, not an oversight:
 - **Search + regex.** `select-all-matches` / `split-on-regex` (§12.2) imply a `regex`
   dependency and a search subsystem in `vortex-core`. Add the `regex` crate to the stack
   when this lands; incremental/streaming search over the rope. Target: M3 band.
-- **Keymap configuration.** §12.2 fixes key→intent as frontend-owned and §10.5 fixes it as
-  a config surface; the remaining open piece is the *keymap file format* (how users
-  rebind): modal vs modeless, chord sequences, per-mode maps. Drafted alongside §12.2's
-  `Action` vocabulary. Target: M1+.
+- **Keymap configuration.** The data-driven keymap and its chord/command string format
+  exist now (§10.5); what remains is loading a user file into it (M5, rides the same
+  `toml` seam) and the richer *modal* design - chord sequences, per-mode maps, modal vs
+  modeless - drafted alongside §12.2's `Action` vocabulary. Target: M1+.
 
 ---
 

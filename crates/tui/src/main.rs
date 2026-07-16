@@ -117,7 +117,7 @@ fn main() -> io::Result<()> {
     // Terminal setup. On any error we still attempt teardown so we never leave the
     // user's terminal in raw mode (the Drop impl is the backstop).
     let mut term = TerminalGuard::enter()?;
-    let result = event_loop(&handle, &mut term.terminal, path, config.theme);
+    let result = event_loop(&handle, &mut term.terminal, path, config);
     term.leave();
 
     // Dropping the handle closes the action channel, so the core loop ends; join
@@ -192,7 +192,7 @@ fn event_loop(
     handle: &vortex_core::CoreHandle,
     terminal: &mut Terminal<ratatui::backend::CrosstermBackend<Stdout>>,
     path: Option<PathBuf>,
-    theme: config::Theme,
+    config: config::Config,
 ) -> io::Result<()> {
     // Prime the view: open the CLI-given file, or just request a snapshot of the
     // empty buffer when none was given. Either way a snapshot follows, so the
@@ -241,7 +241,7 @@ fn event_loop(
         if let Some(snap) = &latest
             && needs_redraw
         {
-            viewport = draw(terminal, snap, viewport, message.as_deref(), theme)?;
+            viewport = draw(terminal, snap, viewport, message.as_deref(), config.theme)?;
             needs_redraw = false;
         }
 
@@ -252,7 +252,9 @@ fn event_loop(
                 Event::Key(key) => {
                     // Page motions need the viewport's page size, which only the
                     // frontend knows (SPEC §5); the keymap folds it into the action.
-                    if let Some(action) = keymap::action_for_key(key, viewport.page()) {
+                    if let Some(action) =
+                        keymap::action_for_key(&config.keymap, key, viewport.page())
+                    {
                         let quit = action == Action::Quit;
                         // A new user action clears the transient file message so it
                         // does not linger while the user keeps typing; Save keeps it
