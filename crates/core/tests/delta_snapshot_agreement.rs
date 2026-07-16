@@ -68,6 +68,11 @@ fn action_strategy() -> impl Strategy<Value = Action> {
         4 => prop::string::string_regex("[a-c\né語]{0,4}").unwrap().prop_map(Action::Insert),
         1 => Just(Action::DeleteBackward),
         1 => Just(Action::DeleteForward),
+        // Undo/redo are edits on the wire too (they emit deltas and bump the
+        // version), so replaying the stream must still reproduce the snapshot even
+        // when the script undoes and redoes its own edits (SPEC §2.4, §5).
+        1 => Just(Action::Undo),
+        1 => Just(Action::Redo),
         1 => prop_oneof![
             Just(Motion::Left),
             Just(Motion::Right),

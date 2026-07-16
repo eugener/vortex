@@ -8,6 +8,7 @@
 pub mod action;
 pub mod buffer;
 pub mod editor;
+mod history;
 pub mod selection;
 pub mod view;
 

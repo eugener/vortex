@@ -25,39 +25,49 @@ use std::fmt;
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use vortex_core::{Action, Motion};
 
-/// A key identity: a key code plus the Ctrl/Shift/Alt modifier state. This is the
-/// left side of a binding and the lookup key. Parsed from a string like `"ctrl+s"`
-/// or `"shift+right"` (see [`Chord::parse`]) so a config file can name it.
+/// A key identity: a key code plus the modifier state. This is the left side of a
+/// binding and the lookup key. Parsed from a string like `"ctrl+s"`, `"cmd+z"`, or
+/// `"shift+right"` (see [`Chord::parse`]) so a config file can name it.
+///
+/// `cmd` is the platform command key - Cmd on macOS, the Super/Win key elsewhere -
+/// which crossterm reports as [`KeyModifiers::SUPER`]. It is only delivered by
+/// terminals that honor the Kitty keyboard protocol's `DISAMBIGUATE_ESCAPE_CODES`
+/// (negotiated at startup); classic terminals intercept Cmd, so a `cmd+` binding is
+/// simply never matched there rather than misfiring.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 struct Chord {
     code: KeyCode,
     ctrl: bool,
     shift: bool,
     alt: bool,
+    cmd: bool,
 }
 
 impl Chord {
-    /// The chord an incoming key event represents (only Ctrl/Shift/Alt are read;
-    /// other modifier bits are ignored so lookup is stable across terminals).
+    /// The chord an incoming key event represents (only Ctrl/Shift/Alt/Cmd are
+    /// read; other modifier bits are ignored so lookup is stable across terminals).
     fn from_event(key: &KeyEvent) -> Self {
         Self {
             code: key.code,
             ctrl: key.modifiers.contains(KeyModifiers::CONTROL),
             shift: key.modifiers.contains(KeyModifiers::SHIFT),
             alt: key.modifiers.contains(KeyModifiers::ALT),
+            cmd: key.modifiers.contains(KeyModifiers::SUPER),
         }
     }
 
-    /// Parse a chord string such as `"ctrl+shift+left"`, `"s"`, or `"pageup"`.
-    /// Modifier tokens (`ctrl`/`control`, `shift`, `alt`/`opt`) may appear in any
-    /// order before the key; matching is case-insensitive. Returns `None` if the key
-    /// token is unknown. (A literal `+` key is not yet expressible - a known limit.)
+    /// Parse a chord string such as `"ctrl+shift+left"`, `"cmd+z"`, `"s"`, or
+    /// `"pageup"`. Modifier tokens (`ctrl`/`control`, `shift`, `alt`/`opt`,
+    /// `cmd`/`super`/`win`) may appear in any order before the key; matching is
+    /// case-insensitive. Returns `None` if the key token is unknown. (A literal `+`
+    /// key is not yet expressible - a known limit.)
     fn parse(spec: &str) -> Option<Self> {
         let mut chord = Chord {
             code: KeyCode::Null,
             ctrl: false,
             shift: false,
             alt: false,
+            cmd: false,
         };
         let mut have_key = false;
         for part in spec.split('+') {
@@ -65,6 +75,7 @@ impl Chord {
                 "ctrl" | "control" => chord.ctrl = true,
                 "shift" => chord.shift = true,
                 "alt" | "opt" | "option" => chord.alt = true,
+                "cmd" | "command" | "super" | "win" => chord.cmd = true,
                 key => {
                     chord.code = parse_key_code(key)?;
                     have_key = true;
@@ -107,6 +118,8 @@ fn parse_key_code(token: &str) -> Option<KeyCode> {
 enum Command {
     Quit,
     Save,
+    Undo,
+    Redo,
     DeleteBackward,
     DeleteForward,
     InsertNewline,
@@ -171,6 +184,8 @@ impl Command {
         Some(match name {
             "quit" => Command::Quit,
             "save" => Command::Save,
+            "undo" => Command::Undo,
+            "redo" => Command::Redo,
             "delete_backward" => Command::DeleteBackward,
             "delete_forward" => Command::DeleteForward,
             "insert_newline" => Command::InsertNewline,
@@ -184,6 +199,8 @@ impl Command {
         match self {
             Command::Quit => Action::Quit,
             Command::Save => Action::Save,
+            Command::Undo => Action::Undo,
+            Command::Redo => Action::Redo,
             Command::DeleteBackward => Action::DeleteBackward,
             Command::DeleteForward => Action::DeleteForward,
             Command::InsertNewline => Action::Insert("\n".to_string()),
@@ -242,6 +259,18 @@ const DEFAULT_BINDINGS: &[(&str, &str)] = &[
     ("shift+pagedown", "select_page_down"),
 ];
 
+/// Undo/redo bindings, on the platform's native command modifier: Cmd on macOS
+/// (crossterm `SUPER`), Ctrl elsewhere. Kept separate from [`DEFAULT_BINDINGS`] so
+/// only this pair is OS-conditional; the rest of the map is identical everywhere.
+/// On macOS these are delivered only by Kitty-protocol terminals (which report
+/// Cmd) - a documented trade-off for matching each OS's muscle memory. Raw mode
+/// delivers the modified `z`/`y` as key events, never a suspend/flow signal, so
+/// binding them is safe.
+#[cfg(target_os = "macos")]
+const UNDO_REDO_BINDINGS: &[(&str, &str)] = &[("cmd+z", "undo"), ("cmd+y", "redo")];
+#[cfg(not(target_os = "macos"))]
+const UNDO_REDO_BINDINGS: &[(&str, &str)] = &[("ctrl+z", "undo"), ("ctrl+y", "redo")];
+
 /// The resolved key bindings. Opaque so its representation can change (e.g. gain
 /// per-mode maps) without touching call sites; built via [`Keymap::from_pairs`].
 #[derive(Debug, Clone)]
@@ -274,11 +303,15 @@ impl Keymap {
 }
 
 impl Default for Keymap {
-    /// The built-in keymap. Parsing [`DEFAULT_BINDINGS`] cannot fail - the table is a
-    /// compile-time constant covered by a test - so the `expect` is invariant-proven.
+    /// The built-in keymap: the OS-independent [`DEFAULT_BINDINGS`] plus the
+    /// platform's [`UNDO_REDO_BINDINGS`]. Parsing cannot fail - both tables are
+    /// compile-time constants covered by a test - so the `expect` is invariant-proven.
     fn default() -> Self {
-        Self::from_pairs(DEFAULT_BINDINGS.iter().copied())
-            .expect("built-in default bindings must be valid")
+        let pairs = DEFAULT_BINDINGS
+            .iter()
+            .chain(UNDO_REDO_BINDINGS.iter())
+            .copied();
+        Self::from_pairs(pairs).expect("built-in default bindings must be valid")
     }
 }
 
@@ -320,10 +353,13 @@ pub fn action_for_key(keymap: &Keymap, key: KeyEvent, page: usize) -> Option<Act
         return Some(command.resolve(page));
     }
 
-    // Text-entry fallback: an unbound printable char inserts itself. A Ctrl-modified
-    // char is a command, never text, so it is not inserted (matches the old behavior:
-    // Ctrl+<unbound> is a no-op, not a literal insert).
+    // Text-entry fallback: an unbound printable char inserts itself. A Ctrl- or
+    // Cmd-modified char is a command chord, never text, so it is not inserted -
+    // otherwise an unbound Cmd+S / Ctrl+A would type a literal `s`/`a`. (Alt is
+    // deliberately allowed through: on many layouts Alt/Option composes accented
+    // characters that are legitimate text.)
     if !chord.ctrl
+        && !chord.cmd
         && let KeyCode::Char(c) = key.code
     {
         return Some(Action::Insert(c.to_string()));
@@ -484,11 +520,58 @@ mod tests {
         );
     }
 
+    /// The platform command modifier the default undo/redo bindings use: Cmd
+    /// (`SUPER`) on macOS, Ctrl elsewhere - mirroring [`UNDO_REDO_BINDINGS`].
+    #[cfg(target_os = "macos")]
+    const CMD_MOD: KeyModifiers = KeyModifiers::SUPER;
+    #[cfg(not(target_os = "macos"))]
+    const CMD_MOD: KeyModifiers = KeyModifiers::CONTROL;
+
+    #[test]
+    fn platform_command_key_undoes_and_redoes() {
+        // The default binds undo/redo to the OS-native command modifier (Cmd on
+        // macOS, Ctrl elsewhere), so a config file needs no per-OS branch.
+        assert_eq!(
+            act(with_mods(KeyCode::Char('z'), CMD_MOD)),
+            Some(Action::Undo)
+        );
+        assert_eq!(
+            act(with_mods(KeyCode::Char('y'), CMD_MOD)),
+            Some(Action::Redo)
+        );
+    }
+
+    #[test]
+    fn a_cmd_chord_parses_and_maps_when_bound() {
+        // `cmd`/`super` is a first-class modifier token, so a user can bind it
+        // regardless of platform (it maps to crossterm SUPER).
+        let keymap = Keymap::from_pairs([("cmd+z", "undo")]).unwrap();
+        assert_eq!(
+            action_for_key(
+                &keymap,
+                with_mods(KeyCode::Char('z'), KeyModifiers::SUPER),
+                PAGE
+            ),
+            Some(Action::Undo)
+        );
+    }
+
     #[test]
     fn ctrl_s_saves() {
         assert_eq!(
             act(with_mods(KeyCode::Char('s'), KeyModifiers::CONTROL)),
             Some(Action::Save)
+        );
+    }
+
+    #[test]
+    fn cmd_other_char_is_unmapped_not_inserted() {
+        // Regression: an unbound Cmd+<char> (e.g. Cmd+S where save is Ctrl+S) must
+        // be a no-op, not insert a literal 's' via the text-entry fallback. A
+        // command modifier means the char is a chord, never text.
+        assert_eq!(
+            act(with_mods(KeyCode::Char('s'), KeyModifiers::SUPER)),
+            None
         );
     }
 
@@ -523,7 +606,8 @@ mod tests {
                 code: KeyCode::Char('s'),
                 ctrl: true,
                 shift: false,
-                alt: false
+                alt: false,
+                cmd: false
             })
         );
         assert_eq!(
@@ -532,8 +616,17 @@ mod tests {
                 code: KeyCode::Left,
                 ctrl: true,
                 shift: true,
-                alt: false
+                alt: false,
+                cmd: false
             })
+        );
+        assert_eq!(
+            Chord::parse("cmd+z").map(|c| (c.cmd, c.code)),
+            Some((true, KeyCode::Char('z')))
+        );
+        assert_eq!(
+            Chord::parse("super+z").map(|c| c.cmd),
+            Some(true) // `super` is an alias for the command modifier
         );
         assert_eq!(
             Chord::parse("pageup").map(|c| c.code),
