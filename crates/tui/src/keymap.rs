@@ -127,6 +127,9 @@ enum Command {
     AddCursorAbove,
     AddCursorBelow,
     CollapseSelections,
+    Copy,
+    Cut,
+    Paste,
     /// A cursor motion; `extend` grows the selection (the `select_*` names).
     Move {
         kind: MoveKind,
@@ -196,6 +199,9 @@ impl Command {
             "add_cursor_above" => Command::AddCursorAbove,
             "add_cursor_below" => Command::AddCursorBelow,
             "collapse_selections" => Command::CollapseSelections,
+            "copy" => Command::Copy,
+            "cut" => Command::Cut,
+            "paste" => Command::Paste,
             _ => return None,
         })
     }
@@ -214,6 +220,9 @@ impl Command {
             Command::AddCursorAbove => Action::AddCursorAbove,
             Command::AddCursorBelow => Action::AddCursorBelow,
             Command::CollapseSelections => Action::CollapseSelections,
+            Command::Copy => Action::Copy,
+            Command::Cut => Action::Cut,
+            Command::Paste => Action::Paste,
             Command::Move { kind, extend } => Action::MoveCursor {
                 motion: kind.motion(page),
                 extend,
@@ -244,7 +253,6 @@ fn parse_move_kind(name: &str) -> Option<MoveKind> {
 /// Text entry (printable chars) is a fallback in [`action_for_key`], not listed here.
 const DEFAULT_BINDINGS: &[(&str, &str)] = &[
     ("ctrl+q", "quit"),
-    ("ctrl+c", "quit"),
     ("ctrl+s", "save"),
     ("enter", "insert_newline"),
     ("tab", "insert_tab"),
@@ -274,17 +282,41 @@ const DEFAULT_BINDINGS: &[(&str, &str)] = &[
     ("esc", "collapse_selections"),
 ];
 
-/// Undo/redo bindings, on the platform's native command modifier: Cmd on macOS
-/// (crossterm `SUPER`), Ctrl elsewhere. Kept separate from [`DEFAULT_BINDINGS`] so
-/// only this pair is OS-conditional; the rest of the map is identical everywhere.
-/// On macOS these are delivered only by Kitty-protocol terminals (which report
-/// Cmd) - a documented trade-off for matching each OS's muscle memory. Raw mode
-/// delivers the modified `z`/`y` as key events, never a suspend/flow signal, so
-/// binding them is safe.
+/// Bindings on the platform's native command modifier: Cmd on macOS (crossterm
+/// `SUPER`), Ctrl elsewhere. Kept separate from [`DEFAULT_BINDINGS`] so only these
+/// are OS-conditional; the rest of the map is identical everywhere. On macOS the
+/// Cmd chords are delivered only by Kitty-protocol terminals (which report Cmd) - a
+/// documented trade-off for matching each OS's muscle memory. Raw mode delivers the
+/// modified letters as key events, never a suspend/flow signal, so binding them is
+/// safe.
+///
+/// Clipboard follows each OS's convention: Cmd+C/X/V on macOS, Ctrl+C/X/V elsewhere.
+/// This reclaims Ctrl+C from quit on non-mac (quit stays Ctrl+Q); on macOS Ctrl+C
+/// remains quit (see [`MACOS_ONLY_BINDINGS`]) since copy is Cmd+C there.
 #[cfg(target_os = "macos")]
-const UNDO_REDO_BINDINGS: &[(&str, &str)] = &[("cmd+z", "undo"), ("cmd+y", "redo")];
+const COMMAND_MOD_BINDINGS: &[(&str, &str)] = &[
+    ("cmd+z", "undo"),
+    ("cmd+y", "redo"),
+    ("cmd+c", "copy"),
+    ("cmd+x", "cut"),
+    ("cmd+v", "paste"),
+];
 #[cfg(not(target_os = "macos"))]
-const UNDO_REDO_BINDINGS: &[(&str, &str)] = &[("ctrl+z", "undo"), ("ctrl+y", "redo")];
+const COMMAND_MOD_BINDINGS: &[(&str, &str)] = &[
+    ("ctrl+z", "undo"),
+    ("ctrl+y", "redo"),
+    ("ctrl+c", "copy"),
+    ("ctrl+x", "cut"),
+    ("ctrl+v", "paste"),
+];
+
+/// Bindings that exist only on macOS: there, Ctrl+C is free (copy is Cmd+C), so it
+/// keeps its terminal-conventional meaning of quit alongside Ctrl+Q. Empty on other
+/// platforms, where Ctrl+C is copy (see [`COMMAND_MOD_BINDINGS`]) and quit is Ctrl+Q.
+#[cfg(target_os = "macos")]
+const MACOS_ONLY_BINDINGS: &[(&str, &str)] = &[("ctrl+c", "quit")];
+#[cfg(not(target_os = "macos"))]
+const MACOS_ONLY_BINDINGS: &[(&str, &str)] = &[];
 
 /// The resolved key bindings. Opaque so its representation can change (e.g. gain
 /// per-mode maps) without touching call sites; built via [`Keymap::from_pairs`].
@@ -319,12 +351,14 @@ impl Keymap {
 
 impl Default for Keymap {
     /// The built-in keymap: the OS-independent [`DEFAULT_BINDINGS`] plus the
-    /// platform's [`UNDO_REDO_BINDINGS`]. Parsing cannot fail - both tables are
-    /// compile-time constants covered by a test - so the `expect` is invariant-proven.
+    /// platform's [`COMMAND_MOD_BINDINGS`] and [`MACOS_ONLY_BINDINGS`]. Parsing
+    /// cannot fail - all three tables are compile-time constants covered by a test -
+    /// so the `expect` is invariant-proven.
     fn default() -> Self {
         let pairs = DEFAULT_BINDINGS
             .iter()
-            .chain(UNDO_REDO_BINDINGS.iter())
+            .chain(COMMAND_MOD_BINDINGS.iter())
+            .chain(MACOS_ONLY_BINDINGS.iter())
             .copied();
         Self::from_pairs(pairs).expect("built-in default bindings must be valid")
     }
@@ -524,15 +558,46 @@ mod tests {
     }
 
     #[test]
-    fn ctrl_q_and_ctrl_c_quit() {
+    fn ctrl_q_always_quits() {
         assert_eq!(
             act(with_mods(KeyCode::Char('q'), KeyModifiers::CONTROL)),
             Some(Action::Quit)
         );
+    }
+
+    #[test]
+    fn ctrl_c_quits_on_macos_and_copies_elsewhere() {
+        // Ctrl+C is platform-dependent: on macOS copy is Cmd+C, so Ctrl+C keeps its
+        // terminal-conventional quit; elsewhere Ctrl+C is copy and quit is Ctrl+Q.
+        let action = act(with_mods(KeyCode::Char('c'), KeyModifiers::CONTROL));
+        #[cfg(target_os = "macos")]
+        assert_eq!(action, Some(Action::Quit));
+        #[cfg(not(target_os = "macos"))]
+        assert_eq!(action, Some(Action::Copy));
+    }
+
+    #[test]
+    fn platform_command_key_copies_cuts_and_pastes() {
+        // Clipboard follows each OS: Cmd+C/X/V on macOS, Ctrl+C/X/V elsewhere.
         assert_eq!(
-            act(with_mods(KeyCode::Char('c'), KeyModifiers::CONTROL)),
-            Some(Action::Quit)
+            act(with_mods(KeyCode::Char('c'), CMD_MOD)),
+            Some(Action::Copy)
         );
+        assert_eq!(
+            act(with_mods(KeyCode::Char('x'), CMD_MOD)),
+            Some(Action::Cut)
+        );
+        assert_eq!(
+            act(with_mods(KeyCode::Char('v'), CMD_MOD)),
+            Some(Action::Paste)
+        );
+    }
+
+    #[test]
+    fn clipboard_command_names_parse() {
+        assert_eq!(Command::parse("copy"), Some(Command::Copy));
+        assert_eq!(Command::parse("cut"), Some(Command::Cut));
+        assert_eq!(Command::parse("paste"), Some(Command::Paste));
     }
 
     /// The platform command modifier the default undo/redo bindings use: Cmd

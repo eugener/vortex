@@ -275,3 +275,34 @@ fn text_clone_is_independent_of_further_edits() {
     assert_eq!(snap.to_string(), "hello");
     assert_eq!(b.text().to_string(), "Xhello");
 }
+
+#[test]
+fn text_slice_returns_the_byte_range() {
+    // The copy path reads a selection's bytes via `slice` (SPEC §11).
+    let text = RopeBuffer::from("hello world").text();
+    assert_eq!(text.slice(0..5), "hello");
+    assert_eq!(text.slice(6..11), "world");
+    assert_eq!(text.slice(3..3), ""); // empty range
+}
+
+#[test]
+fn text_slice_clamps_past_the_end_and_defends_bad_ranges() {
+    // Defensive (SPEC §8): an end past the buffer clamps rather than panicking; an
+    // inverted range (start > clamped end) yields "".
+    let text = RopeBuffer::from("abc").text();
+    assert_eq!(text.slice(1..99), "bc"); // end clamped to len
+    // Start past the (clamped) end: built from variables so it is not a literal
+    // reversed range (which clippy rejects at compile time). Yields "", no panic.
+    let (start, end) = (5, 2);
+    assert_eq!(text.slice(start..end), "");
+}
+
+#[test]
+fn text_slice_off_a_char_boundary_yields_empty_not_a_panic() {
+    // "é" is two UTF-8 bytes; slicing at offset 1 splits the code point. crop's
+    // byte_slice would panic, so `slice` guards and returns "" (SPEC §8).
+    let text = RopeBuffer::from("é").text();
+    assert_eq!(text.byte_len(), 2);
+    assert_eq!(text.slice(0..1), ""); // mid-code-point end
+    assert_eq!(text.slice(0..2), "é"); // full code point is fine
+}

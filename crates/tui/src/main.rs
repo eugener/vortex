@@ -15,6 +15,7 @@
 mod config;
 mod keymap;
 mod layout;
+mod osc52;
 
 use std::ffi::OsString;
 use std::io::{self, Stdout};
@@ -22,8 +23,9 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use ratatui::crossterm::event::{
-    self, DisableMouseCapture, EnableMouseCapture, Event, KeyModifiers, KeyboardEnhancementFlags,
-    MouseButton, MouseEventKind, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
+    self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
+    Event, KeyModifiers, KeyboardEnhancementFlags, MouseButton, MouseEventKind,
+    PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
 };
 use ratatui::crossterm::terminal::{
     BeginSynchronizedUpdate, EndSynchronizedUpdate, supports_keyboard_enhancement,
@@ -144,18 +146,24 @@ Options:
       --           Treat every following argument as a file name
 
 Keys:
-  Ctrl+S           Save        Ctrl+Q / Ctrl+C   Quit
+  Ctrl+S           Save        Ctrl+Q            Quit
   Ctrl+Alt+Up/Down Add cursor above/below        Alt+Click  Add cursor
   Esc              Collapse to one cursor
 ";
 
-/// The undo/redo line of the help, on the platform's command modifier - Cmd on
-/// macOS, Ctrl elsewhere - to match [`keymap`]'s OS-conditional bindings. Split out
-/// because a `const` string cannot itself be built per-OS by concatenation.
+/// The OS-conditional key lines of the help - undo/redo and clipboard - on the
+/// platform's command modifier (Cmd on macOS, Ctrl elsewhere), matching [`keymap`]'s
+/// OS-conditional bindings. On macOS Ctrl+C stays Quit (copy is Cmd+C); elsewhere
+/// Ctrl+C is Copy and Quit is Ctrl+Q only. Split out because a `const` string cannot
+/// be built per-OS by concatenation.
 #[cfg(target_os = "macos")]
-const UNDO_REDO_HELP: &str = "  Cmd+Z            Undo        Cmd+Y             Redo\n";
+const UNDO_REDO_HELP: &str = "  Cmd+Z            Undo        Cmd+Y             Redo
+  Cmd+C / X / V    Copy / Cut / Paste           Ctrl+C     Quit
+";
 #[cfg(not(target_os = "macos"))]
-const UNDO_REDO_HELP: &str = "  Ctrl+Z           Undo        Ctrl+Y            Redo\n";
+const UNDO_REDO_HELP: &str = "  Ctrl+Z           Undo        Ctrl+Y            Redo
+  Ctrl+C / X / V   Copy / Cut / Paste
+";
 
 /// The outcome of parsing the command line - what `main` should do next.
 #[derive(Debug, PartialEq, Eq)]
@@ -252,6 +260,13 @@ fn event_loop(
         // one, SPEC §6), and a file open/save result is surfaced in the status bar
         // (SPEC §8). Keep the latest message worth showing.
         while let Ok(note) = handle.notifications.try_recv() {
+            // A copy/cut asks us to mirror the register to the OS clipboard. We push
+            // it over OSC 52 (clipboard-over-terminal), which works locally and over
+            // SSH (SPEC §11) without a native-clipboard dependency. Best-effort: a
+            // terminal that ignores OSC 52 just leaves the OS clipboard unchanged.
+            if let vortex_core::Notification::SetClipboard { text } = &note {
+                let _ = osc52::copy(text);
+            }
             if let Some(m) = layout::notification_message(&note) {
                 message = Some(m);
                 needs_redraw = true;
@@ -344,6 +359,19 @@ fn event_loop(
                     }
                     _ => {}
                 },
+                // An OS paste (bracketed paste): insert the whole payload as one
+                // action (SPEC §6), splatting the external text at every cursor. This
+                // is distinct from the editor's own `paste` command, which pulls the
+                // core's structured register; the terminal only ever hands us a flat
+                // string, so `Insert` is the right intent here.
+                Event::Paste(text) => {
+                    if message.take().is_some() {
+                        needs_redraw = true;
+                    }
+                    if handle.actions.send_blocking(Action::Insert(text)).is_err() {
+                        return Ok(());
+                    }
+                }
                 // Repaint against the new terminal size.
                 Event::Resize(_, _) => needs_redraw = true,
                 _ => {}
@@ -688,6 +716,10 @@ impl TerminalGuard {
             // Report mouse press/drag/scroll so clicks place the caret and drags
             // select (SPEC §9 input). Disabled symmetrically on teardown.
             EnableMouseCapture,
+            // Deliver an OS paste as a single `Event::Paste` (one `Insert` action,
+            // SPEC §6) instead of a burst of synthetic keystrokes. Disabled on
+            // teardown. Part of crossterm's default features (via ratatui).
+            EnableBracketedPaste,
         )?;
 
         // Negotiate the Kitty keyboard protocol where supported (SPEC §9). A
@@ -733,6 +765,7 @@ impl TerminalGuard {
         }
         let _ = execute!(
             out,
+            DisableBracketedPaste,
             DisableMouseCapture,
             ratatui::crossterm::terminal::LeaveAlternateScreen
         );

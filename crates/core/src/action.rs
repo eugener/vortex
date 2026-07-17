@@ -53,6 +53,23 @@ pub enum Action {
     /// Delete the grapheme after each cursor (Delete), or the selected text if
     /// the selection is non-empty.
     DeleteForward,
+    /// Copy each non-empty selection's text into the clipboard register (SPEC §11),
+    /// one entry per selection in selection order. The buffer is unchanged (no delta
+    /// or version bump); the core emits a `Notification::SetClipboard` so the
+    /// frontend can mirror the register to the OS clipboard (OSC 52 / native). A
+    /// set of bare cursors (nothing selected) is a no-op.
+    Copy,
+    /// Copy the selections into the register (as [`Action::Copy`]) and then delete
+    /// them - one edit, one undo unit. A set of bare cursors is a no-op.
+    Cut,
+    /// Insert the clipboard register at every cursor (SPEC §11), replacing any
+    /// non-empty selection first. Distribution: when the register holds exactly one
+    /// entry it is inserted at every cursor; when it holds exactly as many entries
+    /// as there are cursors, the i-th entry goes to the i-th cursor (the multi-cursor
+    /// copy round-trip); otherwise the entries are joined with newlines and that one
+    /// block is inserted at every cursor. An empty register is a no-op. Like
+    /// [`Action::Insert`] this is ONE action, not a key-per-character (SPEC §6).
+    Paste,
     /// Undo the most recent edit (SPEC §2.4). Moves the buffer to the current
     /// history node's parent, restoring the pre-edit text and selections. A no-op
     /// at the root. Works for any edit action - insert, delete, paste, multi-cursor

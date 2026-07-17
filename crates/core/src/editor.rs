@@ -108,6 +108,12 @@ struct Editor {
     /// The undo tree (SPEC §2.4). Owns the reversible change history and the
     /// coalescing state; reset on a file open (undo does not cross a load).
     history: History,
+    /// The clipboard register: one entry per selection copied/cut, in selection
+    /// order (SPEC §11). The core owns this state so a multi-cursor copy round-trips
+    /// per-cursor on paste; the frontend mirrors a flattened form to the OS clipboard
+    /// via `Notification::SetClipboard`. Survives file opens (a yank is not tied to a
+    /// buffer). Empty until the first copy/cut.
+    register: Vec<String>,
 }
 
 impl Editor {
@@ -120,6 +126,7 @@ impl Editor {
             path: None,
             modified: false,
             history: History::new(),
+            register: Vec::new(),
         }
     }
 
@@ -200,6 +207,67 @@ impl Editor {
         edits.sort_by_key(|e| std::cmp::Reverse(e.0.start));
         edits
     }
+
+    /// Copy every non-empty selection's text into the register (SPEC §11), one
+    /// entry per selection in selection order (the set is sorted, so this is the
+    /// on-screen top-to-bottom order). Returns `true` if anything was copied - a set
+    /// of bare cursors selects nothing, leaves the register untouched, and returns
+    /// `false` so the caller emits no clipboard notification. Reads text via
+    /// [`Text::slice`], which is bounded to the selected bytes, never the whole file.
+    fn fill_register(&mut self) -> bool {
+        let text = self.buffer.text();
+        let slices: Vec<String> = self
+            .selections
+            .all()
+            .iter()
+            .filter(|sel| !sel.is_cursor())
+            .map(|sel| text.slice(sel.start()..sel.end()))
+            .collect();
+        if slices.is_empty() {
+            return false;
+        }
+        self.register = slices;
+        true
+    }
+
+    /// The register flattened for the OS clipboard: entries joined with `\n` (SPEC
+    /// §11). The OS clipboard is a single string, so the per-selection structure is
+    /// collapsed here while the structured register stays in the core for paste.
+    fn register_flattened(&self) -> String {
+        self.register.join("\n")
+    }
+
+    /// Plan the per-cursor edits a `Paste` produces: each selection's span is
+    /// replaced by the register text assigned to it (SPEC §11 distribution rule).
+    /// With one register entry it goes to every cursor; with exactly as many entries
+    /// as selections the i-th entry goes to the i-th selection (the multi-cursor
+    /// round-trip); otherwise every cursor gets the whole register joined with `\n`.
+    /// Returns edits sorted DESCENDING by start (as [`Self::plan_edit`]) so
+    /// back-to-front application is offset-stable, or empty for an empty register.
+    fn plan_paste(&self) -> Vec<(std::ops::Range<usize>, String)> {
+        if self.register.is_empty() {
+            return Vec::new();
+        }
+        let selections = self.selections.all();
+        // The fallback block (used when counts are neither 1 nor equal) is built once.
+        let joined = self.register_flattened();
+        let mut edits: Vec<(std::ops::Range<usize>, String)> = selections
+            .iter()
+            .enumerate()
+            .map(|(i, sel)| {
+                let insert = if self.register.len() == 1 {
+                    self.register[0].clone()
+                } else if self.register.len() == selections.len() {
+                    self.register[i].clone()
+                } else {
+                    joined.clone()
+                };
+                (sel.start()..sel.end(), insert)
+            })
+            .collect();
+        edits.sort_by_key(|e| std::cmp::Reverse(e.0.start));
+        edits
+    }
 }
 
 /// The kind of text edit an action requests, resolved against each selection.
@@ -210,13 +278,20 @@ enum EditKind {
     DeleteBackward,
     /// Delete forward one grapheme (or the selection if non-empty).
     DeleteForward,
+    /// Delete only non-empty selections (the cut edit). A bare cursor is a no-op,
+    /// so cutting with nothing selected changes nothing - unlike backspace/delete,
+    /// which step over a grapheme at a bare cursor.
+    DeleteSelection,
 }
 
 /// What the actor loop must do for one action: apply a text edit, republish the
 /// current state (a motion or snapshot request), or a file op (open/save). Each
 /// path returns "is the frontend still alive?"; `Quit` breaks before this.
 enum Step {
-    Edit(EditKind),
+    /// Apply these pre-planned `(range, replacement)` edits (sorted descending by
+    /// start). The dispatch arm plans them - from an `EditKind` for insert/delete/cut,
+    /// or from the register for paste - so one apply path serves every text change.
+    Edit(Vec<(std::ops::Range<usize>, String)>),
     Undo,
     Redo,
     Republish,
@@ -248,6 +323,10 @@ fn edit_for_selection(
             } else {
                 Some((sel.start()..sel.end(), String::new()))
             }
+        }
+        // Cut deletes only what is selected; a bare cursor contributes nothing.
+        EditKind::DeleteSelection => {
+            (!sel.is_cursor()).then(|| (sel.start()..sel.end(), String::new()))
         }
     }
 }
@@ -318,9 +397,40 @@ async fn run(
         // actions then share one apply_edit call instead of repeating the
         // apply/break plumbing per variant.
         let step = match action {
-            Action::Insert(text) => Step::Edit(EditKind::Insert(text)),
-            Action::DeleteBackward => Step::Edit(EditKind::DeleteBackward),
-            Action::DeleteForward => Step::Edit(EditKind::DeleteForward),
+            Action::Insert(text) => Step::Edit(editor.plan_edit(EditKind::Insert(text))),
+            Action::DeleteBackward => Step::Edit(editor.plan_edit(EditKind::DeleteBackward)),
+            Action::DeleteForward => Step::Edit(editor.plan_edit(EditKind::DeleteForward)),
+            // Copy fills the register but touches no text: emit the clipboard mirror
+            // (if anything was selected) and republish, no delta or version bump.
+            Action::Copy => {
+                if editor.fill_register() {
+                    let _ = notifications.try_send(Notification::SetClipboard {
+                        text: editor.register_flattened(),
+                    });
+                }
+                Step::Republish
+            }
+            // Cut = copy + delete the selections, as one edit / one undo unit. Fill
+            // the register and emit the mirror first, then plan the deletion; a set
+            // of bare cursors selects nothing, so `plan_edit` returns no edits and
+            // the apply path treats it as a no-op.
+            Action::Cut => {
+                if editor.fill_register() {
+                    let _ = notifications.try_send(Notification::SetClipboard {
+                        text: editor.register_flattened(),
+                    });
+                }
+                Step::Edit(editor.plan_edit(EditKind::DeleteSelection))
+            }
+            // Paste distributes the register over the cursors (SPEC §11); an empty
+            // register plans no edits and is a clean no-op. A paste is a distinct
+            // action, not a keystroke, so it ends any typing-coalescing run (SPEC §2.4
+            // break rule (d)) - otherwise a single-char paste right after typing would
+            // fold into that undo unit and one Undo would revert both.
+            Action::Paste => {
+                editor.history.break_coalescing();
+                Step::Edit(editor.plan_paste())
+            }
             Action::MoveCursor { motion, extend } => {
                 editor.move_cursor(motion, extend);
                 // A cursor motion ends the insert-coalescing run (SPEC §2.4 break
@@ -365,8 +475,8 @@ async fn run(
         };
 
         let alive = match step {
-            Step::Edit(kind) => {
-                apply_edit(&mut editor, kind, &deltas, &snapshots, &notifications).await
+            Step::Edit(edits) => {
+                apply_edit(&mut editor, edits, &deltas, &snapshots, &notifications).await
             }
             Step::Undo => {
                 let reverted = editor.history.undo();
@@ -393,10 +503,12 @@ async fn run(
     let _ = notifications.try_send(Notification::ShuttingDown);
 }
 
-/// Apply an edit action end to end: plan the per-selection edits, apply them,
-/// record the reversible revision for undo (SPEC §2.4), remap selections, bump the
-/// version, and publish a snapshot. Returns `false` if the frontend has hung up
-/// (caller then breaks the loop).
+/// Apply an edit action end to end: given the pre-planned per-selection edits, apply
+/// them, record the reversible revision for undo (SPEC §2.4), remap selections, bump
+/// the version, and publish a snapshot. The dispatch arm plans `edits` (from an
+/// `EditKind` for insert/delete/cut, or from the register for paste), so this one
+/// path serves every text change. Returns `false` if the frontend has hung up (caller
+/// then breaks the loop).
 ///
 /// A rejected edit (bad range) is surfaced as a `Notification` and skipped without
 /// bumping the version - the buffer never silently changes (SPEC §8). Because
@@ -404,12 +516,11 @@ async fn run(
 /// against, rejection is not expected in M1, but the path is handled not panicked.
 async fn apply_edit(
     editor: &mut Editor,
-    kind: EditKind,
+    edits: Vec<(std::ops::Range<usize>, String)>,
     deltas: &Sender<Delta>,
     snapshots: &SnapshotSink,
     notifications: &Sender<Notification>,
 ) -> bool {
-    let edits = editor.plan_edit(kind);
     if edits.is_empty() {
         // No-op (e.g. backspace at buffer start): republish so the frontend's
         // view stays current, but do not bump the version or emit a delta.

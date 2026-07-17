@@ -102,6 +102,21 @@ impl Text {
     pub fn line_of_byte(&self, byte_offset: usize) -> usize {
         self.0.line_of_byte(byte_offset.min(self.0.byte_len()))
     }
+
+    /// The text of byte `range` as a `String` - used to copy a selection into the
+    /// clipboard register (SPEC §11). Endpoints are clamped to the buffer and must
+    /// land on code-point boundaries; a non-boundary or inverted range yields `""`
+    /// rather than panicking (crop's `byte_slice` panics off a boundary), keeping
+    /// this off the panic path (SPEC §8). Selection endpoints are always valid
+    /// boundaries in practice, so the guard is defensive, not a hot branch.
+    pub fn slice(&self, range: Range<usize>) -> String {
+        let end = range.end.min(self.0.byte_len());
+        let start = range.start.min(end);
+        if !self.0.is_char_boundary(start) || !self.0.is_char_boundary(end) {
+            return String::new();
+        }
+        self.0.byte_slice(start..end).to_string()
+    }
 }
 
 /// The full contents as a `String` via `to_string()`. O(n) - for tests and save

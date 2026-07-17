@@ -189,13 +189,8 @@ fn multi_cursor_insert_merges_dirty_range() {
     let (note_tx, _note_rx) = async_channel::bounded::<Notification>(16);
     let snapshots = SnapshotSink { tx: snap_tx };
 
-    let alive = smol::block_on(apply_edit(
-        &mut e,
-        EditKind::Insert("X".into()),
-        &delta_tx,
-        &snapshots,
-        &note_tx,
-    ));
+    let edits = e.plan_edit(EditKind::Insert("X".into()));
+    let alive = smol::block_on(apply_edit(&mut e, edits, &delta_tx, &snapshots, &note_tx));
 
     assert!(alive);
     assert_eq!(e.buffer.text().to_string(), "aXbcdXef");
@@ -221,13 +216,8 @@ fn rejected_edit_is_surfaced_and_leaves_state_unchanged() {
     let (note_tx, note_rx) = async_channel::bounded::<Notification>(16);
     let snapshots = SnapshotSink { tx: snap_tx };
 
-    let alive = smol::block_on(apply_edit(
-        &mut e,
-        EditKind::Insert("X".into()),
-        &delta_tx,
-        &snapshots,
-        &note_tx,
-    ));
+    let edits = e.plan_edit(EditKind::Insert("X".into()));
+    let alive = smol::block_on(apply_edit(&mut e, edits, &delta_tx, &snapshots, &note_tx));
 
     assert!(alive);
     assert_eq!(e.buffer.text().to_string(), "abc"); // untouched
@@ -251,9 +241,10 @@ fn edit_sets_modified_flag() {
     let mut e = editor_with("abc", SelectionSet::single(Selection::cursor(3)));
     assert!(!e.modified);
     let h = Harness::new();
+    let edits = e.plan_edit(EditKind::Insert("d".into()));
     smol::block_on(apply_edit(
         &mut e,
-        EditKind::Insert("d".into()),
+        edits,
         &h.delta_tx,
         &h.snapshots,
         &h.note_tx,
@@ -509,9 +500,10 @@ fn open_then_edit_then_save_round_trips_through_disk() {
     ));
     // Move to end and append "d".
     e.selections = SelectionSet::single(Selection::cursor(3));
+    let edits = e.plan_edit(EditKind::Insert("d".into()));
     smol::block_on(apply_edit(
         &mut e,
-        EditKind::Insert("d".into()),
+        edits,
         &h.delta_tx,
         &h.snapshots,
         &h.note_tx,
@@ -539,9 +531,10 @@ fn save_writes_to_a_new_file_that_did_not_exist() {
         &h.note_tx,
     ));
     e.selections = SelectionSet::at_origin();
+    let edits = e.plan_edit(EditKind::Insert("brand new".into()));
     smol::block_on(apply_edit(
         &mut e,
-        EditKind::Insert("brand new".into()),
+        edits,
         &h.delta_tx,
         &h.snapshots,
         &h.note_tx,
@@ -716,9 +709,10 @@ fn multi_cursor_undo_restores_every_cursor() {
     let mut e = editor_with("abcdef", set);
     let h = Harness::new();
 
+    let edits = e.plan_edit(EditKind::Insert("X".into()));
     smol::block_on(apply_edit(
         &mut e,
-        EditKind::Insert("X".into()),
+        edits,
         &h.delta_tx,
         &h.snapshots,
         &h.note_tx,
@@ -834,9 +828,10 @@ fn undo_reports_frontend_gone_when_the_delta_channel_is_closed() {
     let mut e = editor_with("abc", SelectionSet::single(Selection::cursor(3)));
     let h = Harness::new();
     // Record an edit so there is something to undo.
+    let edits = e.plan_edit(EditKind::Insert("d".into()));
     smol::block_on(apply_edit(
         &mut e,
-        EditKind::Insert("d".into()),
+        edits,
         &h.delta_tx,
         &h.snapshots,
         &h.note_tx,
@@ -1094,5 +1089,152 @@ mod atomic_write {
             0o600,
             "final file keeps its private mode"
         );
+    }
+
+    // --- Clipboard register (SPEC §11) -------------------------------------
+
+    #[test]
+    fn fill_register_copies_each_nonempty_selection_in_order() {
+        // Two selections over "abcdef": [0,2) = "ab", [4,6) = "ef". The register
+        // gets one entry per selection in the set's sorted (top-to-bottom) order.
+        // The spans are already sorted and disjoint (2 < 4), so they survive
+        // normalization as two separate selections.
+        let set =
+            SelectionSet::from_sorted_cursors(vec![Selection::new(0, 2), Selection::new(4, 6)]);
+        let mut e = editor_with("abcdef", set);
+        assert!(e.fill_register());
+        assert_eq!(e.register, vec!["ab".to_string(), "ef".to_string()]);
+    }
+
+    #[test]
+    fn fill_register_is_noop_for_bare_cursors() {
+        // Nothing selected: the register is left untouched and the caller is told
+        // not to emit a clipboard notification.
+        let mut e = editor_with("abc", SelectionSet::single(Selection::cursor(1)));
+        e.register = vec!["previous".into()];
+        assert!(!e.fill_register());
+        assert_eq!(e.register, vec!["previous".to_string()]); // unchanged
+    }
+
+    #[test]
+    fn register_flattened_joins_entries_with_newline() {
+        let mut e = editor_with("", SelectionSet::at_origin());
+        e.register = vec!["one".into(), "two".into(), "three".into()];
+        assert_eq!(e.register_flattened(), "one\ntwo\nthree");
+    }
+
+    #[test]
+    fn plan_paste_single_entry_splats_to_every_cursor() {
+        // One register entry goes to all cursors (the common single-copy paste).
+        let set =
+            SelectionSet::from_sorted_cursors(vec![Selection::cursor(0), Selection::cursor(2)]);
+        let mut e = editor_with("ab", set);
+        e.register = vec!["X".into()];
+        let edits = e.plan_paste();
+        // Descending by start; both cursors get "X".
+        assert_eq!(edits, vec![(2..2, "X".into()), (0..0, "X".into())]);
+    }
+
+    #[test]
+    fn plan_paste_matched_counts_distribute_per_cursor() {
+        // Register length == cursor count: the i-th entry lands at the i-th cursor
+        // (the multi-cursor copy/paste round-trip).
+        let set =
+            SelectionSet::from_sorted_cursors(vec![Selection::cursor(0), Selection::cursor(2)]);
+        let mut e = editor_with("ab", set);
+        e.register = vec!["P".into(), "Q".into()];
+        let edits = e.plan_paste();
+        // Descending by start: cursor 1 (start 2) -> "Q", cursor 0 (start 0) -> "P".
+        assert_eq!(edits, vec![(2..2, "Q".into()), (0..0, "P".into())]);
+    }
+
+    #[test]
+    fn plan_paste_mismatched_counts_join_with_newline() {
+        // Three entries, two cursors: neither 1 nor equal, so every cursor gets the
+        // whole register joined with newlines (the leftover policy).
+        let set =
+            SelectionSet::from_sorted_cursors(vec![Selection::cursor(0), Selection::cursor(2)]);
+        let mut e = editor_with("ab", set);
+        e.register = vec!["a".into(), "b".into(), "c".into()];
+        let edits = e.plan_paste();
+        assert_eq!(
+            edits,
+            vec![(2..2, "a\nb\nc".into()), (0..0, "a\nb\nc".into())]
+        );
+    }
+
+    #[test]
+    fn plan_paste_empty_register_is_noop() {
+        let e = editor_with("ab", SelectionSet::single(Selection::cursor(1)));
+        assert!(e.plan_paste().is_empty());
+    }
+
+    #[test]
+    fn plan_paste_replaces_a_nonempty_selection() {
+        // Paste over a selection replaces it (the range is the selection span, not a
+        // zero-width insert), mirroring Insert's replace-then-insert.
+        let set = SelectionSet::single(Selection::new(0, 3)); // "abc" selected
+        let mut e = editor_with("abcdef", set);
+        e.register = vec!["Z".into()];
+        assert_eq!(e.plan_paste(), vec![(0..3, "Z".into())]);
+    }
+
+    #[test]
+    fn delete_selection_editkind_skips_bare_cursors() {
+        // The cut edit deletes only non-empty selections; a bare cursor contributes
+        // nothing (unlike backspace/delete, which step a grapheme at a cursor).
+        let cursor = editor_with("abc", SelectionSet::single(Selection::cursor(1)));
+        assert!(cursor.plan_edit(EditKind::DeleteSelection).is_empty());
+
+        let selected = editor_with("abc", SelectionSet::single(Selection::new(0, 2)));
+        assert_eq!(
+            selected.plan_edit(EditKind::DeleteSelection),
+            vec![(0..2, String::new())]
+        );
+    }
+
+    #[test]
+    fn copy_then_paste_round_trips_through_the_register() {
+        // End-to-end register path: select "ab", copy (fills register + flattens for
+        // the clipboard mirror), collapse to a caret at end, then paste it back.
+        let mut e = editor_with("abcdef", SelectionSet::single(Selection::new(0, 2)));
+        assert!(e.fill_register());
+        assert_eq!(e.register_flattened(), "ab");
+
+        // Caret at end of buffer, paste the register there.
+        e.selections = SelectionSet::single(Selection::cursor(6));
+        let edits = e.plan_paste();
+        let h = Harness::new();
+        smol::block_on(apply_edit(
+            &mut e,
+            edits,
+            &h.delta_tx,
+            &h.snapshots,
+            &h.note_tx,
+        ));
+        assert_eq!(e.buffer.text().to_string(), "abcdefab");
+        assert_eq!(e.version, 1);
+    }
+
+    #[test]
+    fn cut_is_one_edit_that_deletes_the_selection() {
+        // Cut fills the register then applies DeleteSelection as one edit: the
+        // selected text is removed and one undo unit recorded (version bumps once).
+        let mut e = editor_with("abcdef", SelectionSet::single(Selection::new(2, 4)));
+        assert!(e.fill_register());
+        assert_eq!(e.register, vec!["cd".to_string()]);
+
+        let edits = e.plan_edit(EditKind::DeleteSelection);
+        let h = Harness::new();
+        smol::block_on(apply_edit(
+            &mut e,
+            edits,
+            &h.delta_tx,
+            &h.snapshots,
+            &h.note_tx,
+        ));
+        assert_eq!(e.buffer.text().to_string(), "abef");
+        assert_eq!(e.version, 1);
+        assert_eq!(h.delta_rx.len(), 1); // one delta for the single deletion
     }
 }

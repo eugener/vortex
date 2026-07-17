@@ -439,3 +439,186 @@ fn snapshot_cell_try_recv_reads_latest_then_empties() {
         assert!(h.snapshots.try_recv().is_none());
     });
 }
+
+// --- Clipboard through the message seam (SPEC §11) -------------------------
+
+/// Select the first `n` graphemes from the buffer start (BufferStart, then extend
+/// Right `n` times). Leaves a non-empty primary selection for a copy/cut to read.
+async fn select_first(h: &CoreHandle, n: usize) {
+    step(
+        h,
+        Action::MoveCursor {
+            motion: Motion::BufferStart,
+            extend: false,
+        },
+    )
+    .await;
+    for _ in 0..n {
+        step(
+            h,
+            Action::MoveCursor {
+                motion: Motion::Right,
+                extend: true,
+            },
+        )
+        .await;
+    }
+}
+
+#[test]
+fn copy_emits_set_clipboard_and_does_not_change_the_buffer() {
+    // Copy is a pure register write: it emits a SetClipboard notification with the
+    // selected text but leaves the buffer and version untouched (SPEC §11).
+    drive(|h| async move {
+        step(&h, Action::Insert("hello".into())).await;
+        select_first(&h, 3).await; // select "hel"
+        let snap = step(&h, Action::Copy).await;
+        assert_eq!(snap.text.to_string(), "hello"); // unchanged
+        assert_eq!(snap.version, 1); // only the insert bumped it
+        match h.notifications.try_recv() {
+            Ok(Notification::SetClipboard { text }) => assert_eq!(text, "hel"),
+            other => panic!("expected SetClipboard, got {other:?}"),
+        }
+    });
+}
+
+#[test]
+fn copy_with_no_selection_emits_no_clipboard_notification() {
+    // A bare cursor selects nothing: copy is a no-op and must not emit SetClipboard.
+    drive(|h| async move {
+        step(&h, Action::Insert("hello".into())).await;
+        step(&h, Action::Copy).await;
+        assert!(h.notifications.try_recv().is_err()); // nothing emitted
+    });
+}
+
+#[test]
+fn copy_then_paste_round_trips_through_the_seam() {
+    // Copy "hel", move to end, paste: the register text lands at the caret. Drives
+    // the full Copy + Paste actor-loop path end to end (SPEC §11).
+    drive(|h| async move {
+        step(&h, Action::Insert("hello".into())).await;
+        select_first(&h, 3).await; // select "hel"
+        step(&h, Action::Copy).await;
+        step(
+            &h,
+            Action::MoveCursor {
+                motion: Motion::BufferEnd,
+                extend: false,
+            },
+        )
+        .await;
+        let snap = step(&h, Action::Paste).await;
+        assert_eq!(snap.text.to_string(), "hellohel");
+    });
+}
+
+#[test]
+fn cut_removes_the_selection_and_fills_the_clipboard() {
+    // Cut is copy + delete as one edit: the selection is removed, SetClipboard
+    // carries the cut text, and the version bumps once for the deletion (SPEC §11).
+    drive(|h| async move {
+        step(&h, Action::Insert("hello".into())).await;
+        select_first(&h, 3).await; // select "hel"
+        h.actions.send(Action::Cut).await.unwrap();
+        // Cut emits its delete delta before the snapshot; drain it so the actor
+        // proceeds to publish.
+        let _ = h.deltas.recv().await.unwrap();
+        let snap = h.snapshots.recv().await.unwrap();
+        assert_eq!(snap.text.to_string(), "lo");
+        match h.notifications.try_recv() {
+            Ok(Notification::SetClipboard { text }) => assert_eq!(text, "hel"),
+            other => panic!("expected SetClipboard, got {other:?}"),
+        }
+    });
+}
+
+#[test]
+fn paste_with_empty_register_is_a_noop() {
+    // Nothing copied yet: paste plans no edits, so the buffer and version are
+    // unchanged (SPEC §11 empty-register rule).
+    drive(|h| async move {
+        step(&h, Action::Insert("hi".into())).await;
+        let snap = step(&h, Action::Paste).await;
+        assert_eq!(snap.text.to_string(), "hi");
+        assert_eq!(snap.version, 1); // only the insert
+    });
+}
+
+#[test]
+fn cut_with_no_selection_changes_nothing() {
+    // Cut over a bare cursor selects nothing: no register write, no delete, no
+    // clipboard notification, no version bump.
+    drive(|h| async move {
+        step(&h, Action::Insert("hi".into())).await;
+        let snap = step(&h, Action::Cut).await;
+        assert_eq!(snap.text.to_string(), "hi");
+        assert_eq!(snap.version, 1);
+        assert!(h.notifications.try_recv().is_err());
+    });
+}
+
+#[test]
+fn paste_is_its_own_undo_unit_not_merged_into_prior_typing() {
+    // Regression (undo-coalescing bug): a single-char paste right after typing must
+    // NOT fold into the typing run. Put "X" in the register, type "a", paste "X":
+    // one Undo removes only the paste, leaving "a" - never both (SPEC §2.4: a paste
+    // is one distinct action, not part of the typing run).
+    drive(|h| async move {
+        // Load the register with a single char: insert "X", select it, copy.
+        step(&h, Action::Insert("X".into())).await;
+        select_first(&h, 1).await;
+        step(&h, Action::Copy).await;
+        // Reset to an empty buffer with a fresh caret: undo the insert, so the
+        // typing run below starts clean at the origin.
+        step(&h, Action::Undo).await;
+        assert!(step(&h, Action::RequestSnapshot).await.text.is_empty());
+
+        step(&h, Action::Insert("a".into())).await; // opens a coalescing run
+        let pasted = step(&h, Action::Paste).await;
+        assert_eq!(pasted.text.to_string(), "aX");
+        // One Undo peels off only the paste.
+        let after = step(&h, Action::Undo).await;
+        assert_eq!(
+            after.text.to_string(),
+            "a",
+            "paste must be its own undo unit"
+        );
+    });
+}
+
+#[test]
+fn multi_char_insert_is_its_own_undo_unit() {
+    // Regression (bracketed-paste bug): Event::Paste maps to one Action::Insert of
+    // the whole payload; a multi-character insert must be its own undo unit even
+    // with no newline, so it does not coalesce with adjacent typing. Type "a", then
+    // insert "hello" (the bracketed-paste shape); one Undo removes only "hello".
+    drive(|h| async move {
+        step(&h, Action::Insert("a".into())).await;
+        step(&h, Action::Insert("hello".into())).await;
+        let after = step(&h, Action::Undo).await;
+        assert_eq!(
+            after.text.to_string(),
+            "a",
+            "a multi-char insert must not merge with prior typing"
+        );
+    });
+}
+
+#[test]
+fn typing_after_a_paste_starts_a_fresh_undo_unit() {
+    // The reverse coupling: after a paste closes the run, the next typed character
+    // must open a NEW unit, not extend the paste. Type "a", paste "hello", type "b":
+    // one Undo removes only "b", leaving "ahello".
+    drive(|h| async move {
+        step(&h, Action::Insert("a".into())).await;
+        step(&h, Action::Insert("hello".into())).await; // paste-shaped, closes the run
+        step(&h, Action::Insert("b".into())).await; // must be its own unit
+        let after = step(&h, Action::Undo).await;
+        assert_eq!(
+            after.text.to_string(),
+            "ahello",
+            "typing after a paste must not extend the paste's undo unit"
+        );
+    });
+}
