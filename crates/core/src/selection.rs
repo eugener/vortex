@@ -8,9 +8,13 @@
 //! primary tracking) is built and tested from commit one because bolting it on
 //! afterwards is one of the most painful editor refactors (§2.2).
 //!
-//! Positions here are **byte offsets** (SPEC §4 canonical space). M1 stores raw
-//! offsets; M3 swaps them for anchors that survive concurrent edits (§2.1) - the
-//! motion API is shaped so that is a representation change, not a call-site one.
+//! Positions here are **byte offsets** (SPEC §4 canonical space) - a selection
+//! resolves to concrete bytes for the frontend. Surviving an edit is the anchor
+//! layer's job (`crate::anchor`, SPEC §2.1): the editor carries each caret across a
+//! change by transforming an [`Anchor`](crate::anchor) (a start is `Before`-biased,
+//! a caret/end `After`-biased), never by re-deriving raw offsets. Bias is applied at
+//! transform time, so endpoints stay plain offsets here and no call site changes when
+//! a future CRDT backend swaps in behind the same transform.
 //!
 //! Cursor motion is **by grapheme cluster** (§4), computed against a single
 //! line's text so cost is bounded by line length, never the file (§10.4).
@@ -138,8 +142,9 @@ impl SelectionSet {
     /// be non-overlapping (the post-edit case: each edit leaves one caret and the
     /// carets cannot collide once edit offsets are shifted). Coincident cursors
     /// are still merged defensively so the disjoint invariant always holds.
-    /// Primary is the first selection. An empty input falls back to the origin
-    /// cursor, since the set is never empty (SPEC §2.2).
+    /// Primary is the first selection; the caller can then [`Self::retarget_primary`]
+    /// to carry a specific caret's primary designation across an edit. An empty input
+    /// falls back to the origin cursor, since the set is never empty (SPEC §2.2).
     pub(crate) fn from_sorted_cursors(cursors: Vec<Selection>) -> Self {
         if cursors.is_empty() {
             return Self::at_origin();
@@ -152,6 +157,20 @@ impl SelectionSet {
         let head = set.selections[0].head;
         set.normalize(head);
         set
+    }
+
+    /// Point the primary at whichever selection covers byte `head`, leaving it
+    /// unchanged if none does. An edit uses this to keep the *same* caret primary
+    /// across the change (its head transformed like the rest), so the viewport keeps
+    /// following the cursor the user was on rather than snapping to the topmost one.
+    pub(crate) fn retarget_primary(&mut self, head: usize) {
+        if let Some(i) = self
+            .selections
+            .iter()
+            .position(|s| s.start() <= head && head <= s.end())
+        {
+            self.primary = i;
+        }
     }
 
     /// The selections, in sorted order.
@@ -214,6 +233,52 @@ impl SelectionSet {
             offset
         };
         *self = Self::single(Selection::new(anchor, offset));
+    }
+
+    /// Add a cursor one line below the bottommost caret, at that caret's grapheme
+    /// column (the column-select gesture, SPEC §2.2). The new cursor becomes primary
+    /// so the viewport follows it into view. A no-op at the last line (nowhere below);
+    /// if the new caret coincides with an existing one it merges away. Column
+    /// stability across repeated calls is anchored to the moving edge, not a set-wide
+    /// goal column - good enough for M3, refined when a sticky column lands.
+    pub fn add_cursor_below(&mut self, text: &Text) {
+        let from = self.selections.iter().map(|s| s.head).max().unwrap_or(0);
+        self.add_vertical(text, from, Motion::Down);
+    }
+
+    /// Add a cursor one line above the topmost caret, at that caret's grapheme column
+    /// (SPEC §2.2). Mirror of [`Self::add_cursor_below`]; a no-op at the first line.
+    pub fn add_cursor_above(&mut self, text: &Text) {
+        let from = self.selections.iter().map(|s| s.head).min().unwrap_or(0);
+        self.add_vertical(text, from, Motion::Up);
+    }
+
+    /// Shared body of the add-cursor-above/below gesture: step one line in `motion`
+    /// from `from`, and if that lands somewhere new, add it as a cursor and make it
+    /// primary. `motion` must be [`Motion::Up`] or [`Motion::Down`].
+    fn add_vertical(&mut self, text: &Text, from: usize, motion: Motion) {
+        let head = move_selection(text, Selection::cursor(from), motion, false).head;
+        if head == from {
+            return; // at the top/bottom edge: nothing to add
+        }
+        self.selections.push(Selection::cursor(head));
+        // Re-point primary at the freshly added caret (it covers `head`).
+        self.normalize(head);
+    }
+
+    /// Add a plain cursor at byte `offset` (a modifier-click), keeping the existing
+    /// selections (SPEC §2.2). `offset` is clamped to the buffer (SPEC §8). The new
+    /// cursor becomes primary; a coincident one merges away.
+    pub fn add_cursor(&mut self, text: &Text, offset: usize) {
+        let offset = offset.min(text.byte_len());
+        self.selections.push(Selection::cursor(offset));
+        self.normalize(offset);
+    }
+
+    /// Collapse a multi-cursor set back to the primary selection alone (Escape). The
+    /// primary keeps its anchor/head span; the other selections are dropped.
+    pub fn collapse_to_primary(&mut self) {
+        *self = Self::single(*self.primary());
     }
 
     /// Sort by start and merge overlapping/touching selections, then point

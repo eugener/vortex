@@ -94,14 +94,48 @@ fn plan_insert_over_two_cursors_is_descending() {
 
 #[test]
 fn selections_after_two_inserts_account_for_shift() {
-    // Edits at (descending) starts 4 and 1, each inserting "X" (1 byte).
-    // "abcdef" -> insert X at 1 -> "aXbcdef" (caret 2) -> insert X at shifted
-    // 5 -> "aXbcXdef" (caret 6). The earlier insert's +1 shift moves the
-    // later caret from 5 to 6.
-    let edits = vec![(4..4, "X".to_string()), (1..1, "X".to_string())];
-    let set = selections_after_edits(&edits);
+    // Two pre-edit carets at 1 and 4, each inserting "X" (1 byte) at itself.
+    // "abcdef" -> caret 1's X -> caret 2; caret 4 shifts to 5 by the earlier
+    // insert, then its own X -> caret 6. Each caret is an After-anchor transformed
+    // through the applied edits (SPEC §2.1).
+    let before =
+        SelectionSet::from_sorted_cursors(vec![Selection::cursor(1), Selection::cursor(4)]);
+    let changes = vec![
+        Change {
+            start: 1,
+            removed: String::new(),
+            inserted: "X".to_string(),
+        },
+        Change {
+            start: 4,
+            removed: String::new(),
+            inserted: "X".to_string(),
+        },
+    ];
+    let set = selections_after_edits(&before, &changes);
     let cursors: Vec<usize> = set.all().iter().map(|s| s.head).collect();
     assert_eq!(cursors, vec![2, 6]);
+}
+
+#[test]
+fn selections_after_edits_keeps_a_no_op_cursor() {
+    // Multi-cursor: a cursor at buffer start (whose backspace is a no-op) must
+    // survive an edit made by another cursor, shifted by it - not be dropped. Here a
+    // delete at offset 3..4 leaves the start caret at 0 and pulls the second caret in.
+    let before =
+        SelectionSet::from_sorted_cursors(vec![Selection::cursor(0), Selection::cursor(4)]);
+    let changes = vec![Change {
+        start: 3,
+        removed: "d".to_string(),
+        inserted: String::new(),
+    }];
+    let set = selections_after_edits(&before, &changes);
+    let cursors: Vec<usize> = set.all().iter().map(|s| s.head).collect();
+    assert_eq!(
+        cursors,
+        vec![0, 3],
+        "the start cursor is kept, the other shifts"
+    );
 }
 
 #[test]
@@ -710,6 +744,86 @@ fn multi_cursor_undo_restores_every_cursor() {
         e.selections.all(),
         &[Selection::cursor(1), Selection::cursor(4)]
     );
+}
+
+#[test]
+fn add_cursor_below_then_type_edits_every_line_through_the_loop() {
+    // The full multi-cursor path, now reachable through the message seam: type two
+    // lines, go to the start, add a cursor below, then type - both cursors insert as
+    // one action. Previously unreachable (no Action added a second cursor).
+    let (snap, _notes) = run_seam(&[
+        Action::Insert("ab\ncd".into()),
+        Action::MoveCursor {
+            motion: Motion::BufferStart,
+            extend: false,
+        },
+        Action::AddCursorBelow,
+        Action::Insert("X".into()),
+    ]);
+    assert_eq!(snap.text.to_string(), "Xab\nXcd");
+    // Two carets survive the edit, each just past its own inserted "X".
+    let heads: Vec<usize> = snap.selections.iter().map(|s| s.head).collect();
+    assert_eq!(heads, vec![1, 5]);
+    // AddCursorBelow made the lower caret primary; it stays primary across the edit
+    // (index 1, head 5) rather than snapping back to the topmost caret.
+    assert_eq!(
+        snap.primary, 1,
+        "the primary cursor is carried across the edit"
+    );
+}
+
+#[test]
+fn one_multi_cursor_insert_is_a_single_undo_unit_through_the_loop() {
+    // SPEC §2.4: one keystroke over N cursors is ONE undo entry. Build two cursors,
+    // type over both, then a single Undo restores the pre-edit text and both carets.
+    let (snap, _notes) = run_seam(&[
+        Action::Insert("ab\ncd".into()),
+        Action::MoveCursor {
+            motion: Motion::BufferStart,
+            extend: false,
+        },
+        Action::AddCursorBelow, // cursors at 0 and 3
+        Action::Insert("X".into()),
+        Action::Undo,
+    ]);
+    assert_eq!(
+        snap.text.to_string(),
+        "ab\ncd",
+        "one undo reverts both inserts"
+    );
+    let heads: Vec<usize> = snap.selections.iter().map(|s| s.head).collect();
+    assert_eq!(heads, vec![0, 3], "both carets restored");
+}
+
+#[test]
+fn collapse_selections_reduces_to_the_primary_through_the_loop() {
+    let (snap, _notes) = run_seam(&[
+        Action::Insert("ab\ncd\nef".into()),
+        Action::MoveCursor {
+            motion: Motion::BufferStart,
+            extend: false,
+        },
+        Action::AddCursorBelow,
+        Action::AddCursorBelow, // three cursors
+        Action::CollapseSelections,
+    ]);
+    assert_eq!(snap.selections.len(), 1, "collapsed to a single selection");
+}
+
+#[test]
+fn add_cursor_at_offset_through_the_loop_keeps_both_cursors() {
+    // A modifier-click adds a cursor without collapsing the set (unlike PlaceCursor).
+    let (snap, _notes) = run_seam(&[
+        Action::Insert("abcdef".into()),
+        Action::PlaceCursor {
+            offset: 1,
+            extend: false,
+        },
+        Action::AddCursorAt { offset: 4 },
+    ]);
+    let heads: Vec<usize> = snap.selections.iter().map(|s| s.head).collect();
+    assert_eq!(heads, vec![1, 4]);
+    assert_eq!(snap.version, 1, "adding cursors changes no text");
 }
 
 #[test]
