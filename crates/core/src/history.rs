@@ -113,6 +113,15 @@ impl History {
     pub fn record(&mut self, mut changes: Vec<Change>, before: SelectionSet, after: SelectionSet) {
         changes.sort_by_key(|c| c.start);
 
+        // Whether *this* edit is a single typed grapheme decides if a run stays open
+        // for the NEXT keystroke. Computed from the incoming edit (before it is moved
+        // into the node) rather than by re-inspecting the resulting node: a coalesced
+        // typing node ("ab") and a freshly recorded multi-char paste ("hello") are
+        // indistinguishable as nodes (both single-change pure inserts), but only the
+        // former should leave the run open. A paste closes the run so the next typed
+        // character starts its own undo unit (SPEC §2.4).
+        let opens_run = is_typed_grapheme(&changes);
+
         // Try to fold this into the current revision first, from the borrowed pieces
         // - on the hot single-caret typing path this avoids building a `Revision`
         // (and re-cloning `after`/the inserted text) only to drop it.
@@ -133,9 +142,10 @@ impl History {
             self.current = idx;
         }
 
-        // A character insert opens (or continues) a coalescing run; anything else
-        // closes it, so the next insert starts a fresh revision.
-        self.coalescing = self.node_is_coalescable(self.current);
+        // A single typed character opens (or continues) a coalescing run; anything
+        // else - a paste, a delete, a multi-cursor edit - closes it, so the next
+        // insert starts a fresh revision.
+        self.coalescing = opens_run;
     }
 
     /// Try to fold a new edit (`changes` + its post-edit `after` selections) into the
@@ -144,7 +154,9 @@ impl History {
     /// On success the current revision's inserted text grows and its `after`
     /// selections advance.
     fn try_coalesce(&mut self, changes: &[Change], after: &SelectionSet) -> bool {
-        if !changes_are_coalescable(changes) {
+        // The *incoming* edit must be a single typed grapheme (not a multi-char paste),
+        // so a paste immediately after typing does not fold into the typing run.
+        if !is_typed_grapheme(changes) {
             return false;
         }
         let new_change = &changes[0];
@@ -227,23 +239,35 @@ impl History {
     pub fn break_coalescing(&mut self) {
         self.coalescing = false;
     }
-
-    /// Whether node `idx`'s revision is a coalescable character insert (the root,
-    /// with no revision, never is).
-    fn node_is_coalescable(&self, idx: usize) -> bool {
-        self.nodes[idx]
-            .revision
-            .as_ref()
-            .is_some_and(|revision| changes_are_coalescable(&revision.changes))
-    }
 }
 
-/// An edit that can start or continue a coalescing run: exactly one change, a pure
-/// insert (nothing removed), and no newline in the inserted text (break rule (c)).
-/// One change also implies a single caret, so multi-cursor typing does not coalesce
-/// across time - each keystroke stays its own (still one) undo unit.
+/// Whether a node's revision is an **open typing run** a further keystroke may extend:
+/// exactly one change, a pure insert (nothing removed), and no newline (break rule
+/// (c)). One change also implies a single caret, so multi-cursor typing does not
+/// coalesce across time - each keystroke stays its own (still one) undo unit. This is
+/// the *loose* check: it accepts a node that has already accumulated several typed
+/// characters ("abc"), which is exactly what the current run holds after a few
+/// keystrokes. The *incoming* edit is gated more tightly by [`is_typed_grapheme`].
 fn changes_are_coalescable(changes: &[Change]) -> bool {
     changes.len() == 1 && changes[0].removed.is_empty() && !changes[0].inserted.contains('\n')
+}
+
+/// Whether an incoming edit is a single typed grapheme - the *only* kind that may open
+/// or extend a coalescing run. Stricter than [`changes_are_coalescable`]: it also
+/// requires the inserted text to be exactly one grapheme cluster, so a multi-character
+/// insert - a paste, a bracketed paste (`Event::Paste` -> one `Insert`), or a snippet -
+/// is its own undo unit and one Undo never reverts both the paste and the typing before
+/// it (SPEC §2.4: a paste is one distinct action, not part of the typing run). A typed
+/// character is one grapheme even when multi-byte (`é`, an emoji), so ordinary typing
+/// still coalesces.
+fn is_typed_grapheme(changes: &[Change]) -> bool {
+    use unicode_segmentation::UnicodeSegmentation;
+    if !changes_are_coalescable(changes) {
+        return false;
+    }
+    let mut graphemes = changes[0].inserted.graphemes(true);
+    // Exactly one grapheme: a first one exists and there is no second.
+    graphemes.next().is_some() && graphemes.next().is_none()
 }
 
 /// Forward edits to REDO `changes`: re-apply each as originally done. `changes` are

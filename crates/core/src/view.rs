@@ -122,6 +122,13 @@ pub enum Notification {
         path: Option<PathBuf>,
         message: String,
     },
+    /// The clipboard register changed (a `Copy`/`Cut`), carrying the flattened
+    /// text the frontend should push to the OS clipboard (SPEC §11). Flattened
+    /// because the OS clipboard is a single string: the per-selection register
+    /// entries are joined with newlines here, while the structured register stays
+    /// in the core for a `Paste` round-trip. Serializable so it rides the remote
+    /// seam too (a remote frontend bridges to *its* clipboard).
+    SetClipboard { text: String },
     /// The core has stopped its loop and will send nothing further.
     ShuttingDown,
 }

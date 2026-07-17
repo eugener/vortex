@@ -146,6 +146,39 @@ fn a_newline_insert_breaks_coalescing() {
 }
 
 #[test]
+fn a_multi_char_insert_does_not_coalesce_with_adjacent_typing() {
+    // A multi-character insert (a paste / bracketed paste - one `Insert` of the whole
+    // payload) is its own undo unit even with no newline: only a single typed grapheme
+    // opens or extends a run. Type 'a', paste "bc" adjacently, type 'd'; the paste and
+    // each typed char stay separate, so three undos peel them one at a time.
+    let mut h = History::new();
+    h.record(insert(0, "a").0, caret(0), caret(1)); // single char: opens a run
+    h.record(insert(1, "bc").0, caret(1), caret(3)); // multi-char: its own unit
+    h.record(insert(3, "d").0, caret(3), caret(4)); // typing after paste: new unit
+
+    let mut buf = "abcd".to_string();
+    apply(&mut buf, &h.undo().unwrap().edits);
+    assert_eq!(buf, "abc", "the trailing 'd' is its own unit");
+    apply(&mut buf, &h.undo().unwrap().edits);
+    assert_eq!(buf, "a", "the pasted \"bc\" is its own unit");
+    apply(&mut buf, &h.undo().unwrap().edits);
+    assert_eq!(buf, "", "the leading 'a' remains");
+}
+
+#[test]
+fn a_single_multibyte_grapheme_still_coalesces() {
+    // A typed multi-byte character (é, an emoji) is one grapheme from one keypress, so
+    // it must still coalesce - the fix keys on grapheme count, not byte length.
+    let mut h = History::new();
+    h.record(insert(0, "é").0, caret(0), caret(2)); // 2 bytes, 1 grapheme
+    h.record(insert(2, "a").0, caret(2), caret(3)); // adjacent single char
+
+    let mut buf = "éa".to_string();
+    apply(&mut buf, &h.undo().unwrap().edits);
+    assert_eq!(buf, "", "one undo removes the whole coalesced run");
+}
+
+#[test]
 fn break_coalescing_starts_a_new_undo_unit() {
     // A motion between two inserts (modeled by break_coalescing) prevents the
     // merge, so undo peels the second insert only (rule (d)).
