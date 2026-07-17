@@ -124,6 +124,9 @@ enum Command {
     DeleteForward,
     InsertNewline,
     InsertTab,
+    AddCursorAbove,
+    AddCursorBelow,
+    CollapseSelections,
     /// A cursor motion; `extend` grows the selection (the `select_*` names).
     Move {
         kind: MoveKind,
@@ -190,6 +193,9 @@ impl Command {
             "delete_forward" => Command::DeleteForward,
             "insert_newline" => Command::InsertNewline,
             "insert_tab" => Command::InsertTab,
+            "add_cursor_above" => Command::AddCursorAbove,
+            "add_cursor_below" => Command::AddCursorBelow,
+            "collapse_selections" => Command::CollapseSelections,
             _ => return None,
         })
     }
@@ -205,6 +211,9 @@ impl Command {
             Command::DeleteForward => Action::DeleteForward,
             Command::InsertNewline => Action::Insert("\n".to_string()),
             Command::InsertTab => Action::Insert("\t".to_string()),
+            Command::AddCursorAbove => Action::AddCursorAbove,
+            Command::AddCursorBelow => Action::AddCursorBelow,
+            Command::CollapseSelections => Action::CollapseSelections,
             Command::Move { kind, extend } => Action::MoveCursor {
                 motion: kind.motion(page),
                 extend,
@@ -257,6 +266,12 @@ const DEFAULT_BINDINGS: &[(&str, &str)] = &[
     ("shift+end", "select_line_end"),
     ("shift+pageup", "select_page_up"),
     ("shift+pagedown", "select_page_down"),
+    // Multi-cursor (SPEC §2.2). The Ctrl+Alt+Arrow chords need the Kitty protocol's
+    // modifier reporting (negotiated at startup); a classic terminal simply never
+    // matches them rather than misfiring. Esc collapses back to one cursor.
+    ("ctrl+alt+up", "add_cursor_above"),
+    ("ctrl+alt+down", "add_cursor_below"),
+    ("esc", "collapse_selections"),
 ];
 
 /// Undo/redo bindings, on the platform's native command modifier: Cmd on macOS
@@ -594,8 +609,34 @@ mod tests {
     }
 
     #[test]
-    fn esc_is_unmapped_by_default() {
-        assert_eq!(act(press(KeyCode::Esc)), None);
+    fn esc_collapses_selections_by_default() {
+        // Esc reduces a multi-cursor set back to the primary (SPEC §2.2).
+        assert_eq!(act(press(KeyCode::Esc)), Some(Action::CollapseSelections));
+    }
+
+    #[test]
+    fn ctrl_alt_arrows_add_cursors() {
+        // The column-select gesture: Ctrl+Alt+Up/Down add a cursor above/below.
+        let up = with_mods(KeyCode::Up, KeyModifiers::CONTROL | KeyModifiers::ALT);
+        let down = with_mods(KeyCode::Down, KeyModifiers::CONTROL | KeyModifiers::ALT);
+        assert_eq!(act(up), Some(Action::AddCursorAbove));
+        assert_eq!(act(down), Some(Action::AddCursorBelow));
+    }
+
+    #[test]
+    fn multi_cursor_command_names_parse() {
+        assert_eq!(
+            Command::parse("add_cursor_above"),
+            Some(Command::AddCursorAbove)
+        );
+        assert_eq!(
+            Command::parse("add_cursor_below"),
+            Some(Command::AddCursorBelow)
+        );
+        assert_eq!(
+            Command::parse("collapse_selections"),
+            Some(Command::CollapseSelections)
+        );
     }
 
     #[test]

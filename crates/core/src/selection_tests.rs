@@ -399,6 +399,79 @@ fn primary_index_points_at_primary_selection() {
 }
 
 #[test]
+fn add_cursor_below_adds_a_caret_on_the_next_line_at_the_same_column() {
+    let t = text("abcde\nfghij\nklmno");
+    let mut s = SelectionSet::single(Selection::cursor(2)); // line 0, col 2
+    s.add_cursor_below(&t);
+    assert_eq!(s.len(), 2);
+    // Line 1 starts at byte 6; col 2 => byte 8. The new caret is primary.
+    assert_eq!(s.all()[1], Selection::cursor(8));
+    assert_eq!(s.primary().head, 8);
+    // Again: a third caret on line 2 (starts at 12) at col 2 => byte 14.
+    s.add_cursor_below(&t);
+    assert_eq!(s.len(), 3);
+    assert_eq!(s.primary().head, 14);
+}
+
+#[test]
+fn add_cursor_above_adds_a_caret_on_the_previous_line() {
+    let t = text("abcde\nfghij");
+    let mut s = SelectionSet::single(Selection::cursor(8)); // line 1, col 2
+    s.add_cursor_above(&t);
+    assert_eq!(s.len(), 2);
+    assert_eq!(s.all()[0], Selection::cursor(2)); // line 0 col 2
+    assert_eq!(s.primary().head, 2); // the new caret is primary
+}
+
+#[test]
+fn add_cursor_below_at_the_last_line_is_a_no_op() {
+    let t = text("abc\ndef");
+    let mut s = SelectionSet::single(Selection::cursor(5)); // line 1
+    s.add_cursor_below(&t);
+    assert_eq!(s.len(), 1, "nowhere below the last line");
+}
+
+#[test]
+fn add_cursor_above_at_the_first_line_is_a_no_op() {
+    let t = text("abc\ndef");
+    let mut s = SelectionSet::single(Selection::cursor(1)); // line 0
+    s.add_cursor_above(&t);
+    assert_eq!(s.len(), 1, "nowhere above the first line");
+}
+
+#[test]
+fn add_cursor_at_offset_keeps_existing_cursors() {
+    let t = text("abcdef");
+    let mut s = SelectionSet::single(Selection::cursor(1));
+    s.add_cursor(&t, 4);
+    assert_eq!(s.len(), 2);
+    assert_eq!(s.all()[0], Selection::cursor(1));
+    assert_eq!(s.all()[1], Selection::cursor(4));
+    assert_eq!(s.primary().head, 4); // the added cursor is primary
+}
+
+#[test]
+fn add_cursor_clamps_past_the_buffer_end_and_merges_coincident() {
+    let t = text("abc"); // len 3
+    let mut s = SelectionSet::single(Selection::cursor(3));
+    s.add_cursor(&t, 999); // clamps to 3, coincident with the existing caret
+    assert_eq!(s.len(), 1, "a clamped, coincident cursor merges away");
+    assert_eq!(s.primary().head, 3);
+}
+
+#[test]
+fn collapse_to_primary_drops_the_other_cursors() {
+    let t = text("abcdef");
+    let mut s = SelectionSet::from_sorted_cursors(vec![Selection::cursor(1), Selection::cursor(4)]);
+    s.add_cursor(&t, 2); // three cursors, primary at 2
+    assert_eq!(s.len(), 3);
+    let primary = *s.primary();
+    s.collapse_to_primary();
+    assert_eq!(s.len(), 1);
+    assert_eq!(*s.primary(), primary);
+}
+
+#[test]
 fn byte_of_position_consistency_smoke() {
     // Guard that motions and buffer coordinate conversion agree: moving right
     // grapheme-by-grapheme visits the same offsets Buffer reports as valid.

@@ -6,6 +6,7 @@
 //! frontends (GUI, web, remote) attach later without touching core logic.
 
 pub mod action;
+mod anchor;
 pub mod buffer;
 pub mod editor;
 mod history;

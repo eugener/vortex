@@ -50,6 +50,10 @@ pub struct Theme {
     /// The cursor line's background - a subtle tint filling the whole row so the
     /// active line is easy to find without pulling the eye like a selection does.
     pub current_line: Style,
+    /// The marker for a *secondary* (non-primary) caret in a multi-cursor set
+    /// (SPEC §2.2). The terminal has a single real cursor, which the primary caret
+    /// uses; the others are painted as a one-cell reversed block so they are visible.
+    pub secondary_cursor: Style,
 }
 
 impl Default for Theme {
@@ -69,6 +73,9 @@ impl Default for Theme {
                 .bg(Color::Rgb(38, 79, 120))
                 .fg(Color::Rgb(255, 255, 255)),
             current_line: Style::new().bg(Color::Indexed(236)),
+            // Reversed video reads as a block caret against whatever it sits on,
+            // without committing to a palette color (SPEC §2.2 multi-cursor).
+            secondary_cursor: Style::new().add_modifier(Modifier::REVERSED),
         }
     }
 }
@@ -112,5 +119,7 @@ mod tests {
         assert_eq!(t.selection.bg, Some(Color::Rgb(38, 79, 120)));
         assert_eq!(t.selection.fg, Some(Color::Rgb(255, 255, 255)));
         assert_eq!(t.current_line.bg, Some(Color::Indexed(236)));
+        // A secondary caret is a reversed-video marker (multi-cursor, SPEC §2.2).
+        assert!(t.secondary_cursor.add_modifier.contains(Modifier::REVERSED));
     }
 }

@@ -27,6 +27,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use async_channel::{Receiver, Sender};
 
 use crate::action::Action;
+use crate::anchor::{Anchor, Edit};
 use crate::buffer::{Buffer, RopeBuffer};
 use crate::history::{Change, History, Reverted};
 use crate::selection::{Selection, SelectionSet};
@@ -154,6 +155,30 @@ impl Editor {
     fn place_cursor(&mut self, offset: usize, extend: bool) {
         let text = self.buffer.text();
         self.selections.place(&text, offset, extend);
+    }
+
+    /// Add a cursor above (or below) the current set (SPEC §2.2). Pure selection
+    /// change, like [`Self::move_cursor`]: no delta, no version bump.
+    fn add_cursor_vertical(&mut self, above: bool) {
+        let text = self.buffer.text();
+        if above {
+            self.selections.add_cursor_above(&text);
+        } else {
+            self.selections.add_cursor_below(&text);
+        }
+    }
+
+    /// Add a cursor at byte `offset` (a modifier-click, SPEC §2.2), keeping the
+    /// existing cursors. Pure selection change.
+    fn add_cursor_at(&mut self, offset: usize) {
+        let text = self.buffer.text();
+        self.selections.add_cursor(&text, offset);
+    }
+
+    /// Collapse a multi-cursor set back to the primary selection alone (Escape,
+    /// SPEC §2.2). Pure selection change; no buffer access needed.
+    fn collapse_selections(&mut self) {
+        self.selections.collapse_to_primary();
     }
 
     /// Compute the edits an `Insert`/`Delete` action produces over the selection
@@ -308,6 +333,29 @@ async fn run(
                 editor.history.break_coalescing();
                 Step::Republish
             }
+            // Changing the cursor set ends the coalescing run (SPEC §2.4 break rule
+            // (d)), so a following typed character starts a fresh undo unit - one that
+            // spans every cursor at once.
+            Action::AddCursorAbove => {
+                editor.add_cursor_vertical(true);
+                editor.history.break_coalescing();
+                Step::Republish
+            }
+            Action::AddCursorBelow => {
+                editor.add_cursor_vertical(false);
+                editor.history.break_coalescing();
+                Step::Republish
+            }
+            Action::AddCursorAt { offset } => {
+                editor.add_cursor_at(offset);
+                editor.history.break_coalescing();
+                Step::Republish
+            }
+            Action::CollapseSelections => {
+                editor.collapse_selections();
+                editor.history.break_coalescing();
+                Step::Republish
+            }
             Action::Undo => Step::Undo,
             Action::Redo => Step::Redo,
             Action::RequestSnapshot => Step::Republish,
@@ -382,10 +430,10 @@ async fn apply_edit(
         return snapshots.publish(editor.snapshot(None));
     }
 
-    // Remap selections to sit at the end of each applied edit (a cursor after the
-    // inserted text / at the deletion point). Recomputed from the edits so the set
-    // stays disjoint and sorted.
-    editor.selections = selections_after_edits(&edits);
+    // Remap selections by transforming each pre-edit caret through the applied
+    // edits (SPEC §2.1 anchors): a cursor lands after its own inserted text / at its
+    // deletion point, and every other cursor shifts by the edits around it.
+    editor.selections = selections_after_edits(&before, &changes);
     editor.version += 1;
     // One user action is one undo unit, even when it fanned across N cursors
     // (SPEC §2.4). Coalescing (single-caret typing) is decided inside `record`.
@@ -758,27 +806,42 @@ fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), String> {
     Ok(())
 }
 
-/// Cursor positions after applying `edits` (sorted descending by start). Each edit
-/// leaves a cursor just past its inserted text. Rebuilt as a fresh set so the
-/// disjoint+sorted invariant holds.
-fn selections_after_edits(edits: &[(std::ops::Range<usize>, String)]) -> SelectionSet {
-    // `edits` is descending; walk ascending so cumulative offset shifts compose.
-    let mut ascending: Vec<&(std::ops::Range<usize>, String)> = edits.iter().collect();
-    ascending.sort_by_key(|(r, _)| r.start);
+/// Cursor positions after `changes` apply to the buffer they were computed against.
+/// Each pre-edit selection's caret (its `head`) is an [`Anchor::after`] - it rides to
+/// the right of inserted text - transformed through the applied edits (SPEC §2.1). So
+/// one keystroke over N cursors lands N carets at once, and a cursor whose own edit
+/// was a no-op (e.g. backspace at buffer start) still shifts with its neighbors'
+/// edits instead of being dropped. Rebuilt as a fresh set so the disjoint+sorted
+/// invariant holds: the pre-edit heads are ascending and the transform is monotonic,
+/// so the results stay ordered (coincident carets merge).
+fn selections_after_edits(before: &SelectionSet, changes: &[Change]) -> SelectionSet {
+    // Applied edits in base coordinates, ascending by start - the contract
+    // `transform_through` expects. `changes` arrive descending (the back-to-front
+    // application order), so sort a fresh copy.
+    let mut edits: Vec<Edit> = changes
+        .iter()
+        .map(|c| Edit {
+            start: c.start,
+            old_end: c.start + c.removed.len(),
+            insert_len: c.inserted.len(),
+        })
+        .collect();
+    edits.sort_by_key(|e| e.start);
 
-    let mut shift: isize = 0;
-    let mut cursors: Vec<Selection> = Vec::with_capacity(ascending.len());
-    for (range, new_text) in ascending {
-        let start = (range.start as isize + shift) as usize;
-        let caret = start + new_text.len();
-        cursors.push(Selection::cursor(caret));
-        // This edit removed `range.len()` bytes and added `new_text.len()`.
-        shift += new_text.len() as isize - (range.end - range.start) as isize;
-    }
-
-    // Build the set directly; positions are already sorted ascending and an edit's
-    // caret cannot overlap the next edit's shifted range.
-    SelectionSet::from_sorted_cursors(cursors)
+    let cursors: Vec<Selection> = before
+        .all()
+        .iter()
+        .map(|sel| Selection::cursor(Anchor::after(sel.head).transform_through(&edits).offset()))
+        .collect();
+    let mut set = SelectionSet::from_sorted_cursors(cursors);
+    // Carry the primary across the edit: transform its caret the same way and keep
+    // whichever surviving cursor lands there as primary, so the viewport follows the
+    // cursor the user was on instead of snapping to the topmost caret.
+    let primary_head = Anchor::after(before.primary().head)
+        .transform_through(&edits)
+        .offset();
+    set.retarget_primary(primary_head);
+    set
 }
 
 #[cfg(test)]

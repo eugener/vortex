@@ -145,6 +145,8 @@ Options:
 
 Keys:
   Ctrl+S           Save        Ctrl+Q / Ctrl+C   Quit
+  Ctrl+Alt+Up/Down Add cursor above/below        Alt+Click  Add cursor
+  Esc              Collapse to one cursor
 ";
 
 /// The undo/redo line of the help, on the platform's command modifier - Cmd on
@@ -304,6 +306,7 @@ fn event_loop(
                     MouseEventKind::Down(MouseButton::Left)
                     | MouseEventKind::Drag(MouseButton::Left) => {
                         if let Some(snap) = &latest {
+                            let is_press = matches!(mouse.kind, MouseEventKind::Down(_));
                             let extend = matches!(mouse.kind, MouseEventKind::Drag(_))
                                 || mouse.modifiers.contains(KeyModifiers::SHIFT);
                             let offset = pointer_offset(snap, viewport, mouse.column, mouse.row);
@@ -312,11 +315,17 @@ fn event_loop(
                             if message.take().is_some() {
                                 needs_redraw = true;
                             }
-                            if handle
-                                .actions
-                                .send_blocking(Action::PlaceCursor { offset, extend })
-                                .is_err()
+                            // Alt+click adds a cursor without collapsing the set
+                            // (SPEC §2.2 multi-cursor); a plain click/drag places or
+                            // extends the single caret. Alt only adds on a fresh
+                            // press, never mid-drag.
+                            let action = if is_press && mouse.modifiers.contains(KeyModifiers::ALT)
                             {
+                                Action::AddCursorAt { offset }
+                            } else {
+                                Action::PlaceCursor { offset, extend }
+                            };
+                            if handle.actions.send_blocking(action).is_err() {
                                 return Ok(());
                             }
                         }
@@ -465,6 +474,7 @@ fn paint(
             gutter_current: theme.gutter_current,
             selection: theme.selection,
             current_line: theme.current_line,
+            secondary_cursor: theme.secondary_cursor,
         },
     );
     paint_status_bar(
@@ -533,17 +543,20 @@ struct Body {
     selection: Style,
     /// Background tint filling the cursor's whole row (from the active theme).
     current_line: Style,
+    /// Marker for a non-primary caret in a multi-cursor set (from the active theme).
+    secondary_cursor: Style,
 }
 
 /// Paint the text body with a line-number gutter. Each visible row is a gutter
 /// span (dim, or bold for the cursor's line) followed by the tab-expanded line
 /// rendered to styled spans over the horizontal window `[h_scroll, h_scroll +
 /// text_width)`. The gutter is fixed (never scrolls horizontally); only the text
-/// slides under it. Two overlays tint the text: the cursor's row gets a full-width
-/// [`Body::current_line`] wash (via the row's base style), and every selection
-/// paints [`Body::selection`] over the columns it covers (SPEC §2.2 - the primary
-/// caret still renders as the terminal cursor, so a zero-width selection shows
-/// nothing here).
+/// slides under it. Overlays tint the text: the cursor's row gets a full-width
+/// [`Body::current_line`] wash (via the row's base style), every selection paints
+/// [`Body::selection`] over the columns it covers, and every *non-primary* caret
+/// gets a one-cell [`Body::secondary_cursor`] block so a multi-cursor set is visible
+/// (SPEC §2.2 - the primary caret renders as the terminal's own cursor, so its
+/// zero-width selection shows nothing here).
 fn paint_body(frame: &mut Frame, area: Rect, snapshot: &ViewSnapshot, body: Body) {
     let text = &snapshot.text;
     let height = area.height as usize;
@@ -573,7 +586,7 @@ fn paint_body(frame: &mut Frame, area: Rect, snapshot: &ViewSnapshot, body: Body
                 .byte_of_line(line_index + 1)
                 .unwrap_or_else(|| text.byte_len());
             let raw = text.line(line_index).unwrap_or_default();
-            let overlays: Vec<(std::ops::Range<usize>, Style)> = snapshot
+            let mut overlays: Vec<(std::ops::Range<usize>, Style)> = snapshot
                 .selections
                 .iter()
                 .filter_map(|s| {
@@ -588,6 +601,19 @@ fn paint_body(frame: &mut Frame, area: Rect, snapshot: &ViewSnapshot, body: Body
                     .map(|range| (range, body.selection))
                 })
                 .collect();
+            // Mark every secondary (non-primary) caret with a one-cell block so a
+            // multi-cursor set is visible: the terminal has a single real cursor,
+            // which the primary uses (SPEC §2.2). Pushed after the selection washes
+            // so a caret shows on top of any highlight sharing its cell.
+            for (i, s) in snapshot.selections.iter().enumerate() {
+                if i == snapshot.primary || !s.is_cursor() {
+                    continue;
+                }
+                if text.line_of_byte(s.head) == line_index {
+                    let col = layout::display_column(&raw, s.head - line_start, TAB_WIDTH);
+                    overlays.push((col..col + 1, body.secondary_cursor));
+                }
+            }
 
             let mut spans = vec![Span::styled(
                 layout::gutter_label(line_index, body.gutter_width),
@@ -1045,6 +1071,32 @@ mod tests {
         assert_eq!(buf.cell((4, 1)).unwrap().fg, sel.fg.unwrap());
         // A cell past the selected text is not part of the selection.
         assert_ne!(buf.cell((20, 1)).unwrap().bg, sel.bg.unwrap());
+    }
+
+    #[test]
+    fn secondary_caret_is_painted_as_a_reversed_cell() {
+        // Multi-cursor: type two lines, go to the top, add a cursor below. The new
+        // caret (line 1) is primary and shows as the terminal cursor; the caret left
+        // on line 0 is secondary and must be visible as a one-cell reversed block.
+        let snap = snapshot_after(&[
+            Action::Insert("ab\ncd".into()),
+            Action::MoveCursor {
+                motion: vortex_core::Motion::BufferStart,
+                extend: false,
+            },
+            Action::AddCursorBelow,
+        ]);
+        assert_eq!(snap.selections.len(), 2, "two carets");
+        let buf = render(&snap, 40, 10);
+        // Secondary caret at line 0, col 0 -> body row 1, screen col 4 (past the
+        // 4-cell gutter). It carries the reversed-video marker.
+        assert!(
+            buf.cell((4, 1))
+                .unwrap()
+                .modifier
+                .contains(Modifier::REVERSED),
+            "secondary caret cell should be reversed"
+        );
     }
 
     #[test]

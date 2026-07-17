@@ -30,6 +30,20 @@ pub enum Action {
     /// drag grows a selection; otherwise the set becomes a plain cursor at `offset`.
     /// `offset` is clamped to the buffer defensively (SPEC §8).
     PlaceCursor { offset: usize, extend: bool },
+    /// Add a cursor one line above the topmost caret at its column, keeping the
+    /// existing cursors (the column-select gesture, SPEC §2.2). A no-op at the first
+    /// line. Changes only the selection set: no text, so no delta or version bump.
+    AddCursorAbove,
+    /// Add a cursor one line below the bottommost caret at its column (SPEC §2.2).
+    /// A no-op at the last line.
+    AddCursorBelow,
+    /// Add a plain cursor at absolute byte `offset` (a modifier-click), keeping the
+    /// existing cursors (SPEC §2.2). Like [`Action::PlaceCursor`] the frontend
+    /// resolves the pointer to an offset; `offset` is clamped to the buffer (SPEC §8).
+    AddCursorAt { offset: usize },
+    /// Collapse a multi-cursor set back to the primary selection alone (Escape,
+    /// SPEC §2.2). The primary keeps its span; the rest are dropped.
+    CollapseSelections,
     /// Insert `text` at every selection, replacing any non-empty selection first.
     /// A bracketed paste is ONE such action, not a key-per-character (SPEC §6).
     Insert(String),
