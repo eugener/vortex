@@ -56,7 +56,7 @@ boundary, in-process, as message-passing:
 ```
 Frontend  ── Action ─────────▶  [ Core: single-owner actor task ]
 Frontend  ◀─ Delta ───────────     owns SelectionSet, buffers,
-Frontend  ◀─ ViewSnapshot ────     undo tree, syntax trees, styles
+Frontend  ◀─ ViewSnapshot ────     undo tree, syntax trees, decorations
 Frontend  ◀─ Notification ────     (select! over inbound channels)
 LSP client ─ Response ───────▶
 FS watcher ── FsEvent ───────▶
@@ -147,7 +147,7 @@ Retrofitting this onto a single-cursor core is one of the most painful editor re
 Not `Arc<RwLock<Editor>>` shared across threads - that is the road to
 held-lock-across-`.await` deadlocks. Instead:
 
-- One task owns `SelectionSet`, buffers, undo tree, syntax trees, styles. Edits mutate
+- One task owns `SelectionSet`, buffers, undo tree, syntax trees, decorations. Edits mutate
   directly: single owner, zero locking, no data races.
 - LSP client and FS watcher are async tasks that **send messages in**.
 - Heavy tree-sitter reparses run on a **cheap `crop` snapshot** off the critical path
@@ -287,24 +287,22 @@ struct ViewSnapshot {
     version: u64,                 // PER-BUFFER monotonic counter; frontend ignores older
     text: crop::Rope,             // Arc-shared - cheap clone (verified §3)
     selections: Arc<[Selection]>, // Arc-shared - resolved to concrete positions at `version`
-    styles: Arc<StyleMap>,        // Arc-shared - see representation below
+    decorations: Arc<DecorationSet>, // Arc-shared - syntax/diagnostics/git/inlays (below)
     // ... line-count, dirty hint (changed line range) for partial repaint
 }
 ```
 
-- **Every field is cheaply shared, not just `text`.** `selections` and `styles` are behind
+- **Every field is cheaply shared, not just `text`.** `selections` and `decorations` are behind
   `Arc` too, so building a snapshot is a handful of atomic ref-count bumps regardless of
   file size or match count - *not* an O(spans) or O(selections) deep clone per frame. (The
   earlier draft only shared `text`; sharing just the rope while deep-cloning a
   `Vec<span>`/`Vec<selection>` would silently reintroduce per-frame cost - the exact thing
   this model exists to avoid.)
-- **Style representation (resolve the A↔C contradiction):** `StyleMap` stores spans as
-  **anchors internally** (so they survive edits without a reparse), and the frontend
-  **resolves anchors to concrete ranges lazily, for the visible line range only** - never
-  eagerly for the whole file. This bounds resolution cost to viewport size and keeps
-  snapshot construction O(1)-ish.
+- **Decoration representation:** every overlay the core computes (syntax, diagnostics, git
+  signs, inline hints) shares **one** anchor-backed channel, resolved lazily for the visible
+  line range only - see *Decorations* below.
 - **Frontend owns the viewport.** It holds the latest `ViewSnapshot` and, on its own render
-  tick, reads exactly the visible line range from `text` + `styles` and paints. Scrolling
+  tick, reads exactly the visible line range from `text` + `decorations` and paints. Scrolling
   = read a different range from the *same* snapshot. **No message to the core.** This is the
   concrete mechanism that avoids Xi's round-trip-to-scroll.
 - **Latest-wins:** the frontend only ever needs the newest snapshot. Intermediate ones
@@ -321,16 +319,55 @@ snapshot-diffing adapter the earlier draft needed, rather than isolating its cos
 `proto/`. Initial full-buffer sync for a newly-attached remote frontend is one `SetText`
 delta variant (send the whole buffer once), after which only incremental deltas flow.
 
-### Styling pipeline (why styles may lag text by a frame, and why that's fine)
+### Decorations: one anchor-backed channel, not four ad-hoc fields
+
+Syntax highlighting is not the only thing the core computes that the frontend paints at a
+position. LSP **diagnostics** (underlines + gutter severity marks), **git diff signs**
+(added/changed/removed bars), and **inline hints** (LSP inlay hints, end-of-line diagnostic
+messages, later AI ghost text) are the same shape: a payload attached to a buffer position
+that must **survive concurrent edits** - i.e. anchor-backed (§2.1). Giving each its own
+`ViewSnapshot` field would re-plumb the seam, the snapshot builder, and the render loop once
+per feature. Instead there is **one** `decorations` channel carrying a typed set:
+
+```
+enum Decoration {
+    Highlight   { span: (Anchor, Anchor), style: StyleId },      // syntax, semantic tokens, bracket match
+    Underline   { span: (Anchor, Anchor), style: UnderlineStyle }, // error/warn undercurl, spelling
+    GutterMark  { line: Anchor, kind: GutterKind },              // diagnostic severity, git add/change/del
+    VirtualText { at: Anchor, placement: Placement, text: Box<str> }, // inlay hint, eol diagnostic, ghost text
+}
+```
+
+- **Anchor-backed, resolved lazily for the visible range only** (the old `StyleMap` rule,
+  now generalized): the `DecorationSet` stores anchors internally so decorations survive
+  edits without a reparse; the frontend resolves anchors to concrete ranges **only for the
+  visible line range**, never eagerly for the whole file. Snapshot construction stays
+  O(1)-ish (a few `Arc` bumps); resolution cost is bounded by viewport size.
+- **Producers are independent and async:** tree-sitter feeds `Highlight`s (M4), the LSP
+  client feeds `Underline`/`GutterMark`/`VirtualText` diagnostics and inlay hints (M2), a
+  git-diff task feeds `GutterMark`s (M8). Each lands on its own version and **may lag text by
+  a frame** (pipeline below) - correct, because text is never stale and overlays only trail.
+- **Styling stays frontend-owned.** A `StyleId`/`GutterKind` is a *semantic* tag (`keyword`,
+  `error`, `git.added`), never an RGB color. The theme (§10.5) maps tags → concrete
+  colors/attributes, so identical core output themes light/dark and truecolor/256-color
+  without the core knowing terminal capabilities.
+- **`Underline` is separate from `Highlight`** so one cell can carry a syntax foreground
+  color *and* an independent error undercurl at once (Kitty styled underlines, §9-adjacent);
+  merging them would lose that.
+
+This subsumes the earlier `styles: Arc<StyleMap>` - which is now exactly the `Highlight`
+kind - without changing its hard-won lazy-resolution and cheap-snapshot properties.
+
+### Decoration pipeline (why decorations may lag text by a frame, and why that's fine)
 
 Tree-sitter highlighting and LSP diagnostics are **too expensive to recompute
 synchronously per keystroke**. Flow:
 
 1. Edit applies to the buffer immediately (single owner, synchronous). Core emits a
-   snapshot with **text updated now**, styles carried forward / best-effort remapped
+   snapshot with **text updated now**, decorations carried forward / best-effort remapped
    through anchors.
 2. A background task reparses on the cheap snapshot clone; when done, the core emits a new
-   snapshot with **refreshed styles** at a later version.
+   snapshot with **refreshed decorations** at a later version.
 3. Result: **text is never stale** (user always sees what they typed instantly);
    highlighting may trail by a frame or two. This is the correct trade - the reverse
    (blocking on highlight before showing text) is exactly Xi's latency mistake.
@@ -400,7 +437,96 @@ Verified (crossterm 0.29, ratatui docs):
 **Approach:** own the loop; wrap each `draw` in the sync-update pair; frame-budget/coalesce
 input into one `draw`. Ceiling to know: Helix runs its own compositor because
 immediate-mode eventually is not enough - keep the frontend thin so replacing the renderer
-stays local. Earn the compositor by outgrowing ratatui.
+stays local. Earn the compositor by outgrowing ratatui. **"Compositor" is overloaded** here:
+this section defers the custom *cell renderer*; the *overlay/layer* compositor is a separate,
+thinner thing that §7.5 **does** build on top of ratatui - see there.
+
+---
+
+## 7.5 Frontend UI architecture (compositor, surfaces, chrome)
+
+§7 fixes *how a frame reaches the terminal* (own the loop, wrap each `draw` in sync-output,
+let ratatui cell-diff). This section fixes *what the frontend draws and how those pieces are
+organized* - the layer above the renderer. It is entirely frontend-owned (`vortex-tui`) and
+crosses the seam only where the tables below say so.
+
+### Two things called "compositor" - keep them separate
+
+Helix's compositor does two jobs this spec deliberately splits:
+
+1. **A cell renderer** (its own double-buffer + diff). We do **not** build this - ratatui
+   already cell-diffs (§7), and replacing it stays deferred (§11).
+2. **A layer/overlay stack** with event routing - base editor view at the bottom, floating
+   surfaces (palette, picker, completion, prompt) stacked above, events delivered
+   front-to-back until one consumes them. Ratatui has **no** such thing. We build this, thin.
+
+So "compositor" in Vortex means **job 2 only**: an overlay layer manager that paints onto
+ratatui `Buffer`s and routes input. This matters because §7/§11 defer "the compositor"
+meaning job 1; §7.5 adds job 2, which is not that.
+
+### ratatui widgets as primitives, our own layer stack
+
+**Decision: paint with ratatui's widgets; build our own layer stack + event routing; do not
+adopt a component framework.**
+
+- ratatui gives paint primitives we will not rebuild: `Paragraph`, `List`, `Table`,
+  `Block`/borders, `Scrollbar`, and `Clear` (the documented way to punch a hole for a popup -
+  render `Clear`, then the overlay). Verified: ratatui is a widget library, not a
+  component/event framework.
+- ratatui does **not** give a layer stack, focus model, or event propagation. Frameworks that
+  do - `tui-realm` (Elm), `ratatui-kit` (React) - are **rejected**: each is a heavy,
+  opinionated runtime that owns the loop and state model, the opposite of §7's "own the thin
+  loop" and §1's thin frontend. Adopting one is a dependency *and* an architecture we would
+  fight.
+- What we build is small: a `Layer` trait (`render(area, buf)`,
+  `handle_event(ev) -> Handled | Ignored`, `cursor()`, `desired_size()`) and a `Compositor`
+  holding a `Vec<Box<dyn Layer>>`. ~One file, mirrors Helix's `Component`/`Compositor` shape,
+  and keeps the renderer swap (§11) local.
+- Single-purpose widget crates (`tui-input`, `tui-popup`) may be pulled *if* a surface needs
+  more than trivial code, but default to hand-rolling: our input surfaces are single-line and
+  the real editing engine already lives in the core. **Any such crate is a §3 stack addition,
+  asked-for first (CLAUDE.md).**
+
+### UI surfaces (layers), bottom to top
+
+| Surface | Kind | Crosses seam? | Notes |
+|---|---|---|---|
+| **Buffer view** | base | reads snapshot | text + decorations (§5), selections, viewport (frontend-owned) |
+| **Gutter** | base | reads decorations | line numbers (absolute/relative), diagnostic severity, git signs, fold marks |
+| **Status line** | base | reads snapshot | mode, position, selection count, version, diagnostic counts, LSP status |
+| **Head / tab bar** | base | reads snapshot | buffer name + modified marker today; a **bufferline** (tabs) once multi-buffer lands |
+| **Message / toast area** | transient layer | consumes `Notification` | errors, save/LSP status, external-change notices - a real surface, not the status-bar hijack of the current state |
+| **Prompt line** | overlay | emits `Action` on submit | single-line input: save-as path, search query, `:command`. Submit/cancel are the only seam traffic |
+| **Command palette** | overlay | emits `Action` on pick | fuzzy list of commands; nav/filter pure frontend, only the chosen intent hits the core |
+| **Pickers** (file / buffer / global-search / symbol) | overlay | emits `Action` on pick | fuzzy list + optional preview pane; large lists stream in without blocking |
+| **Which-key popup** | overlay | none | after a prefix key, show the available continuations from the keymap (§10.5) - pure frontend introspection of the binding table |
+| **Completion popup** | overlay | emits `Action`, reads decorations | LSP completion menu; ghost-preview of the selected item as a `VirtualText` decoration |
+| **Hover / diagnostic popup** | overlay | reads decorations | LSP hover + full diagnostic text on demand |
+
+**Seam rule for surfaces:** navigation *inside* a surface (moving the palette selection,
+typing in a picker filter) is **pure frontend** and never round-trips to the core - the same
+anti-Xi rule as scrolling (§5). Only the *committed intent* (the picked command, the
+submitted path, the accepted completion) becomes an `Action`. Fuzzy matching runs
+frontend-side (candidate crate: `nucleo`, Helix's matcher - a §3 addition to raise when
+pickers land).
+
+### Chrome and polish (frontend-owned, incremental)
+
+Each reads data the snapshot/decorations already carry; none needs a seam change beyond the
+decoration channel. All are theme-driven (§10.5) and default-off where they add noise,
+matching the config-seam-now / loader-at-M5 stance:
+
+- **Indent guides** - vertical rules per indent level (display-column math already in
+  `layout.rs`).
+- **Relative line numbers** - gutter mode toggle; motion-friendly for modal use.
+- **Cursor shape per mode** - bar/block/underline via the terminal cursor (the frontend
+  already drives the real cursor).
+- **Rulers / colorcolumn** - vertical rule at configured columns.
+- **Scrollbar** - ratatui `Scrollbar` on the right edge, from viewport + line count.
+- **Sticky context header** - pin the enclosing scope (function/class) at the viewport top;
+  needs tree-sitter, so it pairs with M4.
+- **Current-line tint, selection wash, multi-cursor carets** - already built (M1-M3); listed
+  so the catalog is complete.
 
 ---
 
@@ -511,10 +637,13 @@ User configuration is **frontend-owned and file-loaded** (`toml` + `serde`, Heli
 concerns (§2.2, §5) and never cross the seam. Two surfaces are configurable from the
 start of the design, even though file loading itself lands at **M5**:
 
-- **Styles (theme).** Colors/attributes for the non-text chrome - head bar, status bar,
-  and the line-number gutter (active vs inactive line). A future syntax theme maps
-  tree-sitter capture names to styles (§5 `StyleMap`), but that is a separate table from
-  the chrome theme here.
+- **Styles (theme).** Two frontend-owned tables. (a) Colors/attributes for the non-text
+  chrome - head bar, status bar, line-number gutter (active vs inactive). (b) The **semantic
+  tag → style** map the decoration channel needs (§5): `StyleId`/`GutterKind`/severity tags
+  (`keyword`, `error`, `git.added`) resolve to concrete colors/attributes *here*, on the
+  frontend, so identical core output themes light/dark and truecolor/256-color. Terminal-
+  capability fallback (truecolor → 256 → 16, styled-underline support) lives in this
+  resolution step, never in the core.
 - **Keymap.** The key→intent table (§2.2, §12.2) is **data, not code**: a `Keymap` is a
   set of `(chord → command)` bindings, and key translation is a pure lookup over it. Both
   sides parse from strings, so the built-in defaults are expressed in the same form a
@@ -550,7 +679,10 @@ Tier-3 / CRDT move: build the swap-ready seam now, defer the feature.
 - **Out-of-process RPC** - the channel is the seam; add the wire when a non-Rust or remote
   frontend exists (§1). The transport ships the `Delta` stream the core already produces
   (§5) - no snapshot reconstruction needed.
-- **Custom compositor** - earn it by outgrowing ratatui (§7).
+- **Custom cell renderer** - a double-buffered dirty-rect renderer *replacing* ratatui's
+  (Helix compositor's job 1, §7.5); earn it by outgrowing ratatui's cell-diffing (§7). This
+  is **not** the overlay/layer compositor (job 2), which *is* built (§7.5) - only the renderer
+  underneath it stays deferred.
 - **Crash-recovery backups** - room left in the buffer module (§8); not v1.
 - **Tier-3 huge-file backend (bigger-than-RAM editing)** - a paged / mmap piece-table
   buffer (§10.4). Kept swap-ready by putting the buffer behind a `Buffer` trait (§2.1) so
@@ -613,6 +745,11 @@ Seed categories to draft:
   syntax/LSP) - kept minimal so the frontend still owns the literal viewport.
 - **File/buffer lifecycle** (open, save, save-as, reload, close, conflict-resolution
   choice).
+- **UI-commit** intents the frontend surfaces raise only on *commit* (the seam rule, §7.5):
+  submit/cancel a prompt, run a picked command, accept a completion. Surface *navigation*
+  (moving a selection, typing a filter) is never in the vocabulary - it stays frontend-local.
+  The command palette is a discovery surface over the **same stable command identifiers the
+  keymap binds** (§10.5), not a second vocabulary.
 
 ---
 
@@ -624,8 +761,8 @@ The headless, message-driven core (§1) makes this concrete:
   `ViewSnapshot`/`Notification` sequence. No terminal, no PTY, no snapshot-image
   fragility. This is the primary suite and covers the entire editing model. **Assert on
   projections, not whole snapshots** - check text + resolved selection positions +
-  notifications, but not the raw `styles` map, which shifts with tree-sitter grammar
-  versions and would make tests brittle. Style *correctness* is covered separately with
+  notifications, but not the raw `decorations` set, which shifts with tree-sitter grammar
+  versions and would make tests brittle. Decoration *correctness* is covered separately with
   pinned grammar fixtures.
 - **Property / state-machine tests** (`proptest`): generate random `Action` sequences and
   assert the model invariants hold - this is where editor bugs actually live (the
@@ -689,17 +826,35 @@ Incremental build order so the risky assumptions are validated early, not at the
   (§13) passes.
 - **M2 - Async runtime + LSP smoke.** smol executor; `async-lsp` spawns a real server
   (e.g. `rust-analyzer`), completes `initialize`, receives one diagnostic, maps its UTF-16
-  position correctly. **Validates the one unproven stack assumption (§3).** *Verify:* a
-  diagnostic underlines the right span.
+  position correctly, and surfaces it as `Underline` + `GutterMark` decorations (§5) - the
+  first non-syntax producer on the decoration channel. **Validates the one unproven stack
+  assumption (§3).** *Verify:* a diagnostic underlines the right span.
 - **M3 - Anchors + undo tree + multi-cursor.** Full `SelectionSet`, anchor layer,
   coalesced undo tree. *Verify:* property tests (§13) pass; multi-cursor edit + undo works
   in-terminal.
-- **M4 - Syntax highlighting.** tree-sitter background reparse on snapshots feeding
-  `styles`. *Verify:* highlights appear, text never lags input.
+- **M4 - Syntax highlighting.** tree-sitter background reparse on snapshots feeding the
+  `Highlight` kind of the decoration channel (§5). *Verify:* highlights appear, text never
+  lags input.
 - **M5 - File handling hardening.** encoding/EOL preservation, external-change conflicts,
   save-failure handling (§8, §10). *Verify:* fixture round-trips + fault-injection.
+- **M6 - Frontend UI shell.** The overlay compositor (§7.5, job 2 only) + a message/toast
+  surface (consuming `Notification`) + a prompt line. Proves the layer stack and the
+  commit-only seam rule (§7.5): surface navigation stays frontend-local, only the committed
+  intent becomes an `Action`. *Verify:* save-as via a prompt, an error toast from a failed
+  save, and a stacked overlay that dismisses top-first - in a real terminal, with no core
+  round-trip for navigation.
+- **M7 - Pickers + palette + which-key.** `nucleo` fuzzy matching (§3 addition); file /
+  global-search / buffer pickers with a preview pane; a command palette over the §10.5
+  command identifiers; a which-key popup driven by the keymap. Brings **multi-buffer** (the
+  core already keys everything by `BufferId`; only one buffer is live today) + a bufferline -
+  the one core change in this arc, since buffer-switching needs it. *Verify:* open a file via
+  the picker, switch buffers, run a command via the palette - in-terminal.
+- **M8 - Chrome + polish.** Git diff signs (a git-diff task feeding `GutterMark`s; its git
+  source - `gix` / `git2` - is a §3 stack addition to raise), indent guides, relative line
+  numbers, scrollbar, sticky context (tree-sitter), cursor-shape-per-mode, rulers. *Verify:*
+  each renders against real buffers / a real repo.
 
-Extensibility (§12.1) is post-M5 and gated on that decision.
+Extensibility (§12.1) sits after the M0-M8 build order and is gated on that decision.
 
 ---
 
@@ -718,8 +873,16 @@ vortex/
         lsp/            # async-lsp client, UTF-16 position mapping
         action.rs       # Action enum (§12.2)
         view.rs         # ViewSnapshot / Notification
+        decoration.rs   # Decoration / DecorationSet - one channel for all overlays (§5)
         editor.rs       # single-owner actor task
-    tui/                # ratatui + crossterm; keymap keys -> Action; owns viewport
+    tui/                # ratatui + crossterm; keymap keys -> Action; owns viewport + UI (§7.5)
+      src/
+        compositor.rs   # Layer trait + overlay stack + event routing (§7.5, job 2)
+        components/     # prompt, palette, pickers, which-key, completion, hover (§7.5)
+        chrome/         # gutter, status line, bufferline, indent guides, scrollbar (§7.5)
+        layout.rs       # viewport + display-column math (testable)
+        keymap.rs       # key -> Action lookup (data-driven, §10.5)
+        theme.rs        # semantic tag -> style mapping (§5, §10.5)
     proto/              # (later) serde + socket layer at the seam
   docs/
     SPEC.md             # this file
