@@ -767,6 +767,31 @@ fn add_cursor_below_then_type_edits_every_line_through_the_loop() {
 }
 
 #[test]
+fn add_cursor_above_then_type_edits_every_line_through_the_loop() {
+    // Mirror of the AddCursorBelow path: type two lines, sit on the lower one, add a
+    // caret above, then type - both lines get the insert as one action. Covers the
+    // `above = true` branch of add_cursor_vertical and the AddCursorAbove dispatch arm.
+    let (snap, _notes) = run_seam(&[
+        Action::Insert("ab\ncd".into()),
+        Action::MoveCursor {
+            motion: Motion::BufferEnd,
+            extend: false,
+        },
+        Action::AddCursorAbove,
+        Action::Insert("X".into()),
+    ]);
+    assert_eq!(snap.text.to_string(), "abX\ncdX");
+    let heads: Vec<usize> = snap.selections.iter().map(|s| s.head).collect();
+    assert_eq!(heads, vec![3, 7]);
+    // AddCursorAbove made the upper caret primary; it stays primary across the edit
+    // (index 0, head 3) rather than snapping to the originating lower caret.
+    assert_eq!(
+        snap.primary, 0,
+        "the primary cursor is carried across the edit"
+    );
+}
+
+#[test]
 fn one_multi_cursor_insert_is_a_single_undo_unit_through_the_loop() {
     // SPEC §2.4: one keystroke over N cursors is ONE undo entry. Build two cursors,
     // type over both, then a single Undo restores the pre-edit text and both carets.
@@ -956,6 +981,22 @@ mod atomic_write {
             "link.txt should still be a symlink"
         );
         assert_eq!(std::fs::read_to_string(&real).unwrap(), "after");
+    }
+
+    #[test]
+    fn save_through_a_looping_symlink_surfaces_the_error() {
+        // A self-referential symlink (link -> link) lets `symlink_metadata` succeed
+        // (it does not follow the link) but makes `canonicalize` fail with a loop
+        // error - NOT NotFound, so write_atomic cannot resolve it by hand and must
+        // surface the error instead of hanging or panicking.
+        let dir = TempDir::new();
+        let link = dir.file("loop.txt");
+        std::os::unix::fs::symlink(&link, &link).unwrap();
+
+        let err =
+            write_atomic(&link, b"never lands").expect_err("a symlink loop cannot be resolved");
+        assert!(!err.is_empty(), "the underlying error is surfaced: {err}");
+        assert!(!has_temp_file(&dir.path), "no temp file should leak");
     }
 
     #[test]
