@@ -77,6 +77,15 @@ fn set_is_never_empty() {
 }
 
 #[test]
+fn from_sorted_cursors_empty_falls_back_to_origin() {
+    // The set is never empty (SPEC §2.2): an empty input degrades to a single caret
+    // at the origin rather than an unrepresentable zero-cursor state.
+    let s = SelectionSet::from_sorted_cursors(vec![]);
+    assert_eq!(s.len(), 1);
+    assert_eq!(*s.primary(), Selection::cursor(0));
+}
+
+#[test]
 fn move_right_over_ascii() {
     let t = text("hello");
     let mut s = SelectionSet::at_origin();

@@ -225,13 +225,28 @@ fn replace_rejects_non_char_boundary_on_first_line_of_many() {
 
 #[test]
 fn replace_past_end_offset_on_multiline_is_out_of_bounds() {
-    // Exercises the `offset > len` short-circuit in is_char_boundary via a
-    // range whose end runs past the buffer.
+    // A range whose end runs past the buffer is rejected by the bounds check before
+    // the boundary check ever runs.
     let mut b = RopeBuffer::from("ab\ncd");
     assert!(matches!(
         b.replace(3..99, "x"),
         Err(EditError::OutOfBounds { .. })
     ));
+}
+
+#[test]
+fn is_char_boundary_past_end_is_false() {
+    // The defensive `offset > len` guard: callers (replace) pre-validate bounds, so
+    // this never fires in practice, but the helper must not hand an out-of-range
+    // offset to crop (which would panic). Exercised directly since no public path
+    // reaches it.
+    let b = RopeBuffer::from("ab\ncd"); // len 5
+    assert!(!b.is_char_boundary(6));
+    assert!(!b.is_char_boundary(usize::MAX));
+    // Sanity: in-range boundaries and the two endpoints still report true.
+    assert!(b.is_char_boundary(0));
+    assert!(b.is_char_boundary(5));
+    assert!(b.is_char_boundary(2));
 }
 
 #[test]
