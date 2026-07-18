@@ -12,10 +12,12 @@
 //! half-written frame (anti-tearing). The Kitty keyboard protocol is negotiated at
 //! startup for rich modifiers (SPEC §9), with graceful fallback where unsupported.
 
+mod compositor;
 mod config;
 mod keymap;
 mod layout;
 mod osc52;
+mod prompt;
 
 use std::ffi::OsString;
 use std::io::{self, Stdout};
@@ -24,8 +26,8 @@ use std::time::Duration;
 
 use ratatui::crossterm::event::{
     self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
-    Event, KeyModifiers, KeyboardEnhancementFlags, MouseButton, MouseEventKind,
-    PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
+    Event, KeyCode, KeyEventKind, KeyModifiers, KeyboardEnhancementFlags, MouseButton,
+    MouseEventKind, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
 };
 use ratatui::crossterm::terminal::{
     BeginSynchronizedUpdate, EndSynchronizedUpdate, supports_keyboard_enhancement,
@@ -38,6 +40,8 @@ use ratatui::widgets::Paragraph;
 use ratatui::{Frame, Terminal, TerminalOptions, Viewport};
 
 use vortex_core::{Action, Core, ViewSnapshot};
+
+use compositor::{Compositor, EventResult};
 
 /// Default tab stop width for display-column layout (SPEC §4). Config in M5.
 const TAB_WIDTH: usize = 4;
@@ -245,6 +249,10 @@ fn event_loop(
     // from the caret on purpose (SPEC §5, frontend-owned viewport); it resets to
     // true after each frame so a later edit/motion re-centers the caret.
     let mut follow = true;
+    // The overlay UI stack (SPEC §7.5): empty while editing, holding a prompt/
+    // palette/picker when one is open. Overlays get first refusal on keys and paint
+    // over the base editor; an empty stack is a no-op on the hot path.
+    let mut overlays = Compositor::new();
 
     loop {
         // Take the newest snapshot if the core published one (latest-wins cell).
@@ -283,6 +291,7 @@ fn event_loop(
                 message.as_deref(),
                 config.theme,
                 follow,
+                &overlays,
             )?;
             needs_redraw = false;
             // Default back to caret-follow; only a wheel scroll opts out, and only
@@ -295,6 +304,38 @@ fn event_loop(
         if event::poll(POLL)? {
             match event::read()? {
                 Event::Key(key) => {
+                    // Ignore key *releases* (the Kitty protocol reports them, SPEC
+                    // §9): acting on press and release would double-fire, the same
+                    // rule the keymap applies. Skipping early also shields overlays.
+                    if key.kind == KeyEventKind::Release {
+                        continue;
+                    }
+                    // Overlays get first refusal (SPEC §7.5): a prompt consumes its
+                    // keys so they stay frontend-local; only a *committed* intent
+                    // (e.g. a submitted path) comes back as an `Action` for the core.
+                    if !overlays.is_empty() {
+                        let (result, actions) = overlays.handle_key(key);
+                        needs_redraw = true;
+                        for action in actions {
+                            if handle.actions.send_blocking(action).is_err() {
+                                return Ok(());
+                            }
+                        }
+                        if result == EventResult::Consumed {
+                            continue;
+                        }
+                    }
+                    // Frontend UI trigger (SPEC §7.5): Ctrl+O opens the file-open
+                    // prompt. This is a frontend-local command, not a core intent, so
+                    // it is handled here rather than through the keymap (which yields
+                    // only core `Action`s); M7 generalizes it to a command palette.
+                    if key.code == KeyCode::Char('o')
+                        && key.modifiers.contains(KeyModifiers::CONTROL)
+                    {
+                        overlays.push(prompt::open_file(config.theme.prompt));
+                        needs_redraw = true;
+                        continue;
+                    }
                     // Page motions need the viewport's page size, which only the
                     // frontend knows (SPEC §5); the keymap folds it into the action.
                     if let Some(action) =
@@ -313,6 +354,10 @@ fn event_loop(
                         }
                     }
                 }
+                // While an overlay owns the screen (SPEC §7.5) it is modal: mouse
+                // input is swallowed rather than moving the editor caret beneath the
+                // prompt. (Routing clicks into overlays is an M7 concern.)
+                Event::Mouse(_) if !overlays.is_empty() => {}
                 Event::Mouse(mouse) => match mouse.kind {
                     // Left press or drag places/extends the caret at the pointer.
                     // A press is a plain click unless Shift is held (extend from the
@@ -359,6 +404,10 @@ fn event_loop(
                     }
                     _ => {}
                 },
+                // While an overlay is open, swallow OS pastes too rather than
+                // splatting the text into the buffer underneath (SPEC §7.5 modal).
+                // Pasting *into* the prompt is an M7 refinement.
+                Event::Paste(_) if !overlays.is_empty() => {}
                 // An OS paste (bracketed paste): insert the whole payload as one
                 // action (SPEC §6), splatting the external text at every cursor. This
                 // is distinct from the editor's own `paste` command, which pulls the
@@ -412,12 +461,23 @@ fn draw(
     message: Option<&str>,
     theme: config::Theme,
     follow: bool,
+    overlays: &Compositor,
 ) -> io::Result<ViewState> {
     let mut new_viewport = viewport;
     let mut out = io::stdout();
     queue!(out, BeginSynchronizedUpdate)?;
-    terminal
-        .draw(|frame| new_viewport = paint(frame, snapshot, viewport, message, theme, follow))?;
+    terminal.draw(|frame| {
+        new_viewport = paint(frame, snapshot, viewport, message, theme, follow);
+        // Overlays paint over the base editor (SPEC §7.5). The focused overlay owns
+        // the caret, so its cursor - set last - wins over the editor caret `paint`
+        // placed. (A menu-style overlay wanting no caret at all is an M7 concern;
+        // today's only overlay, the prompt, always provides one.)
+        let area = frame.area();
+        overlays.render(area, frame.buffer_mut());
+        if let Some(pos) = overlays.cursor(area) {
+            frame.set_cursor_position(pos);
+        }
+    })?;
     execute!(out, EndSynchronizedUpdate)?;
     Ok(new_viewport)
 }

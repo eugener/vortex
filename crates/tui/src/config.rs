@@ -54,6 +54,10 @@ pub struct Theme {
     /// (SPEC §2.2). The terminal has a single real cursor, which the primary caret
     /// uses; the others are painted as a one-cell reversed block so they are visible.
     pub secondary_cursor: Style,
+    /// The prompt-line overlay (SPEC §7.5): a bottom-row single-line input, e.g. the
+    /// file-open prompt. Styled distinctly from the status bar it covers so an open
+    /// prompt reads as a mode rather than just another transient message.
+    pub prompt: Style,
 }
 
 impl Default for Theme {
@@ -76,6 +80,11 @@ impl Default for Theme {
             // Reversed video reads as a block caret against whatever it sits on,
             // without committing to a palette color (SPEC §2.2 multi-cursor).
             secondary_cursor: Style::new().add_modifier(Modifier::REVERSED),
+            // The same accent blue as a selection, filling the row, so an open
+            // prompt is unmistakably a distinct mode over the editor (SPEC §7.5).
+            prompt: Style::new()
+                .fg(Color::Rgb(255, 255, 255))
+                .bg(Color::Rgb(38, 79, 120)),
         }
     }
 }
