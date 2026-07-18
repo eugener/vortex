@@ -79,6 +79,33 @@ impl Prompt {
             .map(|g| self.cursor + g.len())
             .unwrap_or(self.cursor)
     }
+
+    /// Display columns of the input scrolled off the left so the caret stays within
+    /// `avail` columns: zero until the caret would pass the right edge, then just
+    /// enough to pin it to the last cell (a standard single-line input field).
+    /// Recomputed each frame from the caret, so the prompt holds no scroll state.
+    fn input_scroll(&self, avail: usize) -> usize {
+        let caret = self.input[..self.cursor].width();
+        caret.saturating_sub(avail.saturating_sub(1))
+    }
+}
+
+/// Byte offset in `s` of the first grapheme whose starting display column is at or
+/// beyond `cols` - where rendering begins once `cols` columns are scrolled off the
+/// left. A wide grapheme straddling the boundary is kept whole (drawn one column
+/// early), which is cosmetic.
+fn byte_at_column(s: &str, cols: usize) -> usize {
+    if cols == 0 {
+        return 0;
+    }
+    let mut width = 0;
+    for (i, g) in s.grapheme_indices(true) {
+        if width >= cols {
+            return i;
+        }
+        width += g.width();
+    }
+    s.len()
 }
 
 impl Layer for Prompt {
@@ -91,8 +118,22 @@ impl Layer for Prompt {
         let row = Rect::new(screen.x, screen.bottom() - 1, screen.width, 1);
         Clear.render(row, buf);
         buf.set_style(row, self.style);
-        let text = format!("{}{}", self.label, self.input);
-        buf.set_stringn(row.x, row.y, &text, row.width as usize, self.style);
+        // The label is pinned at the left; the input scrolls horizontally under the
+        // remaining columns so the caret stays visible on a path wider than the row.
+        buf.set_stringn(row.x, row.y, &self.label, row.width as usize, self.style);
+        let label_w = self.label.width() as u16;
+        if label_w >= row.width {
+            return;
+        }
+        let avail = (row.width - label_w) as usize;
+        let start = byte_at_column(&self.input, self.input_scroll(avail));
+        buf.set_stringn(
+            row.x + label_w,
+            row.y,
+            &self.input[start..],
+            avail,
+            self.style,
+        );
     }
 
     fn handle_key(&mut self, key: KeyEvent) -> EventResult {
@@ -144,9 +185,12 @@ impl Layer for Prompt {
         if screen.width == 0 || screen.height == 0 {
             return None;
         }
-        // Caret sits after the label plus the display width of the text left of it,
-        // clamped to the last visible column so a long entry keeps it on screen.
-        let col = self.label.width() + self.input[..self.cursor].width();
+        // Caret column = label width + the caret's offset within the (scrolled) input
+        // area, clamped to the last cell so a long entry keeps it on screen.
+        let label_w = self.label.width();
+        let avail = (screen.width as usize).saturating_sub(label_w);
+        let caret = self.input[..self.cursor].width();
+        let col = label_w + caret.saturating_sub(self.input_scroll(avail));
         let x = (screen.x as usize + col).min(screen.right().saturating_sub(1) as usize) as u16;
         Some(Position::new(x, screen.bottom() - 1))
     }
@@ -304,6 +348,65 @@ mod tests {
             .map(|x| buf.cell((x, 3)).unwrap().symbol().to_string())
             .collect();
         assert!(bottom.starts_with("> hi"), "bottom row: {bottom:?}");
+    }
+
+    #[test]
+    fn long_input_scrolls_to_keep_the_caret_visible() {
+        // Row width 10 = label "> " (2) + 8 input columns. A 16-char entry with the
+        // caret at the end scrolls the input so the tail shows and the head clips.
+        let mut p = echo_prompt();
+        for c in "abcdefghijklmnop".chars() {
+            p.handle_key(key(c));
+        }
+        let mut terminal = Terminal::new(TestBackend::new(10, 3)).unwrap();
+        terminal
+            .draw(|frame| p.render(frame.area(), frame.buffer_mut()))
+            .unwrap();
+        let buf = terminal.backend().buffer().clone();
+        let row: String = (0..10)
+            .map(|x| buf.cell((x, 2)).unwrap().symbol().to_string())
+            .collect();
+        assert!(row.starts_with("> "), "label stays pinned: {row:?}");
+        assert!(row.contains('p'), "caret end is visible: {row:?}");
+        assert!(!row.contains('a'), "head is clipped: {row:?}");
+        // Caret sits on the last cell, past the label, never off the right edge.
+        let pos = p.cursor(Rect::new(0, 0, 10, 3)).unwrap();
+        assert!(pos.x < 10 && pos.x >= 2, "caret on screen: {}", pos.x);
+    }
+
+    #[test]
+    fn home_scrolls_the_input_back_to_the_start() {
+        // After Home the caret returns to column 0, so the scroll resets and the
+        // start of a long entry is shown from the left again.
+        let mut p = echo_prompt();
+        for c in "abcdefghijklmnop".chars() {
+            p.handle_key(key(c));
+        }
+        p.handle_key(press(KeyCode::Home));
+        let mut terminal = Terminal::new(TestBackend::new(10, 3)).unwrap();
+        terminal
+            .draw(|frame| p.render(frame.area(), frame.buffer_mut()))
+            .unwrap();
+        let buf = terminal.backend().buffer().clone();
+        let row: String = (0..10)
+            .map(|x| buf.cell((x, 2)).unwrap().symbol().to_string())
+            .collect();
+        assert!(
+            row.starts_with("> abcdefgh"),
+            "start shown after Home: {row:?}"
+        );
+        assert_eq!(p.cursor(Rect::new(0, 0, 10, 3)).unwrap().x, 2);
+    }
+
+    #[test]
+    fn byte_at_column_maps_display_columns_to_byte_offsets() {
+        // ASCII: column N is byte N. Zero columns scrolled -> start of the string.
+        assert_eq!(byte_at_column("abcdef", 0), 0);
+        assert_eq!(byte_at_column("abcdef", 3), 3);
+        // Past the end clamps to the length.
+        assert_eq!(byte_at_column("abc", 9), 3);
+        // A wide (2-column) char: scrolling 2 columns lands after it (byte 2).
+        assert_eq!(byte_at_column("世x", 2), "世".len());
     }
 
     #[test]
