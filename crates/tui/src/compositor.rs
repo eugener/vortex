@@ -118,11 +118,10 @@ impl Compositor {
     /// handling layers committed. On [`EventResult::Ignored`] the caller falls
     /// through to the editor's keymap; the returned actions are sent to the core.
     ///
-    /// Finished layers are then popped from the top - top-down (`while the top layer
-    /// is_finished`) rather than a blanket filter, because overlays are modal and
-    /// stacked: the layer that finishes is the one on top, and a `Consumed`-then-
-    /// finish (submit/cancel) closes exactly it while leaving any layer beneath
-    /// intact. A committing layer's actions are collected *before* it is popped.
+    /// Every finished layer is then removed, order preserved. Normally that is just
+    /// the top one a submit/cancel closed; but a lower layer that finished on a key
+    /// the top *ignored* is pruned too, so no finished layer can leak beneath an open
+    /// one. A committing layer's actions are collected *before* it is removed.
     pub fn handle_key(&mut self, key: KeyEvent) -> (EventResult, Vec<Action>) {
         let mut result = EventResult::Ignored;
         let mut actions = Vec::new();
@@ -134,9 +133,7 @@ impl Compositor {
                 break;
             }
         }
-        while self.layers.last().is_some_and(|l| l.is_finished()) {
-            self.layers.pop();
-        }
+        self.layers.retain(|l| !l.is_finished());
         (result, actions)
     }
 
@@ -340,6 +337,23 @@ mod tests {
         // The surviving layer still receives the next key.
         assert_eq!(c.handle_key(key('a')).0, EventResult::Ignored);
         assert_eq!(*log.borrow(), vec![2, 1]);
+    }
+
+    #[test]
+    fn a_finished_layer_below_an_open_one_is_pruned() {
+        // The top layer ignores the key so it propagates; the bottom consumes it and
+        // finishes. Removal is order-preserving over the whole stack, not top-only,
+        // so the finished bottom layer does not leak beneath the still-open top one.
+        let log = Rc::new(RefCell::new(Vec::new()));
+        let mut c = Compositor::new();
+        c.push(boxed(Fake::new(1, true, &log).finishing_on(KeyCode::Esc))); // bottom
+        c.push(boxed(Fake::new(2, false, &log))); // top, ignores
+        assert_eq!(c.handle_key(esc()).0, EventResult::Consumed);
+        assert!(!c.is_empty(), "the open top layer remains");
+        // Only layer 2 is left: the next key reaches it, never the pruned layer 1.
+        log.borrow_mut().clear();
+        c.handle_key(key('a'));
+        assert_eq!(*log.borrow(), vec![2]);
     }
 
     #[test]
