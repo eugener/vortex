@@ -29,7 +29,8 @@ floor means no single file can slip below 90% while a 100% neighbor masks it in 
 Scoped to `vortex-core` on purpose - the core is headless and should stay near-100% (M0
 baseline: **100%**), while `vortex-tui` is thin I/O glue with no extractable logic yet; its
 60% floor (SPEC §13) activates at M1+ when it gains keymap/viewport logic worth testing.
-Requires `cargo install cargo-llvm-cov` + `rustup component add llvm-tools-preview`.
+Requires `cargo-llvm-cov` >=0.8.6 (the release that added `--fail-under-file-lines`) +
+`rustup component add llvm-tools-preview`. Install/upgrade with `cargo install cargo-llvm-cov`.
 
 Then, for any change with a runtime surface, **actually exercise it** - do not infer
 success from a green test suite:
