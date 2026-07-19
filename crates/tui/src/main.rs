@@ -158,9 +158,8 @@ Options:
 
 Keys:
   Ctrl+S           Save        Ctrl+Q            Quit
-  Ctrl+O           Open file (prompt; Enter opens, Esc cancels)
+  Ctrl+O           Open file (fuzzy picker over the working directory)
   Ctrl+P           Command palette (type to filter, Enter runs, Esc cancels)
-  Ctrl+F           Find file (fuzzy picker over the working directory)
   Ctrl+Alt+Up/Down Add cursor above/below        Alt+Click  Add cursor
   Esc              Collapse to one cursor
 ";
