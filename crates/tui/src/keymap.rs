@@ -327,6 +327,7 @@ const MACOS_ONLY_BINDINGS: &[(&str, &str)] = &[];
 const UI_DEFAULT_BINDINGS: &[(&str, FrontendCommand)] = &[
     ("ctrl+o", FrontendCommand::OpenFilePrompt),
     ("ctrl+p", FrontendCommand::OpenPalette),
+    ("ctrl+f", FrontendCommand::OpenFilePicker),
 ];
 
 /// The resolved key bindings. Opaque so its representation can change (e.g. gain

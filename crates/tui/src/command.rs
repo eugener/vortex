@@ -18,4 +18,6 @@ pub enum Command {
     OpenFilePrompt,
     /// Open the command palette overlay (frontend-local).
     OpenPalette,
+    /// Open the file picker overlay (frontend-local).
+    OpenFilePicker,
 }
