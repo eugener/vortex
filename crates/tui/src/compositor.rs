@@ -115,6 +115,12 @@ impl Compositor {
         self.layers.push(layer);
     }
 
+    /// Close every overlay. Used when a keybinding fires over an open overlay (SPEC
+    /// §7.5): the shortcut takes precedence, so the picker/palette gives way to it.
+    pub fn dismiss(&mut self) {
+        self.layers.clear();
+    }
+
     /// Offer a key to the stack, top-down, stopping at the first layer that
     /// [`EventResult::Consumed`]s it, and return that outcome plus any [`Command`]s
     /// the handling layers committed. On [`EventResult::Ignored`] the caller falls
@@ -356,6 +362,17 @@ mod tests {
         log.borrow_mut().clear();
         c.handle_key(key('a'));
         assert_eq!(*log.borrow(), vec![2]);
+    }
+
+    #[test]
+    fn dismiss_closes_all_overlays() {
+        let log = Rc::new(RefCell::new(Vec::new()));
+        let mut c = Compositor::new();
+        c.push(boxed(Fake::new(1, false, &log)));
+        c.push(boxed(Fake::new(2, false, &log)));
+        assert!(!c.is_empty());
+        c.dismiss();
+        assert!(c.is_empty(), "dismiss clears the stack");
     }
 
     #[test]

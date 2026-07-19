@@ -347,6 +347,14 @@ fn event_loop(
                     if let Some(command) =
                         keymap::command_for_key(&config.keymap, key, viewport.page())
                     {
+                        // If the binding fired *over* an open overlay (a picker
+                        // deferred its shortcut, SPEC §7.5), the shortcut dismisses the
+                        // overlay and takes precedence. Config-friendly: the binding
+                        // comes from the keymap, the single source the palette shows.
+                        if !overlays.is_empty() {
+                            overlays.dismiss();
+                            needs_redraw = true;
+                        }
                         // A UI overlay (any non-`Editor` command) opens locally, so
                         // repaint now; a core intent repaints when its snapshot
                         // returns, so it need not force one.
