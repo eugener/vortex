@@ -25,6 +25,8 @@ use std::fmt;
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use vortex_core::{Action, Motion};
 
+use crate::command::Command as FrontendCommand;
+
 /// A key identity: a key code plus the modifier state. This is the left side of a
 /// binding and the lookup key. Parsed from a string like `"ctrl+s"`, `"cmd+z"`, or
 /// `"shift+right"` (see [`Chord::parse`]) so a config file can name it.
@@ -318,11 +320,21 @@ const MACOS_ONLY_BINDINGS: &[(&str, &str)] = &[("ctrl+c", "quit")];
 #[cfg(not(target_os = "macos"))]
 const MACOS_ONLY_BINDINGS: &[(&str, &str)] = &[];
 
+/// Frontend-command bindings: keys that open a UI overlay rather than editing (SPEC
+/// §7.5). Kept in a table like [`DEFAULT_BINDINGS`] so the trigger is *data*, not an
+/// inline branch in the event loop, and resolved into [`FrontendCommand`]s that never
+/// cross the seam to the core.
+const UI_DEFAULT_BINDINGS: &[(&str, FrontendCommand)] =
+    &[("ctrl+o", FrontendCommand::OpenFilePrompt)];
+
 /// The resolved key bindings. Opaque so its representation can change (e.g. gain
 /// per-mode maps) without touching call sites; built via [`Keymap::from_pairs`].
 #[derive(Debug, Clone)]
 pub struct Keymap {
     bindings: HashMap<Chord, Command>,
+    /// Chords that open a UI overlay (SPEC §7.5), resolved separately from the core
+    /// `bindings` because they produce a [`FrontendCommand`], not an `Action`.
+    ui_bindings: HashMap<Chord, FrontendCommand>,
 }
 
 impl Keymap {
@@ -345,7 +357,10 @@ impl Keymap {
                 .ok_or_else(|| KeymapError::UnknownCommand(command.to_string()))?;
             bindings.insert(chord_key, command);
         }
-        Ok(Self { bindings })
+        Ok(Self {
+            bindings,
+            ui_bindings: HashMap::new(),
+        })
     }
 }
 
@@ -360,7 +375,12 @@ impl Default for Keymap {
             .chain(COMMAND_MOD_BINDINGS.iter())
             .chain(MACOS_ONLY_BINDINGS.iter())
             .copied();
-        Self::from_pairs(pairs).expect("built-in default bindings must be valid")
+        let mut map = Self::from_pairs(pairs).expect("built-in default bindings must be valid");
+        for (chord, command) in UI_DEFAULT_BINDINGS {
+            let parsed = Chord::parse(chord).expect("built-in ui chord must parse");
+            map.ui_bindings.insert(parsed, command.clone());
+        }
+        map
     }
 }
 
@@ -415,6 +435,23 @@ pub fn action_for_key(keymap: &Keymap, key: KeyEvent, page: usize) -> Option<Act
     }
 
     None
+}
+
+/// Translate a key into a [`FrontendCommand`] - the single type the event loop
+/// dispatches (SPEC §7.5). A UI-overlay chord (e.g. Ctrl+O) resolves to its frontend
+/// command; any other key falls back to its core [`Action`], wrapped as
+/// [`FrontendCommand::Editor`]. `None` if the key is unmapped. UI bindings take
+/// precedence on a shared chord (there are none by default). This is what routes a
+/// UI trigger *through the keymap* instead of an inline branch in the loop.
+pub fn command_for_key(keymap: &Keymap, key: KeyEvent, page: usize) -> Option<FrontendCommand> {
+    if key.kind == KeyEventKind::Release {
+        return None;
+    }
+    let chord = Chord::from_event(&key);
+    if let Some(command) = keymap.ui_bindings.get(&chord) {
+        return Some(command.clone());
+    }
+    action_for_key(keymap, key, page).map(FrontendCommand::Editor)
 }
 
 #[cfg(test)]
@@ -598,6 +635,48 @@ mod tests {
         assert_eq!(Command::parse("copy"), Some(Command::Copy));
         assert_eq!(Command::parse("cut"), Some(Command::Cut));
         assert_eq!(Command::parse("paste"), Some(Command::Paste));
+    }
+
+    #[test]
+    fn command_for_key_routes_ctrl_o_to_the_file_prompt() {
+        // Ctrl+O is a UI-overlay trigger, resolved through the keymap (SPEC §7.5) -
+        // not an inline branch in the loop. It is a frontend command, not a core one.
+        let km = Keymap::default();
+        assert_eq!(
+            command_for_key(
+                &km,
+                with_mods(KeyCode::Char('o'), KeyModifiers::CONTROL),
+                PAGE
+            ),
+            Some(FrontendCommand::OpenFilePrompt)
+        );
+    }
+
+    #[test]
+    fn command_for_key_wraps_core_keys_as_editor_commands() {
+        // A non-UI key falls back to its core action, wrapped for the unified
+        // dispatch path.
+        let km = Keymap::default();
+        assert_eq!(
+            command_for_key(
+                &km,
+                with_mods(KeyCode::Char('s'), KeyModifiers::CONTROL),
+                PAGE
+            ),
+            Some(FrontendCommand::Editor(Action::Save))
+        );
+        assert_eq!(
+            command_for_key(&km, press(KeyCode::Char('a')), PAGE),
+            Some(FrontendCommand::Editor(Action::Insert("a".into())))
+        );
+    }
+
+    #[test]
+    fn command_for_key_ignores_key_releases() {
+        let km = Keymap::default();
+        let mut release = press(KeyCode::Char('a'));
+        release.kind = KeyEventKind::Release;
+        assert_eq!(command_for_key(&km, release, PAGE), None);
     }
 
     /// The platform command modifier the default undo/redo bindings use: Cmd

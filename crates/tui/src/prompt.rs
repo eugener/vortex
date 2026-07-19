@@ -21,6 +21,7 @@ use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 use vortex_core::Action;
 
+use crate::command::Command;
 use crate::compositor::{EventResult, Layer};
 
 /// A modal single-line input. Consumes every key while open (so the editor beneath
@@ -32,23 +33,23 @@ pub struct Prompt {
     input: String,
     /// Caret position as a byte offset into `input`, always on a grapheme boundary.
     cursor: usize,
-    /// Turns the submitted text into an `Action`, or `None` to submit nothing (e.g.
+    /// Turns the submitted text into a [`Command`], or `None` to submit nothing (e.g.
     /// an empty path). A plain `fn` pointer - the builders capture no state.
-    build: fn(&str) -> Option<Action>,
+    build: fn(&str) -> Option<Command>,
     /// Fill style for the prompt row (from the theme).
     style: Style,
     /// Set once the prompt is submitted or cancelled, so the compositor pops it.
     finished: bool,
-    /// The action a submit produced, drained by the compositor via [`take_actions`].
+    /// The command a submit produced, drained by the compositor via [`take_commands`].
     ///
-    /// [`take_actions`]: Layer::take_actions
-    committed: Option<Action>,
+    /// [`take_commands`]: Layer::take_commands
+    committed: Option<Command>,
 }
 
 impl Prompt {
     /// A prompt showing `label`, styled with `style`, whose submitted text is turned
-    /// into an action by `build`.
-    fn new(label: impl Into<String>, style: Style, build: fn(&str) -> Option<Action>) -> Self {
+    /// into a command by `build`.
+    fn new(label: impl Into<String>, style: Style, build: fn(&str) -> Option<Command>) -> Self {
         Self {
             label: label.into(),
             input: String::new(),
@@ -177,7 +178,7 @@ impl Layer for Prompt {
         EventResult::Consumed
     }
 
-    fn take_actions(&mut self) -> Vec<Action> {
+    fn take_commands(&mut self) -> Vec<Command> {
         self.committed.take().into_iter().collect()
     }
 
@@ -201,11 +202,12 @@ impl Layer for Prompt {
 }
 
 /// The file-open prompt: `Open: <path>`, submitting a non-empty path as
-/// `Action::Open`. An empty or whitespace-only entry submits nothing (just closes).
+/// `Command::Editor(Action::Open)`. An empty or whitespace-only entry submits
+/// nothing (just closes).
 pub fn open_file(style: Style) -> Box<dyn Layer> {
     Box::new(Prompt::new("Open: ", style, |text| {
         let path = text.trim();
-        (!path.is_empty()).then(|| Action::Open(std::path::PathBuf::from(path)))
+        (!path.is_empty()).then(|| Command::Editor(Action::Open(std::path::PathBuf::from(path))))
     }))
 }
 
@@ -223,11 +225,11 @@ mod tests {
         KeyEvent::new(code, KeyModifiers::NONE)
     }
 
-    /// A test prompt that echoes its text into `Action::Insert` so submission is
-    /// observable without touching the filesystem.
+    /// A test prompt that echoes its text into `Command::Editor(Action::Insert)` so
+    /// submission is observable without touching the filesystem.
     fn echo_prompt() -> Prompt {
         Prompt::new("> ", Style::default(), |t| {
-            (!t.is_empty()).then(|| Action::Insert(t.to_string()))
+            (!t.is_empty()).then(|| Command::Editor(Action::Insert(t.to_string())))
         })
     }
 
@@ -249,24 +251,27 @@ mod tests {
         }
         p.handle_key(press(KeyCode::Enter));
         assert!(p.is_finished());
-        assert!(matches!(p.take_actions().as_slice(), [Action::Insert(s)] if s == "abc"));
+        assert!(matches!(
+            p.take_commands().as_slice(),
+            [Command::Editor(Action::Insert(s))] if s == "abc"
+        ));
     }
 
     #[test]
-    fn esc_cancels_with_no_action() {
+    fn esc_cancels_with_no_command() {
         let mut p = echo_prompt();
         p.handle_key(key('x'));
         p.handle_key(press(KeyCode::Esc));
         assert!(p.is_finished());
-        assert!(p.take_actions().is_empty());
+        assert!(p.take_commands().is_empty());
     }
 
     #[test]
-    fn empty_submit_finishes_without_an_action() {
+    fn empty_submit_finishes_without_a_command() {
         let mut p = echo_prompt();
         p.handle_key(press(KeyCode::Enter));
         assert!(p.is_finished());
-        assert!(p.take_actions().is_empty());
+        assert!(p.take_commands().is_empty());
     }
 
     #[test]
@@ -410,17 +415,20 @@ mod tests {
     }
 
     #[test]
-    fn open_file_builds_an_open_action_for_a_path() {
-        // The real factory: a non-empty path submits Action::Open; empty submits none.
+    fn open_file_builds_an_open_command_for_a_path() {
+        // The real factory: a non-empty path submits Editor(Open); empty submits none.
         let mut layer = open_file(Style::default());
         for c in "a.txt".chars() {
             layer.handle_key(key(c));
         }
         layer.handle_key(press(KeyCode::Enter));
-        let actions = layer.take_actions();
+        let commands = layer.take_commands();
         assert!(
-            matches!(actions.as_slice(), [Action::Open(p)] if p.ends_with("a.txt")),
-            "actions: {actions:?}"
+            matches!(
+                commands.as_slice(),
+                [Command::Editor(Action::Open(p))] if p.ends_with("a.txt")
+            ),
+            "commands: {commands:?}"
         );
     }
 }

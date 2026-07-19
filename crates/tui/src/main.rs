@@ -12,6 +12,7 @@
 //! half-written frame (anti-tearing). The Kitty keyboard protocol is negotiated at
 //! startup for rich modifiers (SPEC §9), with graceful fallback where unsupported.
 
+mod command;
 mod compositor;
 mod config;
 mod keymap;
@@ -27,8 +28,8 @@ use std::time::{Duration, Instant};
 
 use ratatui::crossterm::event::{
     self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
-    Event, KeyCode, KeyEventKind, KeyModifiers, KeyboardEnhancementFlags, MouseButton,
-    MouseEventKind, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
+    Event, KeyEventKind, KeyModifiers, KeyboardEnhancementFlags, MouseButton, MouseEventKind,
+    PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
 };
 use ratatui::crossterm::terminal::{
     BeginSynchronizedUpdate, EndSynchronizedUpdate, supports_keyboard_enhancement,
@@ -42,6 +43,7 @@ use ratatui::{Frame, Terminal, TerminalOptions, Viewport};
 
 use vortex_core::{Action, Core, ViewSnapshot};
 
+use command::Command;
 use compositor::{Compositor, EventResult};
 use toast::{Level, Toasts};
 
@@ -319,13 +321,13 @@ fn event_loop(
                         continue;
                     }
                     // Overlays get first refusal (SPEC §7.5): a prompt consumes its
-                    // keys so they stay frontend-local; only a *committed* intent
-                    // (e.g. a submitted path) comes back as an `Action` for the core.
+                    // keys so they stay frontend-local; only a *committed* choice
+                    // (e.g. a submitted path) comes back as a `Command` to dispatch.
                     if !overlays.is_empty() {
-                        let (result, actions) = overlays.handle_key(key);
+                        let (result, commands) = overlays.handle_key(key);
                         needs_redraw = true;
-                        for action in actions {
-                            if handle.actions.send_blocking(action).is_err() {
+                        for command in commands {
+                            if !dispatch_command(command, handle, &mut overlays, &config.theme) {
                                 return Ok(());
                             }
                         }
@@ -333,25 +335,21 @@ fn event_loop(
                             continue;
                         }
                     }
-                    // Frontend UI trigger (SPEC §7.5): Ctrl+O opens the file-open
-                    // prompt. This is a frontend-local command, not a core intent, so
-                    // it is handled here rather than through the keymap (which yields
-                    // only core `Action`s); M7 generalizes it to a command palette.
-                    if key.code == KeyCode::Char('o')
-                        && key.modifiers.contains(KeyModifiers::CONTROL)
+                    // Otherwise the keymap resolves the key to a frontend command
+                    // (SPEC §7.5): a UI trigger (Ctrl+O) opens an overlay, any other
+                    // key forwards its core intent. Routed through the keymap, not an
+                    // inline branch, so the binding is data (user-configurable at M5).
+                    // Page size is folded into page motions here (only the frontend
+                    // knows it, SPEC §5).
+                    if let Some(command) =
+                        keymap::command_for_key(&config.keymap, key, viewport.page())
                     {
-                        overlays.push(prompt::open_file(config.theme.prompt));
-                        needs_redraw = true;
-                        continue;
-                    }
-                    // Page motions need the viewport's page size, which only the
-                    // frontend knows (SPEC §5); the keymap folds it into the action.
-                    if let Some(action) =
-                        keymap::action_for_key(&config.keymap, key, viewport.page())
-                    {
-                        let quit = action == Action::Quit;
-                        // If the core is gone, exit cleanly.
-                        if handle.actions.send_blocking(action).is_err() || quit {
+                        // A UI overlay opens locally, so repaint now; a core intent
+                        // repaints when its snapshot returns, so it need not force one.
+                        if matches!(&command, Command::OpenFilePrompt) {
+                            needs_redraw = true;
+                        }
+                        if !dispatch_command(command, handle, &mut overlays, &config.theme) {
                             return Ok(());
                         }
                     }
@@ -421,6 +419,28 @@ fn event_loop(
             }
         }
     }
+}
+
+/// Dispatch one resolved frontend command (SPEC §7.5), from either a bound key or a
+/// compositor layer committing a choice - one path for both. A core intent is
+/// forwarded to the actor; a UI command opens an overlay. Returns `false` when the
+/// app should exit (a quit, or the core's action channel closed).
+fn dispatch_command(
+    command: Command,
+    handle: &vortex_core::CoreHandle,
+    overlays: &mut Compositor,
+    theme: &config::Theme,
+) -> bool {
+    match command {
+        Command::Editor(action) => {
+            let quit = action == Action::Quit;
+            if handle.actions.send_blocking(action).is_err() || quit {
+                return false;
+            }
+        }
+        Command::OpenFilePrompt => overlays.push(prompt::open_file(theme.prompt)),
+    }
+    true
 }
 
 /// Resolve an absolute pointer cell to a buffer byte offset, using the last painted
