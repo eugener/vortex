@@ -64,6 +64,11 @@ pub struct Theme {
     /// Error toasts: save failed, edit rejected. High-contrast red so a failure is
     /// unmistakable (SPEC §8: a failure must be visible, never silent).
     pub toast_error: Style,
+    /// The command palette box (SPEC §7.5): its border, query row, and unselected
+    /// entries.
+    pub palette: Style,
+    /// The palette's highlighted row - an accent fill so the selection is obvious.
+    pub palette_selected: Style,
 }
 
 impl Default for Theme {
@@ -99,6 +104,15 @@ impl Default for Theme {
             toast_error: Style::new()
                 .fg(Color::Rgb(255, 255, 255))
                 .bg(Color::Rgb(150, 45, 45))
+                .add_modifier(Modifier::BOLD),
+            // A dark panel for the palette; the same accent blue as a selection marks
+            // the highlighted row so the current choice is unmistakable (SPEC §7.5).
+            palette: Style::new()
+                .fg(Color::Rgb(220, 220, 220))
+                .bg(Color::Rgb(30, 34, 42)),
+            palette_selected: Style::new()
+                .fg(Color::Rgb(255, 255, 255))
+                .bg(Color::Rgb(38, 79, 120))
                 .add_modifier(Modifier::BOLD),
         }
     }

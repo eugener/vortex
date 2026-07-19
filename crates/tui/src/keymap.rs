@@ -324,8 +324,10 @@ const MACOS_ONLY_BINDINGS: &[(&str, &str)] = &[];
 /// §7.5). Kept in a table like [`DEFAULT_BINDINGS`] so the trigger is *data*, not an
 /// inline branch in the event loop, and resolved into [`FrontendCommand`]s that never
 /// cross the seam to the core.
-const UI_DEFAULT_BINDINGS: &[(&str, FrontendCommand)] =
-    &[("ctrl+o", FrontendCommand::OpenFilePrompt)];
+const UI_DEFAULT_BINDINGS: &[(&str, FrontendCommand)] = &[
+    ("ctrl+o", FrontendCommand::OpenFilePrompt),
+    ("ctrl+p", FrontendCommand::OpenPalette),
+];
 
 /// The resolved key bindings. Opaque so its representation can change (e.g. gain
 /// per-mode maps) without touching call sites; built via [`Keymap::from_pairs`].
