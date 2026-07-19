@@ -24,9 +24,11 @@ use unicode_width::UnicodeWidthStr;
 use crate::command::Command;
 use crate::compositor::{EventResult, Layer};
 
-/// One selectable row: a user-facing label and what running it does.
+/// One selectable row: a user-facing label, an optional shortcut to show
+/// right-aligned (the key that runs it, if any), and what running it does.
 pub struct Item {
     pub label: String,
+    pub shortcut: Option<String>,
     pub command: Command,
 }
 
@@ -159,10 +161,25 @@ impl Layer for Picker {
             } else {
                 self.style
             };
+            let item = &self.items[idx];
             let rect = Rect::new(inner.x, y, inner.width, 1);
             buf.set_style(rect, style);
-            let line = format!("  {}", self.items[idx].label);
-            buf.set_stringn(inner.x, y, &line, inner.width as usize, style);
+            buf.set_stringn(
+                inner.x,
+                y,
+                format!("  {}", item.label),
+                inner.width as usize,
+                style,
+            );
+            // The shortcut (if any) is drawn right-aligned, one cell in from the
+            // border. Labels are short, so it does not collide with them.
+            if let Some(shortcut) = &item.shortcut {
+                let text = format!("{shortcut} ");
+                let w = text.width() as u16;
+                if w < inner.width {
+                    buf.set_stringn(inner.x + inner.width - w, y, &text, w as usize, style);
+                }
+            }
         }
     }
 
@@ -231,14 +248,15 @@ mod tests {
 
     fn items() -> Vec<Item> {
         [
-            ("Save File", Command::Editor(Action::Save)),
-            ("Open Palette", Command::OpenPalette),
-            ("Quit", Command::Editor(Action::Quit)),
-            ("Copy", Command::Editor(Action::Copy)),
+            ("Save File", Some("Ctrl+S"), Command::Editor(Action::Save)),
+            ("Open Palette", None, Command::OpenPalette),
+            ("Quit", Some("Ctrl+Q"), Command::Editor(Action::Quit)),
+            ("Copy", None, Command::Editor(Action::Copy)),
         ]
         .into_iter()
-        .map(|(label, command)| Item {
+        .map(|(label, shortcut, command)| Item {
             label: label.to_string(),
+            shortcut: shortcut.map(str::to_string),
             command,
         })
         .collect()
@@ -356,5 +374,31 @@ mod tests {
             p.cursor(Rect::new(0, 0, 40, 16)),
             Some(Position::new(inner.x + 4, inner.y))
         );
+    }
+
+    #[test]
+    fn renders_the_shortcut_right_aligned() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+        let p = picker(); // "Save File" carries "Ctrl+S"; "Open Palette" carries none
+        let mut terminal = Terminal::new(TestBackend::new(40, 16)).unwrap();
+        terminal
+            .draw(|frame| p.render(frame.area(), frame.buffer_mut()))
+            .unwrap();
+        let buf = terminal.backend().buffer().clone();
+        // "Save File" is the top row of the list (row after the query line).
+        let inner = Block::bordered().inner(Picker::area(Rect::new(0, 0, 40, 16)));
+        let row_y = inner.y + 1;
+        let row: String = (inner.x..inner.right())
+            .map(|x| buf.cell((x, row_y)).unwrap().symbol().to_string())
+            .collect();
+        assert!(row.contains("Save File"), "label on the left: {row:?}");
+        assert!(row.contains("Ctrl+S"), "shortcut shown: {row:?}");
+        // The shortcut sits flush to the right, after the label.
+        assert!(
+            row.find("Save File").unwrap() < row.find("Ctrl+S").unwrap(),
+            "shortcut is right of the label: {row:?}"
+        );
+        assert!(row.trim_end().ends_with("Ctrl+S"), "right-aligned: {row:?}");
     }
 }
