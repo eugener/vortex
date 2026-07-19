@@ -325,9 +325,10 @@ const MACOS_ONLY_BINDINGS: &[(&str, &str)] = &[];
 /// inline branch in the event loop, and resolved into [`FrontendCommand`]s that never
 /// cross the seam to the core.
 const UI_DEFAULT_BINDINGS: &[(&str, FrontendCommand)] = &[
-    ("ctrl+o", FrontendCommand::OpenFilePrompt),
+    // Ctrl+O is the primary "open": the fuzzy file picker. Typing an arbitrary or
+    // new path (the prompt) stays reachable from the palette as "Open Path…".
+    ("ctrl+o", FrontendCommand::OpenFilePicker),
     ("ctrl+p", FrontendCommand::OpenPalette),
-    ("ctrl+f", FrontendCommand::OpenFilePicker),
 ];
 
 /// The resolved key bindings. Opaque so its representation can change (e.g. gain
@@ -641,9 +642,9 @@ mod tests {
     }
 
     #[test]
-    fn command_for_key_routes_ctrl_o_to_the_file_prompt() {
+    fn command_for_key_routes_ctrl_o_to_the_file_picker() {
         // Ctrl+O is a UI-overlay trigger, resolved through the keymap (SPEC §7.5) -
-        // not an inline branch in the loop. It is a frontend command, not a core one.
+        // not an inline branch in the loop. It opens the fuzzy file picker.
         let km = Keymap::default();
         assert_eq!(
             command_for_key(
@@ -651,7 +652,7 @@ mod tests {
                 with_mods(KeyCode::Char('o'), KeyModifiers::CONTROL),
                 PAGE
             ),
-            Some(FrontendCommand::OpenFilePrompt)
+            Some(FrontendCommand::OpenFilePicker)
         );
     }
 

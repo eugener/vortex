@@ -21,8 +21,8 @@ fn registry() -> Vec<Item> {
         command,
     };
     vec![
-        e("Open File…", Command::OpenFilePrompt),
         e("Find File…", Command::OpenFilePicker),
+        e("Open Path…", Command::OpenFilePrompt),
         e("Save File", Command::Editor(Action::Save)),
         e("Undo", Command::Editor(Action::Undo)),
         e("Redo", Command::Editor(Action::Redo)),
