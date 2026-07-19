@@ -232,7 +232,7 @@ mod tests {
     fn items() -> Vec<Item> {
         [
             ("Save File", Command::Editor(Action::Save)),
-            ("Open File", Command::OpenFilePrompt),
+            ("Open Palette", Command::OpenPalette),
             ("Quit", Command::Editor(Action::Quit)),
             ("Copy", Command::Editor(Action::Copy)),
         ]

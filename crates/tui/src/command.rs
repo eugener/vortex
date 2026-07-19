@@ -14,8 +14,6 @@ use vortex_core::Action;
 pub enum Command {
     /// Forward a core intent to the editor actor.
     Editor(Action),
-    /// Open the file-open prompt overlay (frontend-local).
-    OpenFilePrompt,
     /// Open the command palette overlay (frontend-local).
     OpenPalette,
     /// Open the file picker overlay (frontend-local).
