@@ -18,11 +18,12 @@ mod keymap;
 mod layout;
 mod osc52;
 mod prompt;
+mod toast;
 
 use std::ffi::OsString;
 use std::io::{self, Stdout};
 use std::path::PathBuf;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use ratatui::crossterm::event::{
     self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
@@ -42,6 +43,7 @@ use ratatui::{Frame, Terminal, TerminalOptions, Viewport};
 use vortex_core::{Action, Core, ViewSnapshot};
 
 use compositor::{Compositor, EventResult};
+use toast::{Level, Toasts};
 
 /// Default tab stop width for display-column layout (SPEC §4). Config in M5.
 const TAB_WIDTH: usize = 4;
@@ -237,10 +239,10 @@ fn event_loop(
     // View state (scroll on both axes + last page height). Updated by `draw` each
     // frame and carried forward; `page()` sizes PageUp/PageDown (SPEC §5).
     let mut viewport = ViewState::default();
-    // The latest file-lifecycle message (open/save result), shown transiently in
-    // the status bar until the next edit or motion snapshot clears it. A failed
-    // save must be visible, not silent (SPEC §8).
-    let mut message: Option<String> = None;
+    // Transient file/edit notices (open/save results, failures) surface here as
+    // top-right toasts that auto-fade, rather than hijacking the status bar (SPEC
+    // §7.5). A failed save must be visible, not silent (SPEC §8).
+    let mut toasts = Toasts::new(config.theme.toast_info, config.theme.toast_error);
     // Repaint only when something changed - a new snapshot, a resize, or the
     // first frame. Redrawing every idle poll tick is wasted work (ratatui
     // cell-diffs, so it emits nothing, but it still rebuilds the frame ~60x/sec).
@@ -276,10 +278,15 @@ fn event_loop(
             if let vortex_core::Notification::SetClipboard { text } = &note {
                 let _ = osc52::copy(text);
             }
-            if let Some(m) = layout::notification_message(&note) {
-                message = Some(m);
+            if let Some(text) = layout::notification_message(&note) {
+                toasts.push(text, Level::of(&note), Instant::now());
                 needs_redraw = true;
             }
+        }
+        // Fade toasts past their TTL. The 16ms poll tick below drives this even while
+        // the user is idle, so a notice disappears on its own (SPEC §7.5).
+        if toasts.expire(Instant::now()) {
+            needs_redraw = true;
         }
 
         if let Some(snap) = &latest
@@ -289,10 +296,10 @@ fn event_loop(
                 terminal,
                 snap,
                 viewport,
-                message.as_deref(),
                 config.theme,
                 follow,
                 &overlays,
+                &toasts,
             )?;
             needs_redraw = false;
             // Default back to caret-follow; only a wheel scroll opts out, and only
@@ -343,12 +350,6 @@ fn event_loop(
                         keymap::action_for_key(&config.keymap, key, viewport.page())
                     {
                         let quit = action == Action::Quit;
-                        // A new user action clears the transient file message so it
-                        // does not linger while the user keeps typing; Save keeps it
-                        // (its own result replaces it once the notification lands).
-                        if !matches!(action, Action::Save) && message.take().is_some() {
-                            needs_redraw = true;
-                        }
                         // If the core is gone, exit cleanly.
                         if handle.actions.send_blocking(action).is_err() || quit {
                             return Ok(());
@@ -371,11 +372,6 @@ fn event_loop(
                             let extend = matches!(mouse.kind, MouseEventKind::Drag(_))
                                 || mouse.modifiers.contains(KeyModifiers::SHIFT);
                             let offset = pointer_offset(snap, viewport, mouse.column, mouse.row);
-                            // A pointer action clears the transient file message,
-                            // like a keystroke does.
-                            if message.take().is_some() {
-                                needs_redraw = true;
-                            }
                             // Alt+click adds a cursor without collapsing the set
                             // (SPEC §2.2 multi-cursor); a plain click/drag places or
                             // extends the single caret. Alt only adds on a fresh
@@ -415,9 +411,6 @@ fn event_loop(
                 // core's structured register; the terminal only ever hands us a flat
                 // string, so `Insert` is the right intent here.
                 Event::Paste(text) => {
-                    if message.take().is_some() {
-                        needs_redraw = true;
-                    }
                     if handle.actions.send_blocking(Action::Insert(text)).is_err() {
                         return Ok(());
                     }
@@ -459,21 +452,23 @@ fn draw(
     terminal: &mut Terminal<ratatui::backend::CrosstermBackend<Stdout>>,
     snapshot: &ViewSnapshot,
     viewport: ViewState,
-    message: Option<&str>,
     theme: config::Theme,
     follow: bool,
     overlays: &Compositor,
+    toasts: &Toasts,
 ) -> io::Result<ViewState> {
     let mut new_viewport = viewport;
     let mut out = io::stdout();
     queue!(out, BeginSynchronizedUpdate)?;
     terminal.draw(|frame| {
-        new_viewport = paint(frame, snapshot, viewport, message, theme, follow);
-        // Overlays paint over the base editor (SPEC §7.5). The focused overlay owns
-        // the caret, so its cursor - set last - wins over the editor caret `paint`
-        // placed. (A menu-style overlay wanting no caret at all is an M7 concern;
-        // today's only overlay, the prompt, always provides one.)
+        new_viewport = paint(frame, snapshot, viewport, theme, follow);
         let area = frame.area();
+        // Toasts paint over the base editor but consume no input (SPEC §7.5), then
+        // overlays paint over everything. The focused overlay owns the caret, so its
+        // cursor - set last - wins over the editor caret `paint` placed. (A menu-style
+        // overlay wanting no caret at all is an M7 concern; today's only overlay, the
+        // prompt, always provides one.)
+        toasts.render(area, frame.buffer_mut());
         overlays.render(area, frame.buffer_mut());
         if let Some(pos) = overlays.cursor(area) {
             frame.set_cursor_position(pos);
@@ -492,7 +487,6 @@ fn paint(
     frame: &mut Frame,
     snapshot: &ViewSnapshot,
     viewport: ViewState,
-    message: Option<&str>,
     theme: config::Theme,
     follow: bool,
 ) -> ViewState {
@@ -574,7 +568,6 @@ fn paint(
             cursor_line,
             line_text: &line_text,
             cursor_byte_col,
-            message,
             style: theme.status_bar,
         },
     );
@@ -722,14 +715,13 @@ fn paint_body(frame: &mut Frame, area: Rect, snapshot: &ViewSnapshot, body: Body
     frame.render_widget(Paragraph::new(rows), area);
 }
 
-/// Paint the bottom status bar. Normally shows cursor position (left) and buffer
-/// metrics (right); when a transient file `message` is present it replaces the
-/// cursor position so an open/save result - especially a failure - is visible
-/// (SPEC §8).
+/// Paint the bottom status bar: cursor position (left) and buffer metrics (right).
+/// File open/save results surface as toasts now (SPEC §7.5), so the position is
+/// always shown here.
 /// The per-frame inputs [`paint_status_bar`] needs beyond the frame/area/snapshot:
-/// the cursor readout, any transient message, and the bar style (from the active
-/// theme). Bundled as one value so the painter stays within the argument budget,
-/// the same consolidation as [`Body`].
+/// the cursor readout and the bar style (from the active theme). Bundled as one
+/// value so the painter stays within the argument budget, the same consolidation as
+/// [`Body`].
 struct StatusBar<'a> {
     /// 0-based cursor line (displayed 1-based).
     cursor_line: usize,
@@ -737,8 +729,6 @@ struct StatusBar<'a> {
     line_text: &'a str,
     /// Byte column of the cursor within `line_text`.
     cursor_byte_col: usize,
-    /// A transient file open/save message that replaces the position (SPEC §8).
-    message: Option<&'a str>,
     /// Bar fill style (from the active theme).
     style: Style,
 }
@@ -752,7 +742,6 @@ fn paint_status_bar(frame: &mut Frame, area: Rect, snapshot: &ViewSnapshot, stat
         selected,
         snapshot.text.byte_len(),
         snapshot.version,
-        status.message,
     );
     let bar = layout::fit_bar(&left, &right, area.width as usize);
     frame.render_widget(Paragraph::new(bar).style(status.style), area);
@@ -897,17 +886,6 @@ mod tests {
     /// Render `snapshot` into an in-memory `TestBackend` of `w`x`h` cells via the
     /// real [`paint`] path, and hand back the painted buffer for cell assertions.
     fn render(snapshot: &ViewSnapshot, w: u16, h: u16) -> ratatui::buffer::Buffer {
-        render_with_message(snapshot, w, h, None)
-    }
-
-    /// As [`render`], but with a transient status-bar `message` (a file open/save
-    /// result) so its placement can be asserted.
-    fn render_with_message(
-        snapshot: &ViewSnapshot,
-        w: u16,
-        h: u16,
-        message: Option<&str>,
-    ) -> ratatui::buffer::Buffer {
         let mut terminal = Terminal::new(TestBackend::new(w, h)).unwrap();
         terminal
             .draw(|frame| {
@@ -915,7 +893,6 @@ mod tests {
                     frame,
                     snapshot,
                     ViewState::default(),
-                    message,
                     config::Theme::default(),
                     true,
                 );
@@ -1032,20 +1009,6 @@ mod tests {
     }
 
     #[test]
-    fn status_bar_shows_file_message_in_place_of_position() {
-        // With a transient file message the bottom bar shows it instead of the
-        // cursor position (SPEC §8: a save result must be visible).
-        let snap = snapshot_after(&[Action::Insert("hi".into())]);
-        let buf = render_with_message(&snap, 40, 10, Some("Saved out.txt"));
-        let status = row_text(&buf, 9);
-        assert!(status.contains("Saved out.txt"), "status: {status:?}");
-        assert!(
-            !status.contains("Ln 1"),
-            "position should be replaced: {status:?}"
-        );
-    }
-
-    #[test]
     fn status_bar_shows_cursor_position_on_bottom_row() {
         // Insert two lines, leaving the cursor at the end of line 2 (Ln 2, Col 4).
         let snap = snapshot_after(&[Action::Insert("ab\ncde".into())]);
@@ -1099,7 +1062,6 @@ mod tests {
                     frame,
                     &snap,
                     ViewState::default(),
-                    None,
                     config::Theme::default(),
                     true,
                 );
@@ -1230,7 +1192,6 @@ mod tests {
                     frame,
                     &snap,
                     ViewState::default(),
-                    None,
                     config::Theme::default(),
                     true,
                 );
@@ -1307,9 +1268,7 @@ mod tests {
             page_height: 4,
         };
         terminal
-            .draw(|frame| {
-                settled = paint(frame, &snap, stale, None, config::Theme::default(), true)
-            })
+            .draw(|frame| settled = paint(frame, &snap, stale, config::Theme::default(), true))
             .unwrap();
         assert_eq!(settled.scroll, 0, "scroll must clamp to fit the content");
         let buf = terminal.backend().buffer().clone();
@@ -1334,9 +1293,7 @@ mod tests {
             page_height: 2,
         };
         terminal
-            .draw(|frame| {
-                settled = paint(frame, &snap, stale, None, config::Theme::default(), true)
-            })
+            .draw(|frame| settled = paint(frame, &snap, stale, config::Theme::default(), true))
             .unwrap();
         assert_eq!(settled.h_scroll, 0, "h_scroll must clamp to the short line");
         let buf = terminal.backend().buffer().clone();
@@ -1368,16 +1325,7 @@ mod tests {
         let mut settled = ViewState::default();
         let mut terminal = Terminal::new(TestBackend::new(20, 6)).unwrap();
         terminal
-            .draw(|frame| {
-                settled = paint(
-                    frame,
-                    &snap,
-                    scrolled,
-                    None,
-                    config::Theme::default(),
-                    false,
-                )
-            })
+            .draw(|frame| settled = paint(frame, &snap, scrolled, config::Theme::default(), false))
             .unwrap();
         // The view stayed scrolled (not pulled back to the caret on line 0).
         assert_eq!(settled.scroll, 2);
