@@ -184,6 +184,15 @@ impl Layer for Picker {
     }
 
     fn handle_key(&mut self, key: KeyEvent) -> EventResult {
+        // A Ctrl/Cmd chord is a keybinding, not picker input: defer it (Ignored) so
+        // the shortcut runs and the loop dismisses the picker. Kept generic (not
+        // naming keys), so configurable shortcuts (M5) work from a picker for free -
+        // the keymap stays the single source the picker also *displays* (§7.5, §10.5).
+        if key.modifiers.contains(KeyModifiers::CONTROL)
+            || key.modifiers.contains(KeyModifiers::SUPER)
+        {
+            return EventResult::Ignored;
+        }
         match key.code {
             KeyCode::Esc => self.finished = true,
             KeyCode::Enter => {
@@ -202,12 +211,9 @@ impl Layer for Picker {
                 self.refilter();
                 self.selected = 0;
             }
-            // Typing filters. A Ctrl/Cmd-modified char is a chord, not text (same rule
-            // as the keymap and prompt), so it is swallowed rather than added.
-            KeyCode::Char(c)
-                if !key.modifiers.contains(KeyModifiers::CONTROL)
-                    && !key.modifiers.contains(KeyModifiers::SUPER) =>
-            {
+            // Typing filters (Alt passes through for composed accented input; Ctrl/Cmd
+            // already returned above).
+            KeyCode::Char(c) => {
                 self.query.push(c);
                 self.refilter();
                 self.selected = 0;
@@ -323,6 +329,20 @@ mod tests {
         p.handle_key(press(KeyCode::Enter));
         assert!(p.is_finished());
         assert_eq!(p.take_commands(), vec![Command::Editor(Action::Quit)]);
+    }
+
+    #[test]
+    fn ctrl_chord_is_deferred_not_typed() {
+        // A Ctrl/Cmd chord is a shortcut, not filter input: the picker ignores it
+        // (so the loop runs the binding) and does not add it to the query.
+        let mut p = picker();
+        let ctrl_s = KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL);
+        assert_eq!(p.handle_key(ctrl_s), EventResult::Ignored);
+        assert!(p.query.is_empty(), "the chord must not filter");
+        assert!(
+            !p.is_finished(),
+            "deferring does not close the picker itself"
+        );
     }
 
     #[test]

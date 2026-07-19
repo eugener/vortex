@@ -417,18 +417,24 @@ impl Keymap {
     /// core command is matched by resolving each binding to its `Action` (page 0;
     /// palette commands are never page-dependent motions); a UI command is matched
     /// directly in `ui_bindings`.
+    ///
+    /// A command may have several bindings (on macOS Quit is both Ctrl+Q and Ctrl+C);
+    /// `max` picks one **deterministically** - HashMap order is not stable - and
+    /// happens to prefer Ctrl+Q over Ctrl+C.
     pub fn shortcut_for(&self, command: &FrontendCommand) -> Option<String> {
         match command {
             FrontendCommand::Editor(action) => self
                 .bindings
                 .iter()
-                .find(|(_, cmd)| cmd.resolve(0) == *action)
-                .map(|(chord, _)| chord.display()),
+                .filter(|(_, cmd)| cmd.resolve(0) == *action)
+                .map(|(chord, _)| chord.display())
+                .max(),
             ui => self
                 .ui_bindings
                 .iter()
-                .find(|(_, cmd)| *cmd == ui)
-                .map(|(chord, _)| chord.display()),
+                .filter(|(_, cmd)| *cmd == ui)
+                .map(|(chord, _)| chord.display())
+                .max(),
         }
     }
 }
