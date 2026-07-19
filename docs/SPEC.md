@@ -188,6 +188,7 @@ held-lock-across-`.await` deadlocks. Instead:
 | Channels | **`async-channel`** (bounded) + latest-wins snapshot cell | see §6 |
 | Terminal render | **`ratatui` + `crossterm`** | immediate-mode cell-diffing; we own the loop |
 | Frame atomicity | crossterm `BeginSynchronizedUpdate` / `EndSynchronizedUpdate` | anti-tearing (§7) |
+| Fuzzy match | **`nucleo-matcher`** | palette/picker ranking (Helix's matcher); on-thread for small lists (§7.5) |
 | Config | `toml` + `serde` | Helix-style |
 | Encoding | `encoding_rs` | detect on load; edit as UTF-8 internally (§10.1) |
 | File watch | `notify` | external-change detection (§10.2) |
