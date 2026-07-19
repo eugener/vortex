@@ -12,12 +12,15 @@ use vortex_core::Action;
 use crate::command::Command;
 use crate::compositor::Layer;
 use crate::config::Theme;
+use crate::keymap::Keymap;
 use crate::picker::{Item, Picker};
 
-/// The curated command set the palette lists.
-fn registry() -> Vec<Item> {
-    let e = |label: &str, command| Item {
+/// The curated command set the palette lists. Each entry's shortcut is looked up
+/// from the keymap (single source of truth), so it stays right even after a rebind.
+fn registry(keymap: &Keymap) -> Vec<Item> {
+    let e = |label: &str, command: Command| Item {
         label: label.to_string(),
+        shortcut: keymap.shortcut_for(&command),
         command,
     };
     vec![
@@ -38,11 +41,11 @@ fn registry() -> Vec<Item> {
     ]
 }
 
-/// Open the command palette, styled from the theme.
-pub fn open(theme: &Theme) -> Box<dyn Layer> {
+/// Open the command palette, styled from the theme, with shortcuts from the keymap.
+pub fn open(theme: &Theme, keymap: &Keymap) -> Box<dyn Layer> {
     Box::new(Picker::new(
         "Commands",
-        registry(),
+        registry(keymap),
         false,
         theme.palette,
         theme.palette_selected,
@@ -54,15 +57,20 @@ mod tests {
     use super::*;
 
     #[test]
-    fn registry_lists_the_named_commands() {
-        let items = registry();
-        // A representative core command and the file-picker opener are present.
-        assert!(
-            items
-                .iter()
-                .any(|i| matches!(i.command, Command::Editor(Action::Save)))
-        );
-        assert!(items.iter().any(|i| i.command == Command::OpenFilePicker));
+    fn registry_lists_the_named_commands_with_shortcuts() {
+        let items = registry(&Keymap::default());
+        // A representative core command and the file-picker opener are present, and
+        // their shortcuts are populated from the keymap.
+        let save = items
+            .iter()
+            .find(|i| matches!(i.command, Command::Editor(Action::Save)))
+            .expect("Save File listed");
+        assert_eq!(save.shortcut.as_deref(), Some("Ctrl+S"));
+        let find = items
+            .iter()
+            .find(|i| i.command == Command::OpenFilePicker)
+            .expect("Find File listed");
+        assert_eq!(find.shortcut.as_deref(), Some("Ctrl+O"));
         // No duplicate labels (they are the fuzzy haystacks).
         for (n, item) in items.iter().enumerate() {
             assert!(

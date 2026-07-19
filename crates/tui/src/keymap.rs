@@ -86,6 +86,50 @@ impl Chord {
         }
         have_key.then_some(chord)
     }
+
+    /// A human-readable rendering of the chord for display (e.g. `"Ctrl+S"`,
+    /// `"Ctrl+Alt+Up"`), used by the palette to show a command's shortcut. Modifiers
+    /// are listed in a stable order; not guaranteed to round-trip through [`parse`]
+    /// (display casing differs), but that is not required.
+    fn display(&self) -> String {
+        let mut out = String::new();
+        if self.ctrl {
+            out.push_str("Ctrl+");
+        }
+        if self.alt {
+            out.push_str("Alt+");
+        }
+        if self.shift {
+            out.push_str("Shift+");
+        }
+        if self.cmd {
+            out.push_str("Cmd+");
+        }
+        out.push_str(&key_display(self.code));
+        out
+    }
+}
+
+/// A [`KeyCode`] rendered for display (the loose inverse of [`parse_key_code`]).
+fn key_display(code: KeyCode) -> String {
+    match code {
+        KeyCode::Char(' ') => "Space".to_string(),
+        KeyCode::Char(c) => c.to_ascii_uppercase().to_string(),
+        KeyCode::Left => "Left".to_string(),
+        KeyCode::Right => "Right".to_string(),
+        KeyCode::Up => "Up".to_string(),
+        KeyCode::Down => "Down".to_string(),
+        KeyCode::Home => "Home".to_string(),
+        KeyCode::End => "End".to_string(),
+        KeyCode::PageUp => "PageUp".to_string(),
+        KeyCode::PageDown => "PageDown".to_string(),
+        KeyCode::Enter => "Enter".to_string(),
+        KeyCode::Tab => "Tab".to_string(),
+        KeyCode::Backspace => "Backspace".to_string(),
+        KeyCode::Delete => "Delete".to_string(),
+        KeyCode::Esc => "Esc".to_string(),
+        other => format!("{other:?}"),
+    }
 }
 
 /// A key-code token (already lowercased) to its [`KeyCode`]. A single character maps
@@ -365,6 +409,27 @@ impl Keymap {
             bindings,
             ui_bindings: HashMap::new(),
         })
+    }
+
+    /// The shortcut bound to `command`, formatted for display (e.g. `"Ctrl+S"`), or
+    /// `None` if it is unbound. Lets the palette show each command's key without a
+    /// second source of truth - a rebind (M5 config) keeps the palette correct. A
+    /// core command is matched by resolving each binding to its `Action` (page 0;
+    /// palette commands are never page-dependent motions); a UI command is matched
+    /// directly in `ui_bindings`.
+    pub fn shortcut_for(&self, command: &FrontendCommand) -> Option<String> {
+        match command {
+            FrontendCommand::Editor(action) => self
+                .bindings
+                .iter()
+                .find(|(_, cmd)| cmd.resolve(0) == *action)
+                .map(|(chord, _)| chord.display()),
+            ui => self
+                .ui_bindings
+                .iter()
+                .find(|(_, cmd)| *cmd == ui)
+                .map(|(chord, _)| chord.display()),
+        }
     }
 }
 
@@ -673,6 +738,46 @@ mod tests {
             command_for_key(&km, press(KeyCode::Char('a')), PAGE),
             Some(FrontendCommand::Editor(Action::Insert("a".into())))
         );
+    }
+
+    #[test]
+    fn shortcut_for_finds_the_bound_key() {
+        // Platform-independent bindings (not the OS-conditional undo/redo/clipboard).
+        let km = Keymap::default();
+        assert_eq!(
+            km.shortcut_for(&FrontendCommand::Editor(Action::Save))
+                .as_deref(),
+            Some("Ctrl+S")
+        );
+        assert_eq!(
+            km.shortcut_for(&FrontendCommand::Editor(Action::Quit))
+                .as_deref(),
+            Some("Ctrl+Q")
+        );
+        assert_eq!(
+            km.shortcut_for(&FrontendCommand::OpenFilePicker).as_deref(),
+            Some("Ctrl+O")
+        );
+        assert_eq!(
+            km.shortcut_for(&FrontendCommand::OpenPalette).as_deref(),
+            Some("Ctrl+P")
+        );
+    }
+
+    #[test]
+    fn shortcut_for_is_none_when_unbound() {
+        // A keymap with only Save bound: everything else has no shortcut to show.
+        let km = Keymap::from_pairs([("ctrl+s", "save")]).unwrap();
+        assert_eq!(
+            km.shortcut_for(&FrontendCommand::Editor(Action::Save))
+                .as_deref(),
+            Some("Ctrl+S")
+        );
+        assert_eq!(
+            km.shortcut_for(&FrontendCommand::Editor(Action::Undo)),
+            None
+        );
+        assert_eq!(km.shortcut_for(&FrontendCommand::OpenFilePicker), None);
     }
 
     #[test]

@@ -330,7 +330,7 @@ fn event_loop(
                         let (result, commands) = overlays.handle_key(key);
                         needs_redraw = true;
                         for command in commands {
-                            if !dispatch_command(command, handle, &mut overlays, &config.theme) {
+                            if !dispatch_command(command, handle, &mut overlays, &config) {
                                 return Ok(());
                             }
                         }
@@ -353,7 +353,7 @@ fn event_loop(
                         if !matches!(&command, Command::Editor(_)) {
                             needs_redraw = true;
                         }
-                        if !dispatch_command(command, handle, &mut overlays, &config.theme) {
+                        if !dispatch_command(command, handle, &mut overlays, &config) {
                             return Ok(());
                         }
                     }
@@ -433,7 +433,7 @@ fn dispatch_command(
     command: Command,
     handle: &vortex_core::CoreHandle,
     overlays: &mut Compositor,
-    theme: &config::Theme,
+    config: &config::Config,
 ) -> bool {
     match command {
         Command::Editor(action) => {
@@ -442,11 +442,12 @@ fn dispatch_command(
                 return false;
             }
         }
-        Command::OpenPalette => overlays.push(palette::open(theme)),
+        // The palette shows each command's shortcut, so it needs the keymap too.
+        Command::OpenPalette => overlays.push(palette::open(&config.theme, &config.keymap)),
         Command::OpenFilePicker => {
             // Walk the working directory. If it cannot be read, fall back to ".".
             let root = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-            overlays.push(filepicker::open(theme, &root));
+            overlays.push(filepicker::open(&config.theme, &root));
         }
     }
     true

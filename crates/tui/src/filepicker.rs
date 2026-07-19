@@ -75,6 +75,7 @@ fn items(root: &Path) -> Vec<Item> {
         .into_iter()
         .map(|rel| Item {
             label: rel.to_string_lossy().into_owned(),
+            shortcut: None,
             command: Command::Editor(Action::Open(root.join(rel))),
         })
         .collect()
