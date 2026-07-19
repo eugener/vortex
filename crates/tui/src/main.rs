@@ -18,6 +18,7 @@ mod config;
 mod keymap;
 mod layout;
 mod osc52;
+mod palette;
 mod prompt;
 mod toast;
 
@@ -156,6 +157,7 @@ Options:
 Keys:
   Ctrl+S           Save        Ctrl+Q            Quit
   Ctrl+O           Open file (prompt; Enter opens, Esc cancels)
+  Ctrl+P           Command palette (type to filter, Enter runs, Esc cancels)
   Ctrl+Alt+Up/Down Add cursor above/below        Alt+Click  Add cursor
   Esc              Collapse to one cursor
 ";
@@ -346,7 +348,7 @@ fn event_loop(
                     {
                         // A UI overlay opens locally, so repaint now; a core intent
                         // repaints when its snapshot returns, so it need not force one.
-                        if matches!(&command, Command::OpenFilePrompt) {
+                        if matches!(&command, Command::OpenFilePrompt | Command::OpenPalette) {
                             needs_redraw = true;
                         }
                         if !dispatch_command(command, handle, &mut overlays, &config.theme) {
@@ -439,6 +441,7 @@ fn dispatch_command(
             }
         }
         Command::OpenFilePrompt => overlays.push(prompt::open_file(theme.prompt)),
+        Command::OpenPalette => overlays.push(palette::open(theme)),
     }
     true
 }

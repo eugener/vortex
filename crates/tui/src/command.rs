@@ -16,4 +16,6 @@ pub enum Command {
     Editor(Action),
     /// Open the file-open prompt overlay (frontend-local).
     OpenFilePrompt,
+    /// Open the command palette overlay (frontend-local).
+    OpenPalette,
 }

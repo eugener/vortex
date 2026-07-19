@@ -11,6 +11,7 @@ name = "vortex"
 path = "src/main.rs"
 
 [dependencies]
+nucleo-matcher = "0.3.1"
 # crossterm is used via ratatui's re-export (ratatui::crossterm) so the KeyEvent
 # types the render loop and event reader share are guaranteed identical - a
 # separate crossterm dep risks version skew against ratatui's bundled 0.29.
