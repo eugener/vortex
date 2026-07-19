@@ -16,14 +16,16 @@
 //! [`KeyEvent`]s (SPEC §13) - the I/O shell in `main.rs` only feeds it.
 //!
 //! **Seam rule (SPEC §7.5):** navigating *inside* a layer never round-trips to the
-//! core. A layer handles its own keys locally; only a *committed* intent (a picked
-//! command, a submitted path) becomes an `Action`, which the layer emits via
-//! [`Layer::take_actions`] and the compositor hands back to the event loop.
+//! core. A layer handles its own keys locally; only a *committed* choice (a picked
+//! command, a submitted path) becomes a [`Command`], which the layer emits via
+//! [`Layer::take_commands`] and the compositor hands back to the event loop - which
+//! dispatches it identically to a bound key (forward to the core, or open an overlay).
 
 use ratatui::buffer::Buffer;
 use ratatui::crossterm::event::KeyEvent;
 use ratatui::layout::{Position, Rect};
-use vortex_core::Action;
+
+use crate::command::Command;
 
 /// What a [`Layer`] decides about an input event.
 ///
@@ -58,11 +60,11 @@ pub trait Layer {
     /// submits, Esc cancels) so the compositor pops it after the dispatch.
     fn handle_key(&mut self, key: KeyEvent) -> EventResult;
 
-    /// Drain any `Action`s the layer has committed (the §7.5 seam rule: only a
-    /// committed intent crosses to the core). Polled by the compositor after each
-    /// key it hands the layer, so a submit both closes the layer and emits its
-    /// action in one dispatch. Default: emits nothing.
-    fn take_actions(&mut self) -> Vec<Action> {
+    /// Drain any [`Command`]s the layer has committed (the §7.5 seam rule: only a
+    /// committed choice leaves the layer). Polled by the compositor after each key it
+    /// hands the layer, so a submit both closes the layer and emits its command in one
+    /// dispatch. Default: emits nothing.
+    fn take_commands(&mut self) -> Vec<Command> {
         Vec::new()
     }
 
@@ -114,27 +116,27 @@ impl Compositor {
     }
 
     /// Offer a key to the stack, top-down, stopping at the first layer that
-    /// [`EventResult::Consumed`]s it, and return that outcome plus any `Action`s the
-    /// handling layers committed. On [`EventResult::Ignored`] the caller falls
-    /// through to the editor's keymap; the returned actions are sent to the core.
+    /// [`EventResult::Consumed`]s it, and return that outcome plus any [`Command`]s
+    /// the handling layers committed. On [`EventResult::Ignored`] the caller falls
+    /// through to the editor's keymap; the returned commands are dispatched.
     ///
     /// Every finished layer is then removed, order preserved. Normally that is just
     /// the top one a submit/cancel closed; but a lower layer that finished on a key
     /// the top *ignored* is pruned too, so no finished layer can leak beneath an open
-    /// one. A committing layer's actions are collected *before* it is removed.
-    pub fn handle_key(&mut self, key: KeyEvent) -> (EventResult, Vec<Action>) {
+    /// one. A committing layer's commands are collected *before* it is removed.
+    pub fn handle_key(&mut self, key: KeyEvent) -> (EventResult, Vec<Command>) {
         let mut result = EventResult::Ignored;
-        let mut actions = Vec::new();
+        let mut commands = Vec::new();
         for layer in self.layers.iter_mut().rev() {
             let outcome = layer.handle_key(key);
-            actions.append(&mut layer.take_actions());
+            commands.append(&mut layer.take_commands());
             if outcome == EventResult::Consumed {
                 result = EventResult::Consumed;
                 break;
             }
         }
         self.layers.retain(|l| !l.is_finished());
-        (result, actions)
+        (result, commands)
     }
 
     /// Paint every layer over `screen`, bottom-to-top, so the topmost overlay wins
@@ -163,14 +165,14 @@ mod tests {
 
     /// A configurable test [`Layer`]: records (in a shared log) the order in which
     /// layers saw a key, optionally consumes it, optionally finishes on a given key,
-    /// optionally emits an action once, and paints its `id` digit at a fixed cell so
+    /// optionally emits a command once, and paints its `id` digit at a fixed cell so
     /// render order is visible.
     struct Fake {
         id: u8,
         consume: bool,
         finish_on: Option<KeyCode>,
         finished: bool,
-        emit: Option<Action>,
+        emit: Option<Command>,
         marker: Option<(u16, u16)>,
         cursor: Option<Position>,
         log: Rc<RefCell<Vec<u8>>>,
@@ -193,8 +195,8 @@ mod tests {
             self.finish_on = Some(code);
             self
         }
-        fn emitting(mut self, action: Action) -> Self {
-            self.emit = Some(action);
+        fn emitting(mut self, command: Command) -> Self {
+            self.emit = Some(command);
             self
         }
         fn at(mut self, x: u16, y: u16) -> Self {
@@ -224,7 +226,7 @@ mod tests {
                 EventResult::Ignored
             }
         }
-        fn take_actions(&mut self) -> Vec<Action> {
+        fn take_commands(&mut self) -> Vec<Command> {
             self.emit.take().into_iter().collect()
         }
         fn cursor(&self, _screen: Rect) -> Option<Position> {
@@ -299,17 +301,17 @@ mod tests {
     }
 
     #[test]
-    fn committed_actions_flow_back_from_the_handling_layer() {
-        // A layer that emits an action on the key it consumes: the compositor hands
-        // that action back to the loop (which forwards it to the core).
+    fn committed_commands_flow_back_from_the_handling_layer() {
+        // A layer that emits a command on the key it consumes: the compositor hands
+        // that command back to the loop (which dispatches it).
         let log = Rc::new(RefCell::new(Vec::new()));
         let mut c = Compositor::new();
         c.push(boxed(
-            Fake::new(1, true, &log).emitting(Action::RequestSnapshot),
+            Fake::new(1, true, &log).emitting(Command::OpenFilePrompt),
         ));
-        let (res, actions) = c.handle_key(key('x'));
+        let (res, commands) = c.handle_key(key('x'));
         assert_eq!(res, EventResult::Consumed);
-        assert!(matches!(actions.as_slice(), [Action::RequestSnapshot]));
+        assert!(matches!(commands.as_slice(), [Command::OpenFilePrompt]));
     }
 
     #[test]
