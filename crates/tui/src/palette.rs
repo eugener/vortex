@@ -22,7 +22,6 @@ fn registry() -> Vec<Item> {
     };
     vec![
         e("Find File…", Command::OpenFilePicker),
-        e("Open Path…", Command::OpenFilePrompt),
         e("Save File", Command::Editor(Action::Save)),
         e("Undo", Command::Editor(Action::Undo)),
         e("Redo", Command::Editor(Action::Redo)),
@@ -57,13 +56,12 @@ mod tests {
     #[test]
     fn registry_lists_the_named_commands() {
         let items = registry();
-        // A representative core command and the two overlay-openers are present.
+        // A representative core command and the file-picker opener are present.
         assert!(
             items
                 .iter()
                 .any(|i| matches!(i.command, Command::Editor(Action::Save)))
         );
-        assert!(items.iter().any(|i| i.command == Command::OpenFilePrompt));
         assert!(items.iter().any(|i| i.command == Command::OpenFilePicker));
         // No duplicate labels (they are the fuzzy haystacks).
         for (n, item) in items.iter().enumerate() {

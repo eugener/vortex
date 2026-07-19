@@ -21,7 +21,6 @@ mod layout;
 mod osc52;
 mod palette;
 mod picker;
-mod prompt;
 mod toast;
 
 use std::ffi::OsString;
@@ -348,14 +347,10 @@ fn event_loop(
                     if let Some(command) =
                         keymap::command_for_key(&config.keymap, key, viewport.page())
                     {
-                        // A UI overlay opens locally, so repaint now; a core intent
-                        // repaints when its snapshot returns, so it need not force one.
-                        if matches!(
-                            &command,
-                            Command::OpenFilePrompt
-                                | Command::OpenPalette
-                                | Command::OpenFilePicker
-                        ) {
+                        // A UI overlay (any non-`Editor` command) opens locally, so
+                        // repaint now; a core intent repaints when its snapshot
+                        // returns, so it need not force one.
+                        if !matches!(&command, Command::Editor(_)) {
                             needs_redraw = true;
                         }
                         if !dispatch_command(command, handle, &mut overlays, &config.theme) {
@@ -447,7 +442,6 @@ fn dispatch_command(
                 return false;
             }
         }
-        Command::OpenFilePrompt => overlays.push(prompt::open_file(theme.prompt)),
         Command::OpenPalette => overlays.push(palette::open(theme)),
         Command::OpenFilePicker => {
             // Walk the working directory. If it cannot be read, fall back to ".".

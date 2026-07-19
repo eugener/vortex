@@ -2,7 +2,7 @@
 //!
 //! §7 fixes how a frame reaches the terminal (own the loop, sync-output, let
 //! ratatui cell-diff). This module is the layer *above* the renderer: a stack of
-//! floating [`Layer`]s (prompt line, command palette, pickers, …) painted over the
+//! floating [`Layer`]s (command palette, file picker, …) painted over the
 //! base editor view and given first crack at input.
 //!
 //! This is Helix's compositor **minus the custom renderer** (SPEC §7.5 "job 2
@@ -42,8 +42,8 @@ pub enum EventResult {
     Ignored,
 }
 
-/// One floating UI surface in the stack: prompt line, command palette, picker,
-/// which-key popup, completion menu (SPEC §7.5 surface table).
+/// One floating UI surface in the stack: command palette, file picker, which-key
+/// popup, completion menu (SPEC §7.5 surface table).
 ///
 /// A layer is handed the **full screen area** and positions itself within it (a
 /// prompt docks to the bottom row, a palette centers a box), painting a `Clear`
@@ -307,11 +307,11 @@ mod tests {
         let log = Rc::new(RefCell::new(Vec::new()));
         let mut c = Compositor::new();
         c.push(boxed(
-            Fake::new(1, true, &log).emitting(Command::OpenFilePrompt),
+            Fake::new(1, true, &log).emitting(Command::OpenPalette),
         ));
         let (res, commands) = c.handle_key(key('x'));
         assert_eq!(res, EventResult::Consumed);
-        assert!(matches!(commands.as_slice(), [Command::OpenFilePrompt]));
+        assert!(matches!(commands.as_slice(), [Command::OpenPalette]));
     }
 
     #[test]
