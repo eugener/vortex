@@ -58,6 +58,12 @@ pub struct Theme {
     /// file-open prompt. Styled distinctly from the status bar it covers so an open
     /// prompt reads as a mode rather than just another transient message.
     pub prompt: Style,
+    /// Informational toasts (SPEC §7.5): file opened/saved. Calm, so they inform
+    /// without alarming.
+    pub toast_info: Style,
+    /// Error toasts: save failed, edit rejected. High-contrast red so a failure is
+    /// unmistakable (SPEC §8: a failure must be visible, never silent).
+    pub toast_error: Style,
 }
 
 impl Default for Theme {
@@ -85,6 +91,15 @@ impl Default for Theme {
             prompt: Style::new()
                 .fg(Color::Rgb(255, 255, 255))
                 .bg(Color::Rgb(38, 79, 120)),
+            // Toasts (SPEC §7.5): a muted slate for info, a strong red for errors,
+            // both with light text so a top-right notice is legible over any content.
+            toast_info: Style::new()
+                .fg(Color::Rgb(230, 230, 230))
+                .bg(Color::Rgb(60, 70, 90)),
+            toast_error: Style::new()
+                .fg(Color::Rgb(255, 255, 255))
+                .bg(Color::Rgb(150, 45, 45))
+                .add_modifier(Modifier::BOLD),
         }
     }
 }

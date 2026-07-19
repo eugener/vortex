@@ -409,10 +409,10 @@ pub fn head_bar(name: &str, line_count: usize) -> (String, String) {
     (left, right)
 }
 
-/// A short, human-readable status line for a file-lifecycle notification, or
-/// `None` for notifications the status bar does not surface (e.g. `ShuttingDown`).
-/// The frontend shows this transiently in place of the cursor position (SPEC §8:
-/// a save result - especially a failure - must be visible, not silent).
+/// A short, human-readable line for a file-lifecycle notification, or `None` for
+/// notifications the frontend does not surface (e.g. `ShuttingDown`). Shown as a
+/// transient toast ([`crate::toast`], SPEC §7.5, §8: a save result - especially a
+/// failure - must be visible, not silent).
 pub fn notification_message(note: &vortex_core::Notification) -> Option<String> {
     use vortex_core::Notification::*;
     match note {
@@ -451,9 +451,9 @@ pub fn human_size(bytes: usize) -> String {
     format!("{size:.1}{}", UNITS[unit])
 }
 
-/// Status-bar segments `(left, right)` = (cursor position, buffer metrics). When a
-/// transient `message` is present (a file open/save result) it replaces the cursor
-/// position on the left so the result is visible (SPEC §8). `line`/`col` are
+/// Status-bar segments `(left, right)` = (cursor position, buffer metrics). File
+/// open/save results no longer hijack this bar - they surface in the toast area
+/// ([`crate::toast`], SPEC §7.5) - so the position is always shown. `line`/`col` are
 /// 1-based for display; a non-zero `selected` (grapheme count of the active
 /// selection) is appended so the size of a selection is visible while it is held.
 /// `bytes` is the buffer size (rendered via [`human_size`]) and `version` the
@@ -464,12 +464,11 @@ pub fn status_bar(
     selected: usize,
     bytes: usize,
     version: u64,
-    message: Option<&str>,
 ) -> (String, String) {
-    let left = match message {
-        Some(m) => format!(" {m}"),
-        None if selected > 0 => format!(" Ln {line}, Col {col}  ({selected} selected)"),
-        None => format!(" Ln {line}, Col {col}"),
+    let left = if selected > 0 {
+        format!(" Ln {line}, Col {col}  ({selected} selected)")
+    } else {
+        format!(" Ln {line}, Col {col}")
     };
     let right = format!("{} · v{version} ", human_size(bytes));
     (left, right)
@@ -1013,7 +1012,7 @@ mod tests {
 
     #[test]
     fn status_bar_composes_position_and_metrics() {
-        let (left, right) = status_bar(2, 5, 0, 38, 7, None);
+        let (left, right) = status_bar(2, 5, 0, 38, 7);
         assert_eq!(left, " Ln 2, Col 5");
         assert_eq!(right, "38B · v7 ");
     }
@@ -1022,7 +1021,7 @@ mod tests {
     fn status_bar_appends_selection_count_when_active() {
         // A held selection surfaces its size next to the position; an empty one
         // (count 0) leaves the position untouched.
-        let (left, _) = status_bar(2, 5, 12, 38, 7, None);
+        let (left, _) = status_bar(2, 5, 12, 38, 7);
         assert_eq!(left, " Ln 2, Col 5  (12 selected)");
     }
 
@@ -1042,17 +1041,8 @@ mod tests {
 
     #[test]
     fn status_bar_renders_large_sizes_in_scaled_units() {
-        let (_, right) = status_bar(1, 1, 0, 2 * 1024 * 1024, 3, None);
+        let (_, right) = status_bar(1, 1, 0, 2 * 1024 * 1024, 3);
         assert_eq!(right, "2.0MB · v3 ");
-    }
-
-    #[test]
-    fn status_bar_message_replaces_cursor_position() {
-        // A transient file message takes the left slot so the result is visible;
-        // metrics stay on the right (SPEC §8).
-        let (left, right) = status_bar(2, 5, 0, 38, 7, Some("Saved f.rs"));
-        assert_eq!(left, " Saved f.rs");
-        assert_eq!(right, "38B · v7 ");
     }
 
     #[test]
