@@ -591,11 +591,7 @@ fn paint(
             gutter_width,
             text_width,
             cursor_line,
-            gutter: theme.gutter,
-            gutter_current: theme.gutter_current,
-            selection: theme.selection,
-            current_line: theme.current_line,
-            secondary_cursor: theme.secondary_cursor,
+            theme,
         },
     );
     paint_status_bar(
@@ -655,16 +651,10 @@ struct Body {
     text_width: usize,
     /// The cursor's line, so its gutter number can be emphasized.
     cursor_line: usize,
-    /// Gutter style for non-cursor lines (from the active theme).
-    gutter: Style,
-    /// Gutter style for the cursor's line (from the active theme).
-    gutter_current: Style,
-    /// Background wash for selected text (from the active theme).
-    selection: Style,
-    /// Background tint filling the cursor's whole row (from the active theme).
-    current_line: Style,
-    /// Marker for a non-primary caret in a multi-cursor set (from the active theme).
-    secondary_cursor: Style,
+    /// The active theme, read straight through for the chrome styles this paints
+    /// (gutter, selection, current line, secondary caret). `Theme` is `Copy`, so
+    /// holding it beats copying each style field out by hand.
+    theme: config::Theme,
 }
 
 /// Paint the text body with a line-number gutter. Each visible row is a gutter
@@ -685,18 +675,18 @@ fn paint_body(frame: &mut Frame, area: Rect, snapshot: &ViewSnapshot, body: Body
     let rows: Vec<Line> = lines
         .into_iter()
         .enumerate()
-        .map(|(row, content)| {
+        .map(|(row, line)| {
             let line_index = body.scroll + row;
             let is_current = line_index == body.cursor_line;
             // The cursor row's tint fills the whole width, so it is the text's base
             // style and is patched onto the gutter number too for a continuous row.
             let (base, gutter_style) = if is_current {
                 (
-                    body.current_line,
-                    body.gutter_current.patch(body.current_line),
+                    body.theme.current_line,
+                    body.theme.gutter_current.patch(body.theme.current_line),
                 )
             } else {
-                (Style::default(), body.gutter)
+                (Style::default(), body.theme.gutter)
             };
             // Selection overlays for this line, in display columns. The raw line
             // (tabs intact) and its byte span drive the byte->column mapping; the
@@ -705,20 +695,22 @@ fn paint_body(frame: &mut Frame, area: Rect, snapshot: &ViewSnapshot, body: Body
             let line_end_excl = text
                 .byte_of_line(line_index + 1)
                 .unwrap_or_else(|| text.byte_len());
-            let raw = text.line(line_index).unwrap_or_default();
+            // `visible_lines` already fetched this line; reuse its raw form for the
+            // byte->column mapping rather than a second rope traversal per row.
+            let raw = &line.raw;
             let mut overlays: Vec<(std::ops::Range<usize>, Style)> = snapshot
                 .selections
                 .iter()
                 .filter_map(|s| {
                     layout::selection_columns(
-                        &raw,
+                        raw,
                         line_start,
                         line_end_excl,
                         TAB_WIDTH,
                         s.start(),
                         s.end(),
                     )
-                    .map(|range| (range, body.selection))
+                    .map(|range| (range, body.theme.selection))
                 })
                 .collect();
             // Mark every secondary (non-primary) caret with a one-cell block so a
@@ -730,8 +722,8 @@ fn paint_body(frame: &mut Frame, area: Rect, snapshot: &ViewSnapshot, body: Body
                     continue;
                 }
                 if text.line_of_byte(s.head) == line_index {
-                    let col = layout::display_column(&raw, s.head - line_start, TAB_WIDTH);
-                    overlays.push((col..col + 1, body.secondary_cursor));
+                    let col = layout::display_column(raw, s.head - line_start, TAB_WIDTH);
+                    overlays.push((col..col + 1, body.theme.secondary_cursor));
                 }
             }
 
@@ -740,7 +732,7 @@ fn paint_body(frame: &mut Frame, area: Rect, snapshot: &ViewSnapshot, body: Body
                 gutter_style,
             )];
             spans.extend(layout::render_line(
-                &content,
+                line.display(),
                 body.h_scroll,
                 body.text_width,
                 base,
