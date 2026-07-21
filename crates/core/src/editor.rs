@@ -381,6 +381,18 @@ pub fn new(action_capacity: usize) -> Core {
     }
 }
 
+/// Mirror the register to the OS clipboard: fill it from the selections and, if
+/// anything was copied, emit `SetClipboard`. Shared by Copy and Cut, which differ
+/// only in their follow-up step. Lives in the actor (not on `Editor`) so the
+/// notifications channel stays a transport concern, not core state.
+fn mirror_register(editor: &mut Editor, notifications: &Sender<Notification>) {
+    if editor.fill_register() {
+        let _ = notifications.try_send(Notification::SetClipboard {
+            text: editor.register_flattened(),
+        });
+    }
+}
+
 /// The actor loop. M1 handles motion + edit + snapshot + quit; M1+ adds a
 /// `select!` over LSP/FS channels alongside this `recv`.
 async fn run(
@@ -403,11 +415,7 @@ async fn run(
             // Copy fills the register but touches no text: emit the clipboard mirror
             // (if anything was selected) and republish, no delta or version bump.
             Action::Copy => {
-                if editor.fill_register() {
-                    let _ = notifications.try_send(Notification::SetClipboard {
-                        text: editor.register_flattened(),
-                    });
-                }
+                mirror_register(&mut editor, &notifications);
                 Step::Republish
             }
             // Cut = copy + delete the selections, as one edit / one undo unit. Fill
@@ -415,11 +423,7 @@ async fn run(
             // of bare cursors selects nothing, so `plan_edit` returns no edits and
             // the apply path treats it as a no-op.
             Action::Cut => {
-                if editor.fill_register() {
-                    let _ = notifications.try_send(Notification::SetClipboard {
-                        text: editor.register_flattened(),
-                    });
-                }
+                mirror_register(&mut editor, &notifications);
                 Step::Edit(editor.plan_edit(EditKind::DeleteSelection))
             }
             // Paste distributes the register over the cursors (SPEC §11); an empty

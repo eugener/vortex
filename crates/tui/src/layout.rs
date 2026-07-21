@@ -154,6 +154,26 @@ pub fn display_line_count(text: &Text) -> usize {
     text.line_of_byte(text.byte_len()) + 1
 }
 
+/// A visible row, fetched from the rope once. The painter needs the line in two
+/// forms: `raw` (tabs intact) drives byte<->display-column mapping for selections
+/// and carets, while the tab-`expanded` form is what actually gets painted.
+/// Returning both here means the caller never re-fetches (a second rope traversal)
+/// the line it just tab-checked.
+pub struct VisibleLine {
+    /// The line as stored, tabs intact.
+    pub raw: String,
+    /// Tab-expanded text to paint, present only when it differs from `raw` (a
+    /// tab-free line paints as-is, so no second full-line copy is made).
+    pub expanded: Option<String>,
+}
+
+impl VisibleLine {
+    /// The text to paint: the tab-expanded form, or `raw` when it had no tabs.
+    pub fn display(&self) -> &str {
+        self.expanded.as_deref().unwrap_or(&self.raw)
+    }
+}
+
 /// The visible lines to paint: the `height` rows starting at `scroll`, each with
 /// tabs expanded to `tab_width` stops so glyphs align with the cursor column.
 /// Bounded by [`display_line_count`] so a trailing empty line (and the empty
@@ -161,18 +181,20 @@ pub fn display_line_count(text: &Text) -> usize {
 /// to `""`. Stops at the last display line (no blank padding - the terminal
 /// backend clears unused rows). Pure and line-bounded (SPEC §10.4), so the
 /// viewport slice is unit-testable rather than buried in the draw closure (§13).
-pub fn visible_lines(text: &Text, scroll: usize, height: usize, tab_width: usize) -> Vec<String> {
+pub fn visible_lines(
+    text: &Text,
+    scroll: usize,
+    height: usize,
+    tab_width: usize,
+) -> Vec<VisibleLine> {
     (scroll..display_line_count(text))
         .take(height)
         .map(|i| {
             let raw = text.line(i).unwrap_or_default();
-            // Only tab-bearing lines need a rewrite; move the rest as-is to avoid
-            // a second full-line copy per row.
-            if raw.contains('\t') {
-                expand_tabs(&raw, tab_width)
-            } else {
-                raw
-            }
+            // Only tab-bearing lines need a rewrite; a tab-free line paints as-is
+            // (`expanded` stays None) to avoid a second full-line copy per row.
+            let expanded = raw.contains('\t').then(|| expand_tabs(&raw, tab_width));
+            VisibleLine { raw, expanded }
         })
         .collect()
 }
@@ -346,15 +368,11 @@ pub fn gutter_width(line_count: usize) -> usize {
     digit_count(line_count.max(1)).max(MIN_GUTTER_DIGITS) + 1
 }
 
-/// Base-10 digit count of `n` (n >= 1), without floating-point `log10`.
+/// Base-10 digit count of `n` (n >= 1), via the integer `ilog10` intrinsic (no
+/// floating-point `log10`). The `n >= 1` precondition holds: `gutter_width` passes
+/// `line_count.max(1)`, so `ilog10`'s zero-input panic is unreachable.
 fn digit_count(n: usize) -> usize {
-    let mut n = n;
-    let mut digits = 1;
-    while n >= 10 {
-        n /= 10;
-        digits += 1;
-    }
-    digits
+    n.ilog10() as usize + 1
 }
 
 /// The gutter text for the buffer line at 0-based `line_index`: its 1-based
@@ -900,24 +918,35 @@ mod tests {
         assert_eq!(text, "");
     }
 
+    /// The painted text of each visible row, for asserting on the window contents.
+    fn displayed(lines: &[VisibleLine]) -> Vec<&str> {
+        lines.iter().map(VisibleLine::display).collect()
+    }
+
     #[test]
     fn visible_lines_window_from_scroll() {
         let t = text_of("l0\nl1\nl2\nl3\nl4");
         // Window of 2 rows starting at line 1.
-        assert_eq!(visible_lines(&t, 1, 2, 4), vec!["l1", "l2"]);
+        assert_eq!(displayed(&visible_lines(&t, 1, 2, 4)), vec!["l1", "l2"]);
     }
 
     #[test]
     fn visible_lines_stops_at_buffer_end() {
         let t = text_of("a\nb");
         // Height exceeds the buffer: only the two real lines, no blank padding.
-        assert_eq!(visible_lines(&t, 0, 10, 4), vec!["a", "b"]);
+        assert_eq!(displayed(&visible_lines(&t, 0, 10, 4)), vec!["a", "b"]);
     }
 
     #[test]
     fn visible_lines_expands_tabs() {
         let t = text_of("a\tb\nplain");
-        assert_eq!(visible_lines(&t, 0, 2, 4), vec!["a   b", "plain"]);
+        let rows = visible_lines(&t, 0, 2, 4);
+        assert_eq!(displayed(&rows), vec!["a   b", "plain"]);
+        // The tab line carries an expanded copy; the tab-free line paints its raw
+        // form directly (no second allocation).
+        assert_eq!(rows[0].raw, "a\tb");
+        assert_eq!(rows[0].expanded.as_deref(), Some("a   b"));
+        assert_eq!(rows[1].expanded, None);
     }
 
     #[test]
@@ -942,14 +971,17 @@ mod tests {
     fn visible_lines_renders_empty_buffer_as_one_blank_row() {
         // Regression: an empty buffer must still paint one (blank) row so its
         // gutter number "1" shows, rather than zero rows.
-        assert_eq!(visible_lines(&text_of(""), 0, 10, 4), vec![""]);
+        assert_eq!(displayed(&visible_lines(&text_of(""), 0, 10, 4)), vec![""]);
     }
 
     #[test]
     fn visible_lines_renders_trailing_empty_line() {
         // Regression: pressing Enter at end of file ("a\n") must show line 2 as a
         // blank row so it gets a gutter number, not be swallowed as a terminator.
-        assert_eq!(visible_lines(&text_of("a\n"), 0, 10, 4), vec!["a", ""]);
+        assert_eq!(
+            displayed(&visible_lines(&text_of("a\n"), 0, 10, 4)),
+            vec!["a", ""]
+        );
     }
 
     #[test]
