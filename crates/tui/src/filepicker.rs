@@ -95,47 +95,15 @@ pub fn open(theme: &Theme, root: &Path) -> Box<dyn Layer> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// A temp directory tree removed on drop (mirrors the helper in `main`'s tests).
-    struct TempTree {
-        root: PathBuf,
-    }
-
-    impl TempTree {
-        fn new() -> Self {
-            use std::sync::atomic::{AtomicU64, Ordering};
-            static COUNTER: AtomicU64 = AtomicU64::new(0);
-            let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-            let root = std::env::temp_dir().join(format!(
-                "vortex-filepicker-{}-{}",
-                std::process::id(),
-                n
-            ));
-            fs::create_dir_all(&root).unwrap();
-            Self { root }
-        }
-        fn file(&self, rel: &str, body: &str) {
-            let path = self.root.join(rel);
-            if let Some(parent) = path.parent() {
-                fs::create_dir_all(parent).unwrap();
-            }
-            fs::write(path, body).unwrap();
-        }
-    }
-
-    impl Drop for TempTree {
-        fn drop(&mut self) {
-            let _ = fs::remove_dir_all(&self.root);
-        }
-    }
+    use crate::testutil::TempDir;
 
     #[test]
     fn collects_files_recursively_relative_to_root() {
-        let t = TempTree::new();
+        let t = TempDir::new();
         t.file("a.txt", "");
         t.file("src/main.rs", "");
         t.file("src/nested/deep.rs", "");
-        let mut found = collect_files(&t.root);
+        let mut found = collect_files(&t.path);
         found.sort();
         assert_eq!(
             found,
@@ -149,32 +117,32 @@ mod tests {
 
     #[test]
     fn skips_dot_entries_and_ignored_dirs() {
-        let t = TempTree::new();
+        let t = TempDir::new();
         t.file("keep.rs", "");
         t.file(".hidden", ""); // dot-file
         t.file(".git/config", ""); // dot-dir
         t.file("target/debug/thing", ""); // ignored dir
         t.file("node_modules/pkg/index.js", ""); // ignored dir
-        let found = collect_files(&t.root);
+        let found = collect_files(&t.path);
         assert_eq!(found, vec![PathBuf::from("keep.rs")]);
     }
 
     #[test]
     fn items_open_absolute_paths_with_relative_labels() {
-        let t = TempTree::new();
+        let t = TempDir::new();
         t.file("src/main.rs", "");
-        let items = items(&t.root);
+        let items = items(&t.path);
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].label, "src/main.rs");
         assert_eq!(
             items[0].command,
-            Command::Editor(Action::Open(t.root.join("src/main.rs")))
+            Command::Editor(Action::Open(t.path.join("src/main.rs")))
         );
     }
 
     #[test]
     fn empty_directory_yields_no_items() {
-        let t = TempTree::new();
-        assert!(collect_files(&t.root).is_empty());
+        let t = TempDir::new();
+        assert!(collect_files(&t.path).is_empty());
     }
 }

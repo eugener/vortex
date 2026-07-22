@@ -33,13 +33,35 @@ pub enum Level {
     Error,
 }
 
-impl Level {
-    /// The severity of a notification.
-    pub fn of(note: &Notification) -> Level {
-        match note {
-            Notification::FileError { .. } | Notification::EditRejected { .. } => Level::Error,
-            _ => Level::Info,
+/// The toast for a notification - message text and severity decided in one arm
+/// per variant, so a future variant cannot get a message without also picking a
+/// level (a failure silently rendered as a calm info toast is exactly what SPEC
+/// §8's "a failed save must be visible" forbids). `None` for notifications the
+/// frontend does not surface (e.g. `ShuttingDown`).
+pub fn toast_for(note: &Notification) -> Option<(String, Level)> {
+    use crate::layout::buffer_display_name;
+    match note {
+        Notification::FileOpened { path, existed, .. } => {
+            let name = buffer_display_name(Some(path), false);
+            let text = if *existed {
+                format!("Opened {name}")
+            } else {
+                format!("{name} [New File]")
+            };
+            Some((text, Level::Info))
         }
+        Notification::FileSaved { path, .. } => Some((
+            format!("Saved {}", buffer_display_name(Some(path), false)),
+            Level::Info,
+        )),
+        Notification::FileError { message, .. } => {
+            Some((format!("Error: {message}"), Level::Error))
+        }
+        Notification::EditRejected { message, .. } => {
+            Some((format!("Edit rejected: {message}"), Level::Error))
+        }
+        // Non-exhaustive: unknown/silent notifications surface no toast.
+        _ => None,
     }
 }
 
@@ -133,31 +155,54 @@ mod tests {
     }
 
     #[test]
-    fn level_classifies_failures_as_errors() {
+    fn toast_for_renders_file_events_with_their_severity() {
+        use std::path::PathBuf;
         let id = BufferId(0);
         assert_eq!(
-            Level::of(&Notification::FileError {
+            toast_for(&Notification::FileOpened {
                 buffer_id: id,
-                path: None,
-                message: "nope".into(),
+                path: PathBuf::from("dir/a.rs"),
+                existed: true,
             }),
-            Level::Error
+            Some(("Opened a.rs".into(), Level::Info))
         );
         assert_eq!(
-            Level::of(&Notification::EditRejected {
+            toast_for(&Notification::FileOpened {
+                buffer_id: id,
+                path: PathBuf::from("new.rs"),
+                existed: false,
+            }),
+            Some(("new.rs [New File]".into(), Level::Info))
+        );
+        assert_eq!(
+            toast_for(&Notification::FileSaved {
+                buffer_id: id,
+                path: PathBuf::from("dir/a.rs"),
+            }),
+            Some(("Saved a.rs".into(), Level::Info))
+        );
+        // Failures carry the error level in the same arm as their message.
+        assert_eq!(
+            toast_for(&Notification::FileError {
+                buffer_id: id,
+                path: None,
+                message: "disk full".into(),
+            }),
+            Some(("Error: disk full".into(), Level::Error))
+        );
+        assert_eq!(
+            toast_for(&Notification::EditRejected {
                 buffer_id: id,
                 version: 0,
                 message: "nope".into(),
             }),
-            Level::Error
+            Some(("Edit rejected: nope".into(), Level::Error))
         );
-        assert_eq!(
-            Level::of(&Notification::FileSaved {
-                buffer_id: id,
-                path: "f".into(),
-            }),
-            Level::Info
-        );
+    }
+
+    #[test]
+    fn toast_for_none_for_shutting_down() {
+        assert_eq!(toast_for(&Notification::ShuttingDown), None);
     }
 
     #[test]
@@ -204,9 +249,7 @@ mod tests {
         let mut buf = Buffer::empty(area);
         t.render(area, &mut buf);
         // " saved " is 7 cells, flush to the right edge (cols 13..20) on row 1.
-        let row1: String = (0..20)
-            .map(|x| buf.cell((x, 1)).unwrap().symbol().to_string())
-            .collect();
+        let row1 = crate::testutil::row_text(&buf, 1);
         assert!(
             row1.ends_with(" saved "),
             "toast is right-aligned: {row1:?}"
@@ -229,12 +272,8 @@ mod tests {
         t.push("first".into(), Level::Info, Instant::now());
         t.push("second".into(), Level::Error, Instant::now());
         t.render(area, &mut buf);
-        let row1: String = (0..20)
-            .map(|x| buf.cell((x, 1)).unwrap().symbol().to_string())
-            .collect();
-        let row2: String = (0..20)
-            .map(|x| buf.cell((x, 2)).unwrap().symbol().to_string())
-            .collect();
+        let row1 = crate::testutil::row_text(&buf, 1);
+        let row2 = crate::testutil::row_text(&buf, 2);
         assert!(row1.contains("first"), "row1: {row1:?}");
         assert!(row2.contains("second"), "row2: {row2:?}");
         // The error toast uses the error background.

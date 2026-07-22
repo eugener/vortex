@@ -121,24 +121,32 @@ impl Picker {
         let y = screen.y + (screen.height - h) / 2;
         Rect::new(x, y, w, h)
     }
+
+    /// The box's interior, or `None` when the screen is too small to hold a
+    /// usable picker (the editor is then left unobstructed). One home for the
+    /// minimum-size threshold and the border geometry, shared by [`Self::render`]
+    /// and [`Self::cursor`] so the caret can never be placed for a box that was
+    /// not drawn (or in the wrong cell after a size change).
+    fn inner_area(screen: Rect) -> Option<Rect> {
+        if screen.width < 10 || screen.height < 4 {
+            return None;
+        }
+        let inner = Block::bordered().inner(Self::area(screen));
+        (inner.width > 0 && inner.height > 0).then_some(inner)
+    }
 }
 
 impl Layer for Picker {
     fn render(&self, screen: Rect, buf: &mut Buffer) {
-        // Below this the box has no usable interior; the editor is unobstructed.
-        if screen.width < 10 || screen.height < 4 {
+        let Some(inner) = Self::inner_area(screen) else {
             return;
-        }
+        };
         let area = Self::area(screen);
         Clear.render(area, buf);
         let block = Block::bordered()
             .title(format!(" {} ", self.title))
             .style(self.style);
-        let inner = block.inner(area);
         block.render(area, buf);
-        if inner.width == 0 || inner.height == 0 {
-            return;
-        }
         // Query row at the top of the interior.
         let query_line = format!("> {}", self.query);
         buf.set_stringn(
@@ -229,13 +237,7 @@ impl Layer for Picker {
     }
 
     fn cursor(&self, screen: Rect) -> Option<Position> {
-        if screen.width < 10 || screen.height < 4 {
-            return None;
-        }
-        let inner = Block::bordered().inner(Self::area(screen));
-        if inner.width == 0 || inner.height == 0 {
-            return None;
-        }
+        let inner = Self::inner_area(screen)?;
         // Caret in the query row, after the "> " prompt plus the typed text.
         let col = 2 + self.query.width();
         let x = (inner.x as usize + col).min(inner.right().saturating_sub(1) as usize) as u16;

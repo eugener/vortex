@@ -34,11 +34,9 @@ const MIN_GUTTER_DIGITS: usize = 3;
 /// the corner rather than panicking. Kept here (not in the I/O shell) so it is
 /// unit-testable without a terminal (SPEC §13).
 pub fn cursor_line_col(text: &Text, head: usize) -> (usize, usize, String) {
-    let head = head.min(text.byte_len());
-    let line = text.line_of_byte(head);
-    let line_start = text.byte_of_line(line).unwrap_or(0);
-    let line_text = text.line(line).unwrap_or_default();
-    (line, head - line_start, line_text)
+    let pos = text.position_of_byte(head);
+    let line_text = text.line(pos.line).unwrap_or_default();
+    (pos.line, pos.col, line_text)
 }
 
 /// Cells one grapheme occupies starting from display column `col`: a tab advances
@@ -148,10 +146,11 @@ pub fn expand_tabs(line: &str, tab_width: usize) -> String {
 /// crop's [`Text::line_count`] omits both: it counts `""` as 0 lines and does not
 /// count the empty line following a final `"\n"` (a trailing newline is a
 /// *terminator*, not a new line). So `"a\nb\n"` is 2 to the rope but 3 lines on
-/// screen. We derive the count from the last reachable byte's line index instead,
-/// which is exactly "how many lines a cursor can be on" (SPEC §4).
+/// screen. [`Text::last_line_index`] is the core's canonical "last line a cursor
+/// can be on" - the same ceiling vertical motion uses - so gutter numbering and
+/// the navigable range can never disagree (SPEC §4).
 pub fn display_line_count(text: &Text) -> usize {
-    text.line_of_byte(text.byte_len()) + 1
+    text.last_line_index() + 1
 }
 
 /// A visible row, fetched from the rope once. The painter needs the line in two
@@ -327,8 +326,9 @@ pub fn selection_columns(
 /// Total grapheme clusters covered by `selections`, for the status readout when a
 /// selection is active. Counts user-perceived characters (not bytes), line
 /// terminators excluded; zero-width cursors contribute nothing. Bounded by the
-/// selected span, materializing only its lines (SPEC §10.4), so an idle cursor
-/// costs nothing and only a live selection pays.
+/// selected span, materializing only its lines (SPEC §10.4). Cost is O(selected
+/// bytes), so the event loop computes it once per snapshot and carries the value
+/// across repaints rather than re-walking the selection every frame.
 pub fn selected_grapheme_count(text: &Text, selections: &[Selection]) -> usize {
     selections
         .iter()
@@ -425,29 +425,6 @@ pub fn head_bar(name: &str, line_count: usize) -> (String, String) {
         n => format!("{n} lines "),
     };
     (left, right)
-}
-
-/// A short, human-readable line for a file-lifecycle notification, or `None` for
-/// notifications the frontend does not surface (e.g. `ShuttingDown`). Shown as a
-/// transient toast ([`crate::toast`], SPEC §7.5, §8: a save result - especially a
-/// failure - must be visible, not silent).
-pub fn notification_message(note: &vortex_core::Notification) -> Option<String> {
-    use vortex_core::Notification::*;
-    match note {
-        FileOpened { path, existed, .. } => {
-            let name = buffer_display_name(Some(path), false);
-            Some(if *existed {
-                format!("Opened {name}")
-            } else {
-                format!("{name} [New File]")
-            })
-        }
-        FileSaved { path, .. } => Some(format!("Saved {}", buffer_display_name(Some(path), false))),
-        FileError { message, .. } => Some(format!("Error: {message}")),
-        EditRejected { message, .. } => Some(format!("Edit rejected: {message}")),
-        // Non-exhaustive: unknown/silent notifications do not occupy the bar.
-        _ => None,
-    }
 }
 
 /// A byte count as a compact human-readable size: plain bytes under 1 KB, then
@@ -1104,54 +1081,6 @@ mod tests {
         // A path ending in "/" or ".." has no file_name; use the lossy full form
         // rather than the unnamed placeholder.
         assert_eq!(buffer_display_name(Some(Path::new("..")), false), "..");
-    }
-
-    #[test]
-    fn notification_message_renders_file_events() {
-        use std::path::PathBuf;
-        use vortex_core::{BufferId, Notification};
-        let id = BufferId(0);
-        assert_eq!(
-            notification_message(&Notification::FileOpened {
-                buffer_id: id,
-                path: PathBuf::from("dir/a.rs"),
-                existed: true,
-            })
-            .as_deref(),
-            Some("Opened a.rs")
-        );
-        assert_eq!(
-            notification_message(&Notification::FileOpened {
-                buffer_id: id,
-                path: PathBuf::from("new.rs"),
-                existed: false,
-            })
-            .as_deref(),
-            Some("new.rs [New File]")
-        );
-        assert_eq!(
-            notification_message(&Notification::FileSaved {
-                buffer_id: id,
-                path: PathBuf::from("dir/a.rs"),
-            })
-            .as_deref(),
-            Some("Saved a.rs")
-        );
-        assert_eq!(
-            notification_message(&Notification::FileError {
-                buffer_id: id,
-                path: None,
-                message: "disk full".into(),
-            })
-            .as_deref(),
-            Some("Error: disk full")
-        );
-    }
-
-    #[test]
-    fn notification_message_none_for_shutting_down() {
-        use vortex_core::Notification;
-        assert_eq!(notification_message(&Notification::ShuttingDown), None);
     }
 
     #[test]
