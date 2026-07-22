@@ -502,10 +502,11 @@ adopt a component framework.**
 | **Gutter** | base | reads decorations | line numbers (absolute/relative), diagnostic severity, git signs, fold marks |
 | **Status line** | base | reads snapshot | mode, position, selection count, version, diagnostic counts, LSP status |
 | **Head / tab bar** | base | reads snapshot | buffer name + modified marker today; a **bufferline** (tabs) once multi-buffer lands |
-| **Message / toast area** | transient layer | consumes `Notification` | errors, save/LSP status, external-change notices - a real surface, not the status-bar hijack of the current state |
+| **Message / toast area** | transient layer | consumes `Notification` | **built (M6).** errors, save/LSP status, external-change notices - a real surface, not a status-bar hijack |
 | **Prompt line** | overlay | emits `Action` on submit | single-line input: save-as path, search query, `:command`. Submit/cancel are the only seam traffic |
-| **Command palette** | overlay | emits `Action` on pick | fuzzy list of commands; nav/filter pure frontend, only the chosen intent hits the core |
-| **Pickers** (file / buffer / global-search / symbol) | overlay | emits `Action` on pick | fuzzy list + optional preview pane; large lists stream in without blocking |
+| **Command palette** | overlay | emits `Action` on pick | **built (M7).** fuzzy list of commands; nav/filter pure frontend, only the chosen intent hits the core |
+| **Pickers** (file / theme / buffer / global-search / symbol) | overlay | emits `Action` on pick | **file + theme built (M7).** fuzzy list + optional preview pane; large lists stream in without blocking |
+| **Theme picker** | overlay | **none** | **built (M7).** the one surface whose commit never crosses the seam at all - chrome is frontend-owned, so it also *previews* as the highlight moves (§10.5) |
 | **Which-key popup** | overlay | none | after a prefix key, show the available continuations from the keymap (§10.5) - pure frontend introspection of the binding table |
 | **Completion popup** | overlay | emits `Action`, reads decorations | LSP completion menu; ghost-preview of the selected item as a `VirtualText` decoration |
 | **Hover / diagnostic popup** | overlay | reads decorations | LSP hover + full diagnostic text on demand |
@@ -514,14 +515,14 @@ adopt a component framework.**
 typing in a picker filter) is **pure frontend** and never round-trips to the core - the same
 anti-Xi rule as scrolling (§5). Only the *committed intent* (the picked command, the
 submitted path, the accepted completion) becomes an `Action`. Fuzzy matching runs
-frontend-side (candidate crate: `nucleo`, Helix's matcher - a §3 addition to raise when
-pickers land).
+frontend-side, on `nucleo-matcher` (Helix's matcher; §3), which landed with the pickers.
 
 ### Chrome and polish (frontend-owned, incremental)
 
 Each reads data the snapshot/decorations already carry; none needs a seam change beyond the
-decoration channel. All are theme-driven (§10.5) and default-off where they add noise,
-matching the config-seam-now / loader-at-M5 stance:
+decoration channel. All are theme-driven (§10.5) - theme *files* exist now, so a new piece
+of chrome adds a slot to that format rather than a constant - and default-off where they
+add noise, with the on/off switches still waiting on the M5 config loader:
 
 - **Indent guides** - vertical rules per indent level (display-column math already in
   `layout.rs`).
@@ -906,8 +907,9 @@ Coverage is measured and **gated on every change**, not just at milestones - it 
 the verification loop in `CLAUDE.md`, so a change that drops coverage does not pass.
 
 - **Tool:** `cargo-llvm-cov` (LLVM source-based coverage; cross-platform, the current Rust
-  standard). *Verify exact flags at setup - `--fail-under-lines` is confirmed; branch
-  coverage (`--branch`) may require nightly, confirm before relying on it.*
+  standard). Settled: the gate is **`--fail-under-file-lines`** (per *file*, ≥0.8.6), not the
+  package aggregate - a per-file floor stops one file slipping while a 100% neighbour masks
+  it in the total. Branch coverage (`--branch`) may require nightly and is not relied on.
 - **Ratchet, not a fixed number.** The gate is "coverage must not decrease" plus a floor.
   This encodes "max at each turn" without forcing tests on trivial glue. New code lands
   with its tests in the same change, so the ratchet only ever climbs.
@@ -996,13 +998,24 @@ vortex/
         decoration.rs   # Decoration / DecorationSet - one channel for all overlays (§5)
         editor.rs       # single-owner actor task
     tui/                # ratatui + crossterm; keymap keys -> Action; owns viewport + UI (§7.5)
+      themes/           # the built-in theme files, compiled in with include_str! (§10.5)
       src/
+        main.rs         # I/O shell: terminal setup, event loop, paint (kept thin)
+        command.rs      # the dispatchable frontend command (§7.5)
         compositor.rs   # Layer trait + overlay stack + event routing (§7.5, job 2)
-        components/     # prompt, palette, pickers, which-key, completion, hover (§7.5)
-        chrome/         # gutter, status line, bufferline, indent guides, scrollbar (§7.5)
+        picker.rs       # the shared fuzzy picker; palette.rs / filepicker.rs /
+        palette.rs      #   themepicker.rs are thin item lists over it (§7.5)
+        filepicker.rs
+        themepicker.rs
+        toast.rs        # the message surface (§7.5)
+        components/     # (later) prompt, which-key, completion, hover (§7.5)
+        chrome/         # (later) bufferline, indent guides, scrollbar (§7.5)
         layout.rs       # viewport + display-column math (testable)
         keymap.rs       # key -> Action lookup (data-driven, §10.5)
-        theme.rs        # semantic tag -> style mapping (§5, §10.5)
+        config.rs       # the resolved Config value: Theme + Keymap (§10.5)
+        theme.rs        # theme file format, discovery, loading (§10.5); the semantic
+                        #   tag -> style map (§5) joins it with the decoration channel
+        osc52.rs        # clipboard over the terminal (§11)
     proto/              # (later) serde + socket layer at the seam
   docs/
     SPEC.md             # this file
