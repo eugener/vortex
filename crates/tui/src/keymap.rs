@@ -5,7 +5,7 @@
 //! (`Action`), never keystrokes. A future GUI maps its own keys to the same actions.
 //!
 //! The map is **data, not code**: a [`Keymap`] is a set of `(chord -> command)`
-//! bindings, and [`action_for_key`] is a pure lookup over it. Both sides of a binding
+//! bindings, and [`command_for_key`] is a pure lookup over it. Both sides of a binding
 //! parse from strings ([`Chord::parse`], [`Command::parse`]) - the built-in
 //! [`Keymap::default`] is itself built from a table of `("ctrl+s", "save")`-shaped
 //! string pairs, so the default bindings are expressed in the *exact* form a config
@@ -13,6 +13,15 @@
 //! parsing (SPEC §3) and calls [`Keymap::from_pairs`] with the user's table, falling
 //! back to these defaults. Everything is a pure function of a key event, so it stays
 //! unit-testable without a terminal (SPEC §13).
+//!
+//! **One vocabulary, one table.** [`Command`] names everything a key can be bound to,
+//! whether it becomes a core `Action` (`save`, `move_left`) or opens a frontend
+//! overlay (`open_palette`, `open_file_picker`) - so overlay triggers are as
+//! configurable as edits, and `from_pairs` alone is enough to build a complete
+//! keymap. It is also the identity the palette lists and looks shortcuts up by
+//! ([`Keymap::shortcut_for`]), so a command's name, its binding, and its palette row
+//! cannot drift apart. `Command` carries no runtime data: the typed character and
+//! the viewport page size are injected by [`Command::resolve`] at press time.
 //!
 //! Typing a printable character is a **fallback**, not a binding: an unbound char key
 //! with no Ctrl inserts itself, so the map never has to enumerate every letter.
@@ -155,13 +164,21 @@ fn parse_key_code(token: &str) -> Option<KeyCode> {
     })
 }
 
-/// A bindable editor command: the intent side of a binding, carrying no runtime data.
-/// The typed character (text entry) and the viewport page size (page motions) are
-/// injected only when a command is [`resolve`]d into an [`Action`], so the same
-/// `Command` value works for any frame. Command names are the stable identifiers a
-/// config file binds to (e.g. `save`, `move_left`, `select_page_down`).
+/// A bindable command: the intent side of a binding, carrying no runtime data.
+///
+/// This is the single command vocabulary - the stable identifiers a config file
+/// binds to (`save`, `move_left`, `select_page_down`, `open_palette`), the identity
+/// the palette lists, and the key [`Keymap::shortcut_for`] matches on. Both kinds of
+/// outcome live here: most variants become a core [`Action`], while the overlay
+/// triggers stay frontend-local. Keeping them in one enum is what lets a user config
+/// rebind an overlay trigger and what makes the reverse lookup an exact match rather
+/// than a comparison of resolved values.
+///
+/// Carries no runtime data on purpose: the typed character (text entry) and the
+/// viewport page size (page motions) are injected only by [`Command::resolve`], so
+/// the same `Command` value is valid in any frame.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Command {
+pub enum Command {
     Quit,
     Save,
     Undo,
@@ -181,12 +198,16 @@ enum Command {
         kind: MoveKind,
         extend: bool,
     },
+    /// Open the command palette overlay (frontend-local, never crosses the seam).
+    OpenPalette,
+    /// Open the fuzzy file-picker overlay (frontend-local).
+    OpenFilePicker,
 }
 
 /// A motion with the page size left abstract, so a binding is frame-independent;
 /// [`MoveKind::motion`] injects the runtime page for the page motions.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum MoveKind {
+pub enum MoveKind {
     Left,
     Right,
     Up,
@@ -222,7 +243,7 @@ impl Command {
     /// Parse a command name. Motions use a `move_<kind>` / `select_<kind>` scheme
     /// (`select_` is the selection-extending variant), e.g. `move_line_start`,
     /// `select_page_down`. Returns `None` for an unknown name.
-    fn parse(name: &str) -> Option<Self> {
+    pub fn parse(name: &str) -> Option<Self> {
         let name = name.trim();
         if let Some(kind) = name.strip_prefix("move_") {
             return parse_move_kind(kind).map(|kind| Command::Move {
@@ -248,13 +269,19 @@ impl Command {
             "copy" => Command::Copy,
             "cut" => Command::Cut,
             "paste" => Command::Paste,
+            "open_palette" => Command::OpenPalette,
+            "open_file_picker" => Command::OpenFilePicker,
             _ => return None,
         })
     }
 
-    /// Finalize into an `Action` for this frame (`page` sizes page motions).
-    fn resolve(self, page: usize) -> Action {
-        match self {
+    /// Finalize into the dispatchable command for this frame (`page` sizes page
+    /// motions). Overlay triggers resolve to a frontend-local command; everything
+    /// else wraps a core [`Action`] for the seam.
+    pub fn resolve(self, page: usize) -> FrontendCommand {
+        let action = match self {
+            Command::OpenPalette => return FrontendCommand::OpenPalette,
+            Command::OpenFilePicker => return FrontendCommand::OpenFilePicker,
             Command::Quit => Action::Quit,
             Command::Save => Action::Save,
             Command::Undo => Action::Undo,
@@ -273,7 +300,8 @@ impl Command {
                 motion: kind.motion(page),
                 extend,
             },
-        }
+        };
+        FrontendCommand::Editor(action)
     }
 }
 
@@ -296,7 +324,7 @@ fn parse_move_kind(name: &str) -> Option<MoveKind> {
 
 /// The built-in bindings, in the same `(chord, command)` string form a config file
 /// uses. `extend` is explicit: each motion has a plain and a `shift+`/`select_` pair.
-/// Text entry (printable chars) is a fallback in [`action_for_key`], not listed here.
+/// Text entry (printable chars) is a fallback in [`command_for_key`], not listed here.
 const DEFAULT_BINDINGS: &[(&str, &str)] = &[
     ("ctrl+q", "quit"),
     ("ctrl+s", "save"),
@@ -326,6 +354,11 @@ const DEFAULT_BINDINGS: &[(&str, &str)] = &[
     ("ctrl+alt+up", "add_cursor_above"),
     ("ctrl+alt+down", "add_cursor_below"),
     ("esc", "collapse_selections"),
+    // Overlay triggers (SPEC §7.5). They live in this same table, named like any
+    // other command, so a user config can rebind them - and so `from_pairs` alone
+    // yields a complete keymap. Ctrl+O is the primary "open": the fuzzy file picker.
+    ("ctrl+o", "open_file_picker"),
+    ("ctrl+p", "open_palette"),
 ];
 
 /// Bindings on the platform's native command modifier: Cmd on macOS (crossterm
@@ -364,25 +397,16 @@ const MACOS_ONLY_BINDINGS: &[(&str, &str)] = &[("ctrl+c", "quit")];
 #[cfg(not(target_os = "macos"))]
 const MACOS_ONLY_BINDINGS: &[(&str, &str)] = &[];
 
-/// Frontend-command bindings: keys that open a UI overlay rather than editing (SPEC
-/// §7.5). Kept in a table like [`DEFAULT_BINDINGS`] so the trigger is *data*, not an
-/// inline branch in the event loop, and resolved into [`FrontendCommand`]s that never
-/// cross the seam to the core.
-const UI_DEFAULT_BINDINGS: &[(&str, FrontendCommand)] = &[
-    // Ctrl+O is the primary "open": the fuzzy file picker. Typing an arbitrary or
-    // new path (the prompt) stays reachable from the palette as "Open Path…".
-    ("ctrl+o", FrontendCommand::OpenFilePicker),
-    ("ctrl+p", FrontendCommand::OpenPalette),
-];
-
 /// The resolved key bindings. Opaque so its representation can change (e.g. gain
 /// per-mode maps) without touching call sites; built via [`Keymap::from_pairs`].
+///
+/// One table for every binding, edit and overlay alike: a second map would be a
+/// second thing `from_pairs` has to remember to populate, and the M5 config path
+/// goes through `from_pairs` only - so anything it missed would silently vanish the
+/// first time a user wrote a config file.
 #[derive(Debug, Clone)]
 pub struct Keymap {
     bindings: HashMap<Chord, Command>,
-    /// Chords that open a UI overlay (SPEC §7.5), resolved separately from the core
-    /// `bindings` because they produce a [`FrontendCommand`], not an `Action`.
-    ui_bindings: HashMap<Chord, FrontendCommand>,
 }
 
 impl Keymap {
@@ -405,37 +429,27 @@ impl Keymap {
                 .ok_or_else(|| KeymapError::UnknownCommand(command.to_string()))?;
             bindings.insert(chord_key, command);
         }
-        Ok(Self {
-            bindings,
-            ui_bindings: HashMap::new(),
-        })
+        Ok(Self { bindings })
     }
 
     /// The shortcut bound to `command`, formatted for display (e.g. `"Ctrl+S"`), or
     /// `None` if it is unbound. Lets the palette show each command's key without a
-    /// second source of truth - a rebind (M5 config) keeps the palette correct. A
-    /// core command is matched by resolving each binding to its `Action` (page 0;
-    /// palette commands are never page-dependent motions); a UI command is matched
-    /// directly in `ui_bindings`.
+    /// second source of truth - a rebind (M5 config) keeps the palette correct.
+    ///
+    /// Matched on the command **identity**, so the lookup is exact: comparing
+    /// *resolved* values instead would need a page size to resolve against, and any
+    /// command carrying runtime data would silently stop matching (no error - the
+    /// shortcut would just stop appearing).
     ///
     /// A command may have several bindings (on macOS Quit is both Ctrl+Q and Ctrl+C);
     /// `max` picks one **deterministically** - HashMap order is not stable - and
     /// happens to prefer Ctrl+Q over Ctrl+C.
-    pub fn shortcut_for(&self, command: &FrontendCommand) -> Option<String> {
-        match command {
-            FrontendCommand::Editor(action) => self
-                .bindings
-                .iter()
-                .filter(|(_, cmd)| cmd.resolve(0) == *action)
-                .map(|(chord, _)| chord.display())
-                .max(),
-            ui => self
-                .ui_bindings
-                .iter()
-                .filter(|(_, cmd)| *cmd == ui)
-                .map(|(chord, _)| chord.display())
-                .max(),
-        }
+    pub fn shortcut_for(&self, command: Command) -> Option<String> {
+        self.bindings
+            .iter()
+            .filter(|(_, bound)| **bound == command)
+            .map(|(chord, _)| chord.display())
+            .max()
     }
 }
 
@@ -443,19 +457,15 @@ impl Default for Keymap {
     /// The built-in keymap: the OS-independent [`DEFAULT_BINDINGS`] plus the
     /// platform's [`COMMAND_MOD_BINDINGS`] and [`MACOS_ONLY_BINDINGS`]. Parsing
     /// cannot fail - all three tables are compile-time constants covered by a test -
-    /// so the `expect` is invariant-proven.
+    /// so the `expect` is invariant-proven. Nothing is added after `from_pairs`, so
+    /// the defaults are reachable by exactly the path a config file takes.
     fn default() -> Self {
         let pairs = DEFAULT_BINDINGS
             .iter()
             .chain(COMMAND_MOD_BINDINGS.iter())
             .chain(MACOS_ONLY_BINDINGS.iter())
             .copied();
-        let mut map = Self::from_pairs(pairs).expect("built-in default bindings must be valid");
-        for (chord, command) in UI_DEFAULT_BINDINGS {
-            let parsed = Chord::parse(chord).expect("built-in ui chord must parse");
-            map.ui_bindings.insert(parsed, command.clone());
-        }
-        map
+        Self::from_pairs(pairs).expect("built-in default bindings must be valid")
     }
 }
 
@@ -478,14 +488,16 @@ impl fmt::Display for KeymapError {
 
 impl std::error::Error for KeymapError {}
 
-/// Translate a key event into an `Action` under `keymap`, or `None` if unmapped.
+/// Translate a key event into the [`FrontendCommand`] the event loop dispatches
+/// (SPEC §7.5), or `None` if the key is unmapped.
 ///
-/// Only key **press** (and repeat) events map; releases are ignored so the Kitty
-/// protocol's release reporting (SPEC §9) does not double-fire edits. A bound chord
-/// resolves to its command's action (with `page` sizing any page motion). An unbound
-/// **printable char** with no Ctrl falls back to inserting itself, so ordinary typing
-/// needs no per-letter binding.
-pub fn action_for_key(keymap: &Keymap, key: KeyEvent, page: usize) -> Option<Action> {
+/// One lookup for every binding, edit and overlay alike - the routing decision lives
+/// in the command a chord names, not in which table it was found in. Only key
+/// **press** (and repeat) events map; releases are ignored so the Kitty protocol's
+/// release reporting (SPEC §9) does not double-fire edits. `page` sizes any page
+/// motion. An unbound **printable char** with no Ctrl falls back to inserting itself,
+/// so ordinary typing needs no per-letter binding.
+pub fn command_for_key(keymap: &Keymap, key: KeyEvent, page: usize) -> Option<FrontendCommand> {
     // With the Kitty protocol enabled we receive Release events too; act only on
     // Press/Repeat. (Classic terminals only ever send Press, so this is safe.)
     if key.kind == KeyEventKind::Release {
@@ -506,27 +518,10 @@ pub fn action_for_key(keymap: &Keymap, key: KeyEvent, page: usize) -> Option<Act
         && !chord.cmd
         && let KeyCode::Char(c) = key.code
     {
-        return Some(Action::Insert(c.to_string()));
+        return Some(FrontendCommand::Editor(Action::Insert(c.to_string())));
     }
 
     None
-}
-
-/// Translate a key into a [`FrontendCommand`] - the single type the event loop
-/// dispatches (SPEC §7.5). A UI-overlay chord (e.g. Ctrl+O) resolves to its frontend
-/// command; any other key falls back to its core [`Action`], wrapped as
-/// [`FrontendCommand::Editor`]. `None` if the key is unmapped. UI bindings take
-/// precedence on a shared chord (there are none by default). This is what routes a
-/// UI trigger *through the keymap* instead of an inline branch in the loop.
-pub fn command_for_key(keymap: &Keymap, key: KeyEvent, page: usize) -> Option<FrontendCommand> {
-    if key.kind == KeyEventKind::Release {
-        return None;
-    }
-    let chord = Chord::from_event(&key);
-    if let Some(command) = keymap.ui_bindings.get(&chord) {
-        return Some(command.clone());
-    }
-    action_for_key(keymap, key, page).map(FrontendCommand::Editor)
 }
 
 #[cfg(test)]
@@ -545,9 +540,19 @@ mod tests {
         KeyEvent::new(code, mods)
     }
 
-    /// Translate a key against the default keymap with the fixed test [`PAGE`].
+    /// Translate a key against the default keymap with the fixed test [`PAGE`],
+    /// keeping only the core intent - the shape most of these assertions care about.
+    /// A key that resolves to a frontend-local command yields `None` here.
     fn act(key: KeyEvent) -> Option<Action> {
-        action_for_key(&Keymap::default(), key, PAGE)
+        act_on(&Keymap::default(), key, PAGE)
+    }
+
+    /// [`act`] against a specific keymap and page size.
+    fn act_on(keymap: &Keymap, key: KeyEvent, page: usize) -> Option<Action> {
+        match command_for_key(keymap, key, page) {
+            Some(FrontendCommand::Editor(action)) => Some(action),
+            _ => None,
+        }
     }
 
     #[test]
@@ -639,14 +644,14 @@ mod tests {
     fn page_keys_carry_the_supplied_page_size() {
         // The keymap folds the caller's page size into the motion (SPEC §5).
         assert_eq!(
-            action_for_key(&Keymap::default(), press(KeyCode::PageDown), 20),
+            act_on(&Keymap::default(), press(KeyCode::PageDown), 20),
             Some(Action::MoveCursor {
                 motion: Motion::PageDown(20),
                 extend: false
             })
         );
         assert_eq!(
-            action_for_key(&Keymap::default(), press(KeyCode::PageUp), 20),
+            act_on(&Keymap::default(), press(KeyCode::PageUp), 20),
             Some(Action::MoveCursor {
                 motion: Motion::PageUp(20),
                 extend: false
@@ -657,7 +662,7 @@ mod tests {
     #[test]
     fn shift_page_down_extends_selection() {
         assert_eq!(
-            action_for_key(
+            act_on(
                 &Keymap::default(),
                 with_mods(KeyCode::PageDown, KeyModifiers::SHIFT),
                 15
@@ -749,24 +754,34 @@ mod tests {
     #[test]
     fn shortcut_for_finds_the_bound_key() {
         // Platform-independent bindings (not the OS-conditional undo/redo/clipboard).
+        // Editor commands and overlay triggers are looked up the same way - one table,
+        // one identity - so the palette needs no per-kind branch.
         let km = Keymap::default();
+        assert_eq!(km.shortcut_for(Command::Save).as_deref(), Some("Ctrl+S"));
+        assert_eq!(km.shortcut_for(Command::Quit).as_deref(), Some("Ctrl+Q"));
         assert_eq!(
-            km.shortcut_for(&FrontendCommand::Editor(Action::Save))
-                .as_deref(),
-            Some("Ctrl+S")
-        );
-        assert_eq!(
-            km.shortcut_for(&FrontendCommand::Editor(Action::Quit))
-                .as_deref(),
-            Some("Ctrl+Q")
-        );
-        assert_eq!(
-            km.shortcut_for(&FrontendCommand::OpenFilePicker).as_deref(),
+            km.shortcut_for(Command::OpenFilePicker).as_deref(),
             Some("Ctrl+O")
         );
         assert_eq!(
-            km.shortcut_for(&FrontendCommand::OpenPalette).as_deref(),
+            km.shortcut_for(Command::OpenPalette).as_deref(),
             Some("Ctrl+P")
+        );
+    }
+
+    #[test]
+    fn shortcut_for_matches_a_page_motion_without_resolving_it() {
+        // Regression for the old reverse lookup, which compared *resolved* values at a
+        // hardcoded page 0: a page motion resolved at any other page stopped matching
+        // and its shortcut silently disappeared. Identity matching is page-free.
+        let km = Keymap::default();
+        assert_eq!(
+            km.shortcut_for(Command::Move {
+                kind: MoveKind::PageDown,
+                extend: false,
+            })
+            .as_deref(),
+            Some("PageDown")
         );
     }
 
@@ -774,16 +789,50 @@ mod tests {
     fn shortcut_for_is_none_when_unbound() {
         // A keymap with only Save bound: everything else has no shortcut to show.
         let km = Keymap::from_pairs([("ctrl+s", "save")]).unwrap();
+        assert_eq!(km.shortcut_for(Command::Save).as_deref(), Some("Ctrl+S"));
+        assert_eq!(km.shortcut_for(Command::Undo), None);
+        assert_eq!(km.shortcut_for(Command::OpenFilePicker), None);
+    }
+
+    #[test]
+    fn a_config_built_keymap_carries_overlay_triggers() {
+        // The M5 config path is `from_pairs` and nothing else. While overlay triggers
+        // lived in a second map that only `Default` filled in, a keymap built this way
+        // had none - so the first user config would have silently unbound the palette
+        // and the file picker, with no error to explain where they went. They are
+        // ordinary commands in the one table now, so a config can bind them freely.
+        let km = Keymap::from_pairs([("alt+p", "open_palette"), ("ctrl+s", "save")]).unwrap();
         assert_eq!(
-            km.shortcut_for(&FrontendCommand::Editor(Action::Save))
-                .as_deref(),
-            Some("Ctrl+S")
+            command_for_key(&km, with_mods(KeyCode::Char('p'), KeyModifiers::ALT), PAGE),
+            Some(FrontendCommand::OpenPalette)
         );
         assert_eq!(
-            km.shortcut_for(&FrontendCommand::Editor(Action::Undo)),
-            None
+            command_for_key(
+                &km,
+                with_mods(KeyCode::Char('s'), KeyModifiers::CONTROL),
+                PAGE
+            ),
+            Some(FrontendCommand::Editor(Action::Save))
         );
-        assert_eq!(km.shortcut_for(&FrontendCommand::OpenFilePicker), None);
+        // A misspelled overlay command is reported like any other, not dropped.
+        assert_eq!(
+            Keymap::from_pairs([("ctrl+k", "open_paletet")]).unwrap_err(),
+            KeymapError::UnknownCommand("open_paletet".to_string())
+        );
+    }
+
+    #[test]
+    fn overlay_command_names_parse_and_resolve() {
+        assert_eq!(Command::parse("open_palette"), Some(Command::OpenPalette));
+        assert_eq!(
+            Command::parse("open_file_picker"),
+            Some(Command::OpenFilePicker)
+        );
+        // They resolve to frontend-local commands, never crossing the core seam.
+        assert_eq!(
+            Command::OpenPalette.resolve(PAGE),
+            FrontendCommand::OpenPalette
+        );
     }
 
     #[test]
@@ -821,7 +870,7 @@ mod tests {
         // regardless of platform (it maps to crossterm SUPER).
         let keymap = Keymap::from_pairs([("cmd+z", "undo")]).unwrap();
         assert_eq!(
-            action_for_key(
+            act_on(
                 &keymap,
                 with_mods(KeyCode::Char('z'), KeyModifiers::SUPER),
                 PAGE
@@ -974,7 +1023,7 @@ mod tests {
         // takes effect - here Esc (unbound by default) becomes Quit.
         let keymap = Keymap::from_pairs([("esc", "quit")]).unwrap();
         assert_eq!(
-            action_for_key(&keymap, press(KeyCode::Esc), PAGE),
+            act_on(&keymap, press(KeyCode::Esc), PAGE),
             Some(Action::Quit)
         );
     }
