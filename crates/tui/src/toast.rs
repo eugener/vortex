@@ -90,6 +90,13 @@ impl Toasts {
         }
     }
 
+    /// Adopt the info/error styles of a newly applied theme, so a live toast is not
+    /// left painted in the theme that was current when it appeared.
+    pub fn restyle(&mut self, info: Style, error: Style) {
+        self.info = info;
+        self.error = error;
+    }
+
     /// Add a message stamped `now`, dropping the oldest if that would exceed [`MAX`]
     /// so a flood of notifications never fills the screen.
     pub fn push(&mut self, text: String, level: Level, now: Instant) {

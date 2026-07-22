@@ -23,6 +23,8 @@ mod palette;
 mod picker;
 #[cfg(test)]
 mod testutil;
+mod theme;
+mod themepicker;
 mod toast;
 
 use std::ffi::OsString;
@@ -161,6 +163,7 @@ Keys:
   Ctrl+S           Save        Ctrl+Q            Quit
   Ctrl+O           Open file (fuzzy picker over the working directory)
   Ctrl+P           Command palette (type to filter, Enter runs, Esc cancels)
+  Ctrl+T           Theme picker (previews as you move, Esc restores)
   Ctrl+Alt+Up/Down Add cursor above/below        Alt+Click  Add cursor
   Esc              Collapse to one cursor
 ";
@@ -229,7 +232,7 @@ fn event_loop(
     handle: &vortex_core::CoreHandle,
     terminal: &mut Terminal<ratatui::backend::CrosstermBackend<Stdout>>,
     path: Option<PathBuf>,
-    config: config::Config,
+    mut config: config::Config,
 ) -> io::Result<()> {
     // Prime the view: open the CLI-given file, or just request a snapshot of the
     // empty buffer when none was given. Either way a snapshot follows, so the
@@ -341,7 +344,12 @@ fn event_loop(
                         let (result, commands) = overlays.handle_key(key);
                         needs_redraw = true;
                         for command in commands {
-                            if !dispatch_command(command, handle, &mut overlays, &config) {
+                            let mut ui = Frontend {
+                                overlays: &mut overlays,
+                                config: &mut config,
+                                toasts: &mut toasts,
+                            };
+                            if !dispatch_command(command, handle, &mut ui) {
                                 return Ok(());
                             }
                         }
@@ -372,7 +380,12 @@ fn event_loop(
                         if !matches!(&command, Command::Editor(_)) {
                             needs_redraw = true;
                         }
-                        if !dispatch_command(command, handle, &mut overlays, &config) {
+                        let mut ui = Frontend {
+                            overlays: &mut overlays,
+                            config: &mut config,
+                            toasts: &mut toasts,
+                        };
+                        if !dispatch_command(command, handle, &mut ui) {
                             return Ok(());
                         }
                     }
@@ -444,16 +457,22 @@ fn event_loop(
     }
 }
 
+/// The frontend-local state a dispatched command may touch. Bundled rather than
+/// passed as four more parameters, the same consolidation as [`PaintInputs`]: a
+/// theme change writes the live config *and* has to repaint the overlay stack and
+/// the toast surface that cached its styles.
+struct Frontend<'a> {
+    overlays: &'a mut Compositor,
+    config: &'a mut config::Config,
+    toasts: &'a mut Toasts,
+}
+
 /// Dispatch one resolved frontend command (SPEC §7.5), from either a bound key or a
 /// compositor layer committing a choice - one path for both. A core intent is
-/// forwarded to the actor; a UI command opens an overlay. Returns `false` when the
-/// app should exit (a quit, or the core's action channel closed).
-fn dispatch_command(
-    command: Command,
-    handle: &vortex_core::CoreHandle,
-    overlays: &mut Compositor,
-    config: &config::Config,
-) -> bool {
+/// forwarded to the actor; a UI command opens an overlay or restyles the frontend.
+/// Returns `false` when the app should exit (a quit, or the core's action channel
+/// closed).
+fn dispatch_command(command: Command, handle: &vortex_core::CoreHandle, ui: &mut Frontend) -> bool {
     match command {
         Command::Editor(action) => {
             let quit = action == Action::Quit;
@@ -462,12 +481,31 @@ fn dispatch_command(
             }
         }
         // The palette shows each command's shortcut, so it needs the keymap too.
-        Command::OpenPalette => overlays.push(palette::open(&config.theme, &config.keymap)),
+        Command::OpenPalette => ui
+            .overlays
+            .push(palette::open(&ui.config.theme, &ui.config.keymap)),
         Command::OpenFilePicker => {
             // Walk the working directory. If it cannot be read, fall back to ".".
             let root = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-            overlays.push(filepicker::open(&config.theme, &root));
+            ui.overlays.push(filepicker::open(&ui.config.theme, &root));
         }
+        Command::OpenThemePicker => ui
+            .overlays
+            .push(themepicker::open(&ui.config.theme, &ui.config.theme_name)),
+        // Chrome is frontend-owned, so a theme change never crosses the seam: swap
+        // the live config and hand the new styles to the surfaces that cached them.
+        // A theme file that will not load must say so (SPEC §8: never silent) - and
+        // the theme in use is left alone rather than half-applied.
+        Command::SetTheme(name) => match theme::load_named(&name) {
+            Ok(theme) => {
+                ui.config.theme = theme;
+                ui.config.theme_name = name;
+                ui.toasts
+                    .restyle(ui.config.theme.toast_info, ui.config.theme.toast_error);
+                ui.overlays.restyle(&ui.config.theme);
+            }
+            Err(message) => ui.toasts.push(message, toast::Level::Error, Instant::now()),
+        },
     }
     true
 }
@@ -779,7 +817,10 @@ fn paint_body(frame: &mut Frame, area: Rect, snapshot: &ViewSnapshot, body: Body
         })
         .collect();
 
-    frame.render_widget(Paragraph::new(rows), area);
+    // The theme's ground is the base style for the whole body area, so it covers
+    // the rows past the end of the buffer too and a light theme is legible in a dark
+    // terminal. Per-row styles (current line, selection) patch on top of it.
+    frame.render_widget(Paragraph::new(rows).style(body.theme.text), area);
 }
 
 /// Paint the bottom status bar: cursor position (left) and buffer metrics (right).
@@ -902,7 +943,7 @@ mod tests {
     use super::*;
     use crate::testutil::{TempDir, row_text};
     use ratatui::backend::TestBackend;
-    use ratatui::style::{Color, Modifier};
+    use ratatui::style::Modifier;
 
     /// Drive the real core through an action script and return the resulting
     /// snapshot - the same seam a frontend uses (SPEC §1), so the chrome is
@@ -1021,8 +1062,10 @@ mod tests {
         assert!(head.contains(layout::NO_NAME), "head bar: {head:?}");
         assert!(head.contains("3 lines"), "head bar: {head:?}");
         // The whole row is painted with the head background (color, not a border).
-        assert_eq!(buf.cell((0, 0)).unwrap().bg, Color::Gray);
-        assert_eq!(buf.cell((39, 0)).unwrap().bg, Color::Gray);
+        // Asserted against the theme, not a literal, so a retheme is not a test edit.
+        let head_bg = config::Theme::default().head_bar.bg;
+        assert_eq!(buf.cell((0, 0)).unwrap().bg, head_bg.unwrap());
+        assert_eq!(buf.cell((39, 0)).unwrap().bg, head_bg.unwrap());
     }
 
     #[test]
@@ -1061,7 +1104,8 @@ mod tests {
         assert!(status.contains("Ln 2, Col 4"), "status: {status:?}");
         assert!(status.contains("6B"), "status (byte count): {status:?}");
         assert!(status.contains("v1"), "status (version): {status:?}");
-        assert_eq!(buf.cell((0, 9)).unwrap().bg, Color::Gray);
+        let status_bg = config::Theme::default().status_bar.bg;
+        assert_eq!(buf.cell((0, 9)).unwrap().bg, status_bg.unwrap());
     }
 
     #[test]
@@ -1138,11 +1182,14 @@ mod tests {
         let snap = snapshot_after(&[Action::Insert("x\ny".into())]);
         let buf = render(&snap, 40, 10);
         // The '1' digit sits in column 2 of the 4-wide gutter ("  1 ").
+        let theme = config::Theme::default();
         let inactive = buf.cell((2, 1)).unwrap();
         let active = buf.cell((2, 2)).unwrap();
-        assert_eq!(inactive.fg, Color::DarkGray);
-        assert_eq!(active.fg, Color::White);
+        assert_eq!(inactive.fg, theme.gutter.fg.unwrap());
+        assert_eq!(active.fg, theme.gutter_current.fg.unwrap());
         assert!(active.modifier.contains(Modifier::BOLD));
+        // The two must actually differ, or "emphasized" means nothing.
+        assert_ne!(inactive.fg, active.fg);
     }
 
     #[test]
@@ -1183,14 +1230,12 @@ mod tests {
         assert_eq!(snap.selections.len(), 2, "two carets");
         let buf = render(&snap, 40, 10);
         // Secondary caret at line 0, col 0 -> body row 1, screen col 4 (past the
-        // 4-cell gutter). It carries the reversed-video marker.
-        assert!(
-            buf.cell((4, 1))
-                .unwrap()
-                .modifier
-                .contains(Modifier::REVERSED),
-            "secondary caret cell should be reversed"
-        );
+        // 4-cell gutter). It carries the theme's secondary-cursor marker, whatever
+        // that theme expresses it as (a block, reversed video, …).
+        let marker = config::Theme::default().secondary_cursor;
+        let cell = buf.cell((4, 1)).unwrap();
+        assert_eq!(cell.bg, marker.bg.unwrap(), "secondary caret is marked");
+        assert_eq!(cell.fg, marker.fg.unwrap());
     }
 
     #[test]
@@ -1200,8 +1245,9 @@ mod tests {
         let snap = snapshot_after(&[Action::Insert("ab\ncd".into())]);
         let buf = render(&snap, 40, 10);
         // Body row 1 = line 1, row 2 = line 2 (the cursor line).
-        assert_eq!(buf.cell((30, 2)).unwrap().bg, Color::Indexed(236));
-        assert_ne!(buf.cell((30, 1)).unwrap().bg, Color::Indexed(236));
+        let tint = config::Theme::default().current_line.bg.unwrap();
+        assert_eq!(buf.cell((30, 2)).unwrap().bg, tint);
+        assert_ne!(buf.cell((30, 1)).unwrap().bg, tint);
     }
 
     #[test]

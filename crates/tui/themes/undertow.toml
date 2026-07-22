@@ -1,0 +1,18 @@
+# Undertow - the house dark theme, and the default (SPEC §10.5).
+#
+# Discipline: depth is carried by blue (each surface that comes forward gets a
+# lighter, bluer ground), state is carried by the accent #63d2c3 - which is spent
+# only on "you are here", never on ordinary chrome.
+
+text             = { fg = "#ccd2e4", bg = "#151823" }
+head_bar         = { fg = "#ccd2e4", bg = "#11141d", bold = true }
+status_bar       = { fg = "#8a93b5", bg = "#11141d" }
+gutter           = { fg = "#4a5273" }
+gutter_current   = { fg = "#ccd2e4", bold = true }
+selection        = { fg = "#eef1fa", bg = "#2b3557" }
+current_line     = { bg = "#1c2031" }
+secondary_cursor = { fg = "#151823", bg = "#7d6ce0" }
+toast_info       = { fg = "#ccd2e4", bg = "#22283c" }
+toast_error      = { fg = "#ffe7ec", bg = "#7a2f3d", bold = true }
+palette          = { fg = "#ccd2e4", bg = "#1a1e2c" }
+palette_selected = { fg = "#eef1fa", bg = "#2b3557", bold = true }

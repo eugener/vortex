@@ -18,4 +18,12 @@ pub enum Command {
     OpenPalette,
     /// Open the file picker overlay (frontend-local).
     OpenFilePicker,
+    /// Open the theme picker overlay (frontend-local).
+    OpenThemePicker,
+    /// Switch to the named theme (frontend-local: chrome never crosses the seam).
+    ///
+    /// Carries data, so unlike the openers above it is not a bindable
+    /// [`crate::keymap::Command`] - it is only ever emitted by the theme picker,
+    /// which is where the names come from.
+    SetTheme(String),
 }
