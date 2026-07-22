@@ -190,4 +190,4 @@ invariants hold.
 
 ## License
 
-MIT OR Apache-2.0, at your option.
+MIT. See [`LICENSE`](LICENSE).
