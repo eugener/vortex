@@ -20,15 +20,20 @@ cargo fmt --all -- --check     # 1. formatting (use `cargo fmt --all` to fix)
 cargo clippy --all-targets --all-features -- -D warnings   # 2. lint (warnings are errors)
 cargo build --workspace        # 3. compile
 cargo test --workspace         # 4. tests
-# 5. coverage gate - EVERY core file must stay >=90% lines (SPEC §13). Ratchet: no regress.
+# 5. coverage gates - EVERY file must stay above its crate's floor (SPEC §13).
+#    Ratchet: no regress. Current: core 99.4% lines, tui 89.9%.
 cargo llvm-cov --package vortex-core --fail-under-file-lines 90 --summary-only
+cargo llvm-cov --package vortex-tui  --fail-under-file-lines 60 --summary-only
 ```
 
 The gate uses `--fail-under-file-lines` (per-file), not the package aggregate: a per-file
-floor means no single file can slip below 90% while a 100% neighbor masks it in the total.
-Scoped to `vortex-core` on purpose - the core is headless and should stay near-100% (M0
-baseline: **100%**), while `vortex-tui` is thin I/O glue with no extractable logic yet; its
-60% floor (SPEC §13) activates at M1+ when it gains keymap/viewport logic worth testing.
+floor means no single file can slip below its floor while a 100% neighbor masks it in the
+total. The floors are asymmetric because the architecture is (SPEC §13): the core is
+headless and should stay near-100% (M0 baseline: **100%**), while `vortex-tui` carries a
+genuinely untestable I/O shell in `main.rs` alongside logic that *is* extractable and
+tested (keymap, viewport/display-column math, the picker, theme loading). The tui floor
+activated at M1+ as predicted; every file now clears it with room to spare, so the ratchet
+is the binding constraint there, not the floor.
 Requires `cargo-llvm-cov` >=0.8.6 (the release that added `--fail-under-file-lines`) +
 `rustup component add llvm-tools-preview`. Install/upgrade with `cargo install cargo-llvm-cov`.
 

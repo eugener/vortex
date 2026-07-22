@@ -506,3 +506,20 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+mod readme_tests {
+    /// The README documents the theme format with a worked example. A format doc
+    /// that does not parse is worse than none, so it is held to the real parser.
+    #[test]
+    fn the_readme_example_theme_parses() {
+        let readme = include_str!("../../../README.md");
+        let block = readme
+            .split("```toml")
+            .nth(1)
+            .and_then(|rest| rest.split("```").next())
+            .expect("README documents the theme format in a toml block");
+        let theme = super::parse(block).expect("the README's example theme must load");
+        assert_ne!(theme, crate::config::Theme::default(), "example is a no-op");
+    }
+}

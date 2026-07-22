@@ -9,10 +9,11 @@
 //! parse from strings ([`Chord::parse`], [`Command::parse`]) - the built-in
 //! [`Keymap::default`] is itself built from a table of `("ctrl+s", "save")`-shaped
 //! string pairs, so the default bindings are expressed in the *exact* form a config
-//! file will use. That is the config seam: **no file is read yet**; M5 adds `toml`
-//! parsing (SPEC §3) and calls [`Keymap::from_pairs`] with the user's table, falling
-//! back to these defaults. Everything is a pure function of a key event, so it stays
-//! unit-testable without a terminal (SPEC §13).
+//! file will use. That is the config seam: **no keymap file is read yet** (themes
+//! already load from one, see [`crate::theme`]); M5 points the same `toml` seam at a
+//! `[keymap]` table and calls [`Keymap::from_pairs`] with it, falling back to these
+//! defaults. Everything is a pure function of a key event, so it stays unit-testable
+//! without a terminal (SPEC §13).
 //!
 //! **One vocabulary, one table.** [`Command`] names everything a key can be bound to,
 //! whether it becomes a core `Action` (`save`, `move_left`) or opens a frontend
