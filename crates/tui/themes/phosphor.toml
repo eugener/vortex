@@ -1,0 +1,19 @@
+# Phosphor - the amber CRT, taken literally.
+#
+# One hue, five intensities, no exceptions: every distinction the other themes make
+# with color, this one makes with brightness. The only escalation available is
+# inverse video, which is what those terminals actually did - so the bars, the
+# selection and the secondary carets are all the same move at different scales.
+
+text             = { fg = "#ffb000", bg = "#150f06" }
+head_bar         = { fg = "#150f06", bg = "#ffb000", bold = true }
+status_bar       = { fg = "#150f06", bg = "#c48700" }
+gutter           = { fg = "#7a5200" }
+gutter_current   = { fg = "#ffd980", bold = true }
+selection        = { fg = "#150f06", bg = "#ffb000" }
+current_line     = { bg = "#20180a" }
+secondary_cursor = { reversed = true }
+toast_info       = { fg = "#150f06", bg = "#c48700" }
+toast_error      = { fg = "#150f06", bg = "#ffd980", bold = true }
+palette          = { fg = "#ffb000", bg = "#150f06" }
+palette_selected = { fg = "#150f06", bg = "#ffb000", bold = true }

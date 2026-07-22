@@ -195,7 +195,7 @@ held-lock-across-`.await` deadlocks. Instead:
 | Terminal render | **`ratatui` + `crossterm`** | immediate-mode cell-diffing; we own the loop |
 | Frame atomicity | crossterm `BeginSynchronizedUpdate` / `EndSynchronizedUpdate` | anti-tearing (§7) |
 | Fuzzy match | **`nucleo-matcher`** | palette/picker ranking (Helix's matcher); on-thread for small lists (§7.5) |
-| Config | `toml` + `serde` | Helix-style |
+| Config | **`toml` + `serde`** | Helix-style; in `vortex-tui` now, carrying theme files (§10.5) |
 | Encoding | `encoding_rs` | detect on load; edit as UTF-8 internally (§10.1) |
 | File watch | `notify` | external-change detection (§10.2) |
 | Error types | **`thiserror`** (libs) | typed errors across the seam (§8) |
@@ -645,12 +645,15 @@ concerns (§2.2, §5) and never cross the seam. Two surfaces are configurable fr
 start of the design, even though file loading itself lands at **M5**:
 
 - **Styles (theme).** Two frontend-owned tables. (a) Colors/attributes for the non-text
-  chrome - head bar, status bar, line-number gutter (active vs inactive). (b) The **semantic
-  tag → style** map the decoration channel needs (§5): `StyleId`/`GutterKind`/severity tags
-  (`keyword`, `error`, `git.added`) resolve to concrete colors/attributes *here*, on the
-  frontend, so identical core output themes light/dark and truecolor/256-color. Terminal-
-  capability fallback (truecolor → 256 → 16, styled-underline support) lives in this
-  resolution step, never in the core.
+  chrome - editor ground, head bar, status bar, line-number gutter (active vs inactive),
+  selection, carets, toasts, overlay panels. **Built and shipping** - see "Theme files"
+  below. (b) The **semantic tag → style** map the decoration channel needs (§5):
+  `StyleId`/`GutterKind`/severity tags (`keyword`, `error`, `git.added`) resolve to
+  concrete colors/attributes *here*, on the frontend, so identical core output themes
+  light/dark and truecolor/256-color. Not built - it arrives with the decoration channel
+  (M2/M4) and extends the same file format with a second table. Terminal-capability
+  fallback (truecolor → 256 → 16, styled-underline support) lives in this resolution
+  step, never in the core.
 - **Keymap.** The key→intent table (§2.2, §12.2) is **data, not code**: a `Keymap` is a
   set of `(chord → command)` bindings, and key translation is a pure lookup over it. Both
   sides parse from strings, so the built-in defaults are expressed in the same form a
@@ -664,7 +667,7 @@ start of the design, even though file loading itself lands at **M5**:
     so **`extend` is part of the binding, not a runtime modifier** - `right` and
     `shift+right` are distinct entries.
   - **One namespace, one table - including overlay triggers.** Commands that open a
-    frontend surface (`open_palette`, `open_file_picker`, §7.5) are named and bound
+    frontend surface (`open_palette`, `open_file_picker`, `open_theme_picker`, §7.5) are named and bound
     exactly like editing commands, in the same table, even though they resolve to a
     frontend-local effect rather than a core `Action`. A separate map for them would be
     a second thing `from_pairs` has to populate, and since the config path *is*
@@ -678,6 +681,45 @@ start of the design, even though file loading itself lands at **M5**:
     inserts itself, so the map never enumerates every letter.
   - **Open:** modal-vs-modeless, chord *sequences* (multi-key), and per-mode maps are the
     remaining design, drafted alongside the §12.2 `Action` vocabulary.
+
+#### Theme files (built)
+
+Styling is the first configuration surface to become a real file, so it settles the
+format the rest of the config will use.
+
+- **Format: TOML**, one key per style slot of the frontend's `Theme`, each an inline
+  table: `selection = { fg = "#eef1fa", bg = "#2b3557", bold = true }`. Attributes are
+  `bold`/`dim`/`italic`/`underlined`/`reversed`.
+- **Colors are `#rrggbb` only.** A *named* ANSI color is remapped by the user's terminal
+  profile, so a theme built from one cannot promise the contrast it was designed with.
+  Hex is 24-bit and literal; the 256/16-color fallback is the resolution step above, not
+  the file.
+- **Every slot is optional**, inheriting the built-in default, so a user theme can be
+  three lines that recolor one thing. A slot that *is* present replaces its default
+  wholesale rather than merging into it - `current_line = { bg = … }` has no foreground.
+- **Unknown keys are an error**, not a silent no-op: a typo must be reported, or the user
+  stares at a theme that "did not apply" with nothing to go on.
+- **The file stem is the theme's name** (`undertow.toml` → `undertow`), so listing the
+  available themes never parses them. Parsing is lazy - a broken file costs an error
+  toast when it is picked, not a startup failure or a silent omission from the list.
+- **Two locations, always both.** The shipped themes are compiled in with `include_str!`
+  (a fresh install has themes with an empty config dir, and nothing is ever written to
+  the user's disk unasked); `$XDG_CONFIG_HOME/vortex/themes/*.toml` - else
+  `~/.config/vortex/themes` - is scanned too, and a user file **shadows** a built-in of
+  the same name. XDG on every platform, macOS included: that is the terminal-editor
+  convention and it keeps a dotfiles repo portable.
+- **The theme is swappable at runtime** (Ctrl+T, `open_theme_picker`), and the picker
+  **previews**: moving the highlight applies that theme immediately, Enter keeps it, Esc
+  restores the one you opened with. This is only possible because chrome is entirely
+  frontend-owned - a preview is a local repaint, and the seam never hears about it. It
+  is also why `Layer::restyle` exists: layers cache their `Style`s at construction, so a
+  theme change has to hand the new ones to every open overlay and to the toast surface.
+- **Not persisted yet.** The picked theme lasts the session; remembering it needs the
+  config *file* (`theme = "…"`), which is the M5 loader below. Deliberate: the loader is
+  one change, and doing half of it early would mean two.
+- **The built-in `Theme::default()` is written in Rust, not parsed at startup**, so the
+  editor can never fail to have a theme. A test holds it equal to `themes/undertow.toml`,
+  which is what keeps the hand-written copy and the file a user reads from drifting.
 
 **Seam, not yet a loader (current state).** The config lives behind a single resolved
 `Config` value built once at frontend startup (next to argv, before the first frame) and
@@ -764,6 +806,13 @@ None is a correctness bug today.
   rule has not been duplicated even once. **Trigger:** the prompt layer (§7.5), which is
   the second implementor - and also the point where dismiss-*all* becomes the wrong scope
   for nested overlays.
+- **A shortcut fired over the theme picker keeps the preview.** `Compositor::dismiss`
+  drops the stack without asking the layers, so the "Esc restores what you opened with"
+  contract is only honored by Esc: pressing Ctrl+S while previewing leaves the previewed
+  theme applied. Defensible as "you saw it and moved on", and the alternative (running a
+  layer's cancel command on dismissal) is the same widening of the `Layer` seam the
+  `EventResult::Deferred` item above already wants. **Trigger:** taking that item - the
+  two should be designed together, not one at a time.
 - **Cursor motion allocates the caret's line on every keystroke.** `Text::line` returns an
   owned `String`, so Left/Right/Backspace/Delete each copy the current line and vertical
   motions copy two, per cursor. Bounded by line length as §10.4 promises, but on a file
@@ -912,7 +961,9 @@ Incremental build order so the risky assumptions are validated early, not at the
   intent becomes an `Action`. *Verify:* save-as via a prompt, an error toast from a failed
   save, and a stacked overlay that dismisses top-first - in a real terminal, with no core
   round-trip for navigation.
-- **M7 - Pickers + palette + which-key.** `nucleo` fuzzy matching (§3 addition); file /
+- **M7 - Pickers + palette + which-key.** *(in progress: file picker, command palette, and
+  the theme picker with live preview + TOML theme files (§10.5) have landed.)* `nucleo`
+  fuzzy matching (§3 addition); file /
   global-search / buffer pickers with a preview pane; a command palette over the §10.5
   command identifiers; a which-key popup driven by the keymap. Brings **multi-buffer** (the
   core already keys everything by `BufferId`; only one buffer is live today) + a bufferline -

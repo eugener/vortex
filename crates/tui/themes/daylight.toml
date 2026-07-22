@@ -1,0 +1,18 @@
+# Daylight - built for a lit room, which almost no terminal editor is.
+#
+# The metaphor is marked-up paper: the selection is a highlighter stroke (#f6dc86)
+# that leaves the text its own ink instead of washing it white, and the syntax
+# palette is borrowed from print proofing - navy, moss, oxblood.
+
+text             = { fg = "#1f2422", bg = "#eceee9" }
+head_bar         = { fg = "#1f2422", bg = "#dfe2dc", bold = true }
+status_bar       = { fg = "#5c645e", bg = "#dfe2dc" }
+gutter           = { fg = "#9aa29c" }
+gutter_current   = { fg = "#1f2422", bold = true }
+selection        = { fg = "#1f2422", bg = "#f6dc86" }
+current_line     = { bg = "#e3e6e0" }
+secondary_cursor = { fg = "#eceee9", bg = "#8c3a2c" }
+toast_info       = { fg = "#eceee9", bg = "#4a544d" }
+toast_error      = { fg = "#f7efe9", bg = "#9c2f37", bold = true }
+palette          = { fg = "#1f2422", bg = "#f5f6f2" }
+palette_selected = { fg = "#1f2422", bg = "#f6dc86", bold = true }

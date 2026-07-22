@@ -1,0 +1,21 @@
+# Instrument - a measuring device, not a canvas.
+#
+# Achromatic: hierarchy comes from brightness, and exactly one hue is allowed on
+# screen - the signal red #e04b3c, reserved for where you are (the secondary
+# carets) and what is wrong (an error toast). Nothing else may ever be red.
+#
+# The bars are deliberately *unfilled*: they set no background, so they sit on the
+# editor's own ground and are separated from the text by weight alone.
+
+text             = { fg = "#c9ced2", bg = "#141719" }
+head_bar         = { fg = "#eef2f4", bold = true }
+status_bar       = { fg = "#78838a" }
+gutter           = { fg = "#4e575e" }
+gutter_current   = { fg = "#eef2f4", bold = true }
+selection        = { fg = "#eef2f4", bg = "#2f383e" }
+current_line     = { bg = "#1b1f22" }
+secondary_cursor = { fg = "#141719", bg = "#e04b3c" }
+toast_info       = { fg = "#c9ced2", bg = "#242a2e" }
+toast_error      = { fg = "#141719", bg = "#e04b3c", bold = true }
+palette          = { fg = "#c9ced2", bg = "#1b1f22" }
+palette_selected = { fg = "#eef2f4", bg = "#2f383e", bold = true }

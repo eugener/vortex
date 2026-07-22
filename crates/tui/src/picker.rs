@@ -23,6 +23,7 @@ use unicode_width::UnicodeWidthStr;
 
 use crate::command::Command;
 use crate::compositor::{EventResult, Layer};
+use crate::config::Theme;
 
 /// One selectable row: a user-facing label, an optional shortcut to show
 /// right-aligned (the key that runs it, if any), and what running it does.
@@ -60,7 +61,15 @@ pub struct Picker {
     style: Style,
     selected_style: Style,
     finished: bool,
-    committed: Option<Command>,
+    /// Commands the picker has committed, drained by [`Layer::take_commands`].
+    /// A list, not a single slot, because a previewing picker emits as you move.
+    outbox: Vec<Command>,
+    /// Set by [`Self::previewing`]: the command that undoes a preview. Its presence
+    /// is what turns preview mode on.
+    cancel: Option<Command>,
+    /// Item last previewed, so a key that leaves the highlight where it was does not
+    /// re-emit (typing a filter that does not move it, Up at the top, …).
+    previewed: Option<usize>,
 }
 
 impl Picker {
@@ -89,7 +98,46 @@ impl Picker {
             style,
             selected_style,
             finished: false,
-            committed: None,
+            outbox: Vec::new(),
+            cancel: None,
+            previewed: None,
+        }
+    }
+
+    /// Start with row `index` highlighted instead of the first - so a picker over
+    /// "which of these is in use" opens on the one that is.
+    pub fn with_selected(mut self, index: usize) -> Self {
+        self.selected = index.min(self.filtered.len().saturating_sub(1));
+        self
+    }
+
+    /// Preview as the highlight moves: every move emits the newly highlighted item's
+    /// command, and Esc emits `cancel` to undo it. Opening previews nothing - only
+    /// moving does - so the picker is free to open over an unrelated state.
+    ///
+    /// Escaping is the *only* undo: if a keybinding fires over the picker (SPEC §7.5
+    /// dismisses the stack) the last preview stands, which is the honest reading of
+    /// "you saw it applied and moved on".
+    pub fn previewing(mut self, cancel: Command) -> Self {
+        self.cancel = Some(cancel);
+        self.previewed = self.highlighted();
+        self
+    }
+
+    /// The item the highlight sits on, if the filtered list is not empty.
+    fn highlighted(&self) -> Option<usize> {
+        self.filtered.get(self.selected).copied()
+    }
+
+    /// Emit the highlighted item's command if the highlight has moved since the last
+    /// preview. No-op unless [`Self::previewing`] armed it.
+    fn preview(&mut self) {
+        if self.cancel.is_none() || self.highlighted() == self.previewed {
+            return;
+        }
+        self.previewed = self.highlighted();
+        if let Some(idx) = self.previewed {
+            self.outbox.push(self.items[idx].command.clone());
         }
     }
 
@@ -202,10 +250,14 @@ impl Layer for Picker {
             return EventResult::Ignored;
         }
         match key.code {
-            KeyCode::Esc => self.finished = true,
+            KeyCode::Esc => {
+                // Undo any preview this picker applied on the way here.
+                self.outbox.extend(self.cancel.clone());
+                self.finished = true;
+            }
             KeyCode::Enter => {
-                if let Some(&idx) = self.filtered.get(self.selected) {
-                    self.committed = Some(self.items[idx].command.clone());
+                if let Some(idx) = self.highlighted() {
+                    self.outbox.push(self.items[idx].command.clone());
                 }
                 self.finished = true;
             }
@@ -229,11 +281,21 @@ impl Layer for Picker {
             // Modal: swallow anything else so it never reaches the editor beneath.
             _ => {}
         }
+        // Enter and Esc have already said their piece (and finished); every other
+        // key may have moved the highlight, which is what a preview follows.
+        if !self.finished {
+            self.preview();
+        }
         EventResult::Consumed
     }
 
     fn take_commands(&mut self) -> Vec<Command> {
-        self.committed.take().into_iter().collect()
+        std::mem::take(&mut self.outbox)
+    }
+
+    fn restyle(&mut self, theme: &Theme) {
+        self.style = theme.palette;
+        self.selected_style = theme.palette_selected;
     }
 
     fn cursor(&self, screen: Rect) -> Option<Position> {
@@ -353,6 +415,72 @@ mod tests {
         p.handle_key(press(KeyCode::Esc));
         assert!(p.is_finished());
         assert!(p.take_commands().is_empty());
+    }
+
+    #[test]
+    fn a_picker_without_preview_stays_silent_until_enter() {
+        // The palette and file picker must not emit as you arrow through them -
+        // opening a file per row visited would be a disaster. Preview is opt-in.
+        let mut p = picker();
+        for code in [KeyCode::Down, KeyCode::Down, KeyCode::Up] {
+            p.handle_key(press(code));
+            assert!(p.take_commands().is_empty(), "moved but emitted");
+        }
+        type_str(&mut p, "cop");
+        assert!(p.take_commands().is_empty(), "filtered but emitted");
+    }
+
+    #[test]
+    fn with_selected_opens_on_a_given_row_clamped() {
+        let p = picker().with_selected(2);
+        assert_eq!(selected_label(&p), "Quit");
+        // Past the end clamps to the last row rather than pointing at nothing.
+        let p = picker().with_selected(99);
+        assert_eq!(p.selected, p.filtered.len() - 1);
+    }
+
+    #[test]
+    fn previewing_emits_on_every_move_and_undoes_on_cancel() {
+        let cancel = Command::OpenPalette;
+        let mut p = picker().previewing(cancel.clone());
+        // Opening previews nothing: the highlight has not moved yet.
+        assert!(p.take_commands().is_empty());
+
+        p.handle_key(press(KeyCode::Down));
+        assert_eq!(p.take_commands(), vec![Command::OpenPalette]); // row 1's command
+        // A key that leaves the highlight where it is must not re-emit, or a held
+        // Up at the top would fire the same preview over and over.
+        p.handle_key(press(KeyCode::Up));
+        assert_eq!(p.take_commands(), vec![Command::Editor(Action::Save)]);
+        p.handle_key(press(KeyCode::Up));
+        assert!(p.take_commands().is_empty(), "re-emitted without moving");
+
+        // Cancelling emits the undo command; committing does not.
+        p.handle_key(press(KeyCode::Esc));
+        assert_eq!(p.take_commands(), vec![cancel]);
+    }
+
+    #[test]
+    fn a_preview_over_an_empty_result_emits_nothing() {
+        // Filtering down to nothing leaves no highlighted item; the preview must
+        // simply stop rather than reaching for a row that is not there.
+        let mut p = picker().previewing(Command::OpenPalette);
+        type_str(&mut p, "zzzq");
+        assert!(p.filtered.is_empty());
+        assert!(p.take_commands().is_empty());
+    }
+
+    #[test]
+    fn restyle_adopts_the_new_themes_palette_styles() {
+        let mut p = picker();
+        let theme = Theme {
+            palette: Style::new().bg(ratatui::style::Color::Rgb(1, 2, 3)),
+            palette_selected: Style::new().bg(ratatui::style::Color::Rgb(4, 5, 6)),
+            ..Theme::default()
+        };
+        p.restyle(&theme);
+        assert_eq!(p.style, theme.palette);
+        assert_eq!(p.selected_style, theme.palette_selected);
     }
 
     #[test]

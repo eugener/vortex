@@ -1,15 +1,15 @@
 //! Frontend configuration - the seam where user settings enter the TUI.
 //!
-//! Today every value is a hardcoded [`Default`]; **no file is read yet**. The point
-//! of this module is to give file-loaded config a single place to land: M5 adds
-//! `serde` + `toml` (SPEC §3 "Config" row, §10.5) and a `Config::load(path)` that
-//! deserializes the user's config file, falling back to these defaults for anything
-//! unset. Everything downstream already reads from a [`Config`] value, so that
+//! Styling is the first setting to become a real file: a [`Theme`] is loaded from a
+//! TOML file by [`crate::theme`], and the theme picker swaps one in at runtime. The
+//! keymap is still a hardcoded [`Default`]; M5 adds `Config::load(path)` reading the
+//! user's config file over the same `toml` seam (SPEC §3 "Config" row, §10.5) for
+//! the rest. Everything downstream already reads from a [`Config`] value, so that
 //! change touches only this module.
 //!
-//! Scope is deliberately frontend-only: styling (a [`Theme`]) and, next, the keymap
-//! (key→intent is frontend-owned per SPEC §2.2/§12.2). The core stays config-free -
-//! chrome and key bindings never cross the seam.
+//! Scope is deliberately frontend-only: styling and the keymap (key→intent is
+//! frontend-owned per SPEC §2.2/§12.2). The core stays config-free - chrome and key
+//! bindings never cross the seam.
 
 use ratatui::style::{Color, Modifier, Style};
 
@@ -18,21 +18,43 @@ use crate::keymap::Keymap;
 /// All user-configurable frontend settings, resolved once at startup and threaded
 /// into the render and input paths. Grows as configurable surfaces land, so it is
 /// passed as a whole rather than field-by-field (SPEC §10.5).
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct Config {
     /// Colors/attributes for the non-text chrome.
     pub theme: Theme,
+    /// Which theme [`Self::theme`] came from, so the picker can highlight the one
+    /// in use and restore it when a preview is cancelled.
+    pub theme_name: String,
     /// Key -> intent bindings (`Default` is the built-in map; a config file's
     /// `[keymap]` table will replace it via [`Keymap::from_pairs`]).
     pub keymap: Keymap,
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            theme: Theme::default(),
+            theme_name: crate::theme::DEFAULT.to_string(),
+            keymap: Keymap::default(),
+        }
+    }
 }
 
 /// Chrome styling for the frontend's non-text UI: the head/status bars and the
 /// line-number gutter. Bundled into one value (not scattered `const`s) so a config
 /// can swap it wholesale. `Copy` - each [`Style`] is `Copy` - so threading it per
 /// frame is free and it never touches the render hot path beyond a field read.
-#[derive(Debug, Clone, Copy)]
+///
+/// Every field here is a key in a theme file ([`crate::theme`]); adding one means
+/// adding it there too, and the round-trip test in that module holds the built-in
+/// default and `themes/undertow.toml` to being the same theme.
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Theme {
+    /// The editor body's own ground: the background the text area is filled with
+    /// and the foreground unstyled text takes. Painted as the base style beneath
+    /// every row, so a theme is not at the mercy of the user's terminal background
+    /// (a light theme in a black terminal would otherwise be unreadable).
+    pub text: Style,
     /// Top bar: buffer name (left) and line count (right).
     pub head_bar: Style,
     /// Bottom bar: cursor position (left) and buffer metrics (right).
@@ -68,42 +90,59 @@ pub struct Theme {
 }
 
 impl Default for Theme {
-    /// The built-in theme. This is exactly what `Config::load` will fall back to for
-    /// any field the user's config file leaves unset, so the defaults live here and
-    /// nowhere else.
+    /// The built-in theme: **undertow**, the house dark scheme (see
+    /// `themes/undertow.toml`, whose every value this mirrors).
+    ///
+    /// Written out in Rust rather than parsed from that file at startup so the
+    /// editor can never fail to have a theme - `Theme::default()` is infallible, and
+    /// `theme::the_default_theme_is_the_undertow_file` is what keeps the two in
+    /// step. It is also the fallback for any slot a loaded theme file leaves unset.
     fn default() -> Self {
+        // Depth is carried by blue: each surface that comes forward gets a lighter,
+        // bluer ground. Colors are explicit RGB, never named ANSI ones, which the
+        // terminal remaps to its own palette and can render as low-contrast
+        // light-on-light (the same reason `theme::color` accepts hex only).
         Self {
+            text: Style::new()
+                .fg(Color::Rgb(0xcc, 0xd2, 0xe4))
+                .bg(Color::Rgb(0x15, 0x18, 0x23)),
             head_bar: Style::new()
-                .fg(Color::Black)
-                .bg(Color::Gray)
+                .fg(Color::Rgb(0xcc, 0xd2, 0xe4))
+                .bg(Color::Rgb(0x11, 0x14, 0x1d))
                 .add_modifier(Modifier::BOLD),
-            status_bar: Style::new().fg(Color::Black).bg(Color::Gray),
-            gutter: Style::new().fg(Color::DarkGray),
-            gutter_current: Style::new().fg(Color::White).add_modifier(Modifier::BOLD),
+            status_bar: Style::new()
+                .fg(Color::Rgb(0x8a, 0x93, 0xb5))
+                .bg(Color::Rgb(0x11, 0x14, 0x1d)),
+            gutter: Style::new().fg(Color::Rgb(0x4a, 0x52, 0x73)),
+            gutter_current: Style::new()
+                .fg(Color::Rgb(0xcc, 0xd2, 0xe4))
+                .add_modifier(Modifier::BOLD),
             selection: Style::new()
-                .bg(Color::Rgb(38, 79, 120))
-                .fg(Color::Rgb(255, 255, 255)),
-            current_line: Style::new().bg(Color::Indexed(236)),
-            // Reversed video reads as a block caret against whatever it sits on,
-            // without committing to a palette color (SPEC §2.2 multi-cursor).
-            secondary_cursor: Style::new().add_modifier(Modifier::REVERSED),
-            // Toasts (SPEC §7.5): a muted slate for info, a strong red for errors,
-            // both with light text so a top-right notice is legible over any content.
+                .fg(Color::Rgb(0xee, 0xf1, 0xfa))
+                .bg(Color::Rgb(0x2b, 0x35, 0x57)),
+            current_line: Style::new().bg(Color::Rgb(0x1c, 0x20, 0x31)),
+            // A violet block: the terminal has one real cursor, which the primary
+            // caret uses, so the others need a color of their own (SPEC §2.2).
+            secondary_cursor: Style::new()
+                .fg(Color::Rgb(0x15, 0x18, 0x23))
+                .bg(Color::Rgb(0x7d, 0x6c, 0xe0)),
+            // Toasts (SPEC §7.5): a sunk slate for info, a strong red for errors, so
+            // a failure is unmistakable (SPEC §8: never silent).
             toast_info: Style::new()
-                .fg(Color::Rgb(230, 230, 230))
-                .bg(Color::Rgb(60, 70, 90)),
+                .fg(Color::Rgb(0xcc, 0xd2, 0xe4))
+                .bg(Color::Rgb(0x22, 0x28, 0x3c)),
             toast_error: Style::new()
-                .fg(Color::Rgb(255, 255, 255))
-                .bg(Color::Rgb(150, 45, 45))
+                .fg(Color::Rgb(0xff, 0xe7, 0xec))
+                .bg(Color::Rgb(0x7a, 0x2f, 0x3d))
                 .add_modifier(Modifier::BOLD),
-            // A dark panel for the palette; the same accent blue as a selection marks
-            // the highlighted row so the current choice is unmistakable (SPEC §7.5).
+            // The palette floats above the body, so it gets its own lighter panel;
+            // the selection's blue marks the highlighted row (SPEC §7.5).
             palette: Style::new()
-                .fg(Color::Rgb(220, 220, 220))
-                .bg(Color::Rgb(30, 34, 42)),
+                .fg(Color::Rgb(0xcc, 0xd2, 0xe4))
+                .bg(Color::Rgb(0x1a, 0x1e, 0x2c)),
             palette_selected: Style::new()
-                .fg(Color::Rgb(255, 255, 255))
-                .bg(Color::Rgb(38, 79, 120))
+                .fg(Color::Rgb(0xee, 0xf1, 0xfa))
+                .bg(Color::Rgb(0x2b, 0x35, 0x57))
                 .add_modifier(Modifier::BOLD),
         }
     }
@@ -114,11 +153,16 @@ mod tests {
     use super::*;
 
     #[test]
-    fn default_config_carries_the_builtin_theme() {
+    fn default_config_carries_the_builtin_theme_and_its_name() {
         let config = Config::default();
-        assert_eq!(config.theme.head_bar.bg, Some(Color::Gray));
-        assert_eq!(config.theme.status_bar.bg, Some(Color::Gray));
-        assert_eq!(config.theme.head_bar.fg, Some(Color::Black));
+        assert_eq!(config.theme, Theme::default());
+        // The name must be a theme that actually resolves, or the picker opens with
+        // nothing highlighted and a cancelled preview restores a theme that is gone.
+        assert_eq!(config.theme_name, crate::theme::DEFAULT);
+        assert_eq!(
+            crate::theme::load_named(&config.theme_name).unwrap(),
+            config.theme
+        );
     }
 
     #[test]
@@ -144,19 +188,33 @@ mod tests {
     }
 
     #[test]
-    fn default_theme_matches_the_builtin_palette() {
+    fn default_theme_pins_every_color_to_true_color() {
+        // Named/indexed ANSI colors are remapped by the user's terminal profile, so
+        // a theme built from them cannot promise the contrast it was designed with.
+        // Every slot the built-in theme fills must therefore be `Color::Rgb`.
         let t = Theme::default();
-        assert_eq!(t.gutter.fg, Some(Color::DarkGray));
-        assert_eq!(t.gutter_current.fg, Some(Color::White));
+        let slots = [
+            ("text", t.text),
+            ("head_bar", t.head_bar),
+            ("status_bar", t.status_bar),
+            ("gutter", t.gutter),
+            ("gutter_current", t.gutter_current),
+            ("selection", t.selection),
+            ("current_line", t.current_line),
+            ("secondary_cursor", t.secondary_cursor),
+            ("toast_info", t.toast_info),
+            ("toast_error", t.toast_error),
+            ("palette", t.palette),
+            ("palette_selected", t.palette_selected),
+        ];
+        for (name, style) in slots {
+            for color in [style.fg, style.bg].into_iter().flatten() {
+                assert!(matches!(color, Color::Rgb(..)), "{name}: {color:?}");
+            }
+        }
+        // The body has both a ground and an ink, so the theme owns the whole surface.
+        assert!(t.text.fg.is_some() && t.text.bg.is_some());
         assert!(t.gutter_current.add_modifier.contains(Modifier::BOLD));
         assert!(t.head_bar.add_modifier.contains(Modifier::BOLD));
-        // Selection pairs an explicit-RGB background with a contrasting foreground
-        // so selected text stays legible on any terminal palette; the current-line
-        // tint is a background-only wash.
-        assert_eq!(t.selection.bg, Some(Color::Rgb(38, 79, 120)));
-        assert_eq!(t.selection.fg, Some(Color::Rgb(255, 255, 255)));
-        assert_eq!(t.current_line.bg, Some(Color::Indexed(236)));
-        // A secondary caret is a reversed-video marker (multi-cursor, SPEC §2.2).
-        assert!(t.secondary_cursor.add_modifier.contains(Modifier::REVERSED));
     }
 }

@@ -202,6 +202,8 @@ pub enum Command {
     OpenPalette,
     /// Open the fuzzy file-picker overlay (frontend-local).
     OpenFilePicker,
+    /// Open the theme-picker overlay (frontend-local).
+    OpenThemePicker,
 }
 
 /// A motion with the page size left abstract, so a binding is frame-independent;
@@ -271,6 +273,7 @@ impl Command {
             "paste" => Command::Paste,
             "open_palette" => Command::OpenPalette,
             "open_file_picker" => Command::OpenFilePicker,
+            "open_theme_picker" => Command::OpenThemePicker,
             _ => return None,
         })
     }
@@ -282,6 +285,7 @@ impl Command {
         let action = match self {
             Command::OpenPalette => return FrontendCommand::OpenPalette,
             Command::OpenFilePicker => return FrontendCommand::OpenFilePicker,
+            Command::OpenThemePicker => return FrontendCommand::OpenThemePicker,
             Command::Quit => Action::Quit,
             Command::Save => Action::Save,
             Command::Undo => Action::Undo,
@@ -359,6 +363,7 @@ const DEFAULT_BINDINGS: &[(&str, &str)] = &[
     // yields a complete keymap. Ctrl+O is the primary "open": the fuzzy file picker.
     ("ctrl+o", "open_file_picker"),
     ("ctrl+p", "open_palette"),
+    ("ctrl+t", "open_theme_picker"),
 ];
 
 /// Bindings on the platform's native command modifier: Cmd on macOS (crossterm
@@ -729,6 +734,24 @@ mod tests {
                 PAGE
             ),
             Some(FrontendCommand::OpenFilePicker)
+        );
+        // Ctrl+T is the third overlay trigger, and rides the same table.
+        assert_eq!(
+            command_for_key(
+                &km,
+                with_mods(KeyCode::Char('t'), KeyModifiers::CONTROL),
+                PAGE
+            ),
+            Some(FrontendCommand::OpenThemePicker)
+        );
+        // Named like any other command, so a config file can rebind it.
+        assert_eq!(
+            Command::parse("open_theme_picker"),
+            Some(Command::OpenThemePicker)
+        );
+        assert_eq!(
+            km.shortcut_for(Command::OpenThemePicker).as_deref(),
+            Some("Ctrl+T")
         );
     }
 

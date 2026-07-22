@@ -81,6 +81,14 @@ pub trait Layer {
     fn is_finished(&self) -> bool {
         false
     }
+
+    /// Re-read the theme-derived styles the layer cached when it was built.
+    ///
+    /// Layers resolve their styles once at construction (they are `Copy` and read
+    /// every frame), so a theme swapped in *while* an overlay is open would leave it
+    /// painted in the old one. The theme picker previews as you move, which makes
+    /// that the normal case rather than a corner. Default: nothing to re-read.
+    fn restyle(&mut self, _theme: &crate::config::Theme) {}
 }
 
 /// The stack of overlay [`Layer`]s above the base editor view (SPEC §7.5).
@@ -119,6 +127,15 @@ impl Compositor {
     /// §7.5): the shortcut takes precedence, so the picker/palette gives way to it.
     pub fn dismiss(&mut self) {
         self.layers.clear();
+    }
+
+    /// Repaint the whole stack in `theme` after a theme change (see
+    /// [`Layer::restyle`]). Every layer, not just the top one: a stacked overlay
+    /// must not end up half in each theme.
+    pub fn restyle(&mut self, theme: &crate::config::Theme) {
+        for layer in &mut self.layers {
+            layer.restyle(theme);
+        }
     }
 
     /// Offer a key to the stack, top-down, stopping at the first layer that
@@ -241,6 +258,22 @@ mod tests {
         fn is_finished(&self) -> bool {
             self.finished
         }
+
+        fn restyle(&mut self, _theme: &crate::config::Theme) {
+            self.log.borrow_mut().push(self.id);
+        }
+    }
+
+    #[test]
+    fn restyle_reaches_every_layer_bottom_to_top() {
+        // A theme change while overlays are open must repaint all of them: a stack
+        // left half in the old theme and half in the new one is the visible bug.
+        let log = Rc::new(RefCell::new(Vec::new()));
+        let mut compositor = Compositor::new();
+        compositor.push(Box::new(Fake::new(1, true, &log)));
+        compositor.push(Box::new(Fake::new(2, true, &log)));
+        compositor.restyle(&crate::config::Theme::default());
+        assert_eq!(*log.borrow(), vec![1, 2]);
     }
 
     fn key(c: char) -> KeyEvent {
