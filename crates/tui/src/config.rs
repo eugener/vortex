@@ -123,15 +123,23 @@ mod tests {
 
     #[test]
     fn default_config_carries_a_working_keymap() {
-        use crate::keymap::action_for_key;
+        use crate::command::Command;
+        use crate::keymap::command_for_key;
         use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
         use vortex_core::Action;
 
         let config = Config::default();
         let ctrl_s = KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL);
         assert_eq!(
-            action_for_key(&config.keymap, ctrl_s, 10),
-            Some(Action::Save)
+            command_for_key(&config.keymap, ctrl_s, 10),
+            Some(Command::Editor(Action::Save))
+        );
+        // Overlay triggers ride the same table, so the resolved config carries them
+        // too - the property that breaks if they are ever built outside `from_pairs`.
+        let ctrl_p = KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL);
+        assert_eq!(
+            command_for_key(&config.keymap, ctrl_p, 10),
+            Some(Command::OpenPalette)
         );
     }
 
