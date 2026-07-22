@@ -101,10 +101,6 @@ struct Editor {
     version: u64,
     /// The file this buffer is bound to (`Open`/`Save`), or `None` if unnamed.
     path: Option<PathBuf>,
-    /// Whether the buffer differs from its on-disk file. Derived from `history`'s
-    /// save point at each edit/undo/save/open (SPEC §8, §10), so undoing back to the
-    /// saved state clears it. Independent of `version`, which never resets.
-    modified: bool,
     /// The undo tree (SPEC §2.4). Owns the reversible change history and the
     /// coalescing state; reset on a file open (undo does not cross a load).
     history: History,
@@ -124,7 +120,6 @@ impl Editor {
             selections: SelectionSet::at_origin(),
             version: 0,
             path: None,
-            modified: false,
             history: History::new(),
             register: Vec::new(),
         }
@@ -145,8 +140,16 @@ impl Editor {
             primary: self.selections.primary_index(),
             dirty,
             path: self.path.clone(),
-            modified: self.modified,
+            modified: self.modified(),
         }
+    }
+
+    /// Whether the buffer differs from its on-disk file. Derived from `history`'s
+    /// save point - never stored - so no edit/undo/open/save path can forget to
+    /// sync a cached copy, and undoing back to the saved state clears it
+    /// (SPEC §8, §10).
+    fn modified(&self) -> bool {
+        !self.history.at_saved()
     }
 
     /// Apply `motion` to the selection set. Pure state change, no delta - motion
@@ -249,18 +252,18 @@ impl Editor {
             return Vec::new();
         }
         let selections = self.selections.all();
-        // The fallback block (used when counts are neither 1 nor equal) is built once.
-        let joined = self.register_flattened();
+        // The joined fallback applies only when counts are neither 1 nor equal;
+        // build it once then, and not at all on the common paths.
+        let joined = (self.register.len() != 1 && self.register.len() != selections.len())
+            .then(|| self.register_flattened());
         let mut edits: Vec<(std::ops::Range<usize>, String)> = selections
             .iter()
             .enumerate()
             .map(|(i, sel)| {
-                let insert = if self.register.len() == 1 {
-                    self.register[0].clone()
-                } else if self.register.len() == selections.len() {
-                    self.register[i].clone()
-                } else {
-                    joined.clone()
+                let insert = match &joined {
+                    Some(j) => j.clone(),
+                    None if self.register.len() == 1 => self.register[0].clone(),
+                    None => self.register[i].clone(),
                 };
                 (sel.start()..sel.end(), insert)
             })
@@ -555,7 +558,6 @@ async fn apply_edit(
     editor
         .history
         .record(changes, before, editor.selections.clone());
-    editor.modified = !editor.history.at_saved();
     snapshots.publish(editor.snapshot(dirty))
 }
 
@@ -590,7 +592,6 @@ async fn reapply(
         editor.version += 1;
     }
     editor.selections = reverted.selections;
-    editor.modified = !editor.history.at_saved();
     snapshots.publish(editor.snapshot(dirty))
 }
 
@@ -722,7 +723,6 @@ async fn open_file(
     editor.selections = SelectionSet::at_origin();
     editor.path = Some(path.clone());
     editor.history = History::new();
-    editor.modified = false;
 
     let _ = notifications.try_send(Notification::FileOpened {
         buffer_id: editor.id,
@@ -763,7 +763,6 @@ async fn save_file(
     // Mark the current history node as the on-disk state, so undoing back to it
     // later clears the modified marker (SPEC §2.4, §8).
     editor.history.mark_saved();
-    editor.modified = false;
     let _ = notifications.try_send(Notification::FileSaved {
         buffer_id: editor.id,
         path,
@@ -841,10 +840,6 @@ fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), String> {
     } else {
         path.to_path_buf()
     };
-    // Whether a real file exists at the resolved target (false for a first save
-    // through a dangling symlink): governs whether there is a mode to preserve.
-    let target_exists = fs::metadata(&target).is_ok();
-
     // Temp file must sit in the target's directory so the rename stays on one
     // filesystem (a cross-device rename is not atomic and errors). A bare file
     // name has an empty parent, meaning the current directory.
@@ -872,15 +867,12 @@ fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), String> {
     // inner block drops the file handle before the rename (renaming an open file
     // fails on Windows). Any failure shares one cleanup: remove the temp, leaving
     // the original intact (SPEC §8).
-    // The target's current mode (if it exists), so the temp is *created* no wider
-    // than the destination - a 0600 file's contents must never touch disk in a
-    // 0644 temp, even briefly, before being narrowed (that window would expose
-    // e.g. an SSH key to any local user for the length of the write + fsync).
-    let target_mode = if target_exists {
-        fs::metadata(&target).ok().map(|m| m.permissions())
-    } else {
-        None
-    };
+    // The target's current mode (if it exists; `None` for a new file or a first
+    // save through a dangling symlink), so the temp is *created* no wider than
+    // the destination - a 0600 file's contents must never touch disk in a 0644
+    // temp, even briefly, before being narrowed (that window would expose e.g.
+    // an SSH key to any local user for the length of the write + fsync).
+    let target_mode = fs::metadata(&target).ok().map(|m| m.permissions());
     let result = (|| -> std::io::Result<()> {
         {
             let mut opts = fs::OpenOptions::new();

@@ -279,7 +279,9 @@ fn forward_edits(changes: &[Change]) -> Vec<(Range<usize>, String)> {
         .iter()
         .map(|c| (c.start..c.start + c.removed.len(), c.inserted.clone()))
         .collect();
-    edits.sort_by_key(|(r, _)| std::cmp::Reverse(r.start));
+    // `changes` are sorted ascending (record() sorts them), so descending is a
+    // plain reversal - no re-sort needed.
+    edits.reverse();
     edits
 }
 
@@ -299,7 +301,9 @@ fn inverse_edits(changes: &[Change]) -> Vec<(Range<usize>, String)> {
         ));
         shift += change.inserted.len() as isize - change.removed.len() as isize;
     }
-    edits.sort_by_key(|(r, _)| std::cmp::Reverse(r.start));
+    // Shifted starts stay ascending (disjoint ascending changes shift each child
+    // start monotonically), so descending is a plain reversal - no re-sort needed.
+    edits.reverse();
     edits
 }
 

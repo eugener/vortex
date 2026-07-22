@@ -198,9 +198,8 @@ fn replace_rejects_non_char_boundary() {
 
 #[test]
 fn replace_rejects_non_char_boundary_on_later_line() {
-    // A multi-line buffer forces is_char_boundary's binary search to iterate
-    // (single-line buffers short-circuit). "語" starts at byte 6, so offset 7
-    // splits it - the split is on line 2, not the first line.
+    // The boundary check must hold beyond the first line of a multi-line buffer.
+    // "語" starts at byte 6, so offset 7 splits it - on line 2, not the first.
     let mut b = RopeBuffer::from("ab\ncd\n語");
     assert_eq!(
         b.replace(7..9, "x"),
@@ -213,9 +212,8 @@ fn replace_rejects_non_char_boundary_on_later_line() {
 
 #[test]
 fn replace_rejects_non_char_boundary_on_first_line_of_many() {
-    // A split on the FIRST line of a multi-line buffer forces the boundary
-    // search to walk its high end down (the `hi = mid - 1` branch), which a
-    // split on the last line does not exercise. "日" splits at offset 1.
+    // Mirror of the later-line case: a split on the FIRST line of a multi-line
+    // buffer must be rejected too. "日" splits at offset 1.
     let mut b = RopeBuffer::from("日\nab\ncd\nef");
     assert_eq!(
         b.replace(1..3, "x"),
@@ -254,6 +252,32 @@ fn text_byte_len_matches_buffer() {
     let b = RopeBuffer::from("日本語"); // 9 bytes
     assert_eq!(b.text().byte_len(), 9);
     assert_eq!(b.text().byte_len(), b.byte_len());
+}
+
+#[test]
+fn text_position_of_byte_matches_buffer_and_clamps() {
+    // Text hosts the canonical byte -> (line, col) conversion; the Buffer impl
+    // delegates to it, so the two must agree, and an offset past the end clamps
+    // to the buffer end instead of panicking (SPEC §8).
+    let b = RopeBuffer::from("ab\ncd");
+    let t = b.text();
+    assert_eq!(t.position_of_byte(0), Position::new(0, 0));
+    assert_eq!(t.position_of_byte(3), Position::new(1, 0)); // start of line 1
+    assert_eq!(t.position_of_byte(5), Position::new(1, 2)); // buffer end
+    assert_eq!(t.position_of_byte(99), Position::new(1, 2)); // clamped
+    assert_eq!(t.position_of_byte(4), b.position_of_byte(4));
+}
+
+#[test]
+fn text_last_line_index_counts_the_trailing_virtual_line() {
+    // The last navigable line includes the empty line after a final terminator,
+    // which crop's line_count() does not count ("a\n" is 1 line to the rope but
+    // the cursor can sit on line 1). An empty buffer still has line 0.
+    assert_eq!(RopeBuffer::from("").text().last_line_index(), 0);
+    assert_eq!(RopeBuffer::from("a").text().last_line_index(), 0);
+    assert_eq!(RopeBuffer::from("a\n").text().last_line_index(), 1);
+    assert_eq!(RopeBuffer::from("a\nb").text().last_line_index(), 1);
+    assert_eq!(RopeBuffer::from("a\nb\n").text().last_line_index(), 2);
 }
 
 #[test]
