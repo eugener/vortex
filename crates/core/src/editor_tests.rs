@@ -830,6 +830,103 @@ fn one_multi_cursor_insert_is_a_single_undo_unit_through_the_loop() {
 }
 
 #[test]
+fn a_motion_between_keystrokes_splits_the_undo_run_through_the_loop() {
+    // SPEC §2.4 break rule (d), end to end: type "ab", move the caret, type "X".
+    // The first Undo must peel only "X" - if the run had swallowed it, undo would
+    // jump straight back to the empty buffer and eat work the user expected to keep.
+    // This is the integration guard for the rule being structural: no action arm
+    // announces the break, `History` infers it from the edit's own selections.
+    let (snap, _notes) = run_seam(&[
+        Action::Insert("a".into()),
+        Action::Insert("b".into()), // coalesces with "a"
+        Action::MoveCursor {
+            motion: Motion::Left,
+            extend: false,
+        },
+        Action::Insert("X".into()), // starts from a different caret -> new unit
+        Action::Undo,
+    ]);
+    assert_eq!(snap.text.to_string(), "ab", "only the post-motion insert");
+
+    // A second Undo then removes the whole coalesced "ab" run at once.
+    let (snap, _notes) = run_seam(&[
+        Action::Insert("a".into()),
+        Action::Insert("b".into()),
+        Action::MoveCursor {
+            motion: Motion::Left,
+            extend: false,
+        },
+        Action::Insert("X".into()),
+        Action::Undo,
+        Action::Undo,
+    ]);
+    assert_eq!(snap.text.to_string(), "");
+}
+
+#[test]
+fn adding_a_cursor_between_keystrokes_splits_the_undo_run_through_the_loop() {
+    // The cursor-set half of break rule (d): growing the selection set between two
+    // keystrokes ends the run just as a motion does, with no per-action break call.
+    let (snap, _notes) = run_seam(&[
+        Action::Insert("ab\ncd".into()),
+        Action::MoveCursor {
+            motion: Motion::BufferStart,
+            extend: false,
+        },
+        Action::Insert("X".into()), // one caret
+        Action::AddCursorBelow,     // cursor set changes
+        Action::Insert("Y".into()), // must not fold into the "X" unit
+        Action::Undo,
+    ]);
+    assert_eq!(
+        snap.text.to_string(),
+        "Xab\ncd",
+        "undo peels only the multi-cursor insert, leaving the earlier X"
+    );
+}
+
+#[test]
+fn a_round_trip_motion_between_keystrokes_keeps_one_undo_unit() {
+    // The one behavior change from making break rule (d) structural: moving away
+    // and back leaves the selection set exactly as it was, which is indistinguishable
+    // from never having moved, so the typing run survives. Previously every motion
+    // announced a break, so this split into two undo units. Asserted end to end so
+    // the equivalence is a checked decision rather than an undocumented side effect.
+    let (snap, _notes) = run_seam(&[
+        Action::Insert("a".into()),
+        Action::MoveCursor {
+            motion: Motion::Left,
+            extend: false,
+        },
+        Action::MoveCursor {
+            motion: Motion::Right,
+            extend: false,
+        },
+        Action::Insert("b".into()),
+        Action::Undo,
+    ]);
+    assert_eq!(
+        snap.text.to_string(),
+        "",
+        "one undo removes both characters"
+    );
+}
+
+#[test]
+fn consecutive_keystrokes_still_coalesce_through_the_loop() {
+    // The other side of the same mechanism: with no selection change between them,
+    // a run of typed characters is still ONE undo unit (without this, undo reverts
+    // one keystroke at a time - unusable, SPEC §2.4).
+    let (snap, _notes) = run_seam(&[
+        Action::Insert("a".into()),
+        Action::Insert("b".into()),
+        Action::Insert("c".into()),
+        Action::Undo,
+    ]);
+    assert_eq!(snap.text.to_string(), "", "one undo removes the whole run");
+}
+
+#[test]
 fn collapse_selections_reduces_to_the_primary_through_the_loop() {
     let (snap, _notes) = run_seam(&[
         Action::Insert("ab\ncd\nef".into()),

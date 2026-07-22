@@ -431,46 +431,40 @@ async fn run(
             }
             // Paste distributes the register over the cursors (SPEC §11); an empty
             // register plans no edits and is a clean no-op. A paste is a distinct
-            // action, not a keystroke, so it ends any typing-coalescing run (SPEC §2.4
-            // break rule (d)) - otherwise a single-char paste right after typing would
-            // fold into that undo unit and one Undo would revert both.
+            // action, not a keystroke, so it ends any typing-coalescing run - the one
+            // break `History` cannot infer, since a paste leaves the carets exactly
+            // where typing would and a single-character payload is indistinguishable
+            // from a keystroke at the `Change` level (SPEC §2.4).
             Action::Paste => {
                 editor.history.break_coalescing();
                 Step::Edit(editor.plan_paste())
             }
+            // The selection-changing actions need no coalescing bookkeeping: every
+            // edit carries the selection set it started from, so `History` sees the
+            // caret moved and ends the typing run itself (SPEC §2.4 break rule (d)).
+            // A new selection action added here inherits that for free.
             Action::MoveCursor { motion, extend } => {
                 editor.move_cursor(motion, extend);
-                // A cursor motion ends the insert-coalescing run (SPEC §2.4 break
-                // rule (d)): the next typed character starts a new undo unit.
-                editor.history.break_coalescing();
                 Step::Republish
             }
             Action::PlaceCursor { offset, extend } => {
                 editor.place_cursor(offset, extend);
-                editor.history.break_coalescing();
                 Step::Republish
             }
-            // Changing the cursor set ends the coalescing run (SPEC §2.4 break rule
-            // (d)), so a following typed character starts a fresh undo unit - one that
-            // spans every cursor at once.
             Action::AddCursorAbove => {
                 editor.add_cursor_vertical(true);
-                editor.history.break_coalescing();
                 Step::Republish
             }
             Action::AddCursorBelow => {
                 editor.add_cursor_vertical(false);
-                editor.history.break_coalescing();
                 Step::Republish
             }
             Action::AddCursorAt { offset } => {
                 editor.add_cursor_at(offset);
-                editor.history.break_coalescing();
                 Step::Republish
             }
             Action::CollapseSelections => {
                 editor.collapse_selections();
-                editor.history.break_coalescing();
                 Step::Republish
             }
             Action::Undo => Step::Undo,
