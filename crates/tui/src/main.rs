@@ -21,6 +21,8 @@ mod layout;
 mod osc52;
 mod palette;
 mod picker;
+#[cfg(test)]
+mod testutil;
 mod toast;
 
 use std::ffi::OsString;
@@ -47,7 +49,7 @@ use vortex_core::{Action, Core, ViewSnapshot};
 
 use command::Command;
 use compositor::{Compositor, EventResult};
-use toast::{Level, Toasts};
+use toast::Toasts;
 
 /// Default tab stop width for display-column layout (SPEC §4). Config in M5.
 const TAB_WIDTH: usize = 4;
@@ -241,6 +243,11 @@ fn event_loop(
         return Ok(());
     }
     let mut latest: Option<ViewSnapshot> = None;
+    // The active selection's grapheme count for the status bar. O(selected bytes)
+    // to compute, so it is derived once per snapshot here and carried across
+    // repaints - a toast tick or overlay keystroke must not re-walk a large
+    // selection just to redraw the bar.
+    let mut selected = 0;
     // View state (scroll on both axes + last page height). Updated by `draw` each
     // frame and carried forward; `page()` sizes PageUp/PageDown (SPEC §5).
     let mut viewport = ViewState::default();
@@ -265,6 +272,7 @@ fn event_loop(
     loop {
         // Take the newest snapshot if the core published one (latest-wins cell).
         if let Some(snap) = handle.snapshots.try_recv() {
+            selected = layout::selected_grapheme_count(&snap.text, &snap.selections);
             latest = Some(snap);
             needs_redraw = true;
         }
@@ -283,8 +291,8 @@ fn event_loop(
             if let vortex_core::Notification::SetClipboard { text } = &note {
                 let _ = osc52::copy(text);
             }
-            if let Some(text) = layout::notification_message(&note) {
-                toasts.push(text, Level::of(&note), Instant::now());
+            if let Some((text, level)) = toast::toast_for(&note) {
+                toasts.push(text, level, Instant::now());
                 needs_redraw = true;
             }
         }
@@ -300,9 +308,12 @@ fn event_loop(
             viewport = draw(
                 terminal,
                 snap,
-                viewport,
-                config.theme,
-                follow,
+                PaintInputs {
+                    viewport,
+                    theme: config.theme,
+                    follow,
+                    selected,
+                },
                 &overlays,
                 &toasts,
             )?;
@@ -489,17 +500,15 @@ fn pointer_offset(snapshot: &ViewSnapshot, viewport: ViewState, column: u16, row
 fn draw(
     terminal: &mut Terminal<ratatui::backend::CrosstermBackend<Stdout>>,
     snapshot: &ViewSnapshot,
-    viewport: ViewState,
-    theme: config::Theme,
-    follow: bool,
+    inputs: PaintInputs,
     overlays: &Compositor,
     toasts: &Toasts,
 ) -> io::Result<ViewState> {
-    let mut new_viewport = viewport;
+    let mut new_viewport = inputs.viewport;
     let mut out = io::stdout();
     queue!(out, BeginSynchronizedUpdate)?;
     terminal.draw(|frame| {
-        new_viewport = paint(frame, snapshot, viewport, theme, follow);
+        new_viewport = paint(frame, snapshot, inputs);
         let area = frame.area();
         // Toasts paint over the base editor but consume no input (SPEC §7.5), then
         // overlays paint over everything. The focused overlay owns the caret, so its
@@ -516,18 +525,37 @@ fn draw(
     Ok(new_viewport)
 }
 
+/// Everything one frame needs beyond the snapshot itself: the carried view
+/// state, theme, caret-follow flag, and the selection count precomputed by the
+/// event loop. Bundled as one `Copy` value (the same consolidation as
+/// [`ViewState`]/[`Body`]) so `draw`/`paint` stay within the argument budget as
+/// per-frame inputs grow.
+#[derive(Clone, Copy)]
+struct PaintInputs {
+    /// The view state carried from the previous frame.
+    viewport: ViewState,
+    /// The active theme.
+    theme: config::Theme,
+    /// Whether this frame pulls the viewport to keep the caret visible (off only
+    /// for the single frame after a wheel scroll).
+    follow: bool,
+    /// Grapheme count of the active selection, computed once per snapshot by the
+    /// event loop (O(selected bytes) - too costly to re-derive every repaint).
+    selected: usize,
+}
+
 /// Compose the whole frame: head bar, gutter + text, status bar, and the cursor.
 /// Backend-generic (takes a `&mut Frame`) so a `TestBackend` render can assert on
 /// the painted cells (SPEC §13). Returns the scroll offset it settled on so the
 /// caller can carry it forward. All measurement is delegated to the tested
 /// [`layout`] helpers; this function only positions widgets.
-fn paint(
-    frame: &mut Frame,
-    snapshot: &ViewSnapshot,
-    viewport: ViewState,
-    theme: config::Theme,
-    follow: bool,
-) -> ViewState {
+fn paint(frame: &mut Frame, snapshot: &ViewSnapshot, inputs: PaintInputs) -> ViewState {
+    let PaintInputs {
+        viewport,
+        theme,
+        follow,
+        selected,
+    } = inputs;
     let area = frame.area();
     // Head bar (1 row), text body (rest), status bar (1 row). `Min(0)` lets the
     // body shrink to nothing on a tiny terminal without the split failing.
@@ -602,6 +630,7 @@ fn paint(
             cursor_line,
             line_text: &line_text,
             cursor_byte_col,
+            selected,
             style: theme.status_bar,
         },
     );
@@ -672,6 +701,17 @@ fn paint_body(frame: &mut Frame, area: Rect, snapshot: &ViewSnapshot, body: Body
     let height = area.height as usize;
     let lines = layout::visible_lines(text, body.scroll, height, TAB_WIDTH);
 
+    // Each secondary caret's line is invariant across the frame: resolve it once
+    // here (O(selections) rope lookups) instead of per visible row, which would
+    // be O(rows x selections) once M3 multi-cursor grows both factors.
+    let secondary_carets: Vec<(usize, usize)> = snapshot
+        .selections
+        .iter()
+        .enumerate()
+        .filter(|&(i, s)| i != snapshot.primary && s.is_cursor())
+        .map(|(_, s)| (text.line_of_byte(s.head), s.head))
+        .collect();
+
     let rows: Vec<Line> = lines
         .into_iter()
         .enumerate()
@@ -717,12 +757,9 @@ fn paint_body(frame: &mut Frame, area: Rect, snapshot: &ViewSnapshot, body: Body
             // multi-cursor set is visible: the terminal has a single real cursor,
             // which the primary uses (SPEC §2.2). Pushed after the selection washes
             // so a caret shows on top of any highlight sharing its cell.
-            for (i, s) in snapshot.selections.iter().enumerate() {
-                if i == snapshot.primary || !s.is_cursor() {
-                    continue;
-                }
-                if text.line_of_byte(s.head) == line_index {
-                    let col = layout::display_column(raw, s.head - line_start, TAB_WIDTH);
+            for &(line, head) in &secondary_carets {
+                if line == line_index {
+                    let col = layout::display_column(raw, head - line_start, TAB_WIDTH);
                     overlays.push((col..col + 1, body.theme.secondary_cursor));
                 }
             }
@@ -759,17 +796,18 @@ struct StatusBar<'a> {
     line_text: &'a str,
     /// Byte column of the cursor within `line_text`.
     cursor_byte_col: usize,
+    /// Grapheme count of the active selection (see [`PaintInputs::selected`]).
+    selected: usize,
     /// Bar fill style (from the active theme).
     style: Style,
 }
 
 fn paint_status_bar(frame: &mut Frame, area: Rect, snapshot: &ViewSnapshot, status: StatusBar) {
     let col = layout::grapheme_column(status.line_text, status.cursor_byte_col);
-    let selected = layout::selected_grapheme_count(&snapshot.text, &snapshot.selections);
     let (left, right) = layout::status_bar(
         status.cursor_line + 1,
         col,
-        selected,
+        status.selected,
         snapshot.text.byte_len(),
         snapshot.version,
     );
@@ -862,34 +900,9 @@ impl Drop for TerminalGuard {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::testutil::{TempDir, row_text};
     use ratatui::backend::TestBackend;
     use ratatui::style::{Color, Modifier};
-
-    /// A temp directory removed on drop, so a test that opens a real file cleans
-    /// up even if an assertion panics first (a bare trailing `remove_dir_all`
-    /// would leak the dir on failure). Name mixes pid + a counter to avoid
-    /// collisions across parallel tests.
-    struct TempDir {
-        path: std::path::PathBuf,
-    }
-
-    impl TempDir {
-        fn new() -> Self {
-            use std::sync::atomic::{AtomicU64, Ordering};
-            static COUNTER: AtomicU64 = AtomicU64::new(0);
-            let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-            let path =
-                std::env::temp_dir().join(format!("vortex-tui-{}-{}", std::process::id(), n));
-            std::fs::create_dir_all(&path).unwrap();
-            Self { path }
-        }
-    }
-
-    impl Drop for TempDir {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.path);
-        }
-    }
 
     /// Drive the real core through an action script and return the resulting
     /// snapshot - the same seam a frontend uses (SPEC §1), so the chrome is
@@ -913,29 +926,30 @@ mod tests {
         }))
     }
 
+    /// Default per-frame paint inputs for tests: fresh view state, default theme,
+    /// caret-follow on, and the given selection count. Tests needing a different
+    /// viewport or follow flag override via struct update syntax.
+    fn paint_inputs(selected: usize) -> PaintInputs {
+        PaintInputs {
+            viewport: ViewState::default(),
+            theme: config::Theme::default(),
+            follow: true,
+            selected,
+        }
+    }
+
     /// Render `snapshot` into an in-memory `TestBackend` of `w`x`h` cells via the
     /// real [`paint`] path, and hand back the painted buffer for cell assertions.
+    /// The selection count is derived from the snapshot, as the event loop does.
     fn render(snapshot: &ViewSnapshot, w: u16, h: u16) -> ratatui::buffer::Buffer {
         let mut terminal = Terminal::new(TestBackend::new(w, h)).unwrap();
+        let selected = layout::selected_grapheme_count(&snapshot.text, &snapshot.selections);
         terminal
             .draw(|frame| {
-                paint(
-                    frame,
-                    snapshot,
-                    ViewState::default(),
-                    config::Theme::default(),
-                    true,
-                );
+                paint(frame, snapshot, paint_inputs(selected));
             })
             .unwrap();
         terminal.backend().buffer().clone()
-    }
-
-    /// The concatenated symbols of row `y`, for substring assertions on a bar.
-    fn row_text(buf: &ratatui::buffer::Buffer, y: u16) -> String {
-        (0..buf.area().width)
-            .map(|x| buf.cell((x, y)).unwrap().symbol())
-            .collect()
     }
 
     /// Parse a slice of string args (skipping argv[0]) the way `main` does.
@@ -1088,13 +1102,7 @@ mod tests {
         let mut terminal = Terminal::new(TestBackend::new(12, 4)).unwrap();
         terminal
             .draw(|frame| {
-                paint(
-                    frame,
-                    &snap,
-                    ViewState::default(),
-                    config::Theme::default(),
-                    true,
-                );
+                paint(frame, &snap, paint_inputs(0));
             })
             .unwrap();
         let pos = terminal.backend().cursor_position();
@@ -1218,13 +1226,7 @@ mod tests {
         let mut terminal = Terminal::new(TestBackend::new(40, 10)).unwrap();
         terminal
             .draw(|frame| {
-                paint(
-                    frame,
-                    &snap,
-                    ViewState::default(),
-                    config::Theme::default(),
-                    true,
-                );
+                paint(frame, &snap, paint_inputs(0));
             })
             .unwrap();
         let pos = terminal.backend().cursor_position();
@@ -1298,7 +1300,16 @@ mod tests {
             page_height: 4,
         };
         terminal
-            .draw(|frame| settled = paint(frame, &snap, stale, config::Theme::default(), true))
+            .draw(|frame| {
+                settled = paint(
+                    frame,
+                    &snap,
+                    PaintInputs {
+                        viewport: stale,
+                        ..paint_inputs(0)
+                    },
+                )
+            })
             .unwrap();
         assert_eq!(settled.scroll, 0, "scroll must clamp to fit the content");
         let buf = terminal.backend().buffer().clone();
@@ -1323,7 +1334,16 @@ mod tests {
             page_height: 2,
         };
         terminal
-            .draw(|frame| settled = paint(frame, &snap, stale, config::Theme::default(), true))
+            .draw(|frame| {
+                settled = paint(
+                    frame,
+                    &snap,
+                    PaintInputs {
+                        viewport: stale,
+                        ..paint_inputs(0)
+                    },
+                )
+            })
             .unwrap();
         assert_eq!(settled.h_scroll, 0, "h_scroll must clamp to the short line");
         let buf = terminal.backend().buffer().clone();
@@ -1355,7 +1375,17 @@ mod tests {
         let mut settled = ViewState::default();
         let mut terminal = Terminal::new(TestBackend::new(20, 6)).unwrap();
         terminal
-            .draw(|frame| settled = paint(frame, &snap, scrolled, config::Theme::default(), false))
+            .draw(|frame| {
+                settled = paint(
+                    frame,
+                    &snap,
+                    PaintInputs {
+                        viewport: scrolled,
+                        follow: false,
+                        ..paint_inputs(0)
+                    },
+                )
+            })
             .unwrap();
         // The view stayed scrolled (not pulled back to the caret on line 0).
         assert_eq!(settled.scroll, 2);
