@@ -165,6 +165,12 @@ held-lock-across-`.await` deadlocks. Instead:
 - **Coalescing:** consecutive single-character inserts are grouped into one undo unit,
   broken by (a) a time gap, (b) a non-adjacent edit, (c) a newline, or (d) a
   cursor/selection change. Without this, undo reverts one character at a time - unusable.
+  - Rule (d) is enforced **structurally**, not by each action announcing it: every edit
+    is recorded with the selection set it started from, and coalescing is refused when
+    that differs from the previous edit's post-state. No action arm can forget to break
+    the run, which is what keeps the rule true as the selection vocabulary grows. The
+    corollary is that a motion returning to the *exact* same selection set does not
+    break the run - indistinguishable from never having moved, and accepted as such.
 - **One `Action` is one undo unit, even across multiple cursors.** A single keystroke
   applied over an N-cursor `SelectionSet` is N disjoint text edits but **one** undo entry -
   the break rules above are about *separate actions over time*, never about one action
@@ -657,6 +663,17 @@ start of the design, even though file loading itself lands at **M5**:
     `select_` is the selection-extending variant (`move_line_start`, `select_page_down`),
     so **`extend` is part of the binding, not a runtime modifier** - `right` and
     `shift+right` are distinct entries.
+  - **One namespace, one table - including overlay triggers.** Commands that open a
+    frontend surface (`open_palette`, `open_file_picker`, §7.5) are named and bound
+    exactly like editing commands, in the same table, even though they resolve to a
+    frontend-local effect rather than a core `Action`. A separate map for them would be
+    a second thing `from_pairs` has to populate, and since the config path *is*
+    `from_pairs`, anything it missed would silently vanish the first time a user wrote
+    a config file. The same identity is what the palette lists and looks shortcuts up
+    by, so a command's name, its binding, and its palette row cannot drift apart.
+  - **Command names are a public contract** once a config file exists: renaming one
+    breaks user configs. They are cheap to settle now and expensive later, so new
+    commands should be named deliberately rather than after the fact.
   - **Text entry is a fallback, not a binding:** an unbound printable char with no Ctrl
     inserts itself, so the map never enumerates every letter.
   - **Open:** modal-vs-modeless, chord *sequences* (multi-key), and per-mode maps are the
@@ -712,6 +729,57 @@ early milestones is a deliberate scope choice, not an oversight:
   exist now (§10.5); what remains is loading a user file into it (M5, rides the same
   `toml` seam) and the richer *modal* design - chord sequences, per-mode maps, modal vs
   modeless - drafted alongside §12.2's `Action` vocabulary. Target: M1+.
+
+### Known structural debt (identified 2026-07-21, with triggers)
+
+Cleanups that were identified, judged real, and deliberately not taken yet. Each names
+the condition that should pull it forward, so they are scheduled rather than forgotten.
+None is a correctness bug today.
+
+- **Quit is detected by sniffing the `Action` value in the frontend.** `dispatch_command`
+  compares against `Action::Quit` and exits the loop immediately after sending it, while
+  the core's own `Notification::ShuttingDown` (which exists for exactly this) is drained
+  and ignored - two shutdown signals that must agree. Exiting on the notification, or on
+  channel closure, would delete the special case. **Deferred because** the right shape is
+  decided by core-side "unsaved changes, really quit?": if the core can *refuse* a quit,
+  the frontend needs that response path anyway, so building the seam first means guessing
+  at it. **Trigger:** the confirm-on-quit feature. A smaller independent piece can land
+  sooner - the frontend currently keeps painting a stale snapshot if the core thread dies
+  while the user is idle, since only a later keystroke notices the closed channel.
+- **Overlay modality for mouse and paste is hardcoded in the event loop.** Keys route
+  through the compositor's `handle_key`/`EventResult` seam, but `Event::Mouse` and
+  `Event::Paste` are swallowed by `if !overlays.is_empty()` match guards in the loop, so
+  input routing lives at two altitudes and every new event kind adds another guard.
+  Widening the layer seam to whole events (`handle_event`, with defaults) unifies them.
+  **Deferred because** the per-layer behavior this would enable (clicking inside a picker,
+  pasting into a prompt) is M7 design that does not exist yet. **Trigger:** the first
+  overlay that wants to handle a click or a paste.
+- **"A shortcut fires over a picker" is a convention split across two files.** It works
+  only because `Picker::handle_key` returns `Ignored` for any Ctrl/Cmd chord *and* the
+  event loop dismisses the whole overlay stack when a fall-through key turns out to be
+  bound. Neither half is expressed in the `Layer` contract, so the next layer type must
+  rediscover the heuristic or shortcuts silently stop working over it. An explicit
+  `EventResult::Deferred` ("not mine; if it resolves to a command, close me") would put
+  the rule in the seam. **Deferred because** there is still only one layer type, so the
+  rule has not been duplicated even once. **Trigger:** the prompt layer (§7.5), which is
+  the second implementor - and also the point where dismiss-*all* becomes the wrong scope
+  for nested overlays.
+- **Cursor motion allocates the caret's line on every keystroke.** `Text::line` returns an
+  owned `String`, so Left/Right/Backspace/Delete each copy the current line and vertical
+  motions copy two, per cursor. Bounded by line length as §10.4 promises, but on a file
+  whose content is one very long line (minified JS/JSON) holding an arrow key copies
+  megabytes per repeat. A borrowing accessor (grapheme iteration over the line's chunks,
+  or a `Cow` that borrows when the line lies in one chunk) fixes it additively, without
+  putting `crop` in the public API. **Deferred because** it is an additive `Text` method,
+  equally cheap to add later, and it deserves a benchmark rather than being folded into a
+  cleanup pass. **Trigger:** a benchmark harness, or the first large-file report.
+- **The file picker walks the working directory on the UI thread.** Ctrl+O runs a
+  synchronous recursive `read_dir` of up to `MAX_FILES` entries before the overlay paints,
+  so a cold or network filesystem freezes the editor until it finishes. The cap bounds the
+  match cost, not the walk latency. Walking on a background thread and feeding results in
+  incrementally suits the compositor's per-tick repaint already. **Trigger:** the picker
+  being used on a large or remote tree, or the same background-work machinery arriving for
+  §2.3's off-thread file loads.
 
 ---
 
