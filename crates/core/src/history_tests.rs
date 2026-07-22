@@ -180,8 +180,8 @@ fn a_single_multibyte_grapheme_still_coalesces() {
 
 #[test]
 fn break_coalescing_starts_a_new_undo_unit() {
-    // A motion between two inserts (modeled by break_coalescing) prevents the
-    // merge, so undo peels the second insert only (rule (d)).
+    // The explicit break (a paste, a save) prevents the merge, so undo peels the
+    // second insert only.
     let mut h = History::new();
     h.record(insert(0, "a").0, caret(0), caret(1));
     h.break_coalescing();
@@ -190,6 +190,53 @@ fn break_coalescing_starts_a_new_undo_unit() {
     let mut buf = "ab".to_string();
     apply(&mut buf, &h.undo().unwrap().edits);
     assert_eq!(buf, "a"); // 'b' only
+}
+
+#[test]
+fn adjacency_still_guards_a_matching_selection_set() {
+    // The converse of the test below, and the reason rule (b) stays a separate check.
+    // Coalescing appends the new text onto the current revision's `inserted`, which is
+    // only sound if the two edits are contiguous. Here the selections match (so the
+    // rule-(d) check passes) but the edit lands at offset 5 rather than 1 - another
+    // forced state, since a real insert happens *at* its caret. Without this guard the
+    // run would merge two disjoint edits into one revision whose recorded text never
+    // existed in the buffer, and undo would restore garbage.
+    let mut h = History::new();
+    h.record(insert(0, "a").0, caret(0), caret(1));
+    let non_adjacent = vec![Change {
+        start: 5,
+        removed: String::new(),
+        inserted: "b".to_string(),
+    }];
+    h.record(non_adjacent, caret(1), caret(6));
+
+    assert!(h.undo().is_some(), "the second insert is its own unit");
+    assert!(h.undo().is_some(), "the first insert survives separately");
+    assert!(h.undo().is_none());
+}
+
+#[test]
+fn a_changed_selection_set_breaks_the_run_even_when_the_edit_stays_adjacent() {
+    // Isolates the rule-(d) selection check from the rule-(b) adjacency check: the
+    // second insert *is* adjacent (offset 1, right where the first ended), so only
+    // the selection comparison can refuse it.
+    //
+    // Like `coalescing_guards_refuse_a_non_coalescable_target`, this forces a state
+    // the public API cannot currently produce - today an N-caret set fans an insert
+    // into N changes, which `is_typed_grapheme` already rejects, so a one-change
+    // edit always carries a one-caret set whose position adjacency alone would
+    // catch. The guard is what makes rule (d) hold *structurally* rather than as a
+    // side effect of adjacency, which is what lets the editor drop its per-action
+    // break calls; this test is what keeps it honest as new selection actions land.
+    let mut h = History::new();
+    h.record(insert(0, "a").0, caret(0), caret(1));
+    let two_carets =
+        SelectionSet::from_sorted_cursors(vec![Selection::cursor(1), Selection::cursor(9)]);
+    h.record(insert(1, "b").0, two_carets.clone(), two_carets);
+
+    let mut buf = "ab".to_string();
+    apply(&mut buf, &h.undo().unwrap().edits);
+    assert_eq!(buf, "a", "the cursor-set change ended the run");
 }
 
 #[test]

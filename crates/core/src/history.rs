@@ -19,9 +19,28 @@
 //! **Coalescing** merges a run of single-caret character inserts into one undo
 //! unit (without it, undo reverts one keystroke at a time - unusable). The run is
 //! broken by (b) a non-adjacent edit, (c) a newline, or (d) a cursor/selection
-//! change (the editor calls [`History::break_coalescing`] on any motion). SPEC
-//! §2.4's rule (a) - a time gap - needs a clock and is deferred; the frontend can
-//! force a boundary later without changing this shape.
+//! change.
+//!
+//! Rule (d) is enforced **structurally**, not by a call each action must remember:
+//! every edit arrives with the selection set it started from, and
+//! [`History::try_coalesce`] refuses to merge when that differs from the previous
+//! edit's post-state. For the states reachable today this agrees with the
+//! adjacency check (b) - a lone caret that jumped also fails adjacency - so the
+//! comparison is not what *currently* catches a motion. What it buys is that
+//! rule (d) holds by construction instead of as a side effect of (b): the editor
+//! needs no per-action break call, so a new selection action (select-word,
+//! rotate-primary, split-into-lines) cannot silently forget one and ship an "undo
+//! swallowed more than I typed" bug.
+//!
+//! A motion that returns to the *exact* same selection set is indistinguishable
+//! from never having moved, so the run continues - a deliberate equivalence, and
+//! the one case where this is looser than a per-action break call was.
+//!
+//! [`History::break_coalescing`] remains for boundaries that are *not* visible as
+//! a selection change: a paste (a distinct action even when its payload is one
+//! character) and a save (the saved node must stay immutable). SPEC §2.4's rule
+//! (a) - a time gap - needs a clock and is deferred; the frontend can force a
+//! boundary later without changing this shape.
 
 use std::ops::Range;
 
@@ -75,8 +94,10 @@ pub(crate) struct History {
     /// `current != saved` (SPEC §8), so undoing back to the saved state clears the
     /// modified marker.
     saved: Option<usize>,
-    /// Whether the next character insert may coalesce into `current`'s revision.
-    /// Cleared by [`Self::break_coalescing`] (a motion) and by any non-insert edit.
+    /// Whether the last recorded edit was a single typed grapheme, so the next one
+    /// may extend it. Cleared by any non-typing edit and by
+    /// [`Self::break_coalescing`]; a caret move needs no flag, since
+    /// [`Self::try_coalesce`] detects it from the incoming selection set.
     coalescing: bool,
 }
 
@@ -125,7 +146,7 @@ impl History {
         // Try to fold this into the current revision first, from the borrowed pieces
         // - on the hot single-caret typing path this avoids building a `Revision`
         // (and re-cloning `after`/the inserted text) only to drop it.
-        if self.coalescing && self.try_coalesce(&changes, &after) {
+        if self.coalescing && self.try_coalesce(&changes, &before, &after) {
             // Extended the current node's revision in place; `current` unchanged.
         } else {
             let idx = self.nodes.len();
@@ -148,12 +169,17 @@ impl History {
         self.coalescing = opens_run;
     }
 
-    /// Try to fold a new edit (`changes` + its post-edit `after` selections) into the
+    /// Try to fold a new edit (bracketed by its `before`/`after` selections) into the
     /// current node's revision. Succeeds only when both are single-caret character
-    /// inserts and the new one begins exactly where the current one ends (adjacency).
-    /// On success the current revision's inserted text grows and its `after`
-    /// selections advance.
-    fn try_coalesce(&mut self, changes: &[Change], after: &SelectionSet) -> bool {
+    /// inserts, no caret moved in between, and the new one begins exactly where the
+    /// current one ends (adjacency). On success the current revision's inserted text
+    /// grows and its `after` selections advance.
+    fn try_coalesce(
+        &mut self,
+        changes: &[Change],
+        before: &SelectionSet,
+        after: &SelectionSet,
+    ) -> bool {
         // The *incoming* edit must be a single typed grapheme (not a multi-char paste),
         // so a paste immediately after typing does not fold into the typing run.
         if !is_typed_grapheme(changes) {
@@ -163,6 +189,15 @@ impl History {
         let Some(current_revision) = self.nodes[self.current].revision.as_ref() else {
             return false; // at the root: nothing to coalesce into
         };
+        // Break rule (d), structurally: this edit started from `before`, and the
+        // previous one left the carets at `after`. Any difference means a motion,
+        // click, or cursor-set change happened in between, so the run ends here
+        // without the editor having to announce it. (A move away and back to the
+        // exact same set is indistinguishable from no move and keeps the run - a
+        // deliberate, harmless equivalence.)
+        if current_revision.after != *before {
+            return false;
+        }
         if !changes_are_coalescable(&current_revision.changes) {
             return false;
         }
@@ -234,8 +269,11 @@ impl History {
     }
 
     /// End the current coalescing run so the next insert starts a new revision.
-    /// The editor calls this on any cursor motion / selection change (SPEC §2.4
-    /// break rule (d)).
+    ///
+    /// Only for boundaries that a selection comparison cannot see: a paste, whose
+    /// single-character payload is otherwise indistinguishable from a keystroke at
+    /// the [`Change`] level. A cursor motion needs no call - [`Self::try_coalesce`]
+    /// derives break rule (d) from the edit's own `before` selections.
     pub fn break_coalescing(&mut self) {
         self.coalescing = false;
     }
