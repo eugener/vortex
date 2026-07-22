@@ -80,6 +80,21 @@ fn editor_with(text: &str, selections: SelectionSet) -> Editor {
     e
 }
 
+/// Put the editor in the "modified" state by recording a dummy revision, moving
+/// history off its saved node - the same state a real edit leaves behind
+/// (`modified` is derived from the history, not stored).
+fn mark_dirty(e: &mut Editor) {
+    e.history.record(
+        vec![Change {
+            start: 0,
+            removed: String::new(),
+            inserted: "x".into(),
+        }],
+        e.selections.clone(),
+        e.selections.clone(),
+    );
+}
+
 #[test]
 fn plan_insert_over_two_cursors_is_descending() {
     // Two cursors; an insert plans one edit each, sorted descending by start
@@ -239,7 +254,7 @@ fn edit_sets_modified_flag() {
     // The modified axis is independent of version: a fresh buffer is clean; the
     // first applied edit marks it dirty (SPEC §8).
     let mut e = editor_with("abc", SelectionSet::single(Selection::cursor(3)));
-    assert!(!e.modified);
+    assert!(!e.modified());
     let h = Harness::new();
     let edits = e.plan_edit(EditKind::Insert("d".into()));
     smol::block_on(apply_edit(
@@ -249,7 +264,7 @@ fn edit_sets_modified_flag() {
         &h.snapshots,
         &h.note_tx,
     ));
-    assert!(e.modified);
+    assert!(e.modified());
 }
 
 #[test]
@@ -271,7 +286,7 @@ fn open_existing_file_loads_contents_and_binds_path() {
     assert!(alive);
     assert_eq!(e.buffer.text().to_string(), "line one\nline two");
     assert_eq!(e.path, Some(path.clone()));
-    assert!(!e.modified); // a freshly opened buffer matches disk
+    assert!(!e.modified()); // a freshly opened buffer matches disk
     assert_eq!(e.version, 1); // one whole-buffer delta was emitted
     assert_eq!(e.selections.primary().head, 0); // cursor resets to origin
 
@@ -336,7 +351,7 @@ fn open_missing_file_opens_empty_buffer_bound_to_path() {
     assert!(alive);
     assert!(e.buffer.text().is_empty());
     assert_eq!(e.path, Some(path.clone()));
-    assert!(!e.modified);
+    assert!(!e.modified());
     assert_eq!(e.version, 0); // empty->empty: no delta, no version bump
     assert!(h.delta_rx.is_empty());
     // No edit happened, so the repaint hint is None (not a spurious Some(0..0)).
@@ -405,14 +420,14 @@ fn save_writes_buffer_to_bound_file_and_clears_modified() {
 
     let mut e = editor_with("saved text", SelectionSet::at_origin());
     e.path = Some(path.clone());
-    e.modified = true;
+    mark_dirty(&mut e);
 
     let h = Harness::new();
     let alive = smol::block_on(save_file(&mut e, &h.snapshots, &h.note_tx));
 
     assert!(alive);
     assert_eq!(std::fs::read_to_string(&path).unwrap(), "saved text");
-    assert!(!e.modified); // clean after a successful save
+    assert!(!e.modified()); // clean after a successful save
     match h.note_rx.try_recv() {
         Ok(Notification::FileSaved { path: p, .. }) => assert_eq!(p, path),
         other => panic!("expected FileSaved, got {other:?}"),
@@ -437,13 +452,13 @@ fn save_without_path_errors_and_keeps_buffer_dirty() {
     // Save with no bound file: surfaced as FileError, buffer stays dirty so no
     // work is lost (SPEC §8). Save-as (a target path) lands with the prompt UI.
     let mut e = editor_with("unsaved", SelectionSet::at_origin());
-    e.modified = true;
+    mark_dirty(&mut e);
 
     let h = Harness::new();
     let alive = smol::block_on(save_file(&mut e, &h.snapshots, &h.note_tx));
 
     assert!(alive);
-    assert!(e.modified); // still dirty
+    assert!(e.modified()); // still dirty
     match h.note_rx.try_recv() {
         Ok(Notification::FileError { path, message, .. }) => {
             assert_eq!(path, None);
@@ -464,13 +479,13 @@ fn save_failure_keeps_buffer_dirty_and_does_not_corrupt_original() {
 
     let mut e = editor_with("new work", SelectionSet::at_origin());
     e.path = Some(path.clone());
-    e.modified = true;
+    mark_dirty(&mut e);
 
     let h = Harness::new();
     let alive = smol::block_on(save_file(&mut e, &h.snapshots, &h.note_tx));
 
     assert!(alive);
-    assert!(e.modified); // failed save keeps the buffer dirty
+    assert!(e.modified()); // failed save keeps the buffer dirty
     assert!(path.is_dir()); // the target directory is intact, not clobbered
     match h.note_rx.try_recv() {
         Ok(Notification::FileError { path: p, .. }) => assert_eq!(p, Some(path.clone())),
@@ -508,10 +523,10 @@ fn open_then_edit_then_save_round_trips_through_disk() {
         &h.snapshots,
         &h.note_tx,
     ));
-    assert!(e.modified);
+    assert!(e.modified());
     smol::block_on(save_file(&mut e, &h.snapshots, &h.note_tx));
 
-    assert!(!e.modified);
+    assert!(!e.modified());
     assert_eq!(std::fs::read_to_string(&path).unwrap(), "abcd");
 }
 
@@ -549,7 +564,7 @@ fn save_writes_to_a_new_file_that_did_not_exist() {
 fn snapshot_carries_path_and_modified() {
     let mut e = editor_with("x", SelectionSet::at_origin());
     e.path = Some(PathBuf::from("/tmp/demo.txt"));
-    e.modified = true;
+    mark_dirty(&mut e);
     let snap = e.snapshot(None);
     assert_eq!(snap.path, Some(PathBuf::from("/tmp/demo.txt")));
     assert!(snap.modified);
@@ -589,13 +604,13 @@ fn save_into_missing_directory_errors_and_keeps_buffer_dirty() {
     let path = dir.path.join("no-such-subdir").join("file.txt");
     let mut e = editor_with("work", SelectionSet::at_origin());
     e.path = Some(path.clone());
-    e.modified = true;
+    mark_dirty(&mut e);
 
     let h = Harness::new();
     let alive = smol::block_on(save_file(&mut e, &h.snapshots, &h.note_tx));
 
     assert!(alive);
-    assert!(e.modified);
+    assert!(e.modified());
     assert!(matches!(
         h.note_rx.try_recv(),
         Ok(Notification::FileError { .. })

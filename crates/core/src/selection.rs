@@ -164,11 +164,7 @@ impl SelectionSet {
     /// across the change (its head transformed like the rest), so the viewport keeps
     /// following the cursor the user was on rather than snapping to the topmost one.
     pub(crate) fn retarget_primary(&mut self, head: usize) {
-        if let Some(i) = self
-            .selections
-            .iter()
-            .position(|s| s.start() <= head && head <= s.end())
-        {
+        if let Some(i) = covering(&self.selections, head) {
             self.primary = i;
         }
     }
@@ -307,12 +303,20 @@ impl SelectionSet {
 
         // Primary = the selection covering the old primary head (its span
         // includes that offset). Falls back to 0 if somehow not found.
-        self.primary = merged
-            .iter()
-            .position(|s| s.start() <= primary_head && primary_head <= s.end())
-            .unwrap_or(0);
+        self.primary = covering(&merged, primary_head).unwrap_or(0);
         self.selections = merged;
     }
+}
+
+/// Index of the selection whose span covers byte `offset` (both ends inclusive),
+/// if any. The one home for the covering rule, shared by
+/// [`SelectionSet::retarget_primary`] and [`SelectionSet::normalize`] so the
+/// boundary semantics cannot drift between designating the primary after an edit
+/// and after a motion.
+fn covering(selections: &[Selection], offset: usize) -> Option<usize> {
+    selections
+        .iter()
+        .position(|s| s.start() <= offset && offset <= s.end())
 }
 
 /// Apply a single motion to a single selection against `text`. Pure: returns the
@@ -349,9 +353,8 @@ fn move_selection(text: &Text, sel: Selection, motion: Motion, extend: bool) -> 
 
 /// (line index, byte column within the line) for a byte offset.
 fn line_col(text: &Text, offset: usize) -> (usize, usize) {
-    let line = text.line_of_byte(offset);
-    let start = text.byte_of_line(line).unwrap_or(0);
-    (line, offset.saturating_sub(start))
+    let pos = text.position_of_byte(offset);
+    (pos.line, pos.col)
 }
 
 /// Byte offset at the end of `line_index`'s content, before its terminator
@@ -456,11 +459,11 @@ fn vertical(text: &Text, offset: usize, delta: isize, goal: usize) -> usize {
     }
     let (line, _) = line_col(text, offset);
     // The last navigable line, which for a newline-terminated buffer is the virtual
-    // empty line *after* the final terminator (index `line_count`, reachable by
-    // Right at end-of-file) - one past `line_count - 1`. Deriving the ceiling from
-    // the trailing byte's line index keeps it in step with `line_col`, so a Down on
-    // that trailing line stays put instead of collapsing to a line above it.
-    let max_line = text.line_of_byte(text.byte_len());
+    // empty line *after* the final terminator (reachable by Right at end-of-file).
+    // `last_line_index` derives it from the trailing byte's line index, in step
+    // with `line_col`, so a Down on that trailing line stays put instead of
+    // collapsing to a line above it.
+    let max_line = text.last_line_index();
     // Saturating signed add, then clamp into `0..=max_line`.
     let target_line = (line as isize + delta).clamp(0, max_line as isize) as usize;
     let start = text.byte_of_line(target_line).unwrap_or(0);

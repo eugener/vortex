@@ -103,6 +103,26 @@ impl Text {
         self.0.line_of_byte(byte_offset.min(self.0.byte_len()))
     }
 
+    /// Line/column position of `byte_offset`, clamped to the buffer end. The one
+    /// home for byte -> (line, col): the [`Buffer`] impl, cursor motion, and the
+    /// frontend's cursor readout all delegate here, so the clamping rule cannot
+    /// drift between call sites.
+    pub fn position_of_byte(&self, byte_offset: usize) -> Position {
+        let offset = byte_offset.min(self.0.byte_len());
+        let line = self.0.line_of_byte(offset);
+        Position::new(line, offset - self.0.byte_of_line(line))
+    }
+
+    /// Index of the last line a cursor can occupy. For a newline-terminated
+    /// buffer that is the virtual empty line *after* the final terminator, which
+    /// [`Self::line_count`]'s storage semantics do not count ("a\n" is 1 line to
+    /// crop but the cursor can reach line 1). Shared by vertical motion in the
+    /// core and the frontend's display line count so the two sides of the seam
+    /// can never disagree on the navigable range.
+    pub fn last_line_index(&self) -> usize {
+        self.0.line_of_byte(self.0.byte_len())
+    }
+
     /// The text of byte `range` as a `String` - used to copy a selection into the
     /// clipboard register (SPEC §11). Endpoints are clamped to the buffer and must
     /// land on code-point boundaries; a non-boundary or inverted range yields `""`
@@ -235,49 +255,12 @@ impl RopeBuffer {
     }
 
     /// Whether `offset` lies on a UTF-8 code point boundary within the rope.
-    /// `0` and `byte_len()` are always boundaries.
-    ///
-    /// crop's offset-based methods (`byte_slice`, `line_of_byte`) *panic* if the
-    /// offset is not on a code point boundary - the exact input this guards
-    /// against - so we never hand `offset` to one. Line-index methods
-    /// (`byte_of_line`) always return boundary offsets, so we binary-search the
-    /// line-start offsets to locate the line containing `offset`, materialize
-    /// just that line (its endpoints are boundaries, so the slice is safe), and
-    /// defer to `str::is_char_boundary`. Cost is O(log(lines)) lookups plus one
-    /// line's length - bounded, never a full-file scan (SPEC §10.4).
+    /// An offset past the end reports `false` - crop's own `is_char_boundary`
+    /// panics there (its one out-of-bounds case), so the guard keeps this off
+    /// the panic path (SPEC §8). O(log n), zero-alloc: crop locates the chunk
+    /// and defers to `str::is_char_boundary`.
     fn is_char_boundary(&self, offset: usize) -> bool {
-        let len = self.rope.byte_len();
-        if offset == 0 || offset == len {
-            return true;
-        }
-        if offset > len {
-            return false;
-        }
-        // len > 0 here, so there is at least one line. Find the largest line
-        // index whose start offset is <= `offset` (upper-mid to guarantee
-        // progress when `lo == mid`).
-        let line_count = self.rope.line_len();
-        let (mut lo, mut hi) = (0, line_count - 1);
-        while lo < hi {
-            let mid = (lo + hi).div_ceil(2);
-            if self.rope.byte_of_line(mid) <= offset {
-                lo = mid;
-            } else {
-                hi = mid - 1;
-            }
-        }
-        let line_start = self.rope.byte_of_line(lo);
-        let line_end = if lo + 1 < line_count {
-            self.rope.byte_of_line(lo + 1)
-        } else {
-            len
-        };
-        // Slice spans the line *including* its terminator, so an `offset` at a
-        // `\r`/`\n` is classified correctly too.
-        self.rope
-            .byte_slice(line_start..line_end)
-            .to_string()
-            .is_char_boundary(offset - line_start)
+        offset <= self.rope.byte_len() && self.rope.is_char_boundary(offset)
     }
 }
 
@@ -296,22 +279,12 @@ impl Buffer for RopeBuffer {
         // the removed text cannot panic. Capture it before mutating so undo can
         // invert this edit (SPEC §2.4, §5).
         let removed = self.rope.byte_slice(range.clone()).to_string();
-        // crop has no atomic replace; delete-then-insert at the same offset is
-        // equivalent and both endpoints are already validated.
-        if !range.is_empty() {
-            self.rope.delete(range.clone());
-        }
-        if !text.is_empty() {
-            self.rope.insert(range.start, text);
-        }
+        self.rope.replace(range, text);
         Ok(removed)
     }
 
     fn position_of_byte(&self, byte_offset: usize) -> Position {
-        let offset = byte_offset.min(self.rope.byte_len());
-        let line = self.rope.line_of_byte(offset);
-        let line_start = self.rope.byte_of_line(line);
-        Position::new(line, offset - line_start)
+        self.text().position_of_byte(byte_offset)
     }
 
     fn byte_of_position(&self, pos: Position) -> Option<usize> {
