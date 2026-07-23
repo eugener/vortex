@@ -622,3 +622,406 @@ fn typing_after_a_paste_starts_a_fresh_undo_unit() {
         );
     });
 }
+
+// --- LSP integration (SPEC §3, §4, §5; M2) ---
+//
+// Drives the real actor loop against a *fake* server on the same channels the
+// real client uses, so document sync and diagnostics are tested end to end
+// without a subprocess. The real `rust-analyzer` path is covered separately by
+// the `lsp_rust_analyzer` integration test.
+
+use async_channel::{Receiver, Sender};
+
+use crate::decoration::{GutterKind, Severity};
+use crate::lsp::LspHandle;
+
+/// The fixture the M2 spike fed rust-analyzer: byte / char / UTF-16 columns of
+/// the trailing `msg` are 32 / 23 / 24, so only a correct UTF-16 reading lands
+/// on it.
+const FIXTURE: &str = "pub fn bad() -> i32 {\n    let msg = \"日本語 😀\"; msg\n}\n";
+
+/// The server side of the seam: what the editor sent us, and a way to push
+/// events back.
+struct FakeServer {
+    sync: Receiver<crate::lsp::DocumentSync>,
+    events: Sender<crate::lsp::LspEvent>,
+}
+
+/// Like [`drive`], but with a language server attached.
+fn drive_lsp<F, Fut, T>(f: F) -> T
+where
+    F: FnOnce(CoreHandle, FakeServer) -> Fut,
+    Fut: Future<Output = T>,
+{
+    let ex = smol::Executor::new();
+    let (sync_tx, sync_rx) = async_channel::bounded(16);
+    let (event_tx, event_rx) = async_channel::bounded(16);
+    let Core { handle, run } = with_lsp(
+        16,
+        LspHandle {
+            sync: sync_tx,
+            events: event_rx,
+        },
+    );
+    ex.spawn(run).detach();
+    smol::block_on(ex.run(f(
+        handle,
+        FakeServer {
+            sync: sync_rx,
+            events: event_tx,
+        },
+    )))
+}
+
+/// A diagnostic over `start..end` in UTF-16 space on `line`.
+fn diag(line: usize, start: usize, end: usize, severity: Severity) -> Diagnostic {
+    Diagnostic {
+        start: Utf16Position::new(line, start),
+        end: Utf16Position::new(line, end),
+        severity,
+        message: "mismatched types".into(),
+    }
+}
+
+/// Write `FIXTURE` to a temp file, open it in the core, and drain the resulting
+/// snapshot. Returns the path.
+async fn open_fixture(h: &CoreHandle, dir: &std::path::Path) -> std::path::PathBuf {
+    let path = dir.join("lib.rs");
+    std::fs::write(&path, FIXTURE).unwrap();
+    step(h, Action::Open(path.clone())).await;
+    path
+}
+
+/// A temp dir removed on drop, mirroring `editor_tests`' helper.
+struct TempDir(std::path::PathBuf);
+
+impl TempDir {
+    fn new() -> Self {
+        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let mut path = std::env::temp_dir();
+        path.push(format!("vortex-lsp-test-{}-{}", std::process::id(), n));
+        std::fs::create_dir_all(&path).unwrap();
+        Self(path)
+    }
+}
+
+impl Drop for TempDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+#[test]
+fn opening_a_file_announces_it_to_the_server() {
+    let dir = TempDir::new();
+    drive_lsp(|h, server| async move {
+        // Whole-capture the fake server (see `an_edit_sends...` for why): this test
+        // reads only its sync side.
+        let FakeServer {
+            sync,
+            events: _events,
+        } = server;
+        let path = open_fixture(&h, &dir.0).await;
+        match sync.recv().await.unwrap() {
+            crate::lsp::DocumentSync::Opened {
+                path: p,
+                language_id,
+                text,
+            } => {
+                assert_eq!(p, path);
+                // The LSP identifier, not the file extension.
+                assert_eq!(language_id, "rust");
+                assert_eq!(text, FIXTURE);
+            }
+            other => panic!("expected didOpen, got {other:?}"),
+        }
+    });
+}
+
+#[test]
+fn an_edit_sends_the_whole_document_as_a_change() {
+    let dir = TempDir::new();
+    drive_lsp(|h, server| async move {
+        // Read only the sync side, but keep the whole fake server alive: Rust 2021
+        // disjoint capture would otherwise drop the unused `server.events`, closing
+        // that channel, which the core correctly treats as the server dying.
+        let FakeServer {
+            sync,
+            events: _events,
+        } = server;
+        open_fixture(&h, &dir.0).await;
+        sync.recv().await.unwrap(); // the didOpen
+
+        step(&h, Action::Insert("x".into())).await;
+        match sync.recv().await.unwrap() {
+            crate::lsp::DocumentSync::Changed { version, text, .. } => {
+                // Full-text sync (SPEC §5): the entire buffer, not a delta.
+                assert_eq!(text, format!("x{FIXTURE}"));
+                // The load itself is version 1 (one whole-buffer delta), so the
+                // first edit after it is version 2.
+                assert_eq!(version, 2, "the change carries the new buffer version");
+            }
+            other => panic!("expected didChange, got {other:?}"),
+        }
+    });
+}
+
+#[test]
+fn a_diagnostic_underlines_the_right_span_end_to_end() {
+    // M2's acceptance criterion, driven through the actor loop with the exact
+    // positions rust-analyzer produced for this fixture.
+    let dir = TempDir::new();
+    drive_lsp(|h, server| async move {
+        let path = open_fixture(&h, &dir.0).await;
+        server
+            .events
+            .send(LspEvent::Diagnostics {
+                path,
+                diagnostics: vec![diag(1, 24, 27, Severity::Error)],
+            })
+            .await
+            .unwrap();
+
+        let snap = h.snapshots.recv().await.unwrap();
+        let underlines: Vec<_> = snap
+            .decorations
+            .underlines_in(0..snap.text.byte_len())
+            .collect();
+        assert_eq!(underlines.len(), 1);
+        let (range, severity) = underlines.into_iter().next().unwrap();
+        assert_eq!(severity, Severity::Error);
+        assert_eq!(
+            snap.text.slice(range),
+            "msg",
+            "the underline must cover exactly the flagged identifier"
+        );
+        // ...and the gutter is marked on that line.
+        assert_eq!(
+            snap.decorations.gutter_mark(&snap.text, 1),
+            Some(GutterKind::Diagnostic(Severity::Error))
+        );
+    });
+}
+
+#[test]
+fn diagnostics_for_another_file_are_ignored() {
+    // A server analyzes the whole workspace and publishes for files the editor is
+    // not showing; those must not decorate the open buffer.
+    let dir = TempDir::new();
+    drive_lsp(|h, server| async move {
+        open_fixture(&h, &dir.0).await;
+        server
+            .events
+            .send(LspEvent::Diagnostics {
+                path: dir.0.join("other.rs"),
+                diagnostics: vec![diag(1, 24, 27, Severity::Error)],
+            })
+            .await
+            .unwrap();
+
+        // No snapshot should be published for an ignored batch, so a following
+        // action's snapshot is the next thing to arrive - and it is clean.
+        let snap = step(&h, Action::RequestSnapshot).await;
+        assert!(snap.decorations.is_empty());
+    });
+}
+
+#[test]
+fn an_empty_batch_clears_the_squiggles() {
+    // publishDiagnostics with an empty list is how a server says "this file is
+    // clean now" - the fix must actually remove the underline.
+    let dir = TempDir::new();
+    drive_lsp(|h, server| async move {
+        let path = open_fixture(&h, &dir.0).await;
+        server
+            .events
+            .send(LspEvent::Diagnostics {
+                path: path.clone(),
+                diagnostics: vec![diag(1, 24, 27, Severity::Error)],
+            })
+            .await
+            .unwrap();
+        assert!(!h.snapshots.recv().await.unwrap().decorations.is_empty());
+
+        server
+            .events
+            .send(LspEvent::Diagnostics {
+                path,
+                diagnostics: vec![],
+            })
+            .await
+            .unwrap();
+        assert!(h.snapshots.recv().await.unwrap().decorations.is_empty());
+    });
+}
+
+#[test]
+fn typing_before_a_diagnostic_shifts_its_underline() {
+    // Decorations ride edits (SPEC §5) so the squiggle stays on the token it
+    // flagged while the server catches up.
+    let dir = TempDir::new();
+    drive_lsp(|h, server| async move {
+        let path = open_fixture(&h, &dir.0).await;
+        server
+            .events
+            .send(LspEvent::Diagnostics {
+                path,
+                diagnostics: vec![diag(1, 24, 27, Severity::Error)],
+            })
+            .await
+            .unwrap();
+        h.snapshots.recv().await.unwrap();
+
+        // Insert at the very start of the buffer, before the flagged span.
+        let snap = step(&h, Action::Insert("//\n".into())).await;
+        let (range, _) = snap
+            .decorations
+            .underlines_in(0..snap.text.byte_len())
+            .next()
+            .expect("the underline survives the edit");
+        assert_eq!(
+            snap.text.slice(range),
+            "msg",
+            "the underline must still cover the identifier after the shift"
+        );
+    });
+}
+
+#[test]
+fn opening_another_file_clears_decorations_and_reannounces() {
+    let dir = TempDir::new();
+    drive_lsp(|h, server| async move {
+        let path = open_fixture(&h, &dir.0).await;
+        server.sync.recv().await.unwrap(); // didOpen for the first file
+        server
+            .events
+            .send(LspEvent::Diagnostics {
+                path,
+                diagnostics: vec![diag(1, 24, 27, Severity::Error)],
+            })
+            .await
+            .unwrap();
+        assert!(!h.snapshots.recv().await.unwrap().decorations.is_empty());
+
+        let other = dir.0.join("other.rs");
+        std::fs::write(&other, "fn main() {}\n").unwrap();
+        let snap = step(&h, Action::Open(other.clone())).await;
+        assert!(
+            snap.decorations.is_empty(),
+            "the previous file's squiggles describe text that is no longer open"
+        );
+        // The new file is announced as a fresh document, not as a change to the
+        // old one's identity.
+        match server.sync.recv().await.unwrap() {
+            crate::lsp::DocumentSync::Opened { path: p, .. } => assert_eq!(p, other),
+            other => panic!("expected a fresh didOpen, got {other:?}"),
+        }
+    });
+}
+
+#[test]
+fn the_editor_survives_the_language_server_dying() {
+    // A crashed server must degrade to "no diagnostics", never take the editor
+    // down (SPEC §8) - and must not spin the actor loop on its closed channel.
+    let dir = TempDir::new();
+    drive_lsp(|h, server| async move {
+        open_fixture(&h, &dir.0).await;
+        drop(server); // the client task is gone
+
+        let snap = step(&h, Action::Insert("still alive".into())).await;
+        assert!(snap.text.to_string().starts_with("still alive"));
+        let snap = step(&h, Action::Insert("!".into())).await;
+        assert!(snap.text.to_string().starts_with("still alive!"));
+    });
+}
+
+#[test]
+fn a_repeated_identical_batch_does_not_republish() {
+    // Servers re-send the same diagnostics while indexing; an unchanged screen
+    // must not cost a frame.
+    let dir = TempDir::new();
+    drive_lsp(|h, server| async move {
+        let path = open_fixture(&h, &dir.0).await;
+        let batch = vec![diag(1, 24, 27, Severity::Error)];
+        server
+            .events
+            .send(LspEvent::Diagnostics {
+                path: path.clone(),
+                diagnostics: batch.clone(),
+            })
+            .await
+            .unwrap();
+        h.snapshots.recv().await.unwrap();
+
+        server
+            .events
+            .send(LspEvent::Diagnostics {
+                path,
+                diagnostics: batch,
+            })
+            .await
+            .unwrap();
+        // If the duplicate had republished, this snapshot would be that one
+        // rather than the RequestSnapshot's - assert by checking the version is
+        // still the post-open version and the cell held nothing stale.
+        let snap = step(&h, Action::RequestSnapshot).await;
+        assert!(!snap.decorations.is_empty());
+        assert!(h.snapshots.try_recv().is_none(), "no extra snapshot queued");
+    });
+}
+
+#[test]
+fn the_core_stops_when_the_frontend_hangs_up_with_a_server_attached() {
+    // The shutdown path must work identically whether or not an LSP is wired in:
+    // dropping the frontend's handle ends the actor rather than leaving it parked
+    // on the server's channel forever.
+    let dir = TempDir::new();
+    drive_lsp(|h, server| async move {
+        open_fixture(&h, &dir.0).await;
+        let notifications = h.notifications.clone();
+        drop(h); // the frontend is gone
+
+        // The actor drains and emits its final notification (SPEC §6).
+        loop {
+            match notifications.recv().await {
+                Ok(Notification::ShuttingDown) => break,
+                Ok(_) => continue,
+                Err(_) => panic!("core stopped without announcing shutdown"),
+            }
+        }
+        drop(server);
+    });
+}
+
+#[test]
+fn a_second_file_opened_into_an_attached_server_is_announced() {
+    // The picker-open case: with a server already attached, opening another file
+    // (same workspace) must announce it - a didOpen for the new path - so it is
+    // analyzed too, without re-attaching a server.
+    let dir = TempDir::new();
+    drive_lsp(|h, server| async move {
+        // Whole-capture the fake server (see `an_edit_sends...`): sync side only.
+        let FakeServer {
+            sync,
+            events: _events,
+        } = server;
+        open_fixture(&h, &dir.0).await;
+        // Drain the first file's didOpen.
+        assert!(matches!(
+            sync.recv().await.unwrap(),
+            crate::lsp::DocumentSync::Opened { .. }
+        ));
+
+        // Open a second file (as the picker would).
+        let other = dir.0.join("other.rs");
+        std::fs::write(&other, "fn main() {}\n").unwrap();
+        step(&h, Action::Open(other.clone())).await;
+
+        // The already-attached server is told about it as a fresh document.
+        match sync.recv().await.unwrap() {
+            crate::lsp::DocumentSync::Opened { path, .. } => assert_eq!(path, other),
+            other => panic!("expected a didOpen for the second file, got {other:?}"),
+        }
+    });
+}

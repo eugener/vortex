@@ -38,6 +38,32 @@ impl Position {
     }
 }
 
+/// A position in **LSP space**: a 0-based line index plus a 0-based offset in
+/// **UTF-16 code units** within that line (SPEC §4).
+///
+/// A distinct type from [`Position`] on purpose: both are "line + column" but
+/// their column units differ (UTF-16 units vs UTF-8 bytes), and silently passing
+/// one where the other is expected is exactly the "diagnostic underline is one
+/// column off" bug SPEC §4 calls out. Naming the space makes that a type error.
+///
+/// This is the *only* position space in the core that is not byte-derived, and it
+/// exists solely because the LSP spec mandates it (servers may advertise UTF-8
+/// support in their capabilities; the LSP layer prefers it when offered and falls
+/// back to converting here).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct Utf16Position {
+    pub line: usize,
+    /// Offset within the line in UTF-16 code units. A non-BMP character (emoji,
+    /// rare CJK) counts as 2 here but 1 char and 4 bytes.
+    pub character: usize,
+}
+
+impl Utf16Position {
+    pub fn new(line: usize, character: usize) -> Self {
+        Self { line, character }
+    }
+}
+
 /// Immutable, cheaply-cloneable text handle exposed by the buffer.
 ///
 /// Wraps `crop::Rope` (which shares data via `Arc`, so cloning is "extremely
@@ -121,6 +147,54 @@ impl Text {
     /// can never disagree on the navigable range.
     pub fn last_line_index(&self) -> usize {
         self.0.line_of_byte(self.0.byte_len())
+    }
+
+    /// Convert a byte offset to an LSP [`Utf16Position`] (SPEC §4). Clamped to the
+    /// buffer end like [`Self::position_of_byte`], which it builds on - so the
+    /// line index comes from one place and only the column unit differs.
+    ///
+    /// Cost is bounded by the *line's* length, not the file's: the UTF-16 column
+    /// is counted over the line's prefix only. Called per diagnostic / per LSP
+    /// message, never per keystroke.
+    pub fn utf16_position_of_byte(&self, byte_offset: usize) -> Utf16Position {
+        let pos = self.position_of_byte(byte_offset);
+        let line = self.line(pos.line).unwrap_or_default();
+        // Count only characters lying *entirely* before the column. A column mid
+        // character cannot arise from a real boundary, but rounding down keeps
+        // this total instead of panicking on a bad offset (SPEC §8).
+        let character = line
+            .char_indices()
+            .take_while(|(i, c)| i + c.len_utf8() <= pos.col)
+            .map(|(_, c)| c.len_utf16())
+            .sum();
+        Utf16Position::new(pos.line, character)
+    }
+
+    /// Convert an LSP [`Utf16Position`] to a byte offset (SPEC §4). Returns `None`
+    /// only if the line is out of range; a `character` past the line's end clamps
+    /// to the line end, which is what the LSP spec prescribes ("if the character
+    /// value is greater than the line length it defaults back to the line
+    /// length") and what a server sending a stale position relies on.
+    ///
+    /// A `character` landing *inside* a surrogate pair - which happens when a
+    /// server counts a non-BMP char as one unit, or truncates a range mid-emoji -
+    /// rounds **down** to that character's start rather than splitting it, so the
+    /// result is always a valid UTF-8 boundary and can never panic a later slice.
+    pub fn byte_of_utf16_position(&self, pos: Utf16Position) -> Option<usize> {
+        let line_start = self.byte_of_line(pos.line)?;
+        let line = self.line(pos.line).unwrap_or_default();
+        let mut units = 0usize;
+        for (i, c) in line.char_indices() {
+            // Stepping over this char would pass the target: the target is either
+            // exactly here or inside this char, and both land on its start.
+            if units + c.len_utf16() > pos.character {
+                return Some(line_start + i);
+            }
+            units += c.len_utf16();
+        }
+        // Past the last character: clamp to the line's end (excluding its
+        // terminator, which is not addressable as a column).
+        Some(line_start + line.len())
     }
 
     /// The text of byte `range` as a `String` - used to copy a selection into the

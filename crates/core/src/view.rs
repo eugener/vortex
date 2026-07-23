@@ -21,6 +21,7 @@ use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 
 use crate::buffer::Text;
+use crate::decoration::DecorationSet;
 use crate::selection::Selection;
 
 /// Identifies a buffer. Versions are per-buffer (SPEC §5), so an edit in one
@@ -54,7 +55,8 @@ pub struct Delta {
 /// Every field is cheaply shared (SPEC §5): `text` is an `Arc`-backed rope handle
 /// and `selections` is behind `Arc`, so building a snapshot is a handful of
 /// atomic ref-count bumps regardless of file size or selection count - never an
-/// O(n) deep clone per frame. `styles` (tree-sitter/LSP) joins this in M4.
+/// O(n) deep clone per frame - `decorations` included, which is why it is an
+/// `Arc<DecorationSet>` and not a `Vec` of spans.
 #[derive(Debug, Clone)]
 #[non_exhaustive]
 pub struct ViewSnapshot {
@@ -77,6 +79,16 @@ pub struct ViewSnapshot {
     /// `RequestSnapshot`). A local frontend uses it as a partial-repaint hint
     /// (SPEC §5); painting the whole viewport is always correct if ignored.
     pub dirty: Option<std::ops::Range<usize>>,
+    /// Everything to paint *at a position*: LSP diagnostics now, syntax
+    /// highlights (M4) and git signs (M8) later, all on one channel (SPEC §5).
+    /// `Arc`-shared, so carrying it costs a ref-count bump no matter how many
+    /// spans it holds. The frontend resolves it for the **visible line range
+    /// only** (`underlines_in` / `gutter_mark`), never eagerly for the file.
+    ///
+    /// May lag `text` by a frame: producers are async, and an edit remaps
+    /// existing decorations rather than blocking on a refresh. That is the
+    /// correct trade - text is never stale, overlays only trail (SPEC §5).
+    pub decorations: Arc<DecorationSet>,
     /// The file this buffer is bound to (via `Open`), or `None` for an unnamed
     /// buffer. The frontend shows it in the status/head bar (SPEC §10). Carried
     /// on the snapshot rather than queried so a local frontend paints the name
