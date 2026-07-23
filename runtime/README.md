@@ -6,11 +6,12 @@ rebuilding the editor (SPEC §3, §14, M4).
 
 ## Layout
 
-- `grammars/` - loadable grammar libraries (`lib<name>_grammar.dylib` / `.so` /
-  `.dll`), each exporting the uniform `vortex_grammar` entry point. Built from the
-  `grammar-*` workspace crates; **not committed** (see `.gitignore`). For an
-  install, copy each built `grammar-*` cdylib here; for development this directory
-  can stay empty (see Resolution below).
+- `grammars/` - loadable grammar libraries (`libgrammar_<language>.dylib` /
+  `libgrammar_<language>.so` / `grammar_<language>.dll`), each exporting the uniform
+  `vortex_grammar` entry point. Built from the `grammar-*` workspace crates; **not
+  committed** (see `.gitignore`). For an install, copy each built `grammar-*` cdylib
+  here (keeping its `libgrammar_<language>` name); for development this directory can
+  stay empty (see Resolution below).
 - `queries/<language>/` - the tree-sitter highlight queries for a language:
   `highlights.scm` (required) and `injections.scm` (optional). Committed, since
   they are source, and version-paired with the grammar they target.
@@ -20,9 +21,9 @@ rebuilding the editor (SPEC §3, §14, M4).
 The editor looks for this directory, in order:
 
 1. `$VORTEX_RUNTIME`, if set.
-2. A `runtime/` dir beside the executable or any ancestor of it (an install).
-3. A `runtime/` dir in the current directory or any ancestor (running from a repo
+2. A `runtime/` dir in the current directory or any ancestor (running from a repo
    checkout - the dev path).
+3. A `runtime/` dir beside the executable or any ancestor of it (an install).
 
 The grammar library itself is resolved from `$VORTEX_RUNTIME/grammars/` if present,
 otherwise from the directory of the running executable (where `cargo build` places
