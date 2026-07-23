@@ -692,6 +692,73 @@ async fn open_fixture(h: &CoreHandle, dir: &std::path::Path) -> std::path::PathB
     path
 }
 
+#[test]
+fn a_diagnostic_and_a_highlight_both_reach_the_snapshot() {
+    // Both producers feeding at once - an LSP diagnostic and a syntax highlight -
+    // must both land on the decoration channel. The actor's producer scheduling is
+    // fair (it alternates the LSP/syntax poll order each turn, `next_incoming`), so
+    // a burst on one cannot starve the other; here we assert the weaker functional
+    // guarantee that neither event is dropped when both are pending.
+    let dir = TempDir::new();
+    drive_lsp(|h, server| async move {
+        // Keep the whole fake server alive (Rust 2021 disjoint capture would else
+        // drop the unused sync side, which the core reads as the server dying).
+        let FakeServer {
+            sync: _sync,
+            events,
+        } = server;
+        let path = open_fixture(&h, &dir.0).await; // FIXTURE loads as version 1
+
+        // Attach a fake highlighter alongside the already-attached server.
+        let (_sx_sync_tx, _sx_sync_rx) = async_channel::bounded::<SyntaxSync>(16);
+        let (sx_event_tx, sx_event_rx) = async_channel::bounded::<SyntaxEvent>(16);
+        h.syntax
+            .send(SyntaxHandle {
+                sync: _sx_sync_tx,
+                events: sx_event_rx,
+            })
+            .await
+            .unwrap();
+
+        // Feed one of each, both pending before the actor processes either.
+        events
+            .send(LspEvent::Diagnostics {
+                path,
+                diagnostics: vec![diag(0, 0, 3, Severity::Error)],
+            })
+            .await
+            .unwrap();
+        sx_event_tx
+            .send(SyntaxEvent::Highlights {
+                version: 1,
+                spans: vec![HighlightSpan {
+                    range: 0..3,
+                    kind: HighlightKind::Keyword,
+                }],
+            })
+            .await
+            .unwrap();
+
+        // The two buckets are independent, so the accumulated set ends with both.
+        // A correct actor applies each within a turn or two, so this breaks early;
+        // a starved/dropped event would leave one side missing.
+        let mut got_diagnostic = false;
+        let mut got_highlight = false;
+        for _ in 0..6 {
+            if got_diagnostic && got_highlight {
+                break;
+            }
+            let snap = h.snapshots.recv().await.unwrap();
+            got_diagnostic |= snap.decorations.underlines_in(0..9999).count() > 0;
+            got_highlight |= snap.decorations.highlights_in(0..9999).count() > 0;
+        }
+        assert!(
+            got_diagnostic && got_highlight,
+            "both producers must reach the snapshot (diag={got_diagnostic}, hl={got_highlight})"
+        );
+    });
+}
+
 /// A temp dir removed on drop, mirroring `editor_tests`' helper.
 struct TempDir(std::path::PathBuf);
 

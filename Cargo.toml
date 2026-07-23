@@ -6,3 +6,16 @@ members = ["crates/*"]
 edition = "2024"
 license = "MIT"
 repository = "https://github.com/eugener/vortex"
+
+# Build the parsing crates optimized even in dev (M4): tree-sitter query compilation
+# and highlighting are CPU-bound and run on the first frame's critical path, so an
+# unoptimized debug build makes the first highlight visibly lag the text. Optimizing
+# only these dependencies keeps `cargo build` fast and the workspace crates
+# debuggable while the highlighter runs at release speed. The grammar cdylib is
+# optimized (and smaller, so it loads faster) for the same reason.
+[profile.dev.package.tree-sitter]
+opt-level = 3
+[profile.dev.package.tree-sitter-highlight]
+opt-level = 3
+[profile.dev.package.grammar-rust]
+opt-level = 3

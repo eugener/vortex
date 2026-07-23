@@ -88,6 +88,13 @@ impl ViewState {
 /// still gets painted promptly.
 const POLL: Duration = Duration::from_millis(16);
 
+/// How long the first paint of a freshly-opened highlightable buffer waits for its
+/// syntax highlights, so the file appears already colored instead of flashing plain
+/// text for a frame first (M4). Highlights normally arrive within a frame or two of
+/// the text (the grammar is pre-warmed), so this deadline only bounds the wait for a
+/// slow parse or a missing grammar - a brief hold, never a stall.
+const HIGHLIGHT_WAIT: Duration = Duration::from_millis(150);
+
 /// Lines the mouse wheel scrolls the viewport per notch. A few lines per notch is
 /// the common terminal feel; scrolling is a pure frontend viewport move (SPEC §5),
 /// so it never round-trips to the core.
@@ -141,6 +148,14 @@ fn main() -> io::Result<()> {
     // frontend loads the file type's grammar and hands the core a highlighter.
     // Missing grammar degrades silently to no highlighting (SPEC §8).
     let mut grammars = GrammarManager::new();
+    // Pre-warm the launch file's grammar now, so its ~200ms load runs in the
+    // background *during* terminal setup and the core's first read - by the time the
+    // buffer opens and paints, the highlighter is attached and its first batch lands
+    // with the text instead of a visible beat later. A later `FileOpened` for the
+    // same file is deduplicated inside `ensure`.
+    if let Some(p) = &path {
+        grammars.ensure(p, &handle);
+    }
 
     // Resolve frontend configuration once, up front. Today this is the built-in
     // default; M5 swaps it for `Config::load` reading the user's file (SPEC §10.5).
@@ -247,45 +262,50 @@ impl GrammarManager {
     /// Ensure the highlighter attached to the core matches `path`'s language,
     /// loading and attaching its grammar if it differs from the current one. A file
     /// type with no grammar, a missing library, or a load failure leaves the editor
-    /// running with no fresh highlights (SPEC §8) - never crashing. The highlighter
-    /// loop runs on its own thread, off the render thread, exactly like an LSP
-    /// client.
+    /// running with no fresh highlights (SPEC §8) - never crashing.
+    ///
+    /// **The whole load runs on a background thread.** Resolving the grammar,
+    /// `dlopen`ing it, and compiling its queries take ~200ms; doing that on the
+    /// render thread would stall the first frames right when the buffer opens. So
+    /// the thread does the load, hands the core the highlighter, and then runs its
+    /// loop - the render thread never blocks. `current` is set *before* spawning, so
+    /// a language is loaded at most once even though the launch file is both
+    /// pre-warmed (see `main`) and re-announced via `FileOpened`.
     fn ensure(&mut self, path: &Path, handle: &vortex_core::CoreHandle) {
         let Some(lang) = grammar::grammar_target(path) else {
             return;
         };
-        // Same language as the running highlighter: its resync already covers the
-        // newly opened file, so do not reload the grammar.
+        // Same language as the running (or already-loading) highlighter: its resync
+        // covers the newly opened file, so do not load the grammar again.
         if self.current == Some(lang) {
             return;
         }
-        let Some(resolved) = grammar::resolve(lang) else {
-            return;
-        };
-        let Some(language) = load_grammar(&resolved.lib_path) else {
-            return;
-        };
-        let (syntax_handle, syntax_loop) = vortex_core::highlighter(
-            language,
-            lang,
-            resolved.highlights,
-            resolved.injections,
-            String::new(),
-        );
-        // The loop resolves to why it stopped; a query-compile failure is swallowed
-        // rather than crashing the editor (SPEC §8).
-        let spawned = std::thread::Builder::new()
+        self.current = Some(lang);
+        // Only the syntax-attach sender crosses to the thread (it is a cheap channel
+        // handle clone); the render loop keeps the receivers.
+        let syntax_tx = handle.syntax.clone();
+        let _ = std::thread::Builder::new()
             .name("vortex-syntax".into())
             .spawn(move || {
-                let _ = smol::block_on(syntax_loop);
+                let Some(resolved) = grammar::resolve(lang) else {
+                    return;
+                };
+                let Some(language) = load_grammar(&resolved.lib_path) else {
+                    return;
+                };
+                let (syntax_handle, syntax_loop) = vortex_core::highlighter(
+                    language,
+                    lang,
+                    resolved.highlights,
+                    resolved.injections,
+                    String::new(),
+                );
+                // A closed channel means the core has stopped; nothing to attach to.
+                // Otherwise run the highlighter loop here until the core drops it.
+                if syntax_tx.send_blocking(syntax_handle).is_ok() {
+                    let _ = smol::block_on(syntax_loop);
+                }
             });
-        if spawned.is_err() {
-            return;
-        }
-        // A closed channel means the core has stopped; nothing to attach to.
-        if handle.syntax.send_blocking(syntax_handle).is_ok() {
-            self.current = Some(lang);
-        }
     }
 }
 
@@ -474,6 +494,11 @@ fn event_loop(
     // palette/picker when one is open. Overlays get first refusal on keys and paint
     // over the base editor; an empty stack is a no-op on the hot path.
     let mut overlays = Compositor::new();
+    // Set when a highlightable buffer has just opened but not yet painted: the first
+    // paint is held until its highlights arrive (or `HIGHLIGHT_WAIT` elapses) so the
+    // file never flashes plain-then-colored. Any input cancels the hold - a keystroke
+    // must never wait on highlighting.
+    let mut awaiting_highlight: Option<Instant> = None;
 
     loop {
         // Take the newest snapshot if the core published one (latest-wins cell).
@@ -497,6 +522,11 @@ fn event_loop(
             if let vortex_core::Notification::FileOpened { path, .. } = &note {
                 lsp.ensure(path, handle);
                 grammars.ensure(path, handle);
+                // If this file type highlights, hold its first paint for the colors
+                // (below). No grammar -> nothing to wait for, paint as usual.
+                if grammar::grammar_target(path).is_some() {
+                    awaiting_highlight = Some(Instant::now());
+                }
             }
             // A copy/cut asks us to mirror the register to the OS clipboard. We push
             // it over OSC 52 (clipboard-over-terminal), which works locally and over
@@ -516,8 +546,21 @@ fn event_loop(
             needs_redraw = true;
         }
 
+        // Hold the first paint of a just-opened highlightable buffer until its
+        // highlights land, so it appears already colored rather than flashing plain
+        // text first. The hold ends the moment a decorated snapshot arrives, or when
+        // `HIGHLIGHT_WAIT` elapses (a slow parse / missing grammar must not stall the
+        // screen). An overlay open (picker/palette) paints regardless - it is not the
+        // buffer body.
+        let hold_for_highlight = awaiting_highlight.is_some_and(|since| {
+            overlays.is_empty()
+                && latest.as_ref().is_some_and(|s| s.decorations.is_empty())
+                && since.elapsed() < HIGHLIGHT_WAIT
+        });
+
         if let Some(snap) = &latest
             && needs_redraw
+            && !hold_for_highlight
         {
             viewport = draw(
                 terminal,
@@ -532,6 +575,7 @@ fn event_loop(
                 &toasts,
             )?;
             needs_redraw = false;
+            awaiting_highlight = None;
             // Default back to caret-follow; only a wheel scroll opts out, and only
             // for the single frame it triggered.
             follow = true;
@@ -540,7 +584,11 @@ fn event_loop(
         // Wait for input, but no longer than POLL so a snapshot arriving without a
         // keystroke still gets painted on the next tick.
         if event::poll(POLL)? {
-            match event::read()? {
+            let input = event::read()?;
+            // Any input ends a pending highlight-hold: a keystroke (or click) must be
+            // reflected at once, never delayed waiting on syntax colors.
+            awaiting_highlight = None;
+            match input {
                 Event::Key(key) => {
                     // Ignore key *releases* (the Kitty protocol reports them, SPEC
                     // §9): acting on press and release would double-fire, the same
