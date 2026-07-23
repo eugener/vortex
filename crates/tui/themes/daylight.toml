@@ -16,3 +16,10 @@ toast_info       = { fg = "#eceee9", bg = "#4a544d" }
 toast_error      = { fg = "#f7efe9", bg = "#9c2f37", bold = true }
 palette          = { fg = "#1f2422", bg = "#f5f6f2" }
 palette_selected = { fg = "#1f2422", bg = "#f6dc86", bold = true }
+
+# Diagnostics in the proofing palette, dark enough to read on paper: oxblood for
+# errors, a burnt amber for warnings, navy for information, a muted moss for hints.
+diagnostic_error       = { fg = "#9c2f37" }
+diagnostic_warning     = { fg = "#8a5a1a" }
+diagnostic_information = { fg = "#2f4a72" }
+diagnostic_hint        = { fg = "#5c645e" }

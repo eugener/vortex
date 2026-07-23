@@ -19,3 +19,11 @@ toast_info       = { fg = "#c9ced2", bg = "#242a2e" }
 toast_error      = { fg = "#141719", bg = "#e04b3c", bold = true }
 palette          = { fg = "#c9ced2", bg = "#1b1f22" }
 palette_selected = { fg = "#eef2f4", bg = "#2f383e", bold = true }
+
+# Diagnostics stay achromatic except for the one permitted hue: an error takes the
+# signal red (what is wrong), and the quieter severities separate by brightness
+# alone - the underline shape carries them, not a second color.
+diagnostic_error       = { fg = "#e04b3c" }
+diagnostic_warning     = { fg = "#c9ced2" }
+diagnostic_information = { fg = "#78838a" }
+diagnostic_hint        = { fg = "#4e575e" }

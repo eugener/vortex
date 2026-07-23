@@ -24,3 +24,9 @@ toml = "1.1.3"
 unicode-segmentation = "1.13.3"
 unicode-width = "0.2.2"
 vortex-core = { path = "../core" }
+
+[dev-dependencies]
+# Only for tests that drive the core with a fake language server on its channels
+# (the diagnostic-rendering paint tests). Not a runtime dependency: the frontend
+# talks to the core over the handle `vortex-core` hands back, never a raw channel.
+async-channel = "2.5.0"

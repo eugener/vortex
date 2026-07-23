@@ -229,6 +229,10 @@ struct ThemeFile {
     toast_error: Option<StyleSpec>,
     palette: Option<StyleSpec>,
     palette_selected: Option<StyleSpec>,
+    diagnostic_error: Option<StyleSpec>,
+    diagnostic_warning: Option<StyleSpec>,
+    diagnostic_information: Option<StyleSpec>,
+    diagnostic_hint: Option<StyleSpec>,
 }
 
 impl ThemeFile {
@@ -256,6 +260,26 @@ impl ThemeFile {
                 "palette_selected",
                 self.palette_selected,
                 base.palette_selected,
+            )?,
+            diagnostic_error: slot(
+                "diagnostic_error",
+                self.diagnostic_error,
+                base.diagnostic_error,
+            )?,
+            diagnostic_warning: slot(
+                "diagnostic_warning",
+                self.diagnostic_warning,
+                base.diagnostic_warning,
+            )?,
+            diagnostic_information: slot(
+                "diagnostic_information",
+                self.diagnostic_information,
+                base.diagnostic_information,
+            )?,
+            diagnostic_hint: slot(
+                "diagnostic_hint",
+                self.diagnostic_hint,
+                base.diagnostic_hint,
             )?,
         })
     }
@@ -334,6 +358,50 @@ mod tests {
             .find(|&&(name, _)| name == DEFAULT)
             .expect("the default theme is built in");
         assert_eq!(parse(undertow.1).unwrap(), Theme::default());
+    }
+
+    #[test]
+    fn a_theme_can_recolor_a_diagnostic_severity() {
+        // The decoration channel's semantic tags are themed here (SPEC §5), so a
+        // user theme must be able to override each severity's color independently.
+        let theme =
+            parse(r##"diagnostic_warning = { fg = "#abcdef", underlined = true }"##).unwrap();
+        assert_eq!(
+            theme.diagnostic_warning.fg,
+            Some(Color::Rgb(0xab, 0xcd, 0xef))
+        );
+        assert!(
+            theme
+                .diagnostic_warning
+                .add_modifier
+                .contains(Modifier::UNDERLINED)
+        );
+        // The other severities stay at their defaults - one slot, replaced alone.
+        assert_eq!(theme.diagnostic_error, Theme::default().diagnostic_error);
+    }
+
+    #[test]
+    fn a_bad_diagnostic_color_is_an_error_not_a_default() {
+        // The `?` in each diagnostic slot must propagate a bad color rather than
+        // swallow it (a typo should say so, not silently paint the default).
+        let err = parse(r##"diagnostic_error = { fg = "not-a-color" }"##).unwrap_err();
+        assert!(
+            err.contains("diagnostic_error"),
+            "error names the slot: {err}"
+        );
+    }
+
+    #[test]
+    fn diagnostic_resolves_every_severity_to_its_slot() {
+        use vortex_core::Severity;
+        let t = Theme::default();
+        assert_eq!(t.diagnostic(Severity::Error), t.diagnostic_error);
+        assert_eq!(t.diagnostic(Severity::Warning), t.diagnostic_warning);
+        assert_eq!(
+            t.diagnostic(Severity::Information),
+            t.diagnostic_information
+        );
+        assert_eq!(t.diagnostic(Severity::Hint), t.diagnostic_hint);
     }
 
     #[test]
