@@ -535,6 +535,7 @@ async fn next_incoming(
     lsp_attach: &Receiver<LspHandle>,
     syntax: Option<&Receiver<SyntaxEvent>>,
     syntax_attach: &Receiver<SyntaxHandle>,
+    syntax_first: bool,
 ) -> Incoming {
     // Race the frontend action against the two producer sides (LSP and syntax),
     // each of which is itself an attach plus events-once-connected. Nested
@@ -551,7 +552,15 @@ async fn next_incoming(
     // holds `actions` but drops an attach sender (Rust 2021 disjoint capture never
     // moving an unused sender in) would kill the editor the moment it next idles.
     let action = std::pin::pin!(actions.recv());
-    let lsp_side = std::pin::pin!(async {
+    // The two producer sides are boxed to a common type so their poll order can be
+    // swapped: `future::select` is biased to its first argument, so a fixed order
+    // would let a *burst* on one producer starve the other. A rust-analyzer indexing
+    // its workspace floods the LSP side for a second or two; with a fixed order the
+    // one pending syntax-highlight batch would lose that race every call and paint
+    // visibly late. `syntax_first` alternates each loop turn, so each producer is
+    // polled first every other call and neither can be starved for more than a turn.
+    type Side<'a> = std::pin::Pin<Box<dyn Future<Output = Incoming> + Send + 'a>>;
+    let lsp_side: Side = Box::pin(async {
         match lsp {
             Some(events) => {
                 let event = std::pin::pin!(events.recv());
@@ -564,7 +573,7 @@ async fn next_incoming(
             None => Incoming::Attach(recv_attach(lsp_attach).await),
         }
     });
-    let syntax_side = std::pin::pin!(async {
+    let syntax_side: Side = Box::pin(async {
         match syntax {
             Some(events) => {
                 let event = std::pin::pin!(events.recv());
@@ -577,10 +586,15 @@ async fn next_incoming(
             None => Incoming::SyntaxAttach(recv_attach(syntax_attach).await),
         }
     });
-    // `Select<Pin<&mut _>, Pin<&mut _>>` is itself `Unpin`, so the inner
-    // producer-vs-producer select passes by value into the outer action-vs-
-    // producers select without another `pin!`.
-    match futures::future::select(action, futures::future::select(lsp_side, syntax_side)).await {
+    // Poll the two producers in the turn's order; the action channel still wins any
+    // tie (input stays responsive), and both inner arms yield an `Incoming` so the
+    // order only affects *fairness*, never the result.
+    let (first, second) = if syntax_first {
+        (syntax_side, lsp_side)
+    } else {
+        (lsp_side, syntax_side)
+    };
+    match futures::future::select(action, futures::future::select(first, second)).await {
         Either::Left((a, _)) => a.map_or(Incoming::Stopped, Incoming::Action),
         Either::Right((Either::Left((incoming, _)), _)) => incoming,
         Either::Right((Either::Right((incoming, _)), _)) => incoming,
@@ -772,8 +786,12 @@ async fn run(
     let mut lsp_events: Option<Receiver<LspEvent>> = None;
     // The syntax producer's event side, swapped in the same way (M4).
     let mut syntax_events: Option<Receiver<SyntaxEvent>> = None;
+    // Alternates the LSP/syntax poll order each turn so neither producer starves the
+    // other during a burst (see `next_incoming`).
+    let mut syntax_first = false;
 
     loop {
+        syntax_first = !syntax_first;
         // Flush any outstanding document sync before parking on input, so the
         // server and highlighter see the newest text while the user is idle rather
         // than only once they press another key.
@@ -788,6 +806,7 @@ async fn run(
             &lsp_attach,
             syntax_events.as_ref(),
             &syntax_attach,
+            syntax_first,
         )
         .await;
         let action = match incoming {
