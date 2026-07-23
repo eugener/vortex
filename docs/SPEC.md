@@ -972,9 +972,27 @@ Incremental build order so the risky assumptions are validated early, not at the
 - **M3 - Anchors + undo tree + multi-cursor.** Full `SelectionSet`, anchor layer,
   coalesced undo tree. *Verify:* property tests (§13) pass; multi-cursor edit + undo works
   in-terminal.
-- **M4 - Syntax highlighting.** tree-sitter background reparse on snapshots feeding the
-  `Highlight` kind of the decoration channel (§5). *Verify:* highlights appear, text never
-  lags input.
+- **M4 - Syntax highlighting. DONE.** tree-sitter background reparse on snapshots feeding a
+  new `Highlight` decoration on the M2 channel (§5) - the additive variant that decision
+  promised, landing without touching M2's producer code. The highlighter is a second
+  decoration producer shaped exactly like the LSP client (`vortex-core::syntax`): full-text
+  in, highlight spans out, spawned by the frontend on its own thread, off the keystroke
+  path. **Full reparse per snapshot, not incremental** - the same "cannot desync" call M2
+  made for `didChange` (incremental deferred, §14). The core emits a fixed semantic
+  `HighlightKind`; the theme maps it to a color (8 syntax roles per theme), so tree-sitter's
+  own types never cross the seam - the discipline that keeps `lsp_types` out of core too.
+  **Genuinely dynamic grammars:** a grammar is a `cdylib` (`grammar-rust`) the frontend
+  `dlopen`s at runtime from the runtime dir via `libloading`, exporting a uniform
+  `vortex_grammar` entry point - never a compile-time dependency of the editor, so adding a
+  language is a new grammar crate plus a `grammar_target` row (§3, §14). Selection was
+  reordered *under* highlights so selected code keeps its syntax colors on the selection
+  ground. *Verified:* the core unit-tests pin exact spans against a real grammar in-process
+  (no exemption - unlike `lsp/client.rs`, the engine is pure CPU); the real `vortex` binary
+  in a PTY paints `fn`/`let`, `"strings"`, `// comments`, and `i32` in their theme colors.
+  **Deferred within M4:** incremental `didChange`-style reparse (full reparse ships now - it
+  cannot desync); language injection (embedded languages / doc-comment code - the injection
+  callback returns `None`); parse cancellation; an interval index for `highlights_in` /
+  `transform_through` (linear now, the case the decoration channel's own comments flag).
 - **M5 - File handling hardening.** encoding/EOL preservation, external-change conflicts,
   save-failure handling (§8, §10). *Verify:* fixture round-trips + fault-injection.
 - **M6 - Frontend UI shell.** The overlay compositor (§7.5, job 2 only) + a message/toast
