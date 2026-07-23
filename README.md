@@ -4,8 +4,9 @@ A terminal text editor built as a **headless core plus a thin frontend**, so the
 is one possible frontend rather than the only one.
 
 > **Status: early. Not usable as your daily editor yet.** It opens, edits, and saves files
-> with multiple cursors, undo, and a working UI shell - but there is no syntax
-> highlighting, no LSP, and no encoding handling beyond UTF-8. See
+> with multiple cursors, undo, and a working UI shell, and shows `rust-analyzer`
+> diagnostics on Rust files - but there is no syntax highlighting, no LSP features beyond
+> diagnostics, and no encoding handling beyond UTF-8. See
 > [Where it actually is](#where-it-actually-is) before trying it.
 
 ---
@@ -48,9 +49,9 @@ milestones landed before earlier ones - that is a real gap, not a rounding error
 |---|---|---|
 | M0 | Workspace + seam skeleton | done |
 | M1 | Edit + render pipeline | done |
-| M2 | Async runtime + LSP | **not started** - the one unproven stack assumption |
+| M2 | Async runtime + LSP | done - `rust-analyzer` diagnostics for Rust files, underlined by span |
 | M3 | Anchors, undo tree, multi-cursor | done |
-| M4 | Syntax highlighting (tree-sitter) | **not started** - needs the decoration channel from M2 |
+| M4 | Syntax highlighting (tree-sitter) | **not started** - the decoration channel it needs landed in M2 |
 | M5 | File handling (encoding, EOL, conflicts) | **not started** - non-UTF-8 files fail to open today |
 | M6 | UI shell: compositor, toasts | done |
 | M7 | Pickers, palette, themes | in progress - file picker, palette, and themes done; buffer + global-search pickers, preview pane, which-key, and multi-buffer outstanding |
@@ -58,9 +59,11 @@ milestones landed before earlier ones - that is a real gap, not a rounding error
 
 What works today: open/save a file, edit with multiple cursors, undo/redo with coalescing,
 mouse selection, system clipboard (including over SSH via OSC 52), a fuzzy file picker, a
-command palette, and switchable themes.
+command palette, switchable themes, and live `rust-analyzer` diagnostics on Rust files
+(underlined by span, with a colored gutter mark, if `rust-analyzer` is on your PATH).
 
-What does not: syntax colors, diagnostics, search, more than one buffer at a time, any
+What does not: syntax colors, LSP features past diagnostics (no completion, hover, or
+goto), a language server for anything but Rust, search, more than one buffer at a time, any
 file that is not valid UTF-8, and detecting that a file changed underneath you.
 
 ## Build and run
