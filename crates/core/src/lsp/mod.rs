@@ -81,6 +81,12 @@ pub enum DocumentSync {
         path: PathBuf,
         language_id: String,
         text: String,
+        /// The buffer version this text is. Carried so that *reopening* a document
+        /// the server already has open - which the editor announces as another
+        /// `Opened` (it resets its per-buffer opened flag on every load) - can be
+        /// re-sent as a `didChange` at a real version rather than a duplicate
+        /// `didOpen`, which LSP forbids without an intervening `didClose`.
+        version: u64,
     },
     Changed {
         path: PathBuf,

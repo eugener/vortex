@@ -38,6 +38,7 @@ fn opening_a_document_records_it_and_carries_its_text() {
             path: path.clone(),
             language_id: "rust".into(),
             text: "fn main() {}".into(),
+            version: 3,
         },
     );
     let Some(Outgoing::Open(params)) = out else {
@@ -45,6 +46,9 @@ fn opening_a_document_records_it_and_carries_its_text() {
     };
     assert_eq!(params.text_document.language_id, "rust");
     assert_eq!(params.text_document.text, "fn main() {}");
+    // didOpen carries the buffer's real version, not a hardcoded 0, so the server's
+    // per-document version tracking starts where the buffer actually is.
+    assert_eq!(params.text_document.version, 3);
     assert_eq!(opened, vec![path]);
 }
 
@@ -74,6 +78,7 @@ fn a_change_after_the_open_carries_the_whole_document_and_its_version() {
             path: path.clone(),
             language_id: "rust".into(),
             text: "one".into(),
+            version: 1,
         },
     );
     let out = outgoing(
@@ -95,20 +100,46 @@ fn a_change_after_the_open_carries_the_whole_document_and_its_version() {
 }
 
 #[test]
-fn reopening_the_same_document_does_not_duplicate_the_record() {
+fn reopening_the_same_document_resyncs_as_a_change_not_a_second_open() {
+    // A second open of a URI the server already knows must not be another didOpen:
+    // LSP forbids didOpen without an intervening didClose, and this client never
+    // sends didClose (reopen happens on picker A -> B -> A). The reopen leaves as a
+    // didChange carrying the fresh text and version, and the record stays deduped.
     let mut opened = Vec::new();
     let path = tmp_file("a.rs");
-    for _ in 0..3 {
-        outgoing(
-            &mut opened,
-            DocumentSync::Opened {
-                path: path.clone(),
-                language_id: "rust".into(),
-                text: String::new(),
-            },
-        );
-    }
-    assert_eq!(opened.len(), 1);
+
+    let first = outgoing(
+        &mut opened,
+        DocumentSync::Opened {
+            path: path.clone(),
+            language_id: "rust".into(),
+            text: "v1".into(),
+            version: 1,
+        },
+    );
+    assert!(
+        matches!(first, Some(Outgoing::Open(_))),
+        "the first open is a didOpen"
+    );
+
+    let second = outgoing(
+        &mut opened,
+        DocumentSync::Opened {
+            path: path.clone(),
+            language_id: "rust".into(),
+            text: "v4".into(),
+            version: 4,
+        },
+    );
+    let Some(Outgoing::Change(params)) = second else {
+        panic!("a reopen must be a didChange, not a second didOpen");
+    };
+    assert_eq!(params.text_document.version, 4);
+    assert_eq!(params.content_changes[0].text, "v4");
+    assert!(params.content_changes[0].range.is_none());
+
+    // The document is still recorded exactly once.
+    assert_eq!(opened, vec![path]);
 }
 
 #[test]
@@ -122,6 +153,7 @@ fn a_path_that_is_not_a_file_url_is_dropped() {
                 path: PathBuf::from("relative/not/absolute.rs"),
                 language_id: "rust".into(),
                 text: String::new(),
+                version: 1,
             },
         )
         .is_none()
