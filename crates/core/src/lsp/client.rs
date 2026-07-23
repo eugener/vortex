@@ -168,10 +168,16 @@ async fn run(
     // Track the language each opened document was announced with, so a change
     // notification can address a document the server actually knows about.
     let mut opened: Vec<PathBuf> = Vec::new();
+    // Whether the loop stopped because the server's own protocol loop ended (as
+    // opposed to the editor hanging up). It decides whether a graceful shutdown is
+    // even possible below, and guards against polling an already-completed
+    // `protocol` future a second time.
+    let mut server_gone = false;
     let result = loop {
         futures::select! {
             // The protocol loop ending means the server is gone; stop with it.
             r = protocol.as_mut().fuse() => {
+                server_gone = true;
                 break r.map_err(|e| LspError::Protocol(e.to_string()));
             }
             batch = published_rx.next() => {
@@ -194,11 +200,27 @@ async fn run(
         }
     };
 
-    // Best-effort shutdown: we are stopping either way, and a server that has
-    // already died must not turn into an error on the way out.
-    server.shutdown(()).await.ok();
-    server.exit(()).ok();
-    server.emit(Stop).ok();
+    // Best-effort graceful shutdown, but only when the server is still running. If
+    // its protocol loop already ended (`server_gone`) there is nothing to shut down,
+    // and re-polling that completed `protocol` future would panic.
+    //
+    // When the *editor* hung up instead, the server is alive, so the shutdown
+    // request must be RACED against `protocol` - exactly as `initialize` is above.
+    // A `ServerSocket` request only completes while the connection loop is polled;
+    // awaiting `shutdown().await` alone, with nothing driving `protocol`, would hang
+    // `run()` forever and leak the (kill-on-drop) child for the rest of the session.
+    if !server_gone {
+        let shutdown = async {
+            server.shutdown(()).await.ok();
+            server.exit(()).ok();
+            server.emit(Stop).ok();
+        };
+        futures::select! {
+            _ = shutdown.fuse() => {}
+            // The connection ended on its own mid-shutdown; nothing more to do.
+            _ = protocol.as_mut().fuse() => {}
+        }
+    }
     result
 }
 
@@ -240,16 +262,34 @@ fn outgoing(opened: &mut Vec<PathBuf>, message: DocumentSync) -> Option<Outgoing
             path,
             language_id,
             text,
+            version,
         } => {
             let uri = Url::from_file_path(&path).ok()?;
-            if !opened.contains(&path) {
-                opened.push(path);
+            // Reopening a document the server already has open (picker A -> B -> A,
+            // since the editor resets its opened flag on every load and nothing here
+            // ever sends `didClose`): a second `didOpen` for the same URI is a
+            // protocol violation and desyncs a strict server's version tracking, so
+            // resync the fresh text as a `didChange` instead. Its version is the
+            // buffer's, which only ever increases, so it stays monotonic per SPEC §5.
+            if opened.contains(&path) {
+                return Some(Outgoing::Change(DidChangeTextDocumentParams {
+                    text_document: VersionedTextDocumentIdentifier {
+                        uri,
+                        version: version as i32,
+                    },
+                    content_changes: vec![TextDocumentContentChangeEvent {
+                        range: None,
+                        range_length: None,
+                        text,
+                    }],
+                }));
             }
+            opened.push(path);
             Some(Outgoing::Open(DidOpenTextDocumentParams {
                 text_document: TextDocumentItem {
                     uri,
                     language_id,
-                    version: 0,
+                    version: version as i32,
                     text,
                 },
             }))

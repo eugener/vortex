@@ -728,6 +728,7 @@ fn opening_a_file_announces_it_to_the_server() {
                 path: p,
                 language_id,
                 text,
+                ..
             } => {
                 assert_eq!(p, path);
                 // The LSP identifier, not the file extension.

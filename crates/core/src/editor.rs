@@ -327,6 +327,7 @@ impl Editor {
                 path: path.clone(),
                 language_id: language_id(path),
                 text: self.buffer.text().to_string(),
+                version: self.version,
             }
         };
         if sync.try_send(message).is_ok() {
