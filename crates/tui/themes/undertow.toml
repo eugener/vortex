@@ -16,3 +16,10 @@ toast_info       = { fg = "#ccd2e4", bg = "#22283c" }
 toast_error      = { fg = "#ffe7ec", bg = "#7a2f3d", bold = true }
 palette          = { fg = "#ccd2e4", bg = "#1a1e2c" }
 palette_selected = { fg = "#eef1fa", bg = "#2b3557", bold = true }
+
+# Diagnostics (SPEC §5): red error and amber warning carry the signal; info and
+# hint stay quiet so a wall of hints never shouts over a real error.
+diagnostic_error       = { fg = "#e06c75" }
+diagnostic_warning     = { fg = "#d69d53" }
+diagnostic_information = { fg = "#619ad6" }
+diagnostic_hint        = { fg = "#7d86a8" }

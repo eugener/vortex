@@ -17,3 +17,10 @@ toast_info       = { fg = "#150f06", bg = "#c48700" }
 toast_error      = { fg = "#150f06", bg = "#ffd980", bold = true }
 palette          = { fg = "#ffb000", bg = "#150f06" }
 palette_selected = { fg = "#150f06", bg = "#ffb000", bold = true }
+
+# One hue, so diagnostics separate by intensity like everything else: a bright
+# amber error down to a dim hint. The underline shape does the rest.
+diagnostic_error       = { fg = "#ffd980" }
+diagnostic_warning     = { fg = "#ffb000" }
+diagnostic_information = { fg = "#c48700" }
+diagnostic_hint        = { fg = "#7a5200" }

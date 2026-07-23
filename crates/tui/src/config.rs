@@ -87,6 +87,30 @@ pub struct Theme {
     pub palette: Style,
     /// The palette's highlighted row - an accent fill so the selection is obvious.
     pub palette_selected: Style,
+    /// The four LSP diagnostic severities (SPEC §5). The `fg` colors the underline
+    /// under a flagged span and the mark in the gutter; a background, if set, is
+    /// ignored for the underline (which paints only the foreground) so a theme need
+    /// not reserve one. Kept as four fields rather than a lookup so a theme file
+    /// names each severity explicitly, the same as every other slot.
+    pub diagnostic_error: Style,
+    pub diagnostic_warning: Style,
+    pub diagnostic_information: Style,
+    pub diagnostic_hint: Style,
+}
+
+impl Theme {
+    /// The style for a diagnostic [`Severity`](vortex_core::Severity) - the seam's
+    /// semantic tag resolved to concrete colors here, in the frontend, exactly as
+    /// SPEC §5 requires (the core never names a color).
+    pub fn diagnostic(&self, severity: vortex_core::Severity) -> Style {
+        use vortex_core::Severity;
+        match severity {
+            Severity::Error => self.diagnostic_error,
+            Severity::Warning => self.diagnostic_warning,
+            Severity::Information => self.diagnostic_information,
+            Severity::Hint => self.diagnostic_hint,
+        }
+    }
 }
 
 impl Default for Theme {
@@ -144,6 +168,14 @@ impl Default for Theme {
                 .fg(Color::Rgb(0xee, 0xf1, 0xfa))
                 .bg(Color::Rgb(0x2b, 0x35, 0x57))
                 .add_modifier(Modifier::BOLD),
+            // Diagnostics (SPEC §5): a red error and an amber warning carry the
+            // usual severity signal, while information and hint stay quiet - a
+            // desaturated blue and a muted grey - so a wall of hints never shouts
+            // over a real error. These are the underline/gutter foregrounds.
+            diagnostic_error: Style::new().fg(Color::Rgb(0xe0, 0x6c, 0x75)),
+            diagnostic_warning: Style::new().fg(Color::Rgb(0xd6, 0x9d, 0x53)),
+            diagnostic_information: Style::new().fg(Color::Rgb(0x61, 0x9a, 0xd6)),
+            diagnostic_hint: Style::new().fg(Color::Rgb(0x7d, 0x86, 0xa8)),
         }
     }
 }
@@ -206,6 +238,10 @@ mod tests {
             ("toast_error", t.toast_error),
             ("palette", t.palette),
             ("palette_selected", t.palette_selected),
+            ("diagnostic_error", t.diagnostic_error),
+            ("diagnostic_warning", t.diagnostic_warning),
+            ("diagnostic_information", t.diagnostic_information),
+            ("diagnostic_hint", t.diagnostic_hint),
         ];
         for (name, style) in slots {
             for color in [style.fg, style.bg].into_iter().flatten() {

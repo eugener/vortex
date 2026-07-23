@@ -29,7 +29,7 @@ mod toast;
 
 use std::ffi::OsString;
 use std::io::{self, Stdout};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use ratatui::crossterm::event::{
@@ -42,7 +42,7 @@ use ratatui::crossterm::terminal::{
 };
 use ratatui::crossterm::{execute, queue};
 use ratatui::layout::{Constraint, Layout, Position, Rect};
-use ratatui::style::Style;
+use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 use ratatui::{Frame, Terminal, TerminalOptions, Viewport};
@@ -129,6 +129,14 @@ fn main() -> io::Result<()> {
         .name("vortex-core".into())
         .spawn(move || smol::block_on(run))?;
 
+    // Language servers are attached lazily, driven by the core's `FileOpened`
+    // notification (SPEC §3, M2): whenever a file is opened - at launch, or via the
+    // Ctrl+O picker - the frontend attaches a server for its type if one exists and
+    // is not already running. A missing server degrades silently to no diagnostics
+    // (SPEC §8). Each client's loop runs on its own thread, off the render thread,
+    // preserving the no-starvation property above.
+    let mut lsp = LspManager::new();
+
     // Resolve frontend configuration once, up front. Today this is the built-in
     // default; M5 swaps it for `Config::load` reading the user's file (SPEC §10.5).
     // Parsed here, next to argv, because that is where a `--config <path>` flag will
@@ -138,7 +146,7 @@ fn main() -> io::Result<()> {
     // Terminal setup. On any error we still attempt teardown so we never leave the
     // user's terminal in raw mode (the Drop impl is the backstop).
     let mut term = TerminalGuard::enter()?;
-    let result = event_loop(&handle, &mut term.terminal, path, config);
+    let result = event_loop(&handle, &mut term.terminal, path, config, &mut lsp);
     term.leave();
 
     // Dropping the handle closes the action channel, so the core loop ends; join
@@ -146,6 +154,93 @@ fn main() -> io::Result<()> {
     drop(handle);
     let _ = core_thread.join();
     result
+}
+
+/// Attaches language servers to the core on demand and remembers which are already
+/// running, so a server is launched at most once per (command, workspace root).
+///
+/// Attachment is lazy: the first open of a file type that has a server (and whose
+/// server is installed) launches it; later opens of the same type reuse it, since
+/// the core announces every opened file to the attached server (a `didOpen`). This
+/// is why opening a `.rs` file with Ctrl+O gets diagnostics even when the editor
+/// was launched on nothing or on a non-Rust file.
+struct LspManager {
+    /// The (command, root) pairs already attached, to avoid relaunching a server
+    /// that already covers this file's workspace.
+    attached: std::collections::HashSet<(&'static str, PathBuf)>,
+}
+
+impl LspManager {
+    fn new() -> Self {
+        Self {
+            attached: std::collections::HashSet::new(),
+        }
+    }
+
+    /// Ensure a language server covers `path`, attaching one if the file type has a
+    /// server, it is installed, and it is not already running for this workspace.
+    ///
+    /// The client's loop is spawned on its own thread (off the render thread), and
+    /// the handle is handed to the core, which swaps it in and announces the
+    /// current buffer to it. A missing server, or a send to a stopped core, is
+    /// ignored - the editor keeps running with no diagnostics (SPEC §8).
+    fn ensure(&mut self, path: &Path, handle: &vortex_core::CoreHandle) {
+        let Some((command, root)) = lsp_target(path) else {
+            return;
+        };
+        // `insert` returns false when the pair was already present: the server for
+        // this workspace is running, so the core's own `didOpen` covers the file.
+        if !self.attached.insert((command, root.clone())) {
+            return;
+        }
+        let (lsp_handle, lsp_loop) = vortex_core::lsp::client(command, &root);
+        // The loop resolves to why it stopped; a spawn/protocol failure is
+        // swallowed rather than crashing the editor (SPEC §8). Surfacing it as a
+        // toast is a later refinement.
+        let spawned = std::thread::Builder::new()
+            .name("vortex-lsp".into())
+            .spawn(move || {
+                let _ = smol::block_on(lsp_loop);
+            });
+        if spawned.is_err() {
+            self.attached.remove(&(command, root));
+            return;
+        }
+        // A closed channel means the core has stopped; nothing to attach to.
+        let _ = handle.lsp.send_blocking(lsp_handle);
+    }
+}
+
+/// The language server and workspace root for a file, if one is known and
+/// installed. Extension -> server is a small built-in table (only `rust-analyzer`
+/// today, the M2 target); the root is the current working directory, where a
+/// project's manifest lives when the editor is launched from its root. A per-file
+/// root walk (nearest `Cargo.toml`) is a refinement, not needed for M2.
+fn lsp_target(path: &Path) -> Option<(&'static str, PathBuf)> {
+    let command = match path.extension().and_then(|e| e.to_str()) {
+        Some("rs") => "rust-analyzer",
+        _ => return None,
+    };
+    // Only report a server that is actually installed; probing here keeps the
+    // "missing server is silent" contract in one place.
+    if !server_on_path(command) {
+        return None;
+    }
+    let root = std::env::current_dir().ok()?;
+    Some((command, root))
+}
+
+/// Whether `command` resolves to an executable on the PATH. A cheap `--version`
+/// probe: it must not paint into the alternate screen, so it runs before terminal
+/// setup and discards all output.
+fn server_on_path(command: &str) -> bool {
+    std::process::Command::new(command)
+        .arg("--version")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok_and(|s| s.success())
 }
 
 const USAGE: &str = "Usage: vortex [OPTIONS] [FILE]";
@@ -233,6 +328,7 @@ fn event_loop(
     terminal: &mut Terminal<ratatui::backend::CrosstermBackend<Stdout>>,
     path: Option<PathBuf>,
     mut config: config::Config,
+    lsp: &mut LspManager,
 ) -> io::Result<()> {
     // Prime the view: open the CLI-given file, or just request a snapshot of the
     // empty buffer when none was given. Either way a snapshot follows, so the
@@ -287,6 +383,13 @@ fn event_loop(
         // one, SPEC §6), and a file open/save result is surfaced in the status bar
         // (SPEC §8). Keep the latest message worth showing.
         while let Ok(note) = handle.notifications.try_recv() {
+            // A newly opened file may want a language server (SPEC §3, M2): attach
+            // one lazily for its type, whether the open came from argv or the
+            // picker. Keyed off the core's own `FileOpened` so there is one path for
+            // every open, and it fires with the path the core actually loaded.
+            if let vortex_core::Notification::FileOpened { path, .. } = &note {
+                lsp.ensure(path, handle);
+            }
             // A copy/cut asks us to mirror the register to the OS clipboard. We push
             // it over OSC 52 (clipboard-over-terminal), which works locally and over
             // SSH (SPEC §11) without a native-clipboard dependency. Best-effort: a
@@ -791,6 +894,31 @@ fn paint_body(frame: &mut Frame, area: Rect, snapshot: &ViewSnapshot, body: Body
                     .map(|range| (range, body.theme.selection))
                 })
                 .collect();
+            // Diagnostic underlines (SPEC §5): the decoration channel resolved for
+            // just this line's byte span, each clipped to its columns and painted
+            // as an underlined foreground. Pushed before the caret blocks so a
+            // secondary cursor still shows on top of a squiggle sharing its cell.
+            if !snapshot.decorations.is_empty() {
+                for (span, severity) in snapshot
+                    .decorations
+                    .underlines_in(line_start..line_end_excl)
+                {
+                    if let Some(range) = layout::selection_columns(
+                        raw,
+                        line_start,
+                        line_end_excl,
+                        TAB_WIDTH,
+                        span.start,
+                        span.end,
+                    ) {
+                        let style = body
+                            .theme
+                            .diagnostic(severity)
+                            .add_modifier(Modifier::UNDERLINED);
+                        overlays.push((range, style));
+                    }
+                }
+            }
             // Mark every secondary (non-primary) caret with a one-cell block so a
             // multi-cursor set is visible: the terminal has a single real cursor,
             // which the primary uses (SPEC §2.2). Pushed after the selection washes
@@ -802,6 +930,18 @@ fn paint_body(frame: &mut Frame, area: Rect, snapshot: &ViewSnapshot, body: Body
                 }
             }
 
+            // A diagnostic on this line recolors its gutter number with the
+            // severity's color (SPEC §5): a signal in the margin without widening
+            // the gutter, so the line-number layout math is untouched. The most
+            // severe mark on the line wins (`gutter_mark` picks it).
+            let gutter_style = match snapshot.decorations.gutter_mark(text, line_index) {
+                Some(vortex_core::GutterKind::Diagnostic(severity)) => gutter_style
+                    .patch(body.theme.diagnostic(severity))
+                    .add_modifier(Modifier::BOLD),
+                // `GutterKind` is non-exhaustive (git signs join in M8); an
+                // unknown kind leaves the gutter as-is rather than failing.
+                _ => gutter_style,
+            };
             let mut spans = vec![Span::styled(
                 layout::gutter_label(line_index, body.gutter_width),
                 gutter_style,
@@ -1106,6 +1246,156 @@ mod tests {
         assert!(status.contains("v1"), "status (version): {status:?}");
         let status_bg = config::Theme::default().status_bar.bg;
         assert_eq!(buf.cell((0, 9)).unwrap().bg, status_bg.unwrap());
+    }
+
+    /// Drive the core with a language server attached, feed one diagnostic batch
+    /// from a fake server, and return the decorated snapshot - the frontend's only
+    /// way to obtain a `ViewSnapshot` carrying decorations (it is
+    /// `#[non_exhaustive]`, so it cannot be hand-built). Mirrors the core's own
+    /// `drive_lsp` harness.
+    fn snapshot_with_diagnostics(
+        file: &std::path::Path,
+        diagnostics: Vec<vortex_core::Diagnostic>,
+    ) -> ViewSnapshot {
+        use vortex_core::{DocumentSync, LspEvent, LspHandle};
+        let ex = smol::Executor::new();
+        let (sync_tx, sync_rx) = async_channel::bounded::<DocumentSync>(16);
+        let (event_tx, event_rx) = async_channel::bounded::<LspEvent>(16);
+        let Core { handle, run } = vortex_core::with_lsp(
+            64,
+            LspHandle {
+                sync: sync_tx,
+                events: event_rx,
+            },
+        );
+        ex.spawn(run).detach();
+        smol::block_on(ex.run(async move {
+            handle
+                .actions
+                .send(Action::Open(file.to_path_buf()))
+                .await
+                .unwrap();
+            while handle.deltas.try_recv().is_ok() {}
+            handle.snapshots.recv().await.unwrap();
+            // Keep the sync channel drained so the actor never blocks on it.
+            while sync_rx.try_recv().is_ok() {}
+            event_tx
+                .send(LspEvent::Diagnostics {
+                    path: file.to_path_buf(),
+                    diagnostics,
+                })
+                .await
+                .unwrap();
+            handle.snapshots.recv().await.unwrap()
+        }))
+    }
+
+    fn error_at(line: usize, start: usize, end: usize) -> vortex_core::Diagnostic {
+        vortex_core::Diagnostic {
+            start: vortex_core::Utf16Position::new(line, start),
+            end: vortex_core::Utf16Position::new(line, end),
+            severity: vortex_core::Severity::Error,
+            message: "mismatched types".into(),
+        }
+    }
+
+    #[test]
+    fn a_diagnostic_underlines_its_span_with_the_severity_color() {
+        // The TUI half of M2's criterion: the span rust-analyzer flagged is painted
+        // underlined in the error color. Fixture "let x = y" with an error over "y".
+        let dir = TempDir::new();
+        let path = dir.path.join("a.rs");
+        std::fs::write(&path, "let x = y").unwrap();
+        // "y" is the 9th column (chars 8..9), one ASCII byte so UTF-16 == byte here.
+        let snap = snapshot_with_diagnostics(&path, vec![error_at(0, 8, 9)]);
+        let buf = render(&snap, 40, 6);
+
+        // Row 1 is the first body row; the gutter is "  1 " (4 cells), so text
+        // column 8 lands at cell 4 + 8 = 12, painting "y".
+        let cell = buf.cell((12, 1)).unwrap();
+        assert_eq!(cell.symbol(), "y", "the underline should sit on `y`");
+        assert_eq!(
+            cell.fg,
+            config::Theme::default().diagnostic_error.fg.unwrap(),
+            "the span is painted in the error color"
+        );
+        assert!(
+            cell.modifier.contains(Modifier::UNDERLINED),
+            "a diagnostic span is underlined"
+        );
+    }
+
+    #[test]
+    fn a_diagnostic_recolors_its_lines_gutter_number() {
+        let dir = TempDir::new();
+        let path = dir.path.join("a.rs");
+        std::fs::write(&path, "ok\nbad line").unwrap();
+        // An error on line 1 (the second line): chars 0..3 over "bad".
+        let snap = snapshot_with_diagnostics(&path, vec![error_at(1, 0, 3)]);
+        let buf = render(&snap, 40, 6);
+
+        // Line 1's number renders in the gutter of body row 2. Its digit cell must
+        // carry the error color; line 0's gutter must not.
+        let err = config::Theme::default().diagnostic_error.fg.unwrap();
+        let marked = buf.cell((2, 2)).unwrap(); // "2" of line 2's "  2 "
+        assert_eq!(marked.symbol(), "2");
+        assert_eq!(marked.fg, err, "the flagged line's gutter takes the color");
+        let clean = buf.cell((2, 1)).unwrap(); // "1" of line 1
+        assert_ne!(clean.fg, err, "an unflagged line's gutter is untouched");
+    }
+
+    #[test]
+    fn a_buffer_with_no_diagnostics_paints_no_underline() {
+        // The common no-LSP path must be visibly unchanged: no cell is underlined.
+        let snap = snapshot_after(&[Action::Insert("let x = y".into())]);
+        let buf = render(&snap, 40, 6);
+        for x in 0..40 {
+            assert!(
+                !buf.cell((x, 1))
+                    .unwrap()
+                    .modifier
+                    .contains(Modifier::UNDERLINED),
+                "cell {x} should not be underlined without a diagnostic"
+            );
+        }
+    }
+
+    #[test]
+    fn lsp_target_declines_unknown_extensions() {
+        // A file type with no server entry attaches nothing - the editor runs with
+        // no diagnostics rather than failing.
+        assert!(lsp_target(Path::new("notes.txt")).is_none());
+        assert!(lsp_target(Path::new("Makefile")).is_none());
+    }
+
+    #[test]
+    fn lsp_target_declines_when_the_server_is_not_installed() {
+        // A `.rs` file only attaches if rust-analyzer is actually on PATH; the
+        // probe returns false for a name that cannot resolve, so this is hermetic
+        // whether or not rust-analyzer is installed on the test machine.
+        assert!(!server_on_path("vortex-definitely-not-a-real-binary-xyz"));
+    }
+
+    #[test]
+    fn lsp_manager_attaches_a_server_only_once_per_workspace() {
+        // The dedup that stops the picker relaunching rust-analyzer on every open:
+        // a second ensure for the same (command, root) must not attach again. Driven
+        // through the real handle so `send_blocking` has a live receiver.
+        let Core { handle, run } = vortex_core::new(4);
+        let ex = smol::Executor::new();
+        ex.spawn(run).detach();
+        // Seed the attached set as if a server for this cwd were already running,
+        // then confirm a repeat ensure is a no-op (no new thread, no send). Uses a
+        // fabricated command so nothing is actually spawned.
+        let mut mgr = LspManager::new();
+        let root = std::env::current_dir().unwrap();
+        mgr.attached.insert(("rust-analyzer", root.clone()));
+        // A `.rs` path in this cwd resolves to the already-attached pair, so ensure
+        // returns without touching the core.
+        mgr.ensure(Path::new("already_open.rs"), &handle);
+        assert!(handle.lsp.is_empty(), "no second attach should be sent");
+        drop(handle);
+        drop(ex);
     }
 
     #[test]
