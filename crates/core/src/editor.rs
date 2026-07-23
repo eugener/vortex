@@ -25,11 +25,14 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use async_channel::{Receiver, Sender};
+use futures::future::Either;
 
 use crate::action::Action;
 use crate::anchor::{Anchor, Edit};
 use crate::buffer::{Buffer, RopeBuffer};
+use crate::decoration::DecorationSet;
 use crate::history::{Change, History, Reverted};
+use crate::lsp::{Diagnostic, DocumentSync, LspEvent, LspHandle, convert};
 use crate::selection::{Selection, SelectionSet};
 use crate::view::{BufferId, Delta, Notification, ViewSnapshot};
 
@@ -43,6 +46,13 @@ pub struct CoreHandle {
     pub snapshots: SnapshotCell,
     /// core -> frontend, discrete events.
     pub notifications: Receiver<Notification>,
+    /// frontend -> core, a language server to attach at runtime (SPEC §2.3: other
+    /// subsystems reach the single owner by message, never a shared handle). The
+    /// frontend spawns the client loop on its own executor and sends the resulting
+    /// [`LspHandle`] here; the core swaps it in and re-announces the current buffer.
+    /// A later handle replaces an earlier one, so opening a file in a different
+    /// workspace re-roots the server. Bounded and low-volume (one per attach).
+    pub lsp: Sender<LspHandle>,
 }
 
 /// A latest-wins single-slot snapshot channel (SPEC §6 "watch-style cell").
@@ -110,6 +120,28 @@ struct Editor {
     /// via `Notification::SetClipboard`. Survives file opens (a yank is not tied to a
     /// buffer). Empty until the first copy/cut.
     register: Vec<String>,
+    /// Everything the frontend paints at a position (SPEC §5): LSP diagnostics
+    /// now, syntax highlights and git signs later. Held behind an `Arc` so
+    /// publishing a snapshot is a ref-count bump rather than a deep clone of
+    /// every span, and transformed through each edit so overlays keep pointing at
+    /// the right text between a producer's refreshes.
+    decorations: Arc<DecorationSet>,
+    /// editor -> language server, or `None` when no server is attached (the
+    /// common case). Everything LSP-related is an `Option` rather than a separate
+    /// code path so a buffer with no server pays nothing and behaves identically.
+    lsp_sync: Option<Sender<DocumentSync>>,
+    /// The buffer changed but the server has not been told yet - either because
+    /// the sync channel was momentarily full, or because an edit just landed.
+    ///
+    /// A flag rather than a queued message, and this is the payoff of full-text
+    /// sync (see [`DocumentSync`]): re-sending the *current* buffer subsumes every
+    /// missed intermediate state, so a dropped sync can never desync the server.
+    /// It also means the actor never awaits the sync channel, which would deadlock
+    /// against the server task awaiting the event channel.
+    lsp_dirty: bool,
+    /// Whether the server has been told this file exists (`didOpen`). A change
+    /// notification for an unopened document is a protocol error.
+    lsp_opened: bool,
 }
 
 impl Editor {
@@ -122,6 +154,10 @@ impl Editor {
             path: None,
             history: History::new(),
             register: Vec::new(),
+            decorations: Arc::new(DecorationSet::new()),
+            lsp_sync: None,
+            lsp_dirty: false,
+            lsp_opened: false,
         }
     }
 
@@ -139,6 +175,7 @@ impl Editor {
             selections: Arc::from(self.selections.all()),
             primary: self.selections.primary_index(),
             dirty,
+            decorations: Arc::clone(&self.decorations),
             path: self.path.clone(),
             modified: self.modified(),
         }
@@ -233,6 +270,71 @@ impl Editor {
         true
     }
 
+    /// Move every decoration across the applied `changes` (SPEC §5). Skips the
+    /// `Arc` clone entirely when nothing is decorated - the overwhelmingly common
+    /// case of a buffer with no LSP attached, which must not pay for this at all.
+    fn transform_decorations(&mut self, changes: &[Change]) {
+        if self.decorations.is_empty() || changes.is_empty() {
+            return;
+        }
+        let edits = edits_from_changes(changes);
+        // `make_mut` clones only while a published snapshot still shares the set;
+        // once the frontend drops that snapshot this mutates in place.
+        Arc::make_mut(&mut self.decorations).transform_through(&edits);
+    }
+
+    /// Tell the language server about the buffer's current contents, if one is
+    /// attached and anything is outstanding (SPEC §5 full-text sync).
+    ///
+    /// Never awaits: a full sync channel leaves `lsp_dirty` set and the next call
+    /// re-sends the newest text, which is why dropping the attempt is safe.
+    fn sync_lsp(&mut self) {
+        let (Some(sync), Some(path)) = (&self.lsp_sync, &self.path) else {
+            return;
+        };
+        if !self.lsp_dirty {
+            return;
+        }
+        let message = if self.lsp_opened {
+            DocumentSync::Changed {
+                path: path.clone(),
+                version: self.version,
+                text: self.buffer.text().to_string(),
+            }
+        } else {
+            DocumentSync::Opened {
+                path: path.clone(),
+                language_id: language_id(path),
+                text: self.buffer.text().to_string(),
+            }
+        };
+        if sync.try_send(message).is_ok() {
+            self.lsp_dirty = false;
+            self.lsp_opened = true;
+        }
+    }
+
+    /// Replace the LSP's decorations with `diagnostics`, resolved against the
+    /// current buffer (SPEC §5). Ignores batches for a file this buffer is not
+    /// showing - a server analyzes a whole workspace and publishes for any file
+    /// in it, not just the open one.
+    ///
+    /// Returns whether anything changed, so the caller republishes only when the
+    /// screen would actually differ.
+    fn apply_diagnostics(&mut self, path: &Path, diagnostics: &[Diagnostic]) -> bool {
+        if self.path.as_deref() != Some(path) {
+            return false;
+        }
+        let decorations = convert::decorations_for(&self.buffer.text(), diagnostics);
+        let mut updated = (*self.decorations).clone();
+        updated.replace(crate::decoration::DecorationSource::Lsp, decorations);
+        if updated == *self.decorations {
+            return false;
+        }
+        self.decorations = Arc::new(updated);
+        true
+    }
+
     /// The register flattened for the OS clipboard: entries joined with `\n` (SPEC
     /// §11). The OS clipboard is a single string, so the per-selection structure is
     /// collapsed here while the structured register stays in the core for paste.
@@ -273,6 +375,24 @@ impl Editor {
     }
 }
 
+/// The applied `changes` as anchor-transform edits: base coordinates, ascending
+/// by start - the contract [`Anchor::transform_through`] takes. `changes` arrive
+/// descending (the back-to-front application order), so this sorts a fresh copy.
+/// Shared by selection remapping and decoration remapping, which must see the
+/// same batch or a caret and the squiggle under it would drift apart.
+fn edits_from_changes(changes: &[Change]) -> Vec<Edit> {
+    let mut edits: Vec<Edit> = changes
+        .iter()
+        .map(|c| Edit {
+            start: c.start,
+            old_end: c.start + c.removed.len(),
+            insert_len: c.inserted.len(),
+        })
+        .collect();
+    edits.sort_by_key(|e| e.start);
+    edits
+}
+
 /// The kind of text edit an action requests, resolved against each selection.
 enum EditKind {
     /// Insert this text (replacing a non-empty selection).
@@ -300,6 +420,104 @@ enum Step {
     Republish,
     Open(PathBuf),
     Save,
+}
+
+/// What the actor loop woke up for. The LSP arms exist so a server can push work
+/// in without the user touching the keyboard (SPEC §2.3: other subsystems send
+/// messages to the single owner rather than sharing its state).
+enum Incoming {
+    Action(Action),
+    Lsp(LspEvent),
+    /// A language server to attach (the frontend spawned its client and sent the
+    /// handle). Replaces any current server and re-announces the buffer.
+    Attach(LspHandle),
+    /// The LSP *event* channel closed - the server or its task is gone.
+    LspClosed,
+    /// The frontend hung up; the loop should stop.
+    Stopped,
+}
+
+/// Await whichever arrives first: a frontend action, a language-server event, or a
+/// request to attach a (new) server.
+///
+/// `lsp` is `None` until a server attaches: selecting against a not-yet-connected
+/// channel is impossible, and once one *does* attach, a closed event channel
+/// returns ready forever, so it is dropped to `None` on close rather than spun on.
+/// The attach channel is always selected - that is how the first server arrives.
+/// Every `recv` future is cancel-safe, so the losers of a race are dropped and
+/// re-created next iteration without losing a message.
+async fn next_incoming(
+    actions: &Receiver<Action>,
+    lsp: Option<&Receiver<LspEvent>>,
+    attach: &Receiver<LspHandle>,
+) -> Incoming {
+    // Race the frontend action against the LSP side (an attach, plus events once a
+    // server is connected). Two nested two-way `select`s rather than the `select!`
+    // macro: the macro's fused-future handling misbehaves for this loop, while
+    // `future::select` is the same cancel-safe primitive already used elsewhere -
+    // the loser is dropped and its `recv` re-created next call, losing no message.
+    //
+    // **Liveness is the ACTIONS channel alone.** A closed attach channel means the
+    // frontend will simply never attach a server (a valid mode - and the one every
+    // no-LSP core is in), so it must never stop the loop: `recv_attach` pends
+    // forever once closed instead of resolving, leaving `actions` closing as the
+    // one shutdown signal. Without this, a frontend that holds `actions` but drops
+    // `lsp` (e.g. Rust 2021 disjoint capture never moving the unused sender in) kills
+    // the editor the moment it next idles.
+    let action = std::pin::pin!(actions.recv());
+    let lsp_side = std::pin::pin!(async {
+        match lsp {
+            Some(events) => {
+                let event = std::pin::pin!(events.recv());
+                let attach = std::pin::pin!(recv_attach(attach));
+                match futures::future::select(event, attach).await {
+                    Either::Left((e, _)) => e.map_or(Incoming::LspClosed, Incoming::Lsp),
+                    Either::Right((h, _)) => Incoming::Attach(h),
+                }
+            }
+            None => Incoming::Attach(recv_attach(attach).await),
+        }
+    });
+    match futures::future::select(action, lsp_side).await {
+        Either::Left((a, _)) => a.map_or(Incoming::Stopped, Incoming::Action),
+        Either::Right((incoming, _)) => incoming,
+    }
+}
+
+/// Await the next server to attach, or pend forever if the attach channel has
+/// closed (see [`next_incoming`]: a closed attach channel is not a shutdown, so it
+/// must never resolve the select and stop the loop).
+async fn recv_attach(attach: &Receiver<LspHandle>) -> LspHandle {
+    match attach.recv().await {
+        Ok(handle) => handle,
+        Err(_) => std::future::pending().await,
+    }
+}
+
+/// The LSP `languageId` for a path (the protocol's own identifiers, which are
+/// not simply the file extension). An unknown extension falls back to the
+/// extension itself: servers ignore documents they do not claim, so guessing
+/// costs nothing, while refusing to guess would mean no server ever sees a file
+/// type this list has not been taught.
+fn language_id(path: &Path) -> String {
+    let ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or_default();
+    match ext {
+        "rs" => "rust",
+        "js" | "mjs" | "cjs" => "javascript",
+        "ts" => "typescript",
+        "tsx" => "typescriptreact",
+        "jsx" => "javascriptreact",
+        "py" => "python",
+        "go" => "go",
+        "c" | "h" => "c",
+        "cc" | "cpp" | "hpp" | "cxx" => "cpp",
+        "md" => "markdown",
+        other => other,
+    }
+    .to_string()
 }
 
 /// The concrete `(range, new_text)` a single selection contributes for `kind`,
@@ -342,8 +560,10 @@ pub struct Core {
     pub run: BoxFuture,
 }
 
-/// The actor loop's type. Boxed so `vortex-core` exposes no executor type.
-pub type BoxFuture = std::pin::Pin<Box<dyn Future<Output = ()> + Send + 'static>>;
+/// A loop the frontend must spawn, boxed so `vortex-core` exposes no executor
+/// type. Defaults to `()` for the actor loop; the LSP client uses it to hand back
+/// why it stopped (SPEC §8).
+pub type BoxFuture<T = ()> = std::pin::Pin<Box<dyn Future<Output = T> + Send + 'static>>;
 
 /// Latest-wins snapshot slot: capacity 1 (SPEC §6).
 const SNAPSHOT_CAP: usize = 1;
@@ -351,6 +571,9 @@ const SNAPSHOT_CAP: usize = 1;
 const DELTA_CAP: usize = 1024;
 /// Notification channel bound: discrete, low-volume events (SPEC §6).
 const NOTIFICATION_CAP: usize = 64;
+/// LSP-attach channel bound: a language server is attached rarely (once per file
+/// type, on demand), so a small bound is plenty.
+const LSP_ATTACH_CAP: usize = 4;
 
 /// Create a core. Returns a [`CoreHandle`] and the actor loop to spawn.
 ///
@@ -358,15 +581,40 @@ const NOTIFICATION_CAP: usize = 64;
 /// back-pressure-critical stream (SPEC §6). Other channels get their own fixed
 /// bounds so sizing the action queue does not inflate them.
 ///
+/// A language server can be attached later at runtime via [`CoreHandle::lsp`]
+/// (the lazy, on-demand path a file open takes); [`with_lsp`] seeds one up front.
+///
 /// # Panics
 /// Panics if `action_capacity` is 0 (a bounded channel needs capacity >= 1).
 pub fn new(action_capacity: usize) -> Core {
+    build(action_capacity, None)
+}
+
+/// Create a core with a language server already attached (SPEC §3, M2). `lsp`
+/// comes from [`crate::lsp::client`], whose loop the frontend spawns alongside
+/// this one.
+///
+/// Sugar for [`new`] followed by sending `lsp` on [`CoreHandle::lsp`]: the core
+/// attaches it on its first loop turn, so behavior is identical to a runtime
+/// attach - there is one attach path, not two.
+pub fn with_lsp(action_capacity: usize, lsp: LspHandle) -> Core {
+    build(action_capacity, Some(lsp))
+}
+
+fn build(action_capacity: usize, lsp: Option<LspHandle>) -> Core {
     assert!(action_capacity > 0, "action_capacity must be >= 1");
 
     let (action_tx, action_rx) = async_channel::bounded::<Action>(action_capacity);
     let (delta_tx, delta_rx) = async_channel::bounded::<Delta>(DELTA_CAP);
     let (snapshot_tx, snapshot_rx) = async_channel::bounded::<ViewSnapshot>(SNAPSHOT_CAP);
     let (note_tx, note_rx) = async_channel::bounded::<Notification>(NOTIFICATION_CAP);
+    let (lsp_tx, lsp_rx) = async_channel::bounded::<LspHandle>(LSP_ATTACH_CAP);
+
+    // Seed an initial server, if given, down the same channel a runtime attach
+    // uses. `try_send` cannot fail: the channel is fresh and bounded >= 1.
+    if let Some(handle) = lsp {
+        let _ = lsp_tx.try_send(handle);
+    }
 
     Core {
         handle: CoreHandle {
@@ -374,12 +622,14 @@ pub fn new(action_capacity: usize) -> Core {
             deltas: delta_rx,
             snapshots: SnapshotCell { rx: snapshot_rx },
             notifications: note_rx,
+            lsp: lsp_tx,
         },
         run: Box::pin(run(
             action_rx,
             delta_tx,
             SnapshotSink { tx: snapshot_tx },
             note_tx,
+            lsp_rx,
         )),
     }
 }
@@ -403,10 +653,59 @@ async fn run(
     deltas: Sender<Delta>,
     snapshots: SnapshotSink,
     notifications: Sender<Notification>,
+    lsp_attach: Receiver<LspHandle>,
 ) {
     let mut editor = Editor::new();
+    // The event side of the attached server, or `None` until one attaches. The
+    // send side lives on `editor.lsp_sync`, so both are swapped together on attach.
+    let mut lsp_events: Option<Receiver<LspEvent>> = None;
 
-    while let Ok(action) = actions.recv().await {
+    loop {
+        // Flush any outstanding document sync before parking on input, so the
+        // server sees the newest text while the user is idle rather than only
+        // once they press another key.
+        editor.sync_lsp();
+
+        // Bound the borrow of `lsp_events` to this statement so the arms below
+        // can clear it.
+        let incoming = next_incoming(&actions, lsp_events.as_ref(), &lsp_attach).await;
+        let action = match incoming {
+            Incoming::Stopped => break,
+            // A (new) server attached: swap in both channel ends and re-announce
+            // the current buffer to it (a fresh `didOpen`), so a file already open
+            // when the server arrives is analyzed too. Replacing an earlier server
+            // drops its channels, which stops its client loop (SPEC §8).
+            Incoming::Attach(handle) => {
+                editor.lsp_sync = Some(handle.sync);
+                lsp_events = Some(handle.events);
+                editor.lsp_opened = false;
+                editor.lsp_dirty = true;
+                continue;
+            }
+            // The server died, or its task ended. That must never take the editor
+            // with it (SPEC §8): fall back to the no-LSP path, which is also what
+            // keeps `select` from spinning on a permanently-ready closed channel.
+            // Drop the send side too, so a stale sync never targets a dead server.
+            Incoming::LspClosed => {
+                lsp_events = None;
+                editor.lsp_sync = None;
+                editor.lsp_opened = false;
+                continue;
+            }
+            Incoming::Lsp(LspEvent::Diagnostics { path, diagnostics }) => {
+                // Republish only when the screen would actually differ: a server
+                // re-sending an identical batch (common while indexing) must not
+                // cost a frame.
+                if editor.apply_diagnostics(&path, &diagnostics)
+                    && !snapshots.publish(editor.snapshot(None))
+                {
+                    break;
+                }
+                continue;
+            }
+            Incoming::Action(action) => action,
+        };
+
         // Map each action to what the loop must do: an edit to apply, a pure
         // republish (motion / snapshot request), or a stop. The three text-edit
         // actions then share one apply_edit call instead of repeating the
@@ -546,12 +845,17 @@ async fn apply_edit(
     // edits (SPEC §2.1 anchors): a cursor lands after its own inserted text / at its
     // deletion point, and every other cursor shifts by the edits around it.
     editor.selections = selections_after_edits(&before, &changes);
+    // Decorations ride the same batch, so a squiggle stays under the token it
+    // flagged while the producer catches up (SPEC §5).
+    editor.transform_decorations(&changes);
     editor.version += 1;
     // One user action is one undo unit, even when it fanned across N cursors
     // (SPEC §2.4). Coalescing (single-caret typing) is decided inside `record`.
     editor
         .history
         .record(changes, before, editor.selections.clone());
+    // The server's copy is now stale; `sync_lsp` re-sends before the next park.
+    editor.lsp_dirty = true;
     snapshots.publish(editor.snapshot(dirty))
 }
 
@@ -585,6 +889,8 @@ async fn reapply(
     if !changes.is_empty() {
         editor.version += 1;
     }
+    editor.transform_decorations(&changes);
+    editor.lsp_dirty = true;
     editor.selections = reverted.selections;
     snapshots.publish(editor.snapshot(dirty))
 }
@@ -717,6 +1023,13 @@ async fn open_file(
     editor.selections = SelectionSet::at_origin();
     editor.path = Some(path.clone());
     editor.history = History::new();
+    // Decorations describe the *previous* file's text; keeping them would paint
+    // squiggles at meaningless offsets until a producer refreshes.
+    editor.decorations = Arc::new(DecorationSet::new());
+    // A different file is a different document to the server: announce it fresh
+    // rather than sending a change against the old one's identity.
+    editor.lsp_dirty = true;
+    editor.lsp_opened = false;
 
     let _ = notifications.try_send(Notification::FileOpened {
         buffer_id: editor.id,
@@ -916,19 +1229,7 @@ fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), String> {
 /// invariant holds: the pre-edit heads are ascending and the transform is monotonic,
 /// so the results stay ordered (coincident carets merge).
 fn selections_after_edits(before: &SelectionSet, changes: &[Change]) -> SelectionSet {
-    // Applied edits in base coordinates, ascending by start - the contract
-    // `transform_through` expects. `changes` arrive descending (the back-to-front
-    // application order), so sort a fresh copy.
-    let mut edits: Vec<Edit> = changes
-        .iter()
-        .map(|c| Edit {
-            start: c.start,
-            old_end: c.start + c.removed.len(),
-            insert_len: c.inserted.len(),
-        })
-        .collect();
-    edits.sort_by_key(|e| e.start);
-
+    let edits = edits_from_changes(changes);
     let cursors: Vec<Selection> = before
         .all()
         .iter()

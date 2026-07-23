@@ -9,7 +9,25 @@ repository.workspace = true
 
 [dependencies]
 async-channel = "2.5.0"
+# LSP (SPEC §3): tower-based and runtime-agnostic, which is what makes the smol
+# choice safe - `tokio` is an opt-in feature and stays off. `stdio` is off too:
+# it adapts a *server's* own stdin/stdout, while a client talks to a subprocess's
+# pipes, which `async-process` already provides asynchronously. Pins lsp-types
+# 0.95 deliberately (its own note), so we use its re-export rather than a
+# separate dep that could skew.
+async-lsp = { version = "0.2.4", default-features = false, features = [
+    "client-monitor",
+    "omni-trait",
+] }
+# Spawning the language server with async pipes. Part of the smol stack, used
+# only inside the LSP module - it never appears in a public signature, so the
+# core stays executor-agnostic (SPEC §2.3).
+async-process = "2.5.0"
 crop = "0.4.3"
+# async-lsp's service plumbing (`ServiceBuilder`) and combinators; both are
+# required to construct an async-lsp client at all.
+futures = "0.3.33"
+tower = "0.5.3"
 serde = { version = "1.0.228", features = ["derive"] }
 thiserror = "2.0.18"
 unicode-segmentation = "1.13.3"

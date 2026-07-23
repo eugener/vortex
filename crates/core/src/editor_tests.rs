@@ -1391,3 +1391,41 @@ mod atomic_write {
         assert_eq!(h.delta_rx.len(), 1); // one delta for the single deletion
     }
 }
+
+// --- LSP language identifiers (SPEC §3, M2) ---
+
+#[test]
+fn language_id_maps_extensions_to_lsp_identifiers() {
+    // The LSP `languageId` is the protocol's own vocabulary, not the file
+    // extension - a server keyed on "rust" ignores a document announced as "rs".
+    for (file, expected) in [
+        ("a.rs", "rust"),
+        ("a.js", "javascript"),
+        ("a.mjs", "javascript"),
+        ("a.cjs", "javascript"),
+        ("a.ts", "typescript"),
+        ("a.tsx", "typescriptreact"),
+        ("a.jsx", "javascriptreact"),
+        ("a.py", "python"),
+        ("a.go", "go"),
+        ("a.c", "c"),
+        ("a.h", "c"),
+        ("a.cc", "cpp"),
+        ("a.cpp", "cpp"),
+        ("a.hpp", "cpp"),
+        ("a.cxx", "cpp"),
+        ("a.md", "markdown"),
+    ] {
+        assert_eq!(language_id(Path::new(file)), expected, "for {file}");
+    }
+}
+
+#[test]
+fn an_unknown_extension_falls_back_to_the_extension_itself() {
+    // Guessing costs nothing (a server ignores documents it does not claim),
+    // while refusing to guess would mean no server ever sees a file type this
+    // list has not been taught.
+    assert_eq!(language_id(Path::new("a.zig")), "zig");
+    // A file with no extension has no identifier to offer.
+    assert_eq!(language_id(Path::new("Makefile")), "");
+}

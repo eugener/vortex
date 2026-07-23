@@ -13,9 +13,11 @@
 //! the anchor layer is how those offsets *survive an edit*. [`Selection`] endpoints
 //! carry no stored bias - bias is applied at transform time by the caller (a caret
 //! is [`Bias::After`] so typing pushes it right; a selection's start is `Before` and
-//! its end `After` so typing at either boundary grows it, SPEC §2.1). When M2 adds an
-//! LSP client, diagnostics and marks reuse exactly this [`Anchor::transform_through`]
-//! to ride over concurrent edits.
+//! its end `After` so typing at either boundary grows it, SPEC §2.1). The M2
+//! decoration channel (`decoration.rs`) reuses exactly this
+//! [`Anchor::transform_through`] so LSP diagnostics ride over concurrent edits -
+//! a squiggle's span is `After`-biased at its start and `Before`-biased at its end,
+//! the mirror of a selection, so typing beside it shifts it instead of growing it.
 //!
 //! **Implementation baseline (SPEC §2.1):** anchors are maintained by transforming
 //! them through each edit (an offset shift). The API is shaped so a future CRDT
@@ -29,20 +31,9 @@
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Bias {
     /// Stick to the text before this position: an insertion here does not move the
-    /// anchor. A selection's *start* uses this so typing at the start grows it.
-    // The bias axis is a complete, unit-tested primitive, but under M3's editing
-    // model every caret collapses to an `After`-biased point, so `Before` has no
-    // production consumer yet. Its first is M2's LSP marks / diagnostics (and any
-    // selection-preserving edit), which resolve spans across concurrent edits.
-    // `expect` (not `allow`) so this note is forced off the moment it is wired up;
-    // gated to non-test builds because the anchor tests already construct it.
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "Before-bias consumer (LSP marks/spans) lands in M2"
-        )
-    )]
+    /// anchor. A decoration span's *end* uses this so typing at an underline's edge
+    /// does not swallow the new text (SPEC §5); a selection's *start* would use it
+    /// to grow the other way.
     Before,
     /// Stick to the text after this position: an insertion here pushes the anchor
     /// right by the inserted length. A caret and a selection's *end* use this.
@@ -75,14 +66,7 @@ pub(crate) struct Anchor {
 
 impl Anchor {
     /// An anchor at `offset` biased toward the text before it (an insertion at
-    /// `offset` leaves it put). Selection starts use this.
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "Before-bias consumer (LSP marks/spans) lands in M2"
-        )
-    )]
+    /// `offset` leaves it put). Decoration span ends use this (SPEC §5).
     pub(crate) fn before(offset: usize) -> Self {
         Self {
             offset,

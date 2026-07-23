@@ -345,3 +345,145 @@ fn text_slice_off_a_char_boundary_yields_empty_not_a_panic() {
     assert_eq!(text.slice(0..1), ""); // mid-code-point end
     assert_eq!(text.slice(0..2), "é"); // full code point is fine
 }
+
+// --- LSP UTF-16 position space (SPEC §4) ---
+
+// The exact fixture line the M2 spike fed rust-analyzer. Its three coordinate
+// spaces all disagree, which is what makes it a real test rather than an ASCII
+// tautology: the trailing `msg` starts at byte 32, char 23, UTF-16 unit 24.
+// 日本語 are BMP (1 UTF-16 unit, 3 bytes each); 😀 is not (2 units, 4 bytes).
+const MIXED_WIDTH: &str = "pub fn bad() -> i32 {\n    let msg = \"日本語 😀\"; msg\n}\n";
+
+#[test]
+fn utf16_position_matches_what_rust_analyzer_reported() {
+    let text = RopeBuffer::from(MIXED_WIDTH).text();
+    // Ground truth: rust-analyzer put "mismatched types" at line 1, character 24.
+    let byte = text
+        .byte_of_utf16_position(Utf16Position::new(1, 24))
+        .unwrap();
+    assert_eq!(text.slice(byte..byte + 3), "msg");
+    // The span's end (character 27) closes exactly on the identifier.
+    let end = text
+        .byte_of_utf16_position(Utf16Position::new(1, 27))
+        .unwrap();
+    assert_eq!(text.slice(byte..end), "msg");
+    // ...and the byte offset is genuinely 32, so a byte- or char-column reading
+    // of the same number would have landed elsewhere.
+    assert_eq!(byte, text.byte_of_line(1).unwrap() + 32);
+}
+
+#[test]
+fn utf16_position_round_trips_on_every_boundary() {
+    // Every char boundary in adversarial text must survive byte -> UTF-16 -> byte
+    // (SPEC §13 round-trip requirement). Covers CJK, emoji, a ZWJ family cluster,
+    // combining marks, tabs and CRLF in one sweep.
+    let sources = [
+        MIXED_WIDTH,
+        "a\tb\r\nc",
+        FAMILY,
+        "e\u{0301}gg", // combining acute
+        "😀\n😀😀\n",
+        "",
+        "\n\n",
+        "no trailing newline",
+    ];
+    for src in sources {
+        let text = RopeBuffer::from(src).text();
+        for byte in 0..=src.len() {
+            if !src.is_char_boundary(byte) {
+                continue;
+            }
+            let pos = text.utf16_position_of_byte(byte);
+            // An offset *inside* a line terminator (between the \r and \n of a
+            // CRLF) is not an addressable column in any line/col space - the
+            // byte-column `byte_of_position` rejects it outright. It converts by
+            // clamping to the line's end, so it cannot round-trip by
+            // construction; `crlf_interior_clamps_to_the_line_end` pins that
+            // behavior instead.
+            if byte > text.byte_of_line(pos.line).unwrap() + text.line_len(pos.line).unwrap_or(0) {
+                continue;
+            }
+            assert_eq!(
+                text.byte_of_utf16_position(pos),
+                Some(byte),
+                "round-trip failed at byte {byte} of {src:?} (via {pos:?})"
+            );
+        }
+    }
+}
+
+#[test]
+fn utf16_column_counts_units_not_chars_or_bytes() {
+    let text = RopeBuffer::from("日本語 😀x").text();
+    // Before the emoji: 3 CJK chars + a space = 4 units (but 10 bytes).
+    assert_eq!(text.utf16_position_of_byte(10), Utf16Position::new(0, 4));
+    // After the emoji: the surrogate pair adds 2, not 1.
+    assert_eq!(text.utf16_position_of_byte(14), Utf16Position::new(0, 6));
+}
+
+#[test]
+fn utf16_character_inside_a_surrogate_pair_rounds_down() {
+    // A server that miscounts a non-BMP char (or truncates a range mid-emoji) can
+    // send a character offset splitting the pair. Rounding down keeps the result a
+    // valid UTF-8 boundary, so a later slice cannot panic (SPEC §8).
+    let text = RopeBuffer::from("😀x").text();
+    assert_eq!(
+        text.byte_of_utf16_position(Utf16Position::new(0, 1)),
+        Some(0)
+    );
+    assert_eq!(
+        text.byte_of_utf16_position(Utf16Position::new(0, 2)),
+        Some(4)
+    );
+}
+
+#[test]
+fn utf16_character_past_the_line_clamps_to_its_end() {
+    // The LSP spec's own rule: a character greater than the line length defaults
+    // back to the line length. The terminator is not addressable as a column, so
+    // line 0 of "ab\ncd" clamps to byte 2, not into the next line.
+    let text = RopeBuffer::from("ab\ncd").text();
+    assert_eq!(
+        text.byte_of_utf16_position(Utf16Position::new(0, 99)),
+        Some(2)
+    );
+    assert_eq!(
+        text.byte_of_utf16_position(Utf16Position::new(1, 99)),
+        Some(5)
+    );
+}
+
+#[test]
+fn utf16_position_out_of_range_line_is_none_not_a_panic() {
+    let text = RopeBuffer::from("ab\n").text();
+    // The virtual line after a trailing newline is addressable (a caret lives
+    // there); anything beyond it is not.
+    assert_eq!(
+        text.byte_of_utf16_position(Utf16Position::new(1, 0)),
+        Some(3)
+    );
+    assert_eq!(text.byte_of_utf16_position(Utf16Position::new(9, 0)), None);
+}
+
+#[test]
+fn utf16_position_of_byte_clamps_past_the_end() {
+    // Mirrors `position_of_byte`'s clamping contract rather than erroring.
+    let text = RopeBuffer::from("ab").text();
+    assert_eq!(text.utf16_position_of_byte(99), Utf16Position::new(0, 2));
+}
+
+#[test]
+fn crlf_interior_clamps_to_the_line_end() {
+    // The offset between a CRLF's \r and \n addresses no column: the byte-column
+    // conversion rejects it (`byte_of_position` -> None), and the UTF-16 one
+    // clamps it to the line's end. Asserted so the asymmetry is a decision on
+    // record rather than a surprise the round-trip test silently skips.
+    let text = RopeBuffer::from("ab\r\ncd").text();
+    let buffer = RopeBuffer::from("ab\r\ncd");
+    assert_eq!(buffer.byte_of_position(Position::new(0, 3)), None);
+    assert_eq!(text.utf16_position_of_byte(3), Utf16Position::new(0, 2));
+    assert_eq!(
+        text.byte_of_utf16_position(Utf16Position::new(0, 2)),
+        Some(2)
+    );
+}
