@@ -30,8 +30,19 @@ futures = "0.3.33"
 tower = "0.5.3"
 serde = { version = "1.0.228", features = ["derive"] }
 thiserror = "2.0.18"
+# Syntax highlighting (SPEC §3, M4): the parser + the highlight-event helper. Both
+# stay inside the `syntax` module and appear in no public signature except the
+# injected grammar (`tree_sitter::Language`) - a grammar is language data the
+# frontend supplies (dlopened at runtime), the same way it hands the LSP module a
+# server command. The parse runs on the frontend-spawned producer loop, never the
+# editor actor, so the core stays executor-agnostic and off the keystroke path.
+tree-sitter = "0.26.11"
+tree-sitter-highlight = "0.26.11"
 unicode-segmentation = "1.13.3"
 
 [dev-dependencies]
 proptest = "1.11.0"
 smol = "2.0.2"
+# A real grammar to exercise the highlighter end-to-end in-process (no subprocess,
+# unlike the LSP client) - which is why `syntax` needs no coverage exemption.
+tree-sitter-rust = "0.24.2"

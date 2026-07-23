@@ -24,3 +24,15 @@ diagnostic_error       = { fg = "#ffd980" }
 diagnostic_warning     = { fg = "#ffb000" }
 diagnostic_information = { fg = "#c48700" }
 diagnostic_hint        = { fg = "#7a5200" }
+
+# One hue, so syntax separates by intensity like everything else: brightest amber
+# for keywords, the base amber for identifiers, dimmer for strings and constants,
+# and the faintest for comments. No second color ever - this is a monochrome tube.
+syntax_keyword     = { fg = "#ffd980" }
+syntax_function    = { fg = "#ffc94d" }
+syntax_type        = { fg = "#ffc94d" }
+syntax_string      = { fg = "#c48700" }
+syntax_comment     = { fg = "#7a5200", italic = true }
+syntax_constant    = { fg = "#ffd980" }
+syntax_variable    = { fg = "#ffb000" }
+syntax_punctuation = { fg = "#c48700" }

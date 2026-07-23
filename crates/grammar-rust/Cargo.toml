@@ -1,0 +1,18 @@
+# A loadable Rust grammar for the editor (M4). Built as a `cdylib` so the frontend
+# `dlopen`s it at runtime rather than linking it - grammars are data the editor
+# loads dynamically from its runtime dir, never a compile-time dependency of the
+# editor itself (SPEC §3, §14). Adding a language is a new crate like this one plus
+# a config row, never a change to `vortex-core` or `vortex-tui`.
+[package]
+name = "grammar-rust"
+version = "0.0.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+# Bundles and compiles the generated C parser; we only re-export its entry point.
+tree-sitter-rust = "0.24.2"

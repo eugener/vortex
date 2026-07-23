@@ -16,6 +16,7 @@ mod command;
 mod compositor;
 mod config;
 mod filepicker;
+mod grammar;
 mod keymap;
 mod layout;
 mod osc52;
@@ -136,6 +137,10 @@ fn main() -> io::Result<()> {
     // (SPEC §8). Each client's loop runs on its own thread, off the render thread,
     // preserving the no-starvation property above.
     let mut lsp = LspManager::new();
+    // Syntax highlighters are attached the same way (M4): on each file open, the
+    // frontend loads the file type's grammar and hands the core a highlighter.
+    // Missing grammar degrades silently to no highlighting (SPEC §8).
+    let mut grammars = GrammarManager::new();
 
     // Resolve frontend configuration once, up front. Today this is the built-in
     // default; M5 swaps it for `Config::load` reading the user's file (SPEC §10.5).
@@ -146,7 +151,14 @@ fn main() -> io::Result<()> {
     // Terminal setup. On any error we still attempt teardown so we never leave the
     // user's terminal in raw mode (the Drop impl is the backstop).
     let mut term = TerminalGuard::enter()?;
-    let result = event_loop(&handle, &mut term.terminal, path, config, &mut lsp);
+    let result = event_loop(
+        &handle,
+        &mut term.terminal,
+        path,
+        config,
+        &mut lsp,
+        &mut grammars,
+    );
     term.leave();
 
     // Dropping the handle closes the action channel, so the core loop ends; join
@@ -209,6 +221,100 @@ impl LspManager {
         // A closed channel means the core has stopped; nothing to attach to.
         let _ = handle.lsp.send_blocking(lsp_handle);
     }
+}
+
+/// Attaches syntax highlighters to the core on demand and remembers the language
+/// currently attached, so it neither reloads a grammar for a same-language open nor
+/// leaves the wrong one attached when the file's language changes.
+///
+/// The syntax twin of [`LspManager`], driven off the same `FileOpened`
+/// notification. The resolution it needs (which library, which queries) is decided
+/// in [`grammar`]; this owns only the `dlopen`-and-attach I/O, kept here beside the
+/// LSP glue because it is the same shape and equally untestable.
+struct GrammarManager {
+    /// The language whose highlighter is currently attached, if any. Keyed by
+    /// language (not workspace, unlike LSP) because a grammar is global: opening
+    /// another file of the same language reuses the running highlighter, while a
+    /// different language replaces it in the core.
+    current: Option<&'static str>,
+}
+
+impl GrammarManager {
+    fn new() -> Self {
+        Self { current: None }
+    }
+
+    /// Ensure the highlighter attached to the core matches `path`'s language,
+    /// loading and attaching its grammar if it differs from the current one. A file
+    /// type with no grammar, a missing library, or a load failure leaves the editor
+    /// running with no fresh highlights (SPEC §8) - never crashing. The highlighter
+    /// loop runs on its own thread, off the render thread, exactly like an LSP
+    /// client.
+    fn ensure(&mut self, path: &Path, handle: &vortex_core::CoreHandle) {
+        let Some(lang) = grammar::grammar_target(path) else {
+            return;
+        };
+        // Same language as the running highlighter: its resync already covers the
+        // newly opened file, so do not reload the grammar.
+        if self.current == Some(lang) {
+            return;
+        }
+        let Some(resolved) = grammar::resolve(lang) else {
+            return;
+        };
+        let Some(language) = load_grammar(&resolved.lib_path) else {
+            return;
+        };
+        let (syntax_handle, syntax_loop) = vortex_core::highlighter(
+            language,
+            lang,
+            resolved.highlights,
+            resolved.injections,
+            String::new(),
+        );
+        // The loop resolves to why it stopped; a query-compile failure is swallowed
+        // rather than crashing the editor (SPEC §8).
+        let spawned = std::thread::Builder::new()
+            .name("vortex-syntax".into())
+            .spawn(move || {
+                let _ = smol::block_on(syntax_loop);
+            });
+        if spawned.is_err() {
+            return;
+        }
+        // A closed channel means the core has stopped; nothing to attach to.
+        if handle.syntax.send_blocking(syntax_handle).is_ok() {
+            self.current = Some(lang);
+        }
+    }
+}
+
+/// Load a grammar library and return its `Language`, or `None` if it cannot be
+/// opened or does not export the grammar entry point.
+///
+/// The library is deliberately leaked (`std::mem::forget`): the `Language` it
+/// yields is a pointer into the library's image and must stay mapped for as long as
+/// any highlighter thread uses it, which is the whole session, so leaking it for the
+/// process lifetime is the simplest correct choice (and avoids a shutdown race
+/// between unloading and the still-live highlighter thread).
+fn load_grammar(lib_path: &Path) -> Option<tree_sitter::Language> {
+    // SAFETY: `Library::new` runs the library's initializers; we load only grammar
+    // dylibs resolved from the runtime/executable directories (trusted install
+    // locations), and treat any failure as "no highlighting" rather than trusting
+    // partially-loaded state.
+    let lib = unsafe { libloading::Library::new(lib_path) }.ok()?;
+    // SAFETY: the grammar contract is that a grammar dylib exports `vortex_grammar`
+    // with exactly this ABI - `unsafe extern "C" fn() -> *const ()` returning its
+    // static language pointer (see the `grammar-rust` crate). A file that does not
+    // is rejected via `ok()?`.
+    let language: tree_sitter::Language = unsafe {
+        let entry: libloading::Symbol<unsafe extern "C" fn() -> *const ()> =
+            lib.get(b"vortex_grammar").ok()?;
+        tree_sitter_language::LanguageFn::from_raw(*entry).into()
+    };
+    // Keep the grammar mapped for the process; `language` borrows its image.
+    std::mem::forget(lib);
+    Some(language)
 }
 
 /// The language server and workspace root for a file, if one is known and
@@ -329,6 +435,7 @@ fn event_loop(
     path: Option<PathBuf>,
     mut config: config::Config,
     lsp: &mut LspManager,
+    grammars: &mut GrammarManager,
 ) -> io::Result<()> {
     // Prime the view: open the CLI-given file, or just request a snapshot of the
     // empty buffer when none was given. Either way a snapshot follows, so the
@@ -389,6 +496,7 @@ fn event_loop(
             // every open, and it fires with the path the core actually loaded.
             if let vortex_core::Notification::FileOpened { path, .. } = &note {
                 lsp.ensure(path, handle);
+                grammars.ensure(path, handle);
             }
             // A copy/cut asks us to mirror the register to the OS clipboard. We push
             // it over OSC 52 (clipboard-over-terminal), which works locally and over
@@ -879,6 +987,11 @@ fn paint_body(frame: &mut Frame, area: Rect, snapshot: &ViewSnapshot, body: Body
             // `visible_lines` already fetched this line; reuse its raw form for the
             // byte->column mapping rather than a second rope traversal per row.
             let raw = &line.raw;
+            // Selection washes first, so syntax highlights paint *over* them: a
+            // selection sets a background, and the highlight that follows patches
+            // only the foreground, so selected code keeps its syntax colors on the
+            // selection's ground rather than being flattened to the selection's own
+            // foreground (SPEC §5, later overlays win in `render_line`).
             let mut overlays: Vec<(std::ops::Range<usize>, Style)> = snapshot
                 .selections
                 .iter()
@@ -894,6 +1007,26 @@ fn paint_body(frame: &mut Frame, area: Rect, snapshot: &ViewSnapshot, body: Body
                     .map(|range| (range, body.theme.selection))
                 })
                 .collect();
+            // Syntax highlights (M4): each span clipped to this line's byte range,
+            // mapped to display columns, painted as a foreground color over the
+            // selection ground and under the diagnostic underline and carets.
+            if !snapshot.decorations.is_empty() {
+                for (span, kind) in snapshot
+                    .decorations
+                    .highlights_in(line_start..line_end_excl)
+                {
+                    if let Some(range) = layout::selection_columns(
+                        raw,
+                        line_start,
+                        line_end_excl,
+                        TAB_WIDTH,
+                        span.start,
+                        span.end,
+                    ) {
+                        overlays.push((range, body.theme.highlight(kind)));
+                    }
+                }
+            }
             // Diagnostic underlines (SPEC §5): the decoration channel resolved for
             // just this line's byte span, each clipped to its columns and painted
             // as an underlined foreground. Pushed before the caret blocks so a
@@ -1323,6 +1456,113 @@ mod tests {
             cell.modifier.contains(Modifier::UNDERLINED),
             "a diagnostic span is underlined"
         );
+    }
+
+    /// Drive the core with a fake highlighter attached, run `script`, then push one
+    /// highlight batch and return the decorated snapshot - the syntax twin of
+    /// [`snapshot_with_diagnostics`]. `spans` are applied against the version the
+    /// script left the buffer at.
+    fn snapshot_with_highlights(
+        script: &[Action],
+        spans: Vec<vortex_core::HighlightSpan>,
+    ) -> ViewSnapshot {
+        use vortex_core::{SyntaxEvent, SyntaxHandle, SyntaxSync};
+        let ex = smol::Executor::new();
+        let (sync_tx, sync_rx) = async_channel::bounded::<SyntaxSync>(16);
+        let (event_tx, event_rx) = async_channel::bounded::<SyntaxEvent>(16);
+        let Core { handle, run } = vortex_core::new(64);
+        ex.spawn(run).detach();
+        smol::block_on(ex.run(async move {
+            handle
+                .syntax
+                .send(SyntaxHandle {
+                    sync: sync_tx,
+                    events: event_rx,
+                })
+                .await
+                .unwrap();
+            let mut snap = None;
+            for action in script {
+                handle.actions.send(action.clone()).await.unwrap();
+                while handle.deltas.try_recv().is_ok() {}
+                snap = Some(handle.snapshots.recv().await.unwrap());
+            }
+            let version = snap
+                .expect("script must contain at least one action")
+                .version;
+            // Keep the highlighter's sync channel drained so the actor never blocks.
+            while sync_rx.try_recv().is_ok() {}
+            event_tx
+                .send(SyntaxEvent::Highlights { version, spans })
+                .await
+                .unwrap();
+            handle.snapshots.recv().await.unwrap()
+        }))
+    }
+
+    fn highlight_span(
+        range: std::ops::Range<usize>,
+        kind: vortex_core::HighlightKind,
+    ) -> vortex_core::HighlightSpan {
+        vortex_core::HighlightSpan { range, kind }
+    }
+
+    #[test]
+    fn a_syntax_highlight_paints_its_span_with_the_role_color() {
+        // "fn x" with a keyword highlight over "fn": the glyphs take the keyword
+        // color (M4). Gutter "  1 " is 4 cells, so "f" lands at cell 4.
+        let snap = snapshot_with_highlights(
+            &[Action::Insert("fn x".into())],
+            vec![highlight_span(0..2, vortex_core::HighlightKind::Keyword)],
+        );
+        let buf = render(&snap, 40, 6);
+        let cell = buf.cell((4, 1)).unwrap();
+        assert_eq!(cell.symbol(), "f", "the highlight should sit on `fn`");
+        assert_eq!(
+            cell.fg,
+            config::Theme::default().syntax_keyword.fg.unwrap(),
+            "a keyword span is painted in the keyword color"
+        );
+    }
+
+    #[test]
+    fn a_selected_highlight_keeps_its_syntax_color_on_the_selection_ground() {
+        // The behavior selection was reordered under highlights for: selecting the
+        // whole line leaves `fn` its keyword color, on the selection's background -
+        // syntax is not flattened to the selection's own foreground.
+        let snap = snapshot_with_highlights(
+            &[
+                Action::Insert("fn x".into()),
+                Action::PlaceCursor {
+                    offset: 0,
+                    extend: true,
+                },
+            ],
+            vec![highlight_span(0..2, vortex_core::HighlightKind::Keyword)],
+        );
+        let buf = render(&snap, 40, 6);
+        let cell = buf.cell((4, 1)).unwrap();
+        assert_eq!(cell.symbol(), "f");
+        assert_eq!(
+            cell.fg,
+            config::Theme::default().syntax_keyword.fg.unwrap(),
+            "the syntax color survives the selection"
+        );
+        assert_eq!(
+            cell.bg,
+            config::Theme::default().selection.bg.unwrap(),
+            "on the selection's background"
+        );
+    }
+
+    #[test]
+    fn ensure_ignores_a_file_with_no_grammar() {
+        // A file type with no grammar attaches nothing and leaves the manager empty,
+        // the frontend degrading to no highlighting (SPEC §8).
+        let Core { handle, run: _run } = vortex_core::new(16);
+        let mut manager = GrammarManager::new();
+        manager.ensure(Path::new("notes.txt"), &handle);
+        assert_eq!(manager.current, None);
     }
 
     #[test]

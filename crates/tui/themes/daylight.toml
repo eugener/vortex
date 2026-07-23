@@ -23,3 +23,15 @@ diagnostic_error       = { fg = "#9c2f37" }
 diagnostic_warning     = { fg = "#8a5a1a" }
 diagnostic_information = { fg = "#2f4a72" }
 diagnostic_hint        = { fg = "#5c645e" }
+
+# The print-proofing palette this theme was built around: navy keywords, a deeper
+# navy for functions, oxblood types, moss strings, a muted comment, burnt-amber
+# constants - all dark enough to read as ink on paper, never washed-out pastels.
+syntax_keyword     = { fg = "#2f4a72" }
+syntax_function    = { fg = "#3a5f8a" }
+syntax_type        = { fg = "#8c3a2c" }
+syntax_string      = { fg = "#4a6d3a" }
+syntax_comment     = { fg = "#7a8278", italic = true }
+syntax_constant    = { fg = "#8a5a1a" }
+syntax_variable    = { fg = "#1f2422" }
+syntax_punctuation = { fg = "#5c645e" }

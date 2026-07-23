@@ -13,14 +13,18 @@ pub mod editor;
 mod history;
 pub mod lsp;
 pub mod selection;
+pub mod syntax;
 pub mod view;
 
 pub use action::Action;
 pub use buffer::{Buffer, ByteRange, EditError, Position, RopeBuffer, Text, Utf16Position};
-pub use decoration::{Decoration, DecorationSet, DecorationSource, GutterKind, Severity};
+pub use decoration::{
+    Decoration, DecorationSet, DecorationSource, GutterKind, HighlightKind, Severity,
+};
 pub use editor::{Core, CoreHandle, new, with_lsp};
 pub use lsp::{Diagnostic, DocumentSync, LspEvent, LspHandle};
 pub use selection::{Motion, Selection, SelectionSet};
+pub use syntax::{HighlightSpan, SyntaxEvent, SyntaxHandle, SyntaxSync, highlighter};
 pub use view::{BufferId, Delta, Notification, ViewSnapshot};
 
 #[cfg(test)]

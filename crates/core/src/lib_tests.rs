@@ -1025,3 +1025,234 @@ fn a_second_file_opened_into_an_attached_server_is_announced() {
         }
     });
 }
+
+// --- M4: the syntax highlighter as a second decoration producer -------------
+//
+// These drive the editor through the *real* attach seam (`CoreHandle::syntax`),
+// with a fake highlighter standing in for the tree-sitter loop - the exact twin
+// of the `FakeServer` LSP tests above. The engine's own parsing is covered in
+// `syntax::engine`; here we prove the editor wires a highlighter's output onto the
+// snapshot's decoration channel and survives it attaching, closing, and repeating.
+
+/// The highlighter side of the seam: the text the editor sent us, and a way to
+/// push highlight batches back.
+struct FakeHighlighter {
+    /// editor -> us: the buffer to reparse.
+    sync: async_channel::Receiver<SyntaxSync>,
+    /// us -> editor: highlight batches.
+    events: async_channel::Sender<SyntaxEvent>,
+}
+
+/// Attach a fake highlighter over `CoreHandle::syntax`, as a frontend would after
+/// loading a grammar.
+async fn attach_syntax(h: &CoreHandle) -> FakeHighlighter {
+    let (sync_tx, sync_rx) = async_channel::bounded(16);
+    let (event_tx, event_rx) = async_channel::bounded(16);
+    h.syntax
+        .send(SyntaxHandle {
+            sync: sync_tx,
+            events: event_rx,
+        })
+        .await
+        .unwrap();
+    FakeHighlighter {
+        sync: sync_rx,
+        events: event_tx,
+    }
+}
+
+#[test]
+fn attaching_a_highlighter_announces_the_current_buffer() {
+    // Attach re-announces the buffer (a first parse), exactly as an LSP attach
+    // re-sends a didOpen: text typed before the highlighter arrived is still
+    // highlighted.
+    drive(|h| async move {
+        step(&h, Action::Insert("fn f() {}".into())).await;
+        let fake = attach_syntax(&h).await;
+        // The editor flushes the current buffer to the highlighter on its next turn.
+        // Drain to the newest sync (an empty-buffer announce may precede it if the
+        // attach raced ahead of the edit's dirty flag).
+        let mut latest = fake.sync.recv().await.unwrap();
+        while let Ok(newer) = fake.sync.try_recv() {
+            latest = newer;
+        }
+        assert_eq!(latest.text, "fn f() {}");
+    });
+}
+
+#[test]
+fn a_highlight_batch_lands_on_the_snapshot_decorations() {
+    drive(|h| async move {
+        let fake = attach_syntax(&h).await;
+        let snap = step(&h, Action::Insert("fn f() {}".into())).await;
+        // Color `fn` as a keyword. A real highlighter computes this; here we push
+        // it directly to test the editor's plumbing, not the parser.
+        fake.events
+            .send(SyntaxEvent::Highlights {
+                version: snap.version,
+                spans: vec![HighlightSpan {
+                    range: 0..2,
+                    kind: HighlightKind::Keyword,
+                }],
+            })
+            .await
+            .unwrap();
+        let snap = h.snapshots.recv().await.unwrap();
+        assert_eq!(
+            snap.decorations.highlights_in(0..9).collect::<Vec<_>>(),
+            vec![(0..2, HighlightKind::Keyword)]
+        );
+    });
+}
+
+#[test]
+fn re_publishing_an_identical_batch_changes_nothing() {
+    // A reparse that yields the same spans (an edit that left tokens intact) must
+    // not cost a frame: `apply_highlights` returns false and the loop skips the
+    // publish. We exercise that branch, then prove the editor is still live.
+    drive(|h| async move {
+        let fake = attach_syntax(&h).await;
+        let snap = step(&h, Action::Insert("fn f() {}".into())).await;
+        let batch = || SyntaxEvent::Highlights {
+            version: snap.version,
+            spans: vec![HighlightSpan {
+                range: 0..2,
+                kind: HighlightKind::Keyword,
+            }],
+        };
+        fake.events.send(batch()).await.unwrap();
+        // First batch changes the set and republishes.
+        let first = h.snapshots.recv().await.unwrap();
+        assert_eq!(first.decorations.highlights_in(0..9).count(), 1);
+        // Identical batch: no change, no publish. Follow with a snapshot request to
+        // prove the editor processed the duplicate and kept running.
+        fake.events.send(batch()).await.unwrap();
+        let after = step(&h, Action::RequestSnapshot).await;
+        assert_eq!(
+            after.decorations.highlights_in(0..9).collect::<Vec<_>>(),
+            vec![(0..2, HighlightKind::Keyword)]
+        );
+    });
+}
+
+#[test]
+fn a_highlight_batch_for_a_stale_version_is_dropped() {
+    // The spans are byte offsets in the version the highlighter parsed; a batch that
+    // arrives after the buffer has advanced would place them at stale offsets, so it
+    // is dropped rather than misplacing highlights (SPEC §5: overlays trail, never
+    // misplace). Without the version guard this batch would install `Keyword` over
+    // `fn` at v0's coordinates into the v1 buffer.
+    drive(|h| async move {
+        let fake = attach_syntax(&h).await;
+        let snap = step(&h, Action::Insert("fn f() {}".into())).await;
+        assert_eq!(snap.version, 1, "the first edit is version 1");
+        // A batch tagged with the old version 0.
+        fake.events
+            .send(SyntaxEvent::Highlights {
+                version: 0,
+                spans: vec![HighlightSpan {
+                    range: 0..2,
+                    kind: HighlightKind::Keyword,
+                }],
+            })
+            .await
+            .unwrap();
+        // Force a snapshot: the stale batch left no highlights on it (whenever the
+        // actor processed the drop, it never touched the decoration set).
+        let after = step(&h, Action::RequestSnapshot).await;
+        assert!(
+            after.decorations.is_empty(),
+            "a stale-version batch must not install any highlights"
+        );
+    });
+}
+
+#[test]
+fn attaching_a_second_highlighter_replaces_the_first() {
+    // Reopening as a different language attaches a new grammar; the core swaps it in
+    // over the connected one (the attach arrives while the first is live), the same
+    // re-root an LSP attach does.
+    drive(|h| async move {
+        let first = attach_syntax(&h).await;
+        step(&h, Action::Insert("fn f() {}".into())).await;
+        // Drain the first highlighter's announce so it is definitely connected.
+        let _ = first.sync.recv().await.unwrap();
+
+        // A second attach replaces the first in the core (SyntaxAttach while a
+        // highlighter is already connected). The new one is announced the buffer.
+        let second = attach_syntax(&h).await;
+        let mut latest = second.sync.recv().await.unwrap();
+        while let Ok(newer) = second.sync.try_recv() {
+            latest = newer;
+        }
+        assert_eq!(latest.text, "fn f() {}");
+
+        // Highlights from the second highlighter drive the snapshot.
+        let snap = step(&h, Action::RequestSnapshot).await;
+        second
+            .events
+            .send(SyntaxEvent::Highlights {
+                version: snap.version,
+                spans: vec![HighlightSpan {
+                    range: 0..2,
+                    kind: HighlightKind::Keyword,
+                }],
+            })
+            .await
+            .unwrap();
+        let snap = h.snapshots.recv().await.unwrap();
+        assert_eq!(snap.decorations.highlights_in(0..9).count(), 1);
+    });
+}
+
+#[test]
+fn a_highlight_batch_that_cannot_be_published_stops_the_actor() {
+    // The frontend gone while a highlight batch is applied (snapshot receiver
+    // dropped) shuts the actor down cleanly, the syntax twin of
+    // `snapshot_send_failure_stops_the_actor`.
+    drive(|h| async move {
+        let fake = attach_syntax(&h).await;
+        let CoreHandle {
+            snapshots,
+            notifications,
+            actions: _actions,
+            deltas: _deltas,
+            lsp: _lsp,
+            syntax: _syntax,
+        } = h;
+        drop(snapshots);
+        // A non-empty batch for the current version (0, a fresh buffer) changes the
+        // empty set, so the actor tries to publish, finds the channel closed, and
+        // stops.
+        fake.events
+            .send(SyntaxEvent::Highlights {
+                version: 0,
+                spans: vec![HighlightSpan {
+                    range: 0..2,
+                    kind: HighlightKind::Keyword,
+                }],
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            notifications.recv().await.unwrap(),
+            Notification::ShuttingDown
+        );
+    });
+}
+
+#[test]
+fn the_highlighter_closing_does_not_take_the_editor_with_it() {
+    // The highlighter dying (its event channel closed) must degrade to "no fresh
+    // highlights", never to "no editor" (SPEC §8) - the same guarantee as a dead
+    // language server.
+    drive(|h| async move {
+        let fake = attach_syntax(&h).await;
+        step(&h, Action::Insert("fn f() {}".into())).await;
+        // Drop the whole fake: closing the event channel is the highlighter's task
+        // ending. The editor treats it as SyntaxClosed and carries on.
+        drop(fake);
+        let snap = step(&h, Action::Insert("!".into())).await;
+        assert_eq!(snap.text.to_string(), "fn f() {}!");
+    });
+}
