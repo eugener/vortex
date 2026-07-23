@@ -34,6 +34,7 @@ use crate::decoration::DecorationSet;
 use crate::history::{Change, History, Reverted};
 use crate::lsp::{Diagnostic, DocumentSync, LspEvent, LspHandle, convert};
 use crate::selection::{Selection, SelectionSet};
+use crate::syntax::{HighlightSpan, SyntaxEvent, SyntaxHandle, SyntaxSync};
 use crate::view::{BufferId, Delta, Notification, ViewSnapshot};
 
 /// Channels the frontend uses to talk to a running core (SPEC §6).
@@ -53,6 +54,13 @@ pub struct CoreHandle {
     /// A later handle replaces an earlier one, so opening a file in a different
     /// workspace re-roots the server. Bounded and low-volume (one per attach).
     pub lsp: Sender<LspHandle>,
+    /// frontend -> core, a syntax highlighter to attach at runtime (M4). The exact
+    /// twin of [`Self::lsp`]: the frontend loads a grammar, spawns the highlighter
+    /// loop on its own executor, and sends the [`SyntaxHandle`] here; the core
+    /// swaps it in and re-announces the current buffer for a first parse. A later
+    /// handle replaces an earlier one, so reopening as a different file type
+    /// re-highlights. Bounded and low-volume (one per attach).
+    pub syntax: Sender<SyntaxHandle>,
 }
 
 /// A latest-wins single-slot snapshot channel (SPEC §6 "watch-style cell").
@@ -142,6 +150,17 @@ struct Editor {
     /// Whether the server has been told this file exists (`didOpen`). A change
     /// notification for an unopened document is a protocol error.
     lsp_opened: bool,
+    /// editor -> syntax highlighter, or `None` when none is attached (M4). The
+    /// twin of [`Self::lsp_sync`] and, like it, an `Option` so a buffer with no
+    /// highlighter pays nothing. The highlighter has no `didOpen`/`didChange`
+    /// distinction - every message is the full text - so it needs no `opened`
+    /// flag, only the dirty flag below.
+    syntax_sync: Option<Sender<SyntaxSync>>,
+    /// The buffer changed but the highlighter has not been told yet. Same role and
+    /// same full-document-sync payoff as [`Self::lsp_dirty`]: re-sending the
+    /// current buffer subsumes every missed state, so a dropped sync can never
+    /// mis-color, and the actor never awaits the sync channel.
+    syntax_dirty: bool,
 }
 
 impl Editor {
@@ -158,6 +177,8 @@ impl Editor {
             lsp_sync: None,
             lsp_dirty: false,
             lsp_opened: false,
+            syntax_sync: None,
+            syntax_dirty: false,
         }
     }
 
@@ -314,6 +335,59 @@ impl Editor {
         }
     }
 
+    /// Send the current buffer to the highlighter if it has changed since the last
+    /// send (M4). The twin of [`Self::sync_lsp`], minus the `didOpen`/`didChange`
+    /// split the highlighter does not have: every message is the full text.
+    ///
+    /// Never awaits: a full sync channel leaves `syntax_dirty` set and the next
+    /// call re-sends the newest text (the highlighter also coalesces to the newest
+    /// on its side), so a dropped attempt is safe and the actor cannot deadlock
+    /// against the highlighter awaiting the event channel.
+    fn sync_syntax(&mut self) {
+        let Some(sync) = &self.syntax_sync else {
+            return;
+        };
+        if !self.syntax_dirty {
+            return;
+        }
+        let message = SyntaxSync {
+            version: self.version,
+            text: self.buffer.text().to_string(),
+        };
+        if sync.try_send(message).is_ok() {
+            self.syntax_dirty = false;
+        }
+    }
+
+    /// Replace the syntax highlights with `spans` (M4). Mirrors
+    /// [`Self::apply_diagnostics`]: a full replacement of the [`Syntax`] bucket,
+    /// leaving other producers' buckets (the LSP's diagnostics) untouched.
+    ///
+    /// The spans are byte offsets the highlighter resolved against the version it
+    /// parsed; they land unchanged and ongoing edits transform them via the
+    /// decoration channel until the next reparse (SPEC §5: overlays trail text by
+    /// a frame). Returns whether anything changed, so the caller republishes only
+    /// when the screen would differ - a reparse that yields the identical set
+    /// (common when an edit did not alter tokens) costs no frame.
+    ///
+    /// [`Syntax`]: crate::decoration::DecorationSource::Syntax
+    fn apply_highlights(&mut self, spans: Vec<HighlightSpan>) -> bool {
+        let decorations = spans
+            .into_iter()
+            .map(|s| crate::decoration::Decoration::Highlight {
+                range: s.range,
+                kind: s.kind,
+            })
+            .collect();
+        let mut updated = (*self.decorations).clone();
+        updated.replace(crate::decoration::DecorationSource::Syntax, decorations);
+        if updated == *self.decorations {
+            return false;
+        }
+        self.decorations = Arc::new(updated);
+        true
+    }
+
     /// Replace the LSP's decorations with `diagnostics`, resolved against the
     /// current buffer (SPEC §5). Ignores batches for a file this buffer is not
     /// showing - a server analyzes a whole workspace and publishes for any file
@@ -433,6 +507,13 @@ enum Incoming {
     Attach(LspHandle),
     /// The LSP *event* channel closed - the server or its task is gone.
     LspClosed,
+    /// A highlight batch from the syntax producer (M4).
+    Syntax(SyntaxEvent),
+    /// A syntax highlighter to attach (the frontend loaded a grammar and spawned
+    /// its loop). Replaces any current highlighter and re-announces the buffer.
+    SyntaxAttach(SyntaxHandle),
+    /// The syntax *event* channel closed - the highlighter or its task is gone.
+    SyntaxClosed,
     /// The frontend hung up; the loop should stop.
     Stopped,
 }
@@ -446,48 +527,70 @@ enum Incoming {
 /// The attach channel is always selected - that is how the first server arrives.
 /// Every `recv` future is cancel-safe, so the losers of a race are dropped and
 /// re-created next iteration without losing a message.
+#[allow(clippy::too_many_arguments)]
 async fn next_incoming(
     actions: &Receiver<Action>,
     lsp: Option<&Receiver<LspEvent>>,
-    attach: &Receiver<LspHandle>,
+    lsp_attach: &Receiver<LspHandle>,
+    syntax: Option<&Receiver<SyntaxEvent>>,
+    syntax_attach: &Receiver<SyntaxHandle>,
 ) -> Incoming {
-    // Race the frontend action against the LSP side (an attach, plus events once a
-    // server is connected). Two nested two-way `select`s rather than the `select!`
-    // macro: the macro's fused-future handling misbehaves for this loop, while
-    // `future::select` is the same cancel-safe primitive already used elsewhere -
-    // the loser is dropped and its `recv` re-created next call, losing no message.
+    // Race the frontend action against the two producer sides (LSP and syntax),
+    // each of which is itself an attach plus events-once-connected. Nested
+    // two-way `future::select`s rather than the `select!` macro: the macro's
+    // fused-future handling misbehaves for this loop, while `future::select` is
+    // the same cancel-safe primitive used elsewhere - the loser is dropped and its
+    // `recv` re-created next call, losing no message.
     //
     // **Liveness is the ACTIONS channel alone.** A closed attach channel means the
-    // frontend will simply never attach a server (a valid mode - and the one every
-    // no-LSP core is in), so it must never stop the loop: `recv_attach` pends
-    // forever once closed instead of resolving, leaving `actions` closing as the
-    // one shutdown signal. Without this, a frontend that holds `actions` but drops
-    // `lsp` (e.g. Rust 2021 disjoint capture never moving the unused sender in) kills
-    // the editor the moment it next idles.
+    // frontend will simply never attach that producer (a valid mode - the one
+    // every no-LSP, no-highlighter core is in), so it must never stop the loop:
+    // `recv_attach` pends forever once closed instead of resolving, leaving
+    // `actions` closing as the one shutdown signal. Without this, a frontend that
+    // holds `actions` but drops an attach sender (Rust 2021 disjoint capture never
+    // moving an unused sender in) would kill the editor the moment it next idles.
     let action = std::pin::pin!(actions.recv());
     let lsp_side = std::pin::pin!(async {
         match lsp {
             Some(events) => {
                 let event = std::pin::pin!(events.recv());
-                let attach = std::pin::pin!(recv_attach(attach));
+                let attach = std::pin::pin!(recv_attach(lsp_attach));
                 match futures::future::select(event, attach).await {
                     Either::Left((e, _)) => e.map_or(Incoming::LspClosed, Incoming::Lsp),
                     Either::Right((h, _)) => Incoming::Attach(h),
                 }
             }
-            None => Incoming::Attach(recv_attach(attach).await),
+            None => Incoming::Attach(recv_attach(lsp_attach).await),
         }
     });
-    match futures::future::select(action, lsp_side).await {
+    let syntax_side = std::pin::pin!(async {
+        match syntax {
+            Some(events) => {
+                let event = std::pin::pin!(events.recv());
+                let attach = std::pin::pin!(recv_attach(syntax_attach));
+                match futures::future::select(event, attach).await {
+                    Either::Left((e, _)) => e.map_or(Incoming::SyntaxClosed, Incoming::Syntax),
+                    Either::Right((h, _)) => Incoming::SyntaxAttach(h),
+                }
+            }
+            None => Incoming::SyntaxAttach(recv_attach(syntax_attach).await),
+        }
+    });
+    // `Select<Pin<&mut _>, Pin<&mut _>>` is itself `Unpin`, so the inner
+    // producer-vs-producer select passes by value into the outer action-vs-
+    // producers select without another `pin!`.
+    match futures::future::select(action, futures::future::select(lsp_side, syntax_side)).await {
         Either::Left((a, _)) => a.map_or(Incoming::Stopped, Incoming::Action),
-        Either::Right((incoming, _)) => incoming,
+        Either::Right((Either::Left((incoming, _)), _)) => incoming,
+        Either::Right((Either::Right((incoming, _)), _)) => incoming,
     }
 }
 
-/// Await the next server to attach, or pend forever if the attach channel has
-/// closed (see [`next_incoming`]: a closed attach channel is not a shutdown, so it
-/// must never resolve the select and stop the loop).
-async fn recv_attach(attach: &Receiver<LspHandle>) -> LspHandle {
+/// Await the next producer handle to attach, or pend forever if the attach channel
+/// has closed (see [`next_incoming`]: a closed attach channel is not a shutdown, so
+/// it must never resolve the select and stop the loop). Generic over the handle
+/// type so the LSP and syntax attach paths share one definition.
+async fn recv_attach<H>(attach: &Receiver<H>) -> H {
     match attach.recv().await {
         Ok(handle) => handle,
         Err(_) => std::future::pending().await,
@@ -574,6 +677,9 @@ const NOTIFICATION_CAP: usize = 64;
 /// LSP-attach channel bound: a language server is attached rarely (once per file
 /// type, on demand), so a small bound is plenty.
 const LSP_ATTACH_CAP: usize = 4;
+/// Syntax-attach channel bound: a highlighter is attached rarely (once per file
+/// type, on demand), the same profile as the LSP attach.
+const SYNTAX_ATTACH_CAP: usize = 4;
 
 /// Create a core. Returns a [`CoreHandle`] and the actor loop to spawn.
 ///
@@ -609,6 +715,7 @@ fn build(action_capacity: usize, lsp: Option<LspHandle>) -> Core {
     let (snapshot_tx, snapshot_rx) = async_channel::bounded::<ViewSnapshot>(SNAPSHOT_CAP);
     let (note_tx, note_rx) = async_channel::bounded::<Notification>(NOTIFICATION_CAP);
     let (lsp_tx, lsp_rx) = async_channel::bounded::<LspHandle>(LSP_ATTACH_CAP);
+    let (syntax_tx, syntax_rx) = async_channel::bounded::<SyntaxHandle>(SYNTAX_ATTACH_CAP);
 
     // Seed an initial server, if given, down the same channel a runtime attach
     // uses. `try_send` cannot fail: the channel is fresh and bounded >= 1.
@@ -623,6 +730,7 @@ fn build(action_capacity: usize, lsp: Option<LspHandle>) -> Core {
             snapshots: SnapshotCell { rx: snapshot_rx },
             notifications: note_rx,
             lsp: lsp_tx,
+            syntax: syntax_tx,
         },
         run: Box::pin(run(
             action_rx,
@@ -630,6 +738,7 @@ fn build(action_capacity: usize, lsp: Option<LspHandle>) -> Core {
             SnapshotSink { tx: snapshot_tx },
             note_tx,
             lsp_rx,
+            syntax_rx,
         )),
     }
 }
@@ -654,21 +763,32 @@ async fn run(
     snapshots: SnapshotSink,
     notifications: Sender<Notification>,
     lsp_attach: Receiver<LspHandle>,
+    syntax_attach: Receiver<SyntaxHandle>,
 ) {
     let mut editor = Editor::new();
     // The event side of the attached server, or `None` until one attaches. The
     // send side lives on `editor.lsp_sync`, so both are swapped together on attach.
     let mut lsp_events: Option<Receiver<LspEvent>> = None;
+    // The syntax producer's event side, swapped in the same way (M4).
+    let mut syntax_events: Option<Receiver<SyntaxEvent>> = None;
 
     loop {
         // Flush any outstanding document sync before parking on input, so the
-        // server sees the newest text while the user is idle rather than only
-        // once they press another key.
+        // server and highlighter see the newest text while the user is idle rather
+        // than only once they press another key.
         editor.sync_lsp();
+        editor.sync_syntax();
 
-        // Bound the borrow of `lsp_events` to this statement so the arms below
-        // can clear it.
-        let incoming = next_incoming(&actions, lsp_events.as_ref(), &lsp_attach).await;
+        // Bound the borrow of `*_events` to this statement so the arms below can
+        // clear them.
+        let incoming = next_incoming(
+            &actions,
+            lsp_events.as_ref(),
+            &lsp_attach,
+            syntax_events.as_ref(),
+            &syntax_attach,
+        )
+        .await;
         let action = match incoming {
             Incoming::Stopped => break,
             // A (new) server attached: swap in both channel ends and re-announce
@@ -697,6 +817,45 @@ async fn run(
                 // re-sending an identical batch (common while indexing) must not
                 // cost a frame.
                 if editor.apply_diagnostics(&path, &diagnostics)
+                    && !snapshots.publish(editor.snapshot(None))
+                {
+                    break;
+                }
+                continue;
+            }
+            // A highlighter attached: swap in both channel ends and mark the buffer
+            // dirty so the next loop turn sends it for a first parse (M4). Replacing
+            // an earlier highlighter drops its channels, stopping its loop (SPEC §8).
+            Incoming::SyntaxAttach(handle) => {
+                editor.syntax_sync = Some(handle.sync);
+                syntax_events = Some(handle.events);
+                editor.syntax_dirty = true;
+                continue;
+            }
+            // The highlighter died or its task ended. As with LSP, that must never
+            // take the editor with it (SPEC §8): drop both ends and fall back to the
+            // no-highlighter path, which also stops `select` spinning on a
+            // permanently-ready closed channel.
+            Incoming::SyntaxClosed => {
+                syntax_events = None;
+                editor.syntax_sync = None;
+                continue;
+            }
+            Incoming::Syntax(SyntaxEvent::Highlights { version, spans }) => {
+                // Apply only a batch computed against the *current* buffer. The spans
+                // are byte offsets in the version the highlighter parsed; if the
+                // buffer has advanced since (an edit landed while the parse was in
+                // flight), installing them verbatim would place them at stale
+                // offsets - misplaced, not merely a frame behind. A stale batch is
+                // dropped: the resident highlights keep their positions as edits
+                // transform them (`transform_decorations`), and `sync_syntax` keeps
+                // re-sending the newest text, so a fresh matching batch lands the
+                // moment typing pauses. This is the "overlays trail text, never
+                // misplace it" contract (SPEC §5); the `version` on the event exists
+                // for exactly this guard. Republish only when the set actually
+                // changed, so an identical reparse costs no frame.
+                if version == editor.version
+                    && editor.apply_highlights(spans)
                     && !snapshots.publish(editor.snapshot(None))
                 {
                     break;
@@ -854,8 +1013,10 @@ async fn apply_edit(
     editor
         .history
         .record(changes, before, editor.selections.clone());
-    // The server's copy is now stale; `sync_lsp` re-sends before the next park.
+    // The server's and highlighter's copies are now stale; `sync_lsp` /
+    // `sync_syntax` re-send before the next park.
     editor.lsp_dirty = true;
+    editor.syntax_dirty = true;
     snapshots.publish(editor.snapshot(dirty))
 }
 
@@ -891,6 +1052,7 @@ async fn reapply(
     }
     editor.transform_decorations(&changes);
     editor.lsp_dirty = true;
+    editor.syntax_dirty = true;
     editor.selections = reverted.selections;
     snapshots.publish(editor.snapshot(dirty))
 }
@@ -1027,9 +1189,11 @@ async fn open_file(
     // squiggles at meaningless offsets until a producer refreshes.
     editor.decorations = Arc::new(DecorationSet::new());
     // A different file is a different document to the server: announce it fresh
-    // rather than sending a change against the old one's identity.
+    // rather than sending a change against the old one's identity. The highlighter
+    // has no per-document identity, so a plain dirty flag re-parses the new text.
     editor.lsp_dirty = true;
     editor.lsp_opened = false;
+    editor.syntax_dirty = true;
 
     let _ = notifications.try_send(Notification::FileOpened {
         buffer_id: editor.id,

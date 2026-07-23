@@ -53,6 +53,39 @@ pub enum GutterKind {
     Diagnostic(Severity),
 }
 
+/// The semantic category of a syntax-highlighted span (M4) - a tag the theme
+/// maps to a color, never a color itself (SPEC §5), exactly like [`Severity`].
+///
+/// The variants are the granularity the syntax producer resolves a grammar's
+/// capture names to (`syntax::highlight`): a tree-sitter query captures
+/// `@function.method`, `@function.macro`, `@type.builtin` and so on, and the
+/// producer collapses each to the nearest variant here. Kept a *fixed* core enum
+/// rather than an open-ended string so styling stays a closed, themeable set and
+/// tree-sitter's own types never cross the seam - the same discipline that keeps
+/// `lsp_types` out of the core's public API.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[non_exhaustive]
+pub enum HighlightKind {
+    Attribute,
+    Comment,
+    Constant,
+    ConstantBuiltin,
+    Constructor,
+    Escape,
+    Function,
+    Macro,
+    Keyword,
+    Label,
+    Operator,
+    Property,
+    Punctuation,
+    String,
+    Type,
+    TypeBuiltin,
+    Variable,
+    Parameter,
+}
+
 /// One painted overlay. `Highlight` (tree-sitter, M4) and `VirtualText` (inlay
 /// hints, M8) are additive variants on this same enum - adding them later costs
 /// a variant, not a new channel, which is the whole point of SPEC §5's decision
@@ -71,6 +104,14 @@ pub enum Decoration {
     /// index so it rides edits with the text: inserting a line above moves the
     /// mark down without the producer republishing.
     GutterMark { offset: usize, kind: GutterKind },
+    /// Color a byte span with a syntax category (tree-sitter, M4). Distinct from
+    /// [`Decoration::Underline`] so one cell can carry both a syntax foreground
+    /// *and* an independent diagnostic undercurl at once (SPEC §5): the frontend
+    /// paints highlights first, then diagnostic underlines and carets on top.
+    Highlight {
+        range: ByteRange,
+        kind: HighlightKind,
+    },
 }
 
 /// Which subsystem produced a decoration. Each owns its own bucket so producers
@@ -83,6 +124,10 @@ pub enum Decoration {
 pub enum DecorationSource {
     /// The LSP client (M2): diagnostics.
     Lsp,
+    /// The syntax highlighter (M4): tree-sitter highlight spans. Its own bucket,
+    /// so a diagnostics republish cannot wipe highlights and a reparse cannot wipe
+    /// squiggles - the independence that lets both producers run async (SPEC §5).
+    Syntax,
 }
 
 /// Every decoration currently attached to a buffer, bucketed by producer.
@@ -149,6 +194,33 @@ impl DecorationSet {
             })
     }
 
+    /// Highlight spans overlapping `range`, clipped to it, in buffer coordinates
+    /// (M4). Mirrors [`Self::underlines_in`]: the frontend calls it per painted
+    /// line and paints each as a foreground color, so it borrows rather than
+    /// allocating.
+    ///
+    /// Cost is O(decorations) per call - fine for a diagnostic's handful, but a
+    /// syntax-highlighted file puts *thousands* of spans here. That is the case
+    /// the doc-comment on this type flags for an interval index; it stays hidden
+    /// behind this signature, so adding it later touches only this method and
+    /// [`Self::transform_through`], not the frontend.
+    pub fn highlights_in(
+        &self,
+        range: ByteRange,
+    ) -> impl Iterator<Item = (ByteRange, HighlightKind)> {
+        self.by_source
+            .values()
+            .flatten()
+            .filter_map(move |d| match d {
+                Decoration::Highlight { range: span, kind } => {
+                    let start = span.start.max(range.start);
+                    let end = span.end.min(range.end);
+                    (start < end).then_some((start..end, *kind))
+                }
+                _ => None,
+            })
+    }
+
     /// The most severe gutter mark on `line`, or `None`. Several diagnostics
     /// commonly start on one line and the gutter has one cell, so the worst wins.
     pub fn gutter_mark(&self, text: &Text, line: usize) -> Option<GutterKind> {
@@ -184,7 +256,12 @@ impl DecorationSet {
     pub(crate) fn transform_through(&mut self, edits: &[Edit]) {
         for decoration in self.by_source.values_mut().flatten() {
             match decoration {
-                Decoration::Underline { range, .. } => {
+                // A highlight rides edits with the same shift-don't-grow bias as
+                // an underline: typing at a token's edge moves its color along
+                // rather than swallowing the new (as-yet-unparsed) text, which the
+                // next reparse then colors correctly (SPEC §5, overlays trail by a
+                // frame). Sharing the arm keeps the two span kinds identical here.
+                Decoration::Underline { range, .. } | Decoration::Highlight { range, .. } => {
                     range.start = Anchor::after(range.start).transform_through(edits).offset();
                     range.end = Anchor::before(range.end).transform_through(edits).offset();
                     // A deletion spanning the whole range collapses the two ends

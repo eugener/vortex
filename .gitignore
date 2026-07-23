@@ -19,3 +19,7 @@
 
 # Note: Cargo.lock IS committed - this workspace builds a binary (`vortex`),
 # so a pinned lockfile gives reproducible builds. Do not ignore it.
+
+# Built grammar libraries (produced by `cargo build`; loaded from the target dir in
+# dev, or copied here for an install). Queries under runtime/queries/ ARE source and kept.
+/runtime/grammars/

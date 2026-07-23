@@ -222,3 +222,102 @@ fn transform_composes_a_multi_cursor_batch_of_edits() {
         vec![(23..27, Severity::Error)]
     );
 }
+
+fn highlight(range: ByteRange, kind: HighlightKind) -> Decoration {
+    Decoration::Highlight { range, kind }
+}
+
+fn syntax_set(decorations: Vec<Decoration>) -> DecorationSet {
+    let mut s = DecorationSet::new();
+    s.replace(DecorationSource::Syntax, decorations);
+    s
+}
+
+#[test]
+fn highlights_in_clips_spans_to_the_queried_range() {
+    // Same per-line resolution as underlines: the frontend paints one line and
+    // needs only the piece of the span on it.
+    let s = syntax_set(vec![highlight(2..12, HighlightKind::Function)]);
+    assert_eq!(
+        s.highlights_in(5..9).collect::<Vec<_>>(),
+        vec![(5..9, HighlightKind::Function)]
+    );
+}
+
+#[test]
+fn highlights_in_excludes_spans_that_only_touch_the_range_edge() {
+    let s = syntax_set(vec![highlight(0..5, HighlightKind::Keyword)]);
+    assert_eq!(s.highlights_in(5..9).count(), 0);
+    assert_eq!(s.highlights_in(4..9).count(), 1);
+}
+
+#[test]
+fn highlights_in_ignores_underlines_and_gutter_marks() {
+    // The resolver is kind-specific: a diagnostic underline sharing the buffer
+    // must not surface as a highlight (and vice versa via `underlines_in`).
+    let mut s = syntax_set(vec![highlight(0..4, HighlightKind::Type)]);
+    s.replace(
+        DecorationSource::Lsp,
+        vec![underline(0..4, Severity::Error)],
+    );
+    assert_eq!(s.highlights_in(0..9).count(), 1);
+    assert_eq!(s.underlines_in(0..9).count(), 1);
+}
+
+#[test]
+fn a_highlight_and_a_diagnostic_coexist_on_one_cell() {
+    // The whole reason `Highlight` is a distinct variant (SPEC §5): a cell can
+    // carry a syntax color and an independent squiggle at once, from different
+    // producer buckets, and neither resolver sees the other's spans.
+    let mut s = syntax_set(vec![highlight(0..4, HighlightKind::Variable)]);
+    s.replace(
+        DecorationSource::Lsp,
+        vec![underline(0..4, Severity::Warning)],
+    );
+    assert_eq!(
+        s.highlights_in(0..4).collect::<Vec<_>>(),
+        vec![(0..4, HighlightKind::Variable)]
+    );
+    assert_eq!(
+        s.underlines_in(0..4).collect::<Vec<_>>(),
+        vec![(0..4, Severity::Warning)]
+    );
+}
+
+#[test]
+fn replacing_syntax_leaves_the_lsp_bucket_untouched() {
+    // A reparse republishes only the Syntax bucket; diagnostics survive it. This
+    // is the producer independence M4 relies on to land without touching M2.
+    let mut s = syntax_set(vec![highlight(0..4, HighlightKind::Type)]);
+    s.replace(
+        DecorationSource::Lsp,
+        vec![underline(6..9, Severity::Error)],
+    );
+    s.replace(
+        DecorationSource::Syntax,
+        vec![highlight(0..2, HighlightKind::Keyword)],
+    );
+    assert_eq!(
+        s.highlights_in(0..9).collect::<Vec<_>>(),
+        vec![(0..2, HighlightKind::Keyword)]
+    );
+    assert_eq!(s.underlines_in(0..9).count(), 1);
+}
+
+#[test]
+fn a_highlight_rides_edits_with_the_shift_dont_grow_bias() {
+    // Highlights transform through the same channel as underlines and with the
+    // same bias: typing at a token's start shifts its color along (the new text
+    // stays uncolored until the next reparse), never swallowed into the span.
+    let mut s = syntax_set(vec![highlight(4..7, HighlightKind::Function)]);
+    s.transform_through(&[edit(4, 4, 2)]); // type 2 bytes at the span start
+    assert_eq!(
+        s.highlights_in(0..99).collect::<Vec<_>>(),
+        vec![(6..9, HighlightKind::Function)]
+    );
+    s.transform_through(&[edit(9, 9, 2)]); // type 2 bytes at the span end
+    assert_eq!(
+        s.highlights_in(0..99).collect::<Vec<_>>(),
+        vec![(6..9, HighlightKind::Function)]
+    );
+}

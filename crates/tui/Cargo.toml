@@ -11,6 +11,11 @@ name = "vortex"
 path = "src/main.rs"
 
 [dependencies]
+# Load grammar libraries at runtime (M4): the frontend `dlopen`s a `grammar-*`
+# cdylib and resolves its `vortex_grammar` entry point. This is the "genuinely
+# dynamic" half of syntax highlighting - grammars are config-driven runtime data,
+# never compiled into the editor (SPEC §3, §14).
+libloading = "0.9.0"
 nucleo-matcher = "0.3.1"
 # crossterm is used via ratatui's re-export (ratatui::crossterm) so the KeyEvent
 # types the render loop and event reader share are guaranteed identical - a
@@ -21,6 +26,11 @@ smol = "2.0.2"
 # Theme files (SPEC §3 "Config" row, §10.5): the format the config seam was always
 # going to use, arriving first for themes.
 toml = "1.1.3"
+# Wrap the raw grammar pointer from a loaded dylib back into a `Language` to hand
+# to the core highlighter. Only these two tree-sitter crates reach the frontend -
+# the grammar's own C is inside the dylib, never linked here.
+tree-sitter = "0.26.11"
+tree-sitter-language = "0.1.7"
 unicode-segmentation = "1.13.3"
 unicode-width = "0.2.2"
 vortex-core = { path = "../core" }

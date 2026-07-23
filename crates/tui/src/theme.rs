@@ -233,6 +233,14 @@ struct ThemeFile {
     diagnostic_warning: Option<StyleSpec>,
     diagnostic_information: Option<StyleSpec>,
     diagnostic_hint: Option<StyleSpec>,
+    syntax_keyword: Option<StyleSpec>,
+    syntax_function: Option<StyleSpec>,
+    syntax_type: Option<StyleSpec>,
+    syntax_string: Option<StyleSpec>,
+    syntax_comment: Option<StyleSpec>,
+    syntax_constant: Option<StyleSpec>,
+    syntax_variable: Option<StyleSpec>,
+    syntax_punctuation: Option<StyleSpec>,
 }
 
 impl ThemeFile {
@@ -280,6 +288,30 @@ impl ThemeFile {
                 "diagnostic_hint",
                 self.diagnostic_hint,
                 base.diagnostic_hint,
+            )?,
+            syntax_keyword: slot("syntax_keyword", self.syntax_keyword, base.syntax_keyword)?,
+            syntax_function: slot(
+                "syntax_function",
+                self.syntax_function,
+                base.syntax_function,
+            )?,
+            syntax_type: slot("syntax_type", self.syntax_type, base.syntax_type)?,
+            syntax_string: slot("syntax_string", self.syntax_string, base.syntax_string)?,
+            syntax_comment: slot("syntax_comment", self.syntax_comment, base.syntax_comment)?,
+            syntax_constant: slot(
+                "syntax_constant",
+                self.syntax_constant,
+                base.syntax_constant,
+            )?,
+            syntax_variable: slot(
+                "syntax_variable",
+                self.syntax_variable,
+                base.syntax_variable,
+            )?,
+            syntax_punctuation: slot(
+                "syntax_punctuation",
+                self.syntax_punctuation,
+                base.syntax_punctuation,
             )?,
         })
     }

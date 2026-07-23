@@ -23,3 +23,15 @@ diagnostic_error       = { fg = "#e06c75" }
 diagnostic_warning     = { fg = "#d69d53" }
 diagnostic_information = { fg = "#619ad6" }
 diagnostic_hint        = { fg = "#7d86a8" }
+
+# Syntax (SPEC §5, M4): a restrained scheme on the blue ground - violet keyword,
+# blue function, warm-gold type, green string, dim-italic comment, orange constant,
+# body-colored variable so ordinary identifiers stay calm, and a muted punctuation.
+syntax_keyword     = { fg = "#b18be0" }
+syntax_function    = { fg = "#619ad6" }
+syntax_type        = { fg = "#d6b270" }
+syntax_string      = { fg = "#8cc265" }
+syntax_comment     = { fg = "#5a6382", italic = true }
+syntax_constant    = { fg = "#d69d53" }
+syntax_variable    = { fg = "#ccd2e4" }
+syntax_punctuation = { fg = "#8a93b5" }

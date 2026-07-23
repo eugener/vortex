@@ -27,3 +27,15 @@ diagnostic_error       = { fg = "#e04b3c" }
 diagnostic_warning     = { fg = "#c9ced2" }
 diagnostic_information = { fg = "#78838a" }
 diagnostic_hint        = { fg = "#4e575e" }
+
+# Achromatic here too: syntax separates by brightness alone, never by hue (red stays
+# reserved for what is wrong and where you are). A keyword is simply the brightest
+# ink, a comment the dimmest - the readout, not a painting.
+syntax_keyword     = { fg = "#eef2f4", bold = true }
+syntax_function    = { fg = "#dfe4e7" }
+syntax_type        = { fg = "#c9ced2" }
+syntax_string      = { fg = "#a7aeb2" }
+syntax_comment     = { fg = "#78838a", italic = true }
+syntax_constant    = { fg = "#dfe4e7" }
+syntax_variable    = { fg = "#c9ced2" }
+syntax_punctuation = { fg = "#78838a" }
