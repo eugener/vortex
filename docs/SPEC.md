@@ -218,8 +218,11 @@ held-lock-across-`.await` deadlocks. Instead:
   `async-io` (the smol stack). Residual risk: a future tokio-only dependency could force a
   bridge (`async-compat`). Middle path if it bites: tokio `current_thread` + trimmed
   features.
-  - *Not yet run end-to-end:* smol + async-lsp + a real language server is doc-supported
-    but unbuilt here. **Validated by milestone M2 (§14).**
+  - *Validated (M2, §14):* smol + `async-lsp` + a real `rust-analyzer` runs end-to-end
+    with **no tokio anywhere in the dependency tree** (`async-lsp` with `default-features
+    = false`, `client-monitor` + `omni-trait` only; process pipes via `async-process`). The
+    server negotiates UTF-16 and the `lsp_rust_analyzer` test asserts the diagnostic lands
+    on the right span. The residual-risk bridge (`async-compat`) was not needed.
 - **`async-lsp` over `tower-lsp`:** `tower-lsp` is tokio-bound; `async-lsp` is the modern,
   runtime-agnostic choice and is what makes the smol call safe.
 
@@ -916,7 +919,13 @@ the verification loop in `CLAUDE.md`, so a change that drops coverage does not p
 - **Asymmetric floors, because the architecture is asymmetric:**
   - **`vortex-core` ≥ 90% lines** (target higher). The core is headless and message-driven
     (§1) specifically so it is almost fully testable via `Action`→`ViewSnapshot` scripts -
-    there is no excuse for low core coverage.
+    there is no excuse for low core coverage. **One documented exemption:**
+    `lsp/client.rs` (M2), the LSP subprocess + protocol shell - the one genuinely
+    I/O-bound file in the core, the same shape as `vortex-tui`'s `main.rs`. Its decisions
+    are extracted into pure functions (`check_encoding`, `outgoing`, `initialize_params`)
+    and covered 100%; the `run` loop needs a live language server, exercised by the
+    `--ignored` `lsp_rust_analyzer` integration test. The gate passes it via
+    `--ignore-filename-regex 'lsp/client\.rs'` rather than gaming the number.
   - **`vortex-tui` ≥ 60% lines.** Terminal I/O, raw-mode setup, and the render loop are
     hard to cover meaningfully; logic that *can* be extracted from the frontend (keymap
     resolution, viewport math, display-column layout) is pulled into testable functions and
@@ -944,11 +953,22 @@ Incremental build order so the risky assumptions are validated early, not at the
   sync-output framing and Kitty input. Proves §5 render model end-to-end. *Verify:* type in
   a real terminal, no tearing, cursor by grapheme; delta/snapshot-agreement property test
   (§13) passes.
-- **M2 - Async runtime + LSP smoke.** smol executor; `async-lsp` spawns a real server
-  (e.g. `rust-analyzer`), completes `initialize`, receives one diagnostic, maps its UTF-16
-  position correctly, and surfaces it as `Underline` + `GutterMark` decorations (§5) - the
-  first non-syntax producer on the decoration channel. **Validates the one unproven stack
-  assumption (§3).** *Verify:* a diagnostic underlines the right span.
+- **M2 - Async runtime + LSP smoke. DONE.** smol executor; `async-lsp` spawns a real
+  server (e.g. `rust-analyzer`), completes `initialize`, receives diagnostics, maps their
+  UTF-16 positions correctly, and surfaces them as `Underline` + `GutterMark` decorations
+  (§5) - the first non-syntax producer on the decoration channel. **Validated the one
+  unproven stack assumption (§3):** smol + `async-lsp` + real `rust-analyzer` runs with no
+  tokio in the tree and negotiates UTF-16. The decoration channel (`decoration.rs`) landed
+  here as §5 specifies - one anchor-backed set, resolved for the visible range - so M4's
+  syntax highlights are an additive `Highlight` variant, not a new channel. *Verified:*
+  the `lsp_rust_analyzer` integration test underlines exactly `msg` (the UTF-16 column
+  where byte/char/UTF-16 all disagree), and the real binary renders underlines on the
+  flagged tokens in a terminal. **Deferred within M2:** incremental `didChange` (full-text
+  sync ships now - it cannot desync, §5 note in `lsp/mod.rs`); preferring a server's UTF-8
+  encoding (UTF-16 is advertised alone, one conversion path); completion / hover / goto
+  (the client sends only `didOpen`/`didChange` and consumes `publishDiagnostics`); a
+  per-file project-root walk (roots at the cwd); surfacing an LSP spawn failure as a toast
+  (it degrades silently to no diagnostics).
 - **M3 - Anchors + undo tree + multi-cursor.** Full `SelectionSet`, anchor layer,
   coalesced undo tree. *Verify:* property tests (§13) pass; multi-cursor edit + undo works
   in-terminal.
