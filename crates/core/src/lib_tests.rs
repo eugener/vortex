@@ -800,7 +800,7 @@ fn opening_a_file_announces_it_to_the_server() {
                 assert_eq!(p, path);
                 // The LSP identifier, not the file extension.
                 assert_eq!(language_id, "rust");
-                assert_eq!(text, FIXTURE);
+                assert_eq!(text.to_string(), FIXTURE);
             }
             other => panic!("expected didOpen, got {other:?}"),
         }
@@ -825,7 +825,7 @@ fn an_edit_sends_the_whole_document_as_a_change() {
         match sync.recv().await.unwrap() {
             crate::lsp::DocumentSync::Changed { version, text, .. } => {
                 // Full-text sync (SPEC §5): the entire buffer, not a delta.
-                assert_eq!(text, format!("x{FIXTURE}"));
+                assert_eq!(text.to_string(), format!("x{FIXTURE}"));
                 // The load itself is version 1 (one whole-buffer delta), so the
                 // first edit after it is version 2.
                 assert_eq!(version, 2, "the change carries the new buffer version");
@@ -1144,7 +1144,7 @@ fn attaching_a_highlighter_announces_the_current_buffer() {
         while let Ok(newer) = fake.sync.try_recv() {
             latest = newer;
         }
-        assert_eq!(latest.text, "fn f() {}");
+        assert_eq!(latest.text.to_string(), "fn f() {}");
     });
 }
 
@@ -1253,7 +1253,7 @@ fn attaching_a_second_highlighter_replaces_the_first() {
         while let Ok(newer) = second.sync.try_recv() {
             latest = newer;
         }
-        assert_eq!(latest.text, "fn f() {}");
+        assert_eq!(latest.text.to_string(), "fn f() {}");
 
         // Highlights from the second highlighter drive the snapshot.
         let snap = step(&h, Action::RequestSnapshot).await;

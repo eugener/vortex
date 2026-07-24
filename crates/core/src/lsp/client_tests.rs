@@ -152,7 +152,7 @@ fn a_path_that_is_not_a_file_url_is_dropped() {
             DocumentSync::Opened {
                 path: PathBuf::from("relative/not/absolute.rs"),
                 language_id: "rust".into(),
-                text: String::new(),
+                text: "".into(),
                 version: 1,
             },
         )

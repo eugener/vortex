@@ -50,7 +50,7 @@ fn parses_text_and_emits_highlights_for_its_version() {
     let (spans, version) = drive_rust(|sync, events| async move {
         sync.send(SyntaxSync {
             version: 7,
-            text: source.to_string(),
+            text: source.into(),
         })
         .await
         .unwrap();
@@ -80,12 +80,12 @@ fn coalesces_to_the_newest_queued_text() {
     let version = drive_rust(|sync, events| async move {
         sync.try_send(SyntaxSync {
             version: 1,
-            text: "fn old() {}".to_string(),
+            text: "fn old() {}".into(),
         })
         .unwrap();
         sync.try_send(SyntaxSync {
             version: 2,
-            text: "fn new() {}".to_string(),
+            text: "fn new() {}".into(),
         })
         .unwrap();
         let SyntaxEvent::Highlights { version, .. } = events.recv().await.unwrap();
@@ -102,7 +102,7 @@ fn an_empty_buffer_highlights_nothing() {
     let spans = drive_rust(|sync, events| async move {
         sync.send(SyntaxSync {
             version: 1,
-            text: String::new(),
+            text: "".into(),
         })
         .await
         .unwrap();
@@ -121,7 +121,7 @@ fn successive_edits_each_produce_a_fresh_batch() {
         for (v, text) in [(1u64, "fn a() {}"), (2, "fn ab() {}"), (3, "fn abc() {}")] {
             sync.send(SyntaxSync {
                 version: v,
-                text: text.to_string(),
+                text: text.into(),
             })
             .await
             .unwrap();
@@ -165,7 +165,7 @@ fn the_editor_dropping_the_event_channel_stops_the_loop() {
         let SyntaxHandle { sync, events } = handle;
         sync.send(SyntaxSync {
             version: 1,
-            text: "fn a() {}".to_string(),
+            text: "fn a() {}".into(),
         })
         .await
         .unwrap();
@@ -175,7 +175,7 @@ fn the_editor_dropping_the_event_channel_stops_the_loop() {
         drop(events);
         sync.send(SyntaxSync {
             version: 2,
-            text: "fn b() {}".to_string(),
+            text: "fn b() {}".into(),
         })
         .await
         .unwrap();

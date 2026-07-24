@@ -127,7 +127,7 @@ fn selections_after_two_inserts_account_for_shift() {
             inserted: "X".to_string(),
         },
     ];
-    let set = selections_after_edits(&before, &changes);
+    let set = selections_after_edits(&before, &edits_from_changes(&changes));
     let cursors: Vec<usize> = set.all().iter().map(|s| s.head).collect();
     assert_eq!(cursors, vec![2, 6]);
 }
@@ -144,7 +144,7 @@ fn selections_after_edits_keeps_a_no_op_cursor() {
         removed: "d".to_string(),
         inserted: String::new(),
     }];
-    let set = selections_after_edits(&before, &changes);
+    let set = selections_after_edits(&before, &edits_from_changes(&changes));
     let cursors: Vec<usize> = set.all().iter().map(|s| s.head).collect();
     assert_eq!(
         cursors,

@@ -280,7 +280,9 @@ fn outgoing(opened: &mut Vec<PathBuf>, message: DocumentSync) -> Option<Outgoing
                     content_changes: vec![TextDocumentContentChangeEvent {
                         range: None,
                         range_length: None,
-                        text,
+                        // Materialize the buffer here, on the LSP task, not on the
+                        // editor actor (the field is the cheap `Text` handle, #1).
+                        text: text.to_string(),
                     }],
                 }));
             }
@@ -290,7 +292,7 @@ fn outgoing(opened: &mut Vec<PathBuf>, message: DocumentSync) -> Option<Outgoing
                     uri,
                     language_id,
                     version: version as i32,
-                    text,
+                    text: text.to_string(),
                 },
             }))
         }
@@ -313,7 +315,8 @@ fn outgoing(opened: &mut Vec<PathBuf>, message: DocumentSync) -> Option<Outgoing
                 content_changes: vec![TextDocumentContentChangeEvent {
                     range: None,
                     range_length: None,
-                    text,
+                    // Stringified here on the LSP task, not the actor (#1).
+                    text: text.to_string(),
                 }],
             }))
         }

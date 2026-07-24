@@ -245,6 +245,40 @@ fn highlights_in_clips_spans_to_the_queried_range() {
 }
 
 #[test]
+fn highlights_in_returns_only_spans_on_the_line_over_many_sorted_spans() {
+    // Exercises the binary-search path (#2): with many spans, a per-line query
+    // returns only the overlapping ones - including a multi-line span that started
+    // before the query window - and nothing past it. Input order is arbitrary;
+    // `replace` sorts by start.
+    let s = syntax_set(vec![
+        highlight(30..33, HighlightKind::Type),
+        highlight(0..3, HighlightKind::Keyword),
+        highlight(5..20, HighlightKind::Comment), // multi-line, spans the mid window
+        highlight(25..28, HighlightKind::Function),
+    ]);
+    // Mid window: only the long comment overlaps, clipped to the window.
+    assert_eq!(
+        s.highlights_in(10..15).collect::<Vec<_>>(),
+        vec![(10..15, HighlightKind::Comment)]
+    );
+    // Window straddling two spans, each clipped.
+    assert_eq!(
+        s.highlights_in(2..6).collect::<Vec<_>>(),
+        vec![
+            (2..3, HighlightKind::Keyword),
+            (5..6, HighlightKind::Comment)
+        ]
+    );
+    // Past every span.
+    assert_eq!(s.highlights_in(40..50).count(), 0);
+    // Before every span.
+    assert_eq!(
+        s.highlights_in(0..1).collect::<Vec<_>>(),
+        vec![(0..1, HighlightKind::Keyword)]
+    );
+}
+
+#[test]
 fn highlights_in_excludes_spans_that_only_touch_the_range_edge() {
     let s = syntax_set(vec![highlight(0..5, HighlightKind::Keyword)]);
     assert_eq!(s.highlights_in(5..9).count(), 0);

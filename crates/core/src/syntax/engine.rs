@@ -114,12 +114,16 @@ async fn run(
             msg = newer;
         }
         let SyntaxSync { version, text } = msg;
+        // Materialize the rope into contiguous bytes here, on the highlighter's own
+        // thread - never on the editor actor (#1). tree-sitter needs a contiguous
+        // slice, so this copy is unavoidable, but it is off the keystroke path.
+        let source = text.to_string();
 
         // A parse or query-execution error is per-batch, not fatal: skip this
         // version and wait for the next text rather than killing the producer
         // (SPEC §8). `injection_callback` returns `None` - language injection
         // (code in doc comments, embedded languages) is deferred (SPEC §14).
-        let spans = match highlighter.highlight(&config, text.as_bytes(), None, |_| None) {
+        let spans = match highlighter.highlight(&config, source.as_bytes(), None, |_| None) {
             Ok(iter) => match spans_from_events(iter) {
                 Ok(spans) => spans,
                 Err(_) => continue,

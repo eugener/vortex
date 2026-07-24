@@ -158,11 +158,60 @@ impl DecorationSet {
     /// producer contract: LSP `publishDiagnostics` is defined as a full
     /// replacement for a file, and tree-sitter republishes a reparsed range the
     /// same way. Other producers' buckets are untouched.
-    pub(crate) fn replace(&mut self, source: DecorationSource, decorations: Vec<Decoration>) {
+    ///
+    /// The bucket is kept **sorted by span start**. That invariant is what lets
+    /// [`Self::highlights_in`] binary-search instead of scanning every span per
+    /// painted line - the whole point of an interval query on the thousands of
+    /// syntax spans a file carries. Sorting is cheap: tree-sitter already emits
+    /// highlights in document order, so the sort is near-linear, and it is paid
+    /// once per producer republish (amortized against the reparse), never per
+    /// frame. [`Self::transform_through`] preserves the order (edits are disjoint
+    /// and monotonic), so it need not re-sort.
+    ///
+    /// A test convenience: production splits this into [`Self::sorted_bucket`] +
+    /// [`Self::bucket_differs`] + [`Self::set_bucket`] so an unchanged reparse
+    /// clones nothing (see the editor's `apply_highlights`).
+    #[cfg(test)]
+    pub(crate) fn replace(&mut self, source: DecorationSource, mut decorations: Vec<Decoration>) {
         if decorations.is_empty() {
             self.by_source.remove(&source);
         } else {
+            decorations.sort_by_key(span_start);
             self.by_source.insert(source, decorations);
+        }
+    }
+
+    /// Sort `decorations` into the order a bucket is stored in (by span start), so
+    /// the editor can build a candidate bucket, compare it against the current one
+    /// with [`Self::bucket_differs`], and only *then* take a copy-on-write mutable
+    /// borrow via [`Self::set_bucket`] - avoiding cloning the whole set when a
+    /// reparse produced no change (the common case while typing).
+    pub(crate) fn sorted_bucket(mut decorations: Vec<Decoration>) -> Vec<Decoration> {
+        decorations.sort_by_key(span_start);
+        decorations
+    }
+
+    /// Whether `source`'s bucket differs from `candidate` (already sorted via
+    /// [`Self::sorted_bucket`]). Compares only that one bucket, never the whole set.
+    pub(crate) fn bucket_differs(
+        &self,
+        source: DecorationSource,
+        candidate: &[Decoration],
+    ) -> bool {
+        match self.by_source.get(&source) {
+            Some(existing) => existing.as_slice() != candidate,
+            None => !candidate.is_empty(),
+        }
+    }
+
+    /// Store `candidate` (already sorted) as `source`'s bucket, or clear the bucket
+    /// if it is empty. The presorted twin of [`Self::replace`], used after
+    /// [`Self::bucket_differs`] has already established a change.
+    pub(crate) fn set_bucket(&mut self, source: DecorationSource, candidate: Vec<Decoration>) {
+        if candidate.is_empty() {
+            self.by_source.remove(&source);
+        } else {
+            self.by_source.insert(source, candidate);
         }
     }
 
@@ -199,26 +248,34 @@ impl DecorationSet {
     /// line and paints each as a foreground color, so it borrows rather than
     /// allocating.
     ///
-    /// Cost is O(decorations) per call - fine for a diagnostic's handful, but a
-    /// syntax-highlighted file puts *thousands* of spans here. That is the case
-    /// the doc-comment on this type flags for an interval index; it stays hidden
-    /// behind this signature, so adding it later touches only this method and
-    /// [`Self::transform_through`], not the frontend.
+    /// **O(log n + k), not O(n).** This is the per-line-per-frame hot path over
+    /// the thousands of syntax spans a file carries, so it exploits the
+    /// sorted-by-start invariant [`Self::replace`] maintains. Highlights are also
+    /// non-overlapping (one producer, innermost-wins in `syntax::highlight`), so
+    /// their ends are monotonic and `partition_point` finds the first span reaching
+    /// into `range` in O(log n); the forward scan then stops at the first span
+    /// starting past `range.end`, bounded by the `k` spans actually on this line.
+    /// Only the syntax bucket carries `Highlight`s, so a bucket without them
+    /// contributes nothing regardless of where the search lands (its non-monotonic
+    /// ends can misplace the search, but there is nothing there to miss).
     pub fn highlights_in(
         &self,
         range: ByteRange,
     ) -> impl Iterator<Item = (ByteRange, HighlightKind)> {
-        self.by_source
-            .values()
-            .flatten()
-            .filter_map(move |d| match d {
-                Decoration::Highlight { range: span, kind } => {
-                    let start = span.start.max(range.start);
-                    let end = span.end.min(range.end);
-                    (start < end).then_some((start..end, *kind))
-                }
-                _ => None,
-            })
+        self.by_source.values().flat_map(move |bucket| {
+            let first = bucket.partition_point(|d| span_end(d) <= range.start);
+            bucket[first..]
+                .iter()
+                .take_while(move |d| span_start(d) < range.end)
+                .filter_map(move |d| match d {
+                    Decoration::Highlight { range: span, kind } => {
+                        let start = span.start.max(range.start);
+                        let end = span.end.min(range.end);
+                        (start < end).then_some((start..end, *kind))
+                    }
+                    _ => None,
+                })
+        })
     }
 
     /// The most severe gutter mark on `line`, or `None`. Several diagnostics
@@ -274,6 +331,25 @@ impl DecorationSet {
                 }
             }
         }
+    }
+}
+
+/// The interval key a bucket is sorted by ([`DecorationSet::replace`]): a span's
+/// start, or a gutter mark's line offset.
+fn span_start(d: &Decoration) -> usize {
+    match d {
+        Decoration::Underline { range, .. } | Decoration::Highlight { range, .. } => range.start,
+        Decoration::GutterMark { offset, .. } => *offset,
+    }
+}
+
+/// A span's exclusive end, or a gutter mark's point. The monotonic key
+/// [`DecorationSet::highlights_in`] binary-searches over the non-overlapping,
+/// sorted highlight spans.
+fn span_end(d: &Decoration) -> usize {
+    match d {
+        Decoration::Underline { range, .. } | Decoration::Highlight { range, .. } => range.end,
+        Decoration::GutterMark { offset, .. } => *offset,
     }
 }
 
