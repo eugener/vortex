@@ -292,6 +292,82 @@ fn style_at(col: usize, base: Style, overlays: &[(Range<usize>, Style)]) -> Styl
     style
 }
 
+/// A left-to-right byte->display-column resolver for one line, so a *sorted*
+/// sequence of queries costs a single grapheme pass instead of a fresh scan from
+/// byte 0 per query. Built for the syntax-highlight hot path (SPEC §5): a
+/// minified line can carry hundreds of spans, and resolving each independently is
+/// O(spans * line_length) - one shared walker makes the line's whole span set
+/// O(line_length + spans).
+///
+/// Queries must be **non-decreasing** in byte offset. The walker only advances;
+/// a target behind the cursor returns the cursor's current column, not a rescan.
+/// Highlights satisfy this (sorted, non-overlapping - see
+/// [`vortex_core::DecorationSet::highlights_in`]); overlapping or unsorted spans
+/// must use [`display_column`] directly.
+pub struct ColumnWalker<'a> {
+    graphemes: std::iter::Peekable<unicode_segmentation::GraphemeIndices<'a>>,
+    /// Display column at `byte` - the accumulated width of every grapheme consumed.
+    col: usize,
+    tab_width: usize,
+    len: usize,
+}
+
+impl<'a> ColumnWalker<'a> {
+    /// A walker positioned at the start of `line` (column 0).
+    pub fn new(line: &'a str, tab_width: usize) -> Self {
+        Self {
+            graphemes: line.grapheme_indices(true).peekable(),
+            col: 0,
+            tab_width,
+            len: line.len(),
+        }
+    }
+
+    /// Display column at byte offset `target` (a grapheme boundary, clamped to the
+    /// line length). Consumes every remaining grapheme that starts before `target`,
+    /// so it matches [`display_column`] exactly for non-decreasing `target`s.
+    pub fn column_at(&mut self, target: usize) -> usize {
+        let target = target.min(self.len);
+        while let Some(&(idx, g)) = self.graphemes.peek() {
+            if idx >= target {
+                break;
+            }
+            self.col += cells_for(g, self.col, self.tab_width);
+            self.graphemes.next();
+        }
+        self.col
+    }
+}
+
+/// The display-column range a span covers on one buffer line, resolved against a
+/// shared [`ColumnWalker`] - the [`selection_columns`] body, factored out so the
+/// sorted highlight spans on a line share one forward pass. `line_len` is the
+/// line's byte length, `line_start` its first byte offset, `line_end_excl` the
+/// next line's start (or buffer end) so the terminator bytes are included. See
+/// [`selection_columns`] for the newline-cell semantics; the walker's
+/// non-decreasing contract applies to successive calls.
+pub fn span_columns(
+    walker: &mut ColumnWalker,
+    line_len: usize,
+    line_start: usize,
+    line_end_excl: usize,
+    span_start: usize,
+    span_end: usize,
+) -> Option<Range<usize>> {
+    let content_end = line_start + line_len;
+    let lo = span_start.max(line_start);
+    let hi = span_end.min(line_end_excl);
+    if lo >= hi {
+        return None;
+    }
+    let lo_col = walker.column_at((lo - line_start).min(line_len));
+    let hi_content = hi.min(content_end);
+    let hi_col = walker.column_at((hi_content - line_start).min(line_len));
+    // A span reaching past the content consumed this line's newline.
+    let end_col = if hi > content_end { hi_col + 1 } else { hi_col };
+    (lo_col < end_col).then_some(lo_col..end_col)
+}
+
 /// The display-column range a selection covers on one buffer line, or `None` when
 /// the selection does not touch the line or is a zero-width cursor here (a cursor
 /// renders as the terminal caret, not a highlight). `line` is the line's raw text
@@ -301,6 +377,10 @@ fn style_at(col: usize, base: Style, overlays: &[(Range<usize>, Style)]) -> Styl
 /// When the selection runs through this line's terminator (its end lies past the
 /// content), the range gets one extra cell so the consumed line break is visible
 /// and blank lines inside a multi-line selection still show a highlight.
+///
+/// A one-shot walk over the line; when resolving many sorted spans on one line
+/// (syntax highlights), build a single [`ColumnWalker`] and call [`span_columns`]
+/// instead so the line is walked once, not once per span.
 pub fn selection_columns(
     line: &str,
     line_start: usize,
@@ -309,18 +389,15 @@ pub fn selection_columns(
     sel_start: usize,
     sel_end: usize,
 ) -> Option<Range<usize>> {
-    let content_end = line_start + line.len();
-    let lo = sel_start.max(line_start);
-    let hi = sel_end.min(line_end_excl);
-    if lo >= hi {
-        return None;
-    }
-    let lo_col = display_column(line, (lo - line_start).min(line.len()), tab_width);
-    let hi_content = hi.min(content_end);
-    let hi_col = display_column(line, (hi_content - line_start).min(line.len()), tab_width);
-    // A selection reaching past the content consumed this line's newline.
-    let end_col = if hi > content_end { hi_col + 1 } else { hi_col };
-    (lo_col < end_col).then_some(lo_col..end_col)
+    let mut walker = ColumnWalker::new(line, tab_width);
+    span_columns(
+        &mut walker,
+        line.len(),
+        line_start,
+        line_end_excl,
+        sel_start,
+        sel_end,
+    )
 }
 
 /// Total grapheme clusters covered by `selections`, for the status readout when a
@@ -798,6 +875,58 @@ mod tests {
         // "a\tb": selecting the tab (bytes 1..2) covers columns 1..4 (the tab spans
         // to the next 4-stop), matching the painted glyphs.
         assert_eq!(selection_columns("a\tb", 0, 4, 4, 1, 2), Some(1..4));
+    }
+
+    #[test]
+    fn column_walker_matches_display_column_for_sorted_targets() {
+        // The walker's incremental columns equal display_column at every boundary,
+        // across tabs and wide chars, for non-decreasing queries.
+        let line = "a\t日bc\td";
+        let mut w = ColumnWalker::new(line, 4);
+        let boundaries = [0, 1, 2, 5, 6, 7, 8, line.len()];
+        for &b in &boundaries {
+            assert_eq!(w.column_at(b), display_column(line, b, 4), "at byte {b}");
+        }
+    }
+
+    #[test]
+    fn column_walker_clamps_target_past_line_end() {
+        let mut w = ColumnWalker::new("hi", 4);
+        assert_eq!(w.column_at(99), 2);
+    }
+
+    #[test]
+    fn column_walker_non_decreasing_returns_current_column() {
+        // The contract: a target behind the cursor is not a rescan; the walker only
+        // advances, so it reports the column it already reached (never a lower one).
+        let mut w = ColumnWalker::new("abcdef", 4);
+        assert_eq!(w.column_at(4), 4);
+        assert_eq!(w.column_at(2), 4); // does not walk backward
+    }
+
+    #[test]
+    fn span_columns_matches_selection_columns_for_each_span() {
+        // A shared walker over sorted, non-overlapping spans yields the same ranges
+        // selection_columns computes span-by-span - the highlight hot path invariant.
+        let line = "let\tx = 日本;";
+        let line_end_excl = line.len() + 1; // one trailing newline byte
+        let spans = [(0, 3), (4, 5), (8, 14)]; // "let", "x", "日本"
+        let mut w = ColumnWalker::new(line, 4);
+        for &(s, e) in &spans {
+            assert_eq!(
+                span_columns(&mut w, line.len(), 0, line_end_excl, s, e),
+                selection_columns(line, 0, line_end_excl, 4, s, e),
+                "span {s}..{e}"
+            );
+        }
+    }
+
+    #[test]
+    fn span_columns_preserves_newline_cell() {
+        // A span running past the content (through the terminator) still gets the
+        // extra cell, matching selection_columns.
+        let mut w = ColumnWalker::new("ab", 4);
+        assert_eq!(span_columns(&mut w, 2, 0, 3, 0, 3), Some(0..3));
     }
 
     #[test]
