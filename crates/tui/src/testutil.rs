@@ -1,4 +1,11 @@
 //! Shared helpers for this crate's unit tests (compiled only under `cfg(test)`).
+//!
+//! The same file backs the library's `pub mod testutil` and the binary's own
+//! `mod testutil` (a dependency's `cfg(test)` items are invisible to the crate
+//! that depends on it, so the binary needs its own view). Each test build uses a
+//! subset of these helpers, so unused-in-one-crate items and the missing
+//! `Default` on a side-effecting constructor are expected, not smells.
+#![allow(dead_code, clippy::new_without_default)]
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
