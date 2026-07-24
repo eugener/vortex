@@ -1059,15 +1059,19 @@ fn paint_body(frame: &mut Frame, area: Rect, snapshot: &ViewSnapshot, body: Body
             // mapped to display columns, painted as a foreground color over the
             // selection ground and under the diagnostic underline and carets.
             if !snapshot.decorations.is_empty() {
+                // Highlights arrive sorted and non-overlapping, so one walker
+                // resolves every span on this line in a single left-to-right pass
+                // (O(line + spans)) instead of rescanning from byte 0 per span.
+                let mut walker = layout::ColumnWalker::new(raw, TAB_WIDTH);
                 for (span, kind) in snapshot
                     .decorations
                     .highlights_in(line_start..line_end_excl)
                 {
-                    if let Some(range) = layout::selection_columns(
-                        raw,
+                    if let Some(range) = layout::span_columns(
+                        &mut walker,
+                        raw.len(),
                         line_start,
                         line_end_excl,
-                        TAB_WIDTH,
                         span.start,
                         span.end,
                     ) {
@@ -1570,6 +1574,38 @@ mod tests {
             cell.fg,
             config::Theme::default().syntax_keyword.fg.unwrap(),
             "a keyword span is painted in the keyword color"
+        );
+    }
+
+    #[test]
+    fn multiple_highlights_on_a_line_paint_at_their_own_columns_past_a_wide_char() {
+        // The shared-walker path (one ColumnWalker resolves every span on a line):
+        // two sorted spans separated by a wide char must each land at the right
+        // cell, proving the walker tracks display columns across the 2-cell glyph
+        // rather than drifting. "fn 日x": "fn" (keyword) at cols 0-1, "日" (2 cells)
+        // at cols 3-4, "x" (type) at col 5. Gutter "  1 " is 4 cells.
+        let snap = snapshot_with_highlights(
+            &[Action::Insert("fn 日x".into())],
+            vec![
+                highlight_span(0..2, vortex_core::HighlightKind::Keyword),
+                highlight_span(6..7, vortex_core::HighlightKind::Type),
+            ],
+        );
+        let buf = render(&snap, 40, 6);
+        let kw = buf.cell((4, 1)).unwrap();
+        assert_eq!(kw.symbol(), "f");
+        assert_eq!(
+            kw.fg,
+            config::Theme::default().syntax_keyword.fg.unwrap(),
+            "the first span keeps the keyword color"
+        );
+        // The second span sits at gutter 4 + col 5 = cell 9, after the wide glyph.
+        let ty = buf.cell((9, 1)).unwrap();
+        assert_eq!(ty.symbol(), "x");
+        assert_eq!(
+            ty.fg,
+            config::Theme::default().syntax_type.fg.unwrap(),
+            "the second span resolves to the correct column past the wide char"
         );
     }
 
