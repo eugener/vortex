@@ -41,8 +41,19 @@ tree-sitter-highlight = "0.26.11"
 unicode-segmentation = "1.13.3"
 
 [dev-dependencies]
+# Microbenchmark harness for the per-keystroke hot paths (`benches/hot_paths.rs`,
+# SPEC §13). Slim on purpose: `default-features = false` drops the plotters/html
+# report tree and rayon; `cargo_bench_support` is kept for `--save-baseline` A/B
+# comparison and the `--test` smoke mode the verification loop runs.
+criterion = { version = "0.8.2", default-features = false, features = [
+    "cargo_bench_support",
+] }
 proptest = "1.11.0"
 smol = "2.0.2"
 # A real grammar to exercise the highlighter end-to-end in-process (no subprocess,
 # unlike the LSP client) - which is why `syntax` needs no coverage exemption.
 tree-sitter-rust = "0.24.2"
+
+[[bench]]
+name = "hot_paths"
+harness = false

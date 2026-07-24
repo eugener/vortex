@@ -25,6 +25,8 @@ cargo test --workspace         # 4. tests
 cargo llvm-cov --package vortex-core --fail-under-file-lines 90 \
   --ignore-filename-regex 'lsp/client\.rs' --summary-only
 cargo llvm-cov --package vortex-tui  --fail-under-file-lines 60 --summary-only
+# 6. benches still build and run (bit-rot check, NOT a timing gate - see below).
+cargo bench --package vortex-core -- --test
 ```
 
 `lsp/client.rs` is exempted from the core gate (M2): it is the LSP subprocess +
@@ -50,6 +52,18 @@ coverage harness, so the successful-load path cannot run there. The *resolution*
 tui line total eased from 89.9% to 88.9% while every file still clears its floor.
 Requires `cargo-llvm-cov` >=0.8.6 (the release that added `--fail-under-file-lines`) +
 `rustup component add llvm-tools-preview`. Install/upgrade with `cargo install cargo-llvm-cov`.
+
+Step 6 runs the benchmark harness (`crates/core/benches/hot_paths.rs`) in criterion's
+`--test` mode: each benchmark executes **once**, unmeasured, so the loop catches a bench
+that stopped compiling or started panicking without paying for a timed run. **Wall-clock
+timings are deliberately not gated** - they are machine-dependent and noisy, so a green
+loop must never depend on them; a threshold there would fail on a busy laptop and pass on a
+fast one. The benches are a *tool*, not a gate: when you touch a hot path, run
+`cargo bench -p vortex-core -- --save-baseline before` on the old code and
+`--baseline before` on the new, and read criterion's per-benchmark delta yourself. The
+harness covers the per-keystroke motion paths today (the line-copy §10.4 flags); the edit
+remap and the tui layout functions need an actor-driven bench and a tui lib target
+respectively (noted in the bench file's header) and are not benched yet.
 
 Then, for any change with a runtime surface, **actually exercise it** - do not infer
 success from a green test suite:
