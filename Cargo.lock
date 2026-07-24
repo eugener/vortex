@@ -2542,6 +2542,7 @@ name = "vortex-tui"
 version = "0.0.0"
 dependencies = [
  "async-channel",
+ "criterion",
  "libloading",
  "nucleo-matcher",
  "ratatui",

@@ -26,7 +26,7 @@ cargo llvm-cov --package vortex-core --fail-under-file-lines 90 \
   --ignore-filename-regex 'lsp/client\.rs' --summary-only
 cargo llvm-cov --package vortex-tui  --fail-under-file-lines 60 --summary-only
 # 6. benches still build and run (bit-rot check, NOT a timing gate - see below).
-cargo bench --package vortex-core -- --test
+cargo bench --workspace -- --test
 ```
 
 `lsp/client.rs` is exempted from the core gate (M2): it is the LSP subprocess +
@@ -53,17 +53,25 @@ tui line total eased from 89.9% to 88.9% while every file still clears its floor
 Requires `cargo-llvm-cov` >=0.8.6 (the release that added `--fail-under-file-lines`) +
 `rustup component add llvm-tools-preview`. Install/upgrade with `cargo install cargo-llvm-cov`.
 
-Step 6 runs the benchmark harness (`crates/core/benches/hot_paths.rs`) in criterion's
-`--test` mode: each benchmark executes **once**, unmeasured, so the loop catches a bench
-that stopped compiling or started panicking without paying for a timed run. **Wall-clock
-timings are deliberately not gated** - they are machine-dependent and noisy, so a green
-loop must never depend on them; a threshold there would fail on a busy laptop and pass on a
-fast one. The benches are a *tool*, not a gate: when you touch a hot path, run
-`cargo bench -p vortex-core -- --save-baseline before` on the old code and
-`--baseline before` on the new, and read criterion's per-benchmark delta yourself. The
-harness covers the per-keystroke motion paths today (the line-copy §10.4 flags); the edit
-remap and the tui layout functions need an actor-driven bench and a tui lib target
-respectively (noted in the bench file's header) and are not benched yet.
+Step 6 runs the benchmark harness in criterion's `--test` mode: each benchmark executes
+**once**, unmeasured, so the loop catches a bench that stopped compiling or started
+panicking without paying for a timed run. **Wall-clock timings are deliberately not
+gated** - they are machine-dependent and noisy, so a green loop must never depend on them;
+a threshold there would fail on a busy laptop and pass on a fast one. The benches are a
+*tool*, not a gate: when you touch a hot path, run
+`cargo bench --workspace -- --save-baseline before` on the old code and `--baseline before`
+on the new, and read criterion's per-benchmark delta yourself.
+
+`vortex-core/benches/hot_paths.rs` covers the per-keystroke motion paths (the line-copy
+§10.4 flags); `vortex-tui/benches/layout.rs` covers the display-column paint paths
+(`render_line`/`style_at`, and the sorted-span column walk). The tui benches are why the
+frontend's logic lives in a **library target** (`crates/tui/src/lib.rs`): a `[[bench]]` can
+only link a lib, so the pure paint math had to move out of the binary. `main.rs` is now the
+thin I/O shell it always claimed to be and depends on the lib; `testutil.rs` backs both a
+`pub mod` in the lib and a `#[cfg(test)] mod` in the binary, since a dependency's
+`cfg(test)` items are invisible to the crate depending on it. Still not benched: the edit
+path's O(N²) selection remap, which needs an actor-driven bench (noted in the core bench's
+header).
 
 Then, for any change with a runtime surface, **actually exercise it** - do not infer
 success from a green test suite:

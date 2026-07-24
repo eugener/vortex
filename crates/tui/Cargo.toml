@@ -40,3 +40,14 @@ vortex-core = { path = "../core" }
 # (the diagnostic-rendering paint tests). Not a runtime dependency: the frontend
 # talks to the core over the handle `vortex-core` hands back, never a raw channel.
 async-channel = "2.5.0"
+# Microbenchmarks for the display-column paint hot paths (`benches/layout.rs`).
+# Slim, matching vortex-core: no plotters/html/rayon, `cargo_bench_support` kept
+# for `--save-baseline` and the loop's `--test` smoke mode. Reachable only because
+# the layout logic lives in the library target (see `lib.rs`), not the binary.
+criterion = { version = "0.8.2", default-features = false, features = [
+    "cargo_bench_support",
+] }
+
+[[bench]]
+name = "layout"
+harness = false

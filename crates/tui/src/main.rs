@@ -12,21 +12,13 @@
 //! half-written frame (anti-tearing). The Kitty keyboard protocol is negotiated at
 //! startup for rich modifiers (SPEC §9), with graceful fallback where unsupported.
 
-mod command;
-mod compositor;
-mod config;
-mod filepicker;
-mod grammar;
-mod keymap;
-mod layout;
-mod osc52;
-mod palette;
-mod picker;
+// The frontend's logic modules live in the library crate (see `lib.rs`); the
+// binary depends on them. Only `testutil` is redeclared here: it is `cfg(test)`,
+// and a dependency's test-only items are invisible to the crate depending on it,
+// so the binary's own tests need their own view of the same file.
 #[cfg(test)]
+#[path = "testutil.rs"]
 mod testutil;
-mod theme;
-mod themepicker;
-mod toast;
 
 use std::ffi::OsString;
 use std::io::{self, Stdout};
@@ -50,9 +42,10 @@ use ratatui::{Frame, Terminal, TerminalOptions, Viewport};
 
 use vortex_core::{Action, Core, ViewSnapshot};
 
-use command::Command;
-use compositor::{Compositor, EventResult};
-use toast::Toasts;
+use vortex_tui::command::Command;
+use vortex_tui::compositor::{Compositor, EventResult};
+use vortex_tui::toast::{self, Toasts};
+use vortex_tui::{config, filepicker, grammar, keymap, layout, osc52, palette, theme, themepicker};
 
 /// Default tab stop width for display-column layout (SPEC §4). Config in M5.
 const TAB_WIDTH: usize = 4;
