@@ -30,7 +30,7 @@
 pub(crate) mod engine;
 pub(crate) mod highlight;
 
-use crate::buffer::ByteRange;
+use crate::buffer::{ByteRange, Text};
 use crate::decoration::HighlightKind;
 
 pub use engine::{SyntaxError, SyntaxHandle, highlighter};
@@ -47,7 +47,10 @@ pub type BoxSyntaxLoop = crate::editor::BoxFuture<Result<(), SyntaxError>>;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SyntaxSync {
     pub version: u64,
-    pub text: String,
+    /// The buffer text as the core's cheap `Arc`-backed handle. It becomes owned
+    /// bytes only inside the highlighter loop, on the highlighter's own thread -
+    /// never on the editor actor, which would copy the whole file per keystroke.
+    pub text: Text,
 }
 
 /// One highlighted span, in the core's own vocabulary rather than tree-sitter's:

@@ -23,7 +23,7 @@ pub(crate) mod convert;
 
 use std::path::PathBuf;
 
-use crate::buffer::Utf16Position;
+use crate::buffer::{Text, Utf16Position};
 use crate::decoration::Severity;
 
 pub use client::{LspError, LspHandle, client};
@@ -80,7 +80,10 @@ pub enum DocumentSync {
     Opened {
         path: PathBuf,
         language_id: String,
-        text: String,
+        /// The buffer text, as the core's cheap `Arc`-backed handle. It becomes an
+        /// owned `String` only in `client::outgoing`, on the LSP task - never on the
+        /// editor actor's hot path (that would copy the whole file per keystroke).
+        text: Text,
         /// The buffer version this text is. Carried so that *reopening* a document
         /// the server already has open - which the editor announces as another
         /// `Opened` (it resets its per-buffer opened flag on every load) - can be
@@ -93,6 +96,8 @@ pub enum DocumentSync {
         /// The buffer version this text is (SPEC §5). The server echoes it back
         /// on diagnostics so a stale batch is recognizable.
         version: u64,
-        text: String,
+        /// The buffer text as the cheap `Arc`-backed handle; stringified on the LSP
+        /// task, not the actor (see [`Self::Opened`]).
+        text: Text,
     },
 }

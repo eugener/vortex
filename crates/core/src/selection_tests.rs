@@ -340,7 +340,7 @@ fn page_down_extends_selection_when_asked() {
 fn overlapping_selections_merge() {
     // Directly exercise the disjoint invariant with two overlapping ranges.
     let mut set = SelectionSet {
-        selections: vec![Selection::new(0, 5), Selection::new(3, 8)],
+        selections: vec![Selection::new(0, 5), Selection::new(3, 8)].into(),
         primary: 1,
     };
     // A no-op absolute motion still runs normalize over the set.
@@ -356,7 +356,7 @@ fn overlapping_selections_merge() {
 fn disjoint_cursors_do_not_merge() {
     let t = text("abcdef");
     let mut set = SelectionSet {
-        selections: vec![Selection::cursor(1), Selection::cursor(4)],
+        selections: vec![Selection::cursor(1), Selection::cursor(4)].into(),
         primary: 0,
     };
     set.move_all(&t, Motion::Left, false); // 1->0, 4->3; still disjoint
@@ -369,7 +369,7 @@ fn disjoint_cursors_do_not_merge() {
 fn coincident_cursors_merge_to_one() {
     let t = text("abcdef");
     let mut set = SelectionSet {
-        selections: vec![Selection::cursor(1), Selection::cursor(2)],
+        selections: vec![Selection::cursor(1), Selection::cursor(2)].into(),
         primary: 1,
     };
     // Move both left: 1->0, 2->1; still disjoint. Move left again: 0->0, 1->0
@@ -384,7 +384,7 @@ fn coincident_cursors_merge_to_one() {
 fn primary_tracks_through_merge() {
     let t = text("0123456789");
     let mut set = SelectionSet {
-        selections: vec![Selection::new(0, 2), Selection::new(6, 8)],
+        selections: vec![Selection::new(0, 2), Selection::new(6, 8)].into(),
         primary: 1, // the [6,8] selection
     };
     // Extend the second selection's head left into the first so they merge.
@@ -400,7 +400,7 @@ fn primary_tracks_through_merge() {
 #[test]
 fn primary_index_points_at_primary_selection() {
     let set = SelectionSet {
-        selections: vec![Selection::new(0, 2), Selection::new(6, 8)],
+        selections: vec![Selection::new(0, 2), Selection::new(6, 8)].into(),
         primary: 1,
     };
     assert_eq!(set.primary_index(), 1);

@@ -19,6 +19,8 @@
 //! Cursor motion is **by grapheme cluster** (§4), computed against a single
 //! line's text so cost is bounded by line length, never the file (§10.4).
 
+use std::sync::Arc;
+
 use serde::{Deserialize, Serialize};
 use unicode_segmentation::UnicodeSegmentation;
 
@@ -120,7 +122,13 @@ pub enum Motion {
 /// [`Selection::start`] and no two overlap or touch.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SelectionSet {
-    selections: Vec<Selection>,
+    /// Behind an `Arc` so publishing a snapshot clones the handle, not the array
+    /// (SPEC §5): a republish that does not change the set - a decoration batch, a
+    /// `RequestSnapshot` - costs a ref-count bump instead of re-allocating and
+    /// copying every selection every frame. Mutations rebuild the `Arc` once
+    /// (via [`Self::normalize`]), which is the same single allocation the old
+    /// `Vec` mutation already paid.
+    selections: Arc<[Selection]>,
     primary: usize,
 }
 
@@ -128,7 +136,7 @@ impl SelectionSet {
     /// A set with a single selection (the M1 common case).
     pub fn single(selection: Selection) -> Self {
         Self {
-            selections: vec![selection],
+            selections: Arc::from([selection]),
             primary: 0,
         }
     }
@@ -149,13 +157,10 @@ impl SelectionSet {
         if cursors.is_empty() {
             return Self::at_origin();
         }
-        let mut set = Self {
-            selections: cursors,
-            primary: 0,
-        };
         // Reuse the merge half of normalize: primary_head = first cursor's head.
-        let head = set.selections[0].head;
-        set.normalize(head);
+        let head = cursors[0].head;
+        let mut set = Self::at_origin();
+        set.normalize(cursors, head);
         set
     }
 
@@ -172,6 +177,12 @@ impl SelectionSet {
     /// The selections, in sorted order.
     pub fn all(&self) -> &[Selection] {
         &self.selections
+    }
+
+    /// The selections as the shared `Arc` handle, so the snapshot clones the handle
+    /// rather than re-allocating the array every frame (SPEC §5).
+    pub fn shared(&self) -> Arc<[Selection]> {
+        Arc::clone(&self.selections)
     }
 
     /// The primary selection - always present (the set is never empty).
@@ -207,10 +218,11 @@ impl SelectionSet {
         // Track the primary's head so we can keep the primary designation on the
         // selection that ends up owning that position after a merge.
         let primary_head = self.selections[self.primary].head;
-        for sel in &mut self.selections {
+        let mut sels = self.selections.to_vec();
+        for sel in &mut sels {
             *sel = move_selection(text, *sel, motion, extend);
         }
-        self.normalize(primary_head);
+        self.normalize(sels, primary_head);
     }
 
     /// Collapse the set to a single selection whose head sits at byte `offset` (a
@@ -257,9 +269,10 @@ impl SelectionSet {
         if head == from {
             return; // at the top/bottom edge: nothing to add
         }
-        self.selections.push(Selection::cursor(head));
+        let mut sels = self.selections.to_vec();
+        sels.push(Selection::cursor(head));
         // Re-point primary at the freshly added caret (it covers `head`).
-        self.normalize(head);
+        self.normalize(sels, head);
     }
 
     /// Add a plain cursor at byte `offset` (a modifier-click), keeping the existing
@@ -267,8 +280,9 @@ impl SelectionSet {
     /// cursor becomes primary; a coincident one merges away.
     pub fn add_cursor(&mut self, text: &Text, offset: usize) {
         let offset = offset.min(text.byte_len());
-        self.selections.push(Selection::cursor(offset));
-        self.normalize(offset);
+        let mut sels = self.selections.to_vec();
+        sels.push(Selection::cursor(offset));
+        self.normalize(sels, offset);
     }
 
     /// Collapse a multi-cursor set back to the primary selection alone (Escape). The
@@ -277,13 +291,15 @@ impl SelectionSet {
         *self = Self::single(*self.primary());
     }
 
-    /// Sort by start and merge overlapping/touching selections, then point
-    /// `primary` at whichever surviving selection covers `primary_head`.
-    fn normalize(&mut self, primary_head: usize) {
-        self.selections.sort_by_key(Selection::start);
+    /// Sort `sels` by start and merge overlapping/touching selections, store the
+    /// result as the new (single) `Arc`, and point `primary` at whichever surviving
+    /// selection covers `primary_head`. Taking the working `Vec` by value keeps the
+    /// one allocation a mutation already needs and rebuilds the shared `Arc` once.
+    fn normalize(&mut self, mut sels: Vec<Selection>, primary_head: usize) {
+        sels.sort_by_key(Selection::start);
 
-        let mut merged: Vec<Selection> = Vec::with_capacity(self.selections.len());
-        for sel in self.selections.drain(..) {
+        let mut merged: Vec<Selection> = Vec::with_capacity(sels.len());
+        for sel in sels {
             match merged.last_mut() {
                 // Sorted by start, so `sel.start() >= prev.start()`. Merge when
                 // the ranges overlap or touch (`sel.start() <= prev.end()`); this
@@ -304,7 +320,7 @@ impl SelectionSet {
         // Primary = the selection covering the old primary head (its span
         // includes that offset). Falls back to 0 if somehow not found.
         self.primary = covering(&merged, primary_head).unwrap_or(0);
-        self.selections = merged;
+        self.selections = merged.into();
     }
 }
 

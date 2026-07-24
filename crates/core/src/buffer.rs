@@ -71,8 +71,20 @@ impl Utf16Position {
 /// leaks into a public signature (SPEC §2.1). A [`ViewSnapshot`](crate::view)
 /// carries a `Text` and cloning one to hand to the frontend and to a background
 /// reparse is a handful of atomic ref-count bumps regardless of file size.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Text(Rope);
+
+impl From<&str> for Text {
+    fn from(s: &str) -> Self {
+        Text(Rope::from(s))
+    }
+}
+
+impl From<String> for Text {
+    fn from(s: String) -> Self {
+        Text(Rope::from(s))
+    }
+}
 
 impl Text {
     /// Total length in UTF-8 bytes.

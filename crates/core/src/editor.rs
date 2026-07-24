@@ -193,7 +193,7 @@ impl Editor {
             buffer_id: self.id,
             version: self.version,
             text: self.buffer.text(),
-            selections: Arc::from(self.selections.all()),
+            selections: self.selections.shared(),
             primary: self.selections.primary_index(),
             dirty,
             decorations: Arc::clone(&self.decorations),
@@ -294,14 +294,13 @@ impl Editor {
     /// Move every decoration across the applied `changes` (SPEC §5). Skips the
     /// `Arc` clone entirely when nothing is decorated - the overwhelmingly common
     /// case of a buffer with no LSP attached, which must not pay for this at all.
-    fn transform_decorations(&mut self, changes: &[Change]) {
-        if self.decorations.is_empty() || changes.is_empty() {
+    fn transform_decorations(&mut self, edits: &[Edit]) {
+        if self.decorations.is_empty() || edits.is_empty() {
             return;
         }
-        let edits = edits_from_changes(changes);
         // `make_mut` clones only while a published snapshot still shares the set;
         // once the frontend drops that snapshot this mutates in place.
-        Arc::make_mut(&mut self.decorations).transform_through(&edits);
+        Arc::make_mut(&mut self.decorations).transform_through(edits);
     }
 
     /// Tell the language server about the buffer's current contents, if one is
@@ -320,13 +319,13 @@ impl Editor {
             DocumentSync::Changed {
                 path: path.clone(),
                 version: self.version,
-                text: self.buffer.text().to_string(),
+                text: self.buffer.text(),
             }
         } else {
             DocumentSync::Opened {
                 path: path.clone(),
                 language_id: language_id(path),
-                text: self.buffer.text().to_string(),
+                text: self.buffer.text(),
                 version: self.version,
             }
         };
@@ -353,7 +352,7 @@ impl Editor {
         }
         let message = SyntaxSync {
             version: self.version,
-            text: self.buffer.text().to_string(),
+            text: self.buffer.text(),
         };
         if sync.try_send(message).is_ok() {
             self.syntax_dirty = false;
@@ -373,19 +372,27 @@ impl Editor {
     ///
     /// [`Syntax`]: crate::decoration::DecorationSource::Syntax
     fn apply_highlights(&mut self, spans: Vec<HighlightSpan>) -> bool {
-        let decorations = spans
-            .into_iter()
-            .map(|s| crate::decoration::Decoration::Highlight {
-                range: s.range,
-                kind: s.kind,
-            })
-            .collect();
-        let mut updated = (*self.decorations).clone();
-        updated.replace(crate::decoration::DecorationSource::Syntax, decorations);
-        if updated == *self.decorations {
+        use crate::decoration::{Decoration, DecorationSet, DecorationSource};
+        let candidate = DecorationSet::sorted_bucket(
+            spans
+                .into_iter()
+                .map(|s| Decoration::Highlight {
+                    range: s.range,
+                    kind: s.kind,
+                })
+                .collect(),
+        );
+        // Compare only the syntax bucket, without cloning the set - a reparse that
+        // yields the identical spans (an edit that left tokens intact) allocates
+        // nothing. Only a real change takes the copy-on-write mutable borrow, which
+        // clones the set once, and only if a published snapshot still shares it.
+        if !self
+            .decorations
+            .bucket_differs(DecorationSource::Syntax, &candidate)
+        {
             return false;
         }
-        self.decorations = Arc::new(updated);
+        Arc::make_mut(&mut self.decorations).set_bucket(DecorationSource::Syntax, candidate);
         true
     }
 
@@ -400,13 +407,19 @@ impl Editor {
         if self.path.as_deref() != Some(path) {
             return false;
         }
-        let decorations = convert::decorations_for(&self.buffer.text(), diagnostics);
-        let mut updated = (*self.decorations).clone();
-        updated.replace(crate::decoration::DecorationSource::Lsp, decorations);
-        if updated == *self.decorations {
+        use crate::decoration::{DecorationSet, DecorationSource};
+        let candidate = DecorationSet::sorted_bucket(convert::decorations_for(
+            &self.buffer.text(),
+            diagnostics,
+        ));
+        // Compare only the LSP bucket, no whole-set clone (see `apply_highlights`).
+        if !self
+            .decorations
+            .bucket_differs(DecorationSource::Lsp, &candidate)
+        {
             return false;
         }
-        self.decorations = Arc::new(updated);
+        Arc::make_mut(&mut self.decorations).set_bucket(DecorationSource::Lsp, candidate);
         true
     }
 
@@ -1020,13 +1033,17 @@ async fn apply_edit(
         return snapshots.publish(editor.snapshot(None));
     }
 
+    // Build the anchor-transform edit list once and share it: both the selection
+    // remap and the decoration remap need the identical batch, so computing it twice
+    // (a sort + allocation each) was pure waste on the keystroke path (#5).
+    let edits = edits_from_changes(&changes);
     // Remap selections by transforming each pre-edit caret through the applied
     // edits (SPEC §2.1 anchors): a cursor lands after its own inserted text / at its
     // deletion point, and every other cursor shifts by the edits around it.
-    editor.selections = selections_after_edits(&before, &changes);
+    editor.selections = selections_after_edits(&before, &edits);
     // Decorations ride the same batch, so a squiggle stays under the token it
     // flagged while the producer catches up (SPEC §5).
-    editor.transform_decorations(&changes);
+    editor.transform_decorations(&edits);
     editor.version += 1;
     // One user action is one undo unit, even when it fanned across N cursors
     // (SPEC §2.4). Coalescing (single-caret typing) is decided inside `record`.
@@ -1070,7 +1087,7 @@ async fn reapply(
     if !changes.is_empty() {
         editor.version += 1;
     }
-    editor.transform_decorations(&changes);
+    editor.transform_decorations(&edits_from_changes(&changes));
     editor.lsp_dirty = true;
     editor.syntax_dirty = true;
     editor.selections = reverted.selections;
@@ -1412,19 +1429,18 @@ fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), String> {
 /// edits instead of being dropped. Rebuilt as a fresh set so the disjoint+sorted
 /// invariant holds: the pre-edit heads are ascending and the transform is monotonic,
 /// so the results stay ordered (coincident carets merge).
-fn selections_after_edits(before: &SelectionSet, changes: &[Change]) -> SelectionSet {
-    let edits = edits_from_changes(changes);
+fn selections_after_edits(before: &SelectionSet, edits: &[Edit]) -> SelectionSet {
     let cursors: Vec<Selection> = before
         .all()
         .iter()
-        .map(|sel| Selection::cursor(Anchor::after(sel.head).transform_through(&edits).offset()))
+        .map(|sel| Selection::cursor(Anchor::after(sel.head).transform_through(edits).offset()))
         .collect();
     let mut set = SelectionSet::from_sorted_cursors(cursors);
     // Carry the primary across the edit: transform its caret the same way and keep
     // whichever surviving cursor lands there as primary, so the viewport follows the
     // cursor the user was on instead of snapping to the topmost caret.
     let primary_head = Anchor::after(before.primary().head)
-        .transform_through(&edits)
+        .transform_through(edits)
         .offset();
     set.retarget_primary(primary_head);
     set
