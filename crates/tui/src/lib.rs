@@ -26,6 +26,7 @@ pub mod layout;
 pub mod osc52;
 pub mod palette;
 pub mod picker;
+pub mod prompt;
 pub mod theme;
 pub mod themepicker;
 pub mod toast;

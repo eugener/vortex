@@ -45,7 +45,9 @@ use vortex_core::{Action, Core, ViewSnapshot};
 use vortex_tui::command::Command;
 use vortex_tui::compositor::{Compositor, EventResult};
 use vortex_tui::toast::{self, Toasts};
-use vortex_tui::{config, filepicker, grammar, keymap, layout, osc52, palette, theme, themepicker};
+use vortex_tui::{
+    config, filepicker, grammar, keymap, layout, osc52, palette, prompt, theme, themepicker,
+};
 
 /// Default tab stop width for display-column layout (SPEC §4). Config in M5.
 const TAB_WIDTH: usize = 4;
@@ -375,6 +377,7 @@ Options:
 
 Keys:
   Ctrl+S           Save        Ctrl+Q            Quit
+  Ctrl+Shift+S     Save as (prompt for a path; needs a Kitty-protocol terminal)
   Ctrl+O           Open file (fuzzy picker over the working directory)
   Ctrl+P           Command palette (type to filter, Enter runs, Esc cancels)
   Ctrl+T           Theme picker (previews as you move, Esc restores)
@@ -600,6 +603,7 @@ fn event_loop(
                                 overlays: &mut overlays,
                                 config: &mut config,
                                 toasts: &mut toasts,
+                                path: latest.as_ref().and_then(|s| s.path.as_deref()),
                             };
                             if !dispatch_command(command, handle, &mut ui) {
                                 return Ok(());
@@ -636,6 +640,7 @@ fn event_loop(
                             overlays: &mut overlays,
                             config: &mut config,
                             toasts: &mut toasts,
+                            path: latest.as_ref().and_then(|s| s.path.as_deref()),
                         };
                         if !dispatch_command(command, handle, &mut ui) {
                             return Ok(());
@@ -717,6 +722,9 @@ struct Frontend<'a> {
     overlays: &'a mut Compositor,
     config: &'a mut config::Config,
     toasts: &'a mut Toasts,
+    /// The current buffer's file path (from the latest snapshot), so the save-as
+    /// prompt can pre-fill it. `None` before any file is bound.
+    path: Option<&'a std::path::Path>,
 }
 
 /// Dispatch one resolved frontend command (SPEC §7.5), from either a bound key or a
@@ -744,6 +752,9 @@ fn dispatch_command(command: Command, handle: &vortex_core::CoreHandle, ui: &mut
         Command::OpenThemePicker => ui
             .overlays
             .push(themepicker::open(&ui.config.theme, &ui.config.theme_name)),
+        // The save-as prompt pre-fills the current path (if any) so a save-as is a
+        // quick edit of the existing name; its committed path returns as SaveAs.
+        Command::OpenSavePrompt => ui.overlays.push(prompt::save_as(&ui.config.theme, ui.path)),
         // Chrome is frontend-owned, so a theme change never crosses the seam: swap
         // the live config and hand the new styles to the surfaces that cached them.
         // A theme file that will not load must say so (SPEC §8: never silent) - and

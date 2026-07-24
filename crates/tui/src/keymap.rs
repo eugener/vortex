@@ -182,6 +182,7 @@ fn parse_key_code(token: &str) -> Option<KeyCode> {
 pub enum Command {
     Quit,
     Save,
+    SaveAs,
     Undo,
     Redo,
     DeleteBackward,
@@ -260,6 +261,7 @@ impl Command {
         Some(match name {
             "quit" => Command::Quit,
             "save" => Command::Save,
+            "save_as" => Command::SaveAs,
             "undo" => Command::Undo,
             "redo" => Command::Redo,
             "delete_backward" => Command::DeleteBackward,
@@ -287,6 +289,7 @@ impl Command {
             Command::OpenPalette => return FrontendCommand::OpenPalette,
             Command::OpenFilePicker => return FrontendCommand::OpenFilePicker,
             Command::OpenThemePicker => return FrontendCommand::OpenThemePicker,
+            Command::SaveAs => return FrontendCommand::OpenSavePrompt,
             Command::Quit => Action::Quit,
             Command::Save => Action::Save,
             Command::Undo => Action::Undo,
@@ -333,6 +336,11 @@ fn parse_move_kind(name: &str) -> Option<MoveKind> {
 const DEFAULT_BINDINGS: &[(&str, &str)] = &[
     ("ctrl+q", "quit"),
     ("ctrl+s", "save"),
+    // Save-as opens the prompt line (SPEC §7.5). The shift disambiguation needs the
+    // Kitty protocol (negotiated at startup); a classic terminal that folds shift
+    // away delivers plain Ctrl+S instead, degrading to a safe ordinary save rather
+    // than misfiring - the same "never misfires" stance as the Ctrl+Alt chords below.
+    ("ctrl+shift+s", "save_as"),
     ("enter", "insert_newline"),
     ("tab", "insert_tab"),
     ("backspace", "delete_backward"),
@@ -908,6 +916,34 @@ mod tests {
         assert_eq!(
             act(with_mods(KeyCode::Char('s'), KeyModifiers::CONTROL)),
             Some(Action::Save)
+        );
+    }
+
+    #[test]
+    fn ctrl_shift_s_opens_the_save_prompt() {
+        // Save-as is a frontend-local overlay trigger (opens the prompt line), not a
+        // core action, so it resolves to a FrontendCommand and never reaches `act`.
+        let km = Keymap::default();
+        assert_eq!(
+            command_for_key(
+                &km,
+                with_mods(
+                    KeyCode::Char('s'),
+                    KeyModifiers::CONTROL | KeyModifiers::SHIFT
+                ),
+                PAGE
+            ),
+            Some(FrontendCommand::OpenSavePrompt)
+        );
+        // Named like any other command (config-rebindable) and resolves frontend-local.
+        assert_eq!(Command::parse("save_as"), Some(Command::SaveAs));
+        assert_eq!(
+            Command::SaveAs.resolve(PAGE),
+            FrontendCommand::OpenSavePrompt
+        );
+        assert_eq!(
+            km.shortcut_for(Command::SaveAs).as_deref(),
+            Some("Ctrl+Shift+S")
         );
     }
 

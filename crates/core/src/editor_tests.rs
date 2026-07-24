@@ -531,6 +531,124 @@ fn open_then_edit_then_save_round_trips_through_disk() {
 }
 
 #[test]
+fn save_as_writes_to_target_adopts_it_and_clears_modified() {
+    // Save-as on a buffer with no bound file: the write lands, the path is adopted
+    // (a following plain Save targets it), and the buffer goes clean (SPEC §7.5, §8).
+    let dir = TempDir::new();
+    let target = dir.file("as.txt");
+
+    let mut e = editor_with("save-as body", SelectionSet::at_origin());
+    assert!(e.path.is_none());
+    mark_dirty(&mut e);
+
+    let h = Harness::new();
+    let alive = smol::block_on(save_as_file(
+        &mut e,
+        target.clone(),
+        &h.snapshots,
+        &h.note_tx,
+    ));
+
+    assert!(alive);
+    assert_eq!(std::fs::read_to_string(&target).unwrap(), "save-as body");
+    assert_eq!(e.path.as_deref(), Some(target.as_path())); // adopted
+    assert!(!e.modified()); // clean after a successful save-as
+    match h.note_rx.try_recv() {
+        Ok(Notification::FileSaved { path: p, .. }) => assert_eq!(p, target),
+        other => panic!("expected FileSaved, got {other:?}"),
+    }
+    // The adopted path is now bound: a subsequent plain Save writes to it.
+    e.selections = SelectionSet::single(Selection::cursor(12));
+    let edits = e.plan_edit(EditKind::Insert("!".into()));
+    smol::block_on(apply_edit(
+        &mut e,
+        edits,
+        &h.delta_tx,
+        &h.snapshots,
+        &h.note_tx,
+    ));
+    smol::block_on(save_file(&mut e, &h.snapshots, &h.note_tx));
+    assert_eq!(std::fs::read_to_string(&target).unwrap(), "save-as body!");
+    assert!(!has_temp_file(&dir.path), "leftover .vortex-tmp file");
+}
+
+#[test]
+fn save_as_failure_keeps_old_path_and_stays_dirty() {
+    // Save-as whose write fails (target is a directory): the buffer keeps its
+    // previous path binding and stays dirty, and the target is untouched - a
+    // rejected save-as loses neither the work nor the original association (SPEC §8).
+    let dir = TempDir::new();
+    let old = dir.file("original.txt");
+    let target = dir.file("a-directory");
+    std::fs::create_dir(&target).unwrap();
+
+    let mut e = editor_with("in progress", SelectionSet::at_origin());
+    e.path = Some(old.clone());
+    mark_dirty(&mut e);
+
+    let h = Harness::new();
+    let alive = smol::block_on(save_as_file(
+        &mut e,
+        target.clone(),
+        &h.snapshots,
+        &h.note_tx,
+    ));
+
+    assert!(alive);
+    assert_eq!(e.path.as_deref(), Some(old.as_path())); // binding unchanged
+    assert!(e.modified()); // still dirty
+    assert!(target.is_dir()); // the target directory is intact, not clobbered
+    match h.note_rx.try_recv() {
+        Ok(Notification::FileError { path: p, .. }) => assert_eq!(p, Some(target.clone())),
+        other => panic!("expected FileError, got {other:?}"),
+    }
+    assert!(!has_temp_file(&dir.path), "leftover .vortex-tmp file");
+}
+
+#[test]
+fn save_as_to_a_new_path_reannounces_to_the_language_server() {
+    // Adopting a *different* path changes the document's identity, so the server is
+    // re-announced: the next sync sends a fresh didOpen under the new name. A save-as
+    // to the *same* path is a plain re-save and leaves the announce state alone.
+    let dir = TempDir::new();
+    let old = dir.file("a.rs");
+    let renamed = dir.file("b.rs");
+
+    let mut e = editor_with("fn main() {}", SelectionSet::at_origin());
+    e.path = Some(old.clone());
+    e.lsp_opened = true;
+    e.lsp_dirty = false;
+
+    let h = Harness::new();
+    smol::block_on(save_as_file(
+        &mut e,
+        renamed.clone(),
+        &h.snapshots,
+        &h.note_tx,
+    ));
+    assert!(
+        !e.lsp_opened,
+        "a renamed document must be re-opened to the server"
+    );
+    assert!(e.lsp_dirty, "the new identity must be re-synced");
+
+    // Saving-as again to the same (now current) path is a plain save: no re-announce.
+    e.lsp_opened = true;
+    e.lsp_dirty = false;
+    smol::block_on(save_as_file(
+        &mut e,
+        renamed.clone(),
+        &h.snapshots,
+        &h.note_tx,
+    ));
+    assert!(
+        e.lsp_opened,
+        "same-path save-as must not reset the announce state"
+    );
+    assert!(!e.lsp_dirty);
+}
+
+#[test]
 fn save_writes_to_a_new_file_that_did_not_exist() {
     // Opening a missing path then saving creates the file (Vim's behavior).
     let dir = TempDir::new();
@@ -711,6 +829,29 @@ fn open_then_save_through_the_actor_loop() {
         notes
             .iter()
             .any(|n| matches!(n, Notification::FileSaved { .. }))
+    );
+}
+
+#[test]
+fn save_as_through_the_actor_loop() {
+    // End-to-end through the real loop (the dispatch arm the direct save_as_file
+    // tests bypass): type text with no bound file, then SaveAs writes it, adopts the
+    // path, and reports it clean - what the frontend's prompt commits (SPEC §7.5).
+    let dir = TempDir::new();
+    let target = dir.file("committed.txt");
+
+    let (snap, notes) = run_seam(&[
+        Action::Insert("hello".into()),
+        Action::SaveAs(target.clone()),
+    ]);
+
+    assert_eq!(snap.path, Some(target.clone()));
+    assert!(!snap.modified); // clean after the save-as
+    assert_eq!(std::fs::read_to_string(&target).unwrap(), "hello");
+    assert!(
+        notes
+            .iter()
+            .any(|n| matches!(n, Notification::FileSaved { path, .. } if path == &target))
     );
 }
 
