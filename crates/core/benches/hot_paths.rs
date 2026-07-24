@@ -11,6 +11,12 @@
 //! - **`cursor_motion_scaling`** - the same motion over a growing cursor set, so
 //!   the per-cursor cost (and any super-linear surprise) is visible as multi-cursor
 //!   grows the count.
+//! - **`multicursor_edit`** - an edit applied over a growing cursor set, driven
+//!   through the actor. This is the one path where the O(N²) selection remap
+//!   (`selections_after_edits` × `Anchor::transform_through`, both `pub(crate)`)
+//!   actually bites: N selections each transformed through N edits. Motion scales
+//!   linearly (`cursor_motion_scaling`); this is where to watch for the quadratic
+//!   as multi-cursor (M3) makes high cursor counts reachable.
 //!
 //! ## Running
 //!
@@ -27,19 +33,15 @@
 //! noisy, so they are never gated in the loop; they are a tool for A/B comparison
 //! when a hot path is touched, read by a human against a baseline.
 //!
-//! ## Not yet covered (need a lib/bin split or actor drive - deliberately deferred)
+//! ## Not yet covered
 //!
-//! - The edit path's O(N²) selection remap (`selections_after_edits`) and the
-//!   decoration `transform` are `pub(crate)`, reachable only by driving the actor
-//!   with an `Action` script - an async, executor-bound bench worth adding when the
-//!   remap is the question.
-//! - `vortex-tui`'s `render_line`/`style_at`/`span_columns` live in a bin-only
-//!   crate, so a bench cannot link them until the frontend grows a lib target.
+//! - `vortex-tui`'s paint paths are benched in that crate's own `benches/layout.rs`
+//!   (they moved into its library target so a bench can link them).
 
 use std::hint::black_box;
 
 use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
-use vortex_core::{Buffer, Motion, RopeBuffer, Selection, SelectionSet, Text};
+use vortex_core::{Action, Buffer, Core, Motion, RopeBuffer, Selection, SelectionSet, Text};
 
 /// A buffer of a single line of `n` ASCII bytes - the minified-file shape whose
 /// per-keystroke line copy §10.4 flags.
@@ -103,5 +105,68 @@ fn cursor_motion_scaling(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, cursor_motion, cursor_motion_scaling);
+/// Drain the (bounded, lossless) delta channel so the actor never blocks on it,
+/// then take the latest snapshot - the same handshake the frontend and the core's
+/// interaction tests use after each action.
+async fn settle(handle: &vortex_core::CoreHandle) -> vortex_core::ViewSnapshot {
+    while handle.deltas.try_recv().is_ok() {}
+    handle.snapshots.recv().await.unwrap()
+}
+
+fn multicursor_edit(c: &mut Criterion) {
+    let mut group = c.benchmark_group("multicursor_edit");
+
+    for &n in &[1usize, 16, 64, 256] {
+        // Build the actor and an n-cursor selection once, off the clock: n lines,
+        // caret to the top, then a caret added on each line below.
+        let ex = smol::Executor::new();
+        let Core { handle, run } = vortex_core::new(256);
+        ex.spawn(run).detach();
+        smol::block_on(ex.run(async {
+            let text = vec!["abcdef"; n].join("\n");
+            handle.actions.send(Action::Insert(text)).await.unwrap();
+            settle(&handle).await;
+            handle
+                .actions
+                .send(Action::PlaceCursor {
+                    offset: 0,
+                    extend: false,
+                })
+                .await
+                .unwrap();
+            settle(&handle).await;
+            for _ in 1..n {
+                handle.actions.send(Action::AddCursorBelow).await.unwrap();
+                settle(&handle).await;
+            }
+        }));
+
+        // Timed: one multi-cursor insert then its delete, so the buffer returns to
+        // baseline each iteration (no growth confound) while both edits pay the
+        // full N-selections-through-N-edits remap.
+        group.bench_with_input(BenchmarkId::from_parameter(n), &n, |b, _| {
+            b.iter(|| {
+                smol::block_on(ex.run(async {
+                    handle
+                        .actions
+                        .send(Action::Insert("x".into()))
+                        .await
+                        .unwrap();
+                    settle(&handle).await;
+                    handle.actions.send(Action::DeleteBackward).await.unwrap();
+                    black_box(settle(&handle).await.selections.len())
+                }))
+            })
+        });
+    }
+
+    group.finish();
+}
+
+criterion_group!(
+    benches,
+    cursor_motion,
+    cursor_motion_scaling,
+    multicursor_edit
+);
 criterion_main!(benches);
