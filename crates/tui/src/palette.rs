@@ -23,6 +23,7 @@ const PALETTE: &[(&str, Bindable)] = &[
     ("Find File…", Bindable::OpenFilePicker),
     ("Change Theme…", Bindable::OpenThemePicker),
     ("Save File", Bindable::Save),
+    ("Save As…", Bindable::SaveAs),
     ("Undo", Bindable::Undo),
     ("Redo", Bindable::Redo),
     ("Copy", Bindable::Copy),
@@ -85,6 +86,12 @@ mod tests {
             .find(|i| i.command == Command::OpenFilePicker)
             .expect("Find File listed");
         assert_eq!(find.shortcut.as_deref(), Some("Ctrl+O"));
+        // Save-as opens the prompt overlay (frontend-local) and shows its shortcut.
+        let save_as = items
+            .iter()
+            .find(|i| i.command == Command::OpenSavePrompt)
+            .expect("Save As listed");
+        assert_eq!(save_as.shortcut.as_deref(), Some("Ctrl+Shift+S"));
         // No duplicate labels (they are the fuzzy haystacks).
         for (n, item) in items.iter().enumerate() {
             assert!(

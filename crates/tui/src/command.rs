@@ -20,6 +20,10 @@ pub enum Command {
     OpenFilePicker,
     /// Open the theme picker overlay (frontend-local).
     OpenThemePicker,
+    /// Open the save-as prompt overlay (frontend-local). The prompt commits an
+    /// [`Action::SaveAs`] for the typed path, so the target never crosses the seam
+    /// until it is chosen (SPEC §7.5).
+    OpenSavePrompt,
     /// Switch to the named theme (frontend-local: chrome never crosses the seam).
     ///
     /// Carries data, so unlike the openers above it is not a bindable

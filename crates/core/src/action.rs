@@ -87,11 +87,19 @@ pub enum Action {
     /// buffer, so the delta/snapshot invariant (SPEC §5) still holds.
     Open(PathBuf),
     /// Write the buffer to its associated file (set by `Open`). Fails with a
-    /// `Notification` if no path is set - save-as (a target path) lands with the
-    /// prompt UI, not here. The write is atomic (temp file + rename, SPEC §8) so
-    /// a failed write never corrupts the existing file, and the buffer stays
+    /// `Notification` if no path is set - write to an explicit target with
+    /// [`Action::SaveAs`] instead. The write is atomic (temp file + rename, SPEC §8)
+    /// so a failed write never corrupts the existing file, and the buffer stays
     /// dirty on failure so no work is lost.
     Save,
+    /// Write the buffer to `path` and adopt it as the buffer's file, so subsequent
+    /// `Save`s target it (the "save-as" the frontend's prompt commits, SPEC §7.5).
+    /// The write is atomic like `Save`; on failure the old path binding and dirty
+    /// state are left untouched (SPEC §8), so a rejected save-as loses neither the
+    /// work nor the original association. Adopting a new path re-announces the
+    /// document to the language server (a fresh `didOpen`, possibly a new
+    /// `languageId`) since its identity changed.
+    SaveAs(PathBuf),
     /// Shut the editor down cleanly. The core drains and stops its loop.
     Quit,
 }

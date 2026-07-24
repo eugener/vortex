@@ -508,6 +508,7 @@ enum Step {
     Republish,
     Open(PathBuf),
     Save,
+    SaveAs(PathBuf),
 }
 
 /// What the actor loop woke up for. The LSP arms exist so a server can push work
@@ -963,6 +964,7 @@ async fn run(
             Action::RequestSnapshot => Step::Republish,
             Action::Open(path) => Step::Open(path),
             Action::Save => Step::Save,
+            Action::SaveAs(path) => Step::SaveAs(path),
             Action::Quit => break,
         };
 
@@ -983,6 +985,7 @@ async fn run(
                 open_file(&mut editor, path, &deltas, &snapshots, &notifications).await
             }
             Step::Save => save_file(&mut editor, &snapshots, &notifications).await,
+            Step::SaveAs(path) => save_as_file(&mut editor, path, &snapshots, &notifications).await,
         };
         if !alive {
             break;
@@ -1270,6 +1273,48 @@ async fn save_file(
 
     // Mark the current history node as the on-disk state, so undoing back to it
     // later clears the modified marker (SPEC §2.4, §8).
+    editor.history.mark_saved();
+    let _ = notifications.try_send(Notification::FileSaved {
+        buffer_id: editor.id,
+        path,
+    });
+    snapshots.publish(editor.snapshot(None))
+}
+
+/// Write the buffer to `path` and adopt it as the buffer's file (the save-as the
+/// prompt commits, SPEC §7.5). The write is atomic like [`save_file`]; on failure
+/// the buffer keeps its previous path and stays dirty, so a rejected save-as loses
+/// neither the work nor the original association (SPEC §8). Returns `false` if the
+/// frontend has hung up.
+///
+/// Adopting a path that differs from the current one changes the document's
+/// *identity*, so the language server is re-announced: `lsp_opened` is cleared and
+/// `lsp_dirty` set, and the next [`Editor::sync_lsp`] sends a fresh `didOpen` under
+/// the new path (whose extension may map to a different `languageId`). The old
+/// document is not formally closed - the same re-announce shape [`open_file`] uses.
+/// The highlighter is path-agnostic and the text is unchanged, so no reparse is
+/// forced; a save-as that changes the *language* still needs the frontend to attach
+/// the new grammar, deferred with per-buffer grammar (M7).
+async fn save_as_file(
+    editor: &mut Editor,
+    path: PathBuf,
+    snapshots: &SnapshotSink,
+    notifications: &Sender<Notification>,
+) -> bool {
+    let contents = editor.buffer.text().to_string();
+    if let Err(message) = write_atomic(&path, contents.as_bytes()) {
+        return report_file_error(editor, Some(path), &message, snapshots, notifications);
+    }
+
+    // A different target is a different document to the server; re-announce it so
+    // diagnostics track the new name rather than the old one.
+    if editor.path.as_deref() != Some(path.as_path()) {
+        editor.lsp_opened = false;
+        editor.lsp_dirty = true;
+    }
+    editor.path = Some(path.clone());
+    // The write is now the on-disk state (SPEC §2.4, §8): undoing back to this node
+    // later clears the modified marker, exactly as a plain save.
     editor.history.mark_saved();
     let _ = notifications.try_send(Notification::FileSaved {
         buffer_id: editor.id,
