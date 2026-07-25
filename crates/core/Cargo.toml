@@ -24,6 +24,12 @@ async-lsp = { version = "0.2.4", default-features = false, features = [
 # core stays executor-agnostic (SPEC §2.3).
 async-process = "2.5.0"
 crop = "0.4.3"
+# Encoding detection + transcoding on the file boundary (SPEC §3, §10.1). Gecko's
+# implementation of the WHATWG Encoding Standard: it is what makes "open a
+# latin-1 file and save it back byte-for-byte" possible instead of refusing every
+# file that is not UTF-8. Confined to `file.rs` and never in a public signature -
+# the encoding is exposed as its name, not as an `encoding_rs` type.
+encoding_rs = "0.8.35"
 # async-lsp's service plumbing (`ServiceBuilder`) and combinators; both are
 # required to construct an async-lsp client at all.
 futures = "0.3.33"

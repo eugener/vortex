@@ -18,7 +18,7 @@ use ratatui::style::Style;
 use ratatui::text::Span;
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
-use vortex_core::{BufferId, BufferInfo, Selection, Text};
+use vortex_core::{BufferId, BufferInfo, FileFormat, Selection, Text};
 
 /// Shown in the head bar when the buffer has no bound file (SPEC §10 lifecycle).
 pub const NO_NAME: &str = "[No Name]";
@@ -748,19 +748,32 @@ pub fn human_size(bytes: usize) -> String {
 /// selection) is appended so the size of a selection is visible while it is held.
 /// `bytes` is the buffer size (rendered via [`human_size`]) and `version` the
 /// document version (SPEC §5), surfaced while the delta/version model is young.
+///
+/// `format` is the file's on-disk encoding and line terminator (SPEC §10.1). It is
+/// shown because it is otherwise invisible: the buffer holds UTF-8 with LF
+/// terminators whatever the file holds, so without this readout there is nothing to
+/// tell a user that opening a CRLF latin-1 file preserved it - or that a new buffer
+/// will not.
 pub fn status_bar(
     line: usize,
     col: usize,
     selected: usize,
     bytes: usize,
     version: u64,
+    format: FileFormat,
 ) -> (String, String) {
     let left = if selected > 0 {
         format!(" Ln {line}, Col {col}  ({selected} selected)")
     } else {
         format!(" Ln {line}, Col {col}")
     };
-    let right = format!("{} · v{version} ", human_size(bytes));
+    let bom = if format.bom { " BOM" } else { "" };
+    let right = format!(
+        "{}{bom} · {} · {} · v{version} ",
+        format.encoding_name(),
+        format.eol.name(),
+        human_size(bytes),
+    );
     (left, right)
 }
 
@@ -1635,17 +1648,28 @@ mod tests {
 
     #[test]
     fn status_bar_composes_position_and_metrics() {
-        let (left, right) = status_bar(2, 5, 0, 38, 7);
+        let (left, right) = status_bar(2, 5, 0, 38, 7, FileFormat::default());
         assert_eq!(left, " Ln 2, Col 5");
-        assert_eq!(right, "38B · v7 ");
+        assert_eq!(right, "UTF-8 · LF · 38B · v7 ");
     }
 
     #[test]
     fn status_bar_appends_selection_count_when_active() {
         // A held selection surfaces its size next to the position; an empty one
         // (count 0) leaves the position untouched.
-        let (left, _) = status_bar(2, 5, 12, 38, 7);
+        let (left, _) = status_bar(2, 5, 12, 38, 7, FileFormat::default());
         assert_eq!(left, " Ln 2, Col 5  (12 selected)");
+    }
+
+    #[test]
+    fn status_bar_reports_the_files_own_encoding_and_terminator() {
+        // The readout is the only place a preserved CRLF or BOM is visible: the
+        // buffer itself is always UTF-8 with LF terminators (SPEC §10.1).
+        let mut format = FileFormat::default();
+        format.eol = vortex_core::LineEnding::Crlf;
+        format.bom = true;
+        let (_, right) = status_bar(1, 1, 0, 4, 0, format);
+        assert_eq!(right, "UTF-8 BOM · CRLF · 4B · v0 ");
     }
 
     #[test]
@@ -1664,8 +1688,8 @@ mod tests {
 
     #[test]
     fn status_bar_renders_large_sizes_in_scaled_units() {
-        let (_, right) = status_bar(1, 1, 0, 2 * 1024 * 1024, 3);
-        assert_eq!(right, "2.0MB · v3 ");
+        let (_, right) = status_bar(1, 1, 0, 2 * 1024 * 1024, 3, FileFormat::default());
+        assert_eq!(right, "UTF-8 · LF · 2.0MB · v3 ");
     }
 
     #[test]

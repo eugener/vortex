@@ -10,6 +10,7 @@ mod anchor;
 pub mod buffer;
 pub mod decoration;
 pub mod editor;
+pub mod file;
 mod history;
 pub mod lsp;
 pub mod selection;
@@ -22,6 +23,7 @@ pub use decoration::{
     Decoration, DecorationSet, DecorationSource, GutterKind, HighlightKind, Severity,
 };
 pub use editor::{Core, CoreHandle, new, with_lsp};
+pub use file::{FileFormat, LineEnding};
 pub use lsp::{Diagnostic, DocumentSync, LspEvent, LspHandle};
 pub use selection::{Motion, Selection, SelectionSet};
 pub use syntax::{HighlightSpan, SyntaxEvent, SyntaxHandle, SyntaxSync, highlighter};
