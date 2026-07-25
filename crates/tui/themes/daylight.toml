@@ -6,6 +6,7 @@
 
 text             = { fg = "#1f2422", bg = "#eceee9" }
 head_bar         = { fg = "#1f2422", bg = "#dfe2dc", bold = true }
+head_bar_inactive = { fg = "#8a918b", bg = "#dfe2dc" }
 status_bar       = { fg = "#5c645e", bg = "#dfe2dc" }
 gutter           = { fg = "#9aa29c" }
 gutter_current   = { fg = "#1f2422", bold = true }

@@ -20,6 +20,10 @@ pub enum Command {
     OpenFilePicker,
     /// Open the theme picker overlay (frontend-local).
     OpenThemePicker,
+    /// Open the buffer picker overlay (frontend-local). Its rows come from the
+    /// snapshot's buffer list, so opening it needs no round trip; a pick commits an
+    /// [`Action::SwitchBuffer`].
+    OpenBufferPicker,
     /// Open the save-as prompt overlay (frontend-local). The prompt commits an
     /// [`Action::SaveAs`] for the typed path, so the target never crosses the seam
     /// until it is chosen (SPEC §7.5).
