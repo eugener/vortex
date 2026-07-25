@@ -754,6 +754,12 @@ pub fn human_size(bytes: usize) -> String {
 /// terminators whatever the file holds, so without this readout there is nothing to
 /// tell a user that opening a CRLF latin-1 file preserved it - or that a new buffer
 /// will not.
+///
+/// `read_only` leads the **left** segment, ahead of the cursor position. Placement
+/// is the whole point: [`fit_bar`] drops the right segment first and then truncates
+/// the left from its *end*, so the front of the left segment is the only spot that
+/// survives any width - and of everything on this bar, "your edits will be refused"
+/// is what a user must not have to widen the terminal to discover.
 pub fn status_bar(
     line: usize,
     col: usize,
@@ -761,11 +767,13 @@ pub fn status_bar(
     bytes: usize,
     version: u64,
     format: FileFormat,
+    read_only: bool,
 ) -> (String, String) {
+    let lock = if read_only { " [read-only] " } else { "" };
     let left = if selected > 0 {
-        format!(" Ln {line}, Col {col}  ({selected} selected)")
+        format!("{lock} Ln {line}, Col {col}  ({selected} selected)")
     } else {
-        format!(" Ln {line}, Col {col}")
+        format!("{lock} Ln {line}, Col {col}")
     };
     let bom = if format.bom { " BOM" } else { "" };
     let right = format!(
@@ -1648,7 +1656,7 @@ mod tests {
 
     #[test]
     fn status_bar_composes_position_and_metrics() {
-        let (left, right) = status_bar(2, 5, 0, 38, 7, FileFormat::default());
+        let (left, right) = status_bar(2, 5, 0, 38, 7, FileFormat::default(), false);
         assert_eq!(left, " Ln 2, Col 5");
         assert_eq!(right, "UTF-8 · LF · 38B · v7 ");
     }
@@ -1657,8 +1665,19 @@ mod tests {
     fn status_bar_appends_selection_count_when_active() {
         // A held selection surfaces its size next to the position; an empty one
         // (count 0) leaves the position untouched.
-        let (left, _) = status_bar(2, 5, 12, 38, 7, FileFormat::default());
+        let (left, _) = status_bar(2, 5, 12, 38, 7, FileFormat::default(), false);
         assert_eq!(left, " Ln 2, Col 5  (12 selected)");
+    }
+
+    #[test]
+    fn status_bar_marks_a_read_only_buffer_where_truncation_cannot_reach_it() {
+        let (left, _) = status_bar(2, 5, 0, 38, 7, FileFormat::default(), true);
+        assert_eq!(left, " [read-only]  Ln 2, Col 5");
+        let (left, _) = status_bar(2, 5, 3, 38, 7, FileFormat::default(), true);
+        assert_eq!(left, " [read-only]  Ln 2, Col 5  (3 selected)");
+        // A 20-cell bar has room for neither the metrics nor the whole position -
+        // the marker is at the front, so it is what is left.
+        assert!(fit_bar(&left, "UTF-8 · LF · 38B · v7 ", 20).contains("[read-only]"));
     }
 
     #[test]
@@ -1668,7 +1687,7 @@ mod tests {
         let mut format = FileFormat::default();
         format.eol = vortex_core::LineEnding::Crlf;
         format.bom = true;
-        let (_, right) = status_bar(1, 1, 0, 4, 0, format);
+        let (_, right) = status_bar(1, 1, 0, 4, 0, format, false);
         assert_eq!(right, "UTF-8 BOM · CRLF · 4B · v0 ");
     }
 
@@ -1688,7 +1707,7 @@ mod tests {
 
     #[test]
     fn status_bar_renders_large_sizes_in_scaled_units() {
-        let (_, right) = status_bar(1, 1, 0, 2 * 1024 * 1024, 3, FileFormat::default());
+        let (_, right) = status_bar(1, 1, 0, 2 * 1024 * 1024, 3, FileFormat::default(), false);
         assert_eq!(right, "UTF-8 · LF · 2.0MB · v3 ");
     }
 

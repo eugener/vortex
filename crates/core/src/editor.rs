@@ -138,6 +138,10 @@ struct Document {
     /// CRLF latin-1 file is written back as one rather than silently converted
     /// to LF UTF-8. An unnamed buffer carries the default (UTF-8, LF).
     format: FileFormat,
+    /// Why this buffer refuses edits, or `None` if it does not (SPEC §10.3).
+    /// Decided at load time and never inferred later, so the reason is available
+    /// to explain the refusal rather than only the fact of it.
+    read_only: Option<ReadOnly>,
     /// The undo tree (SPEC §2.4). Owns the reversible change history and the
     /// coalescing state; reset on a file open (undo does not cross a load).
     history: History,
@@ -161,6 +165,36 @@ struct Document {
     /// current buffer subsumes every missed state, so a dropped sync can never
     /// mis-color, and the actor never awaits the sync channel.
     syntax_dirty: bool,
+}
+
+/// Why a buffer will not accept edits (SPEC §10.3). Both reasons are decided when
+/// the file is loaded; neither can be overridden yet - a `:set noreadonly`
+/// equivalent is keymap vocabulary, not core state, and would need a deliberate
+/// `Action` rather than an implicit one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReadOnly {
+    /// The file exists but this process cannot write it. Refusing up front beats
+    /// discovering it after an hour of typing, which is what a save-time-only
+    /// check would give (the save still fails safely - this is about telling the
+    /// user first).
+    Permissions,
+    /// The decode replaced bytes it could not interpret, so the buffer is not a
+    /// faithful copy of the file. Writing it back would replace those bytes with
+    /// U+FFFD - a silent corruption of data the user never touched (SPEC §8), and
+    /// the one case where "you may look but not save" is exactly right.
+    Undecodable,
+}
+
+impl ReadOnly {
+    /// Why the edit was refused, for the notification the frontend shows.
+    fn message(self) -> &'static str {
+        match self {
+            ReadOnly::Permissions => "file is read-only",
+            ReadOnly::Undecodable => {
+                "read-only: parts of this file could not be decoded, and saving would overwrite them"
+            }
+        }
+    }
 }
 
 /// A live connection to a language server, and which documents *this* connection
@@ -337,6 +371,7 @@ impl Document {
             version: 0,
             path: None,
             format: FileFormat::default(),
+            read_only: None,
             history: History::new(),
             decorations: Arc::new(DecorationSet::new()),
             lsp_dirty: false,
@@ -366,6 +401,7 @@ impl Document {
             path: self.path.clone(),
             modified: self.modified(),
             format: self.format,
+            read_only: self.read_only.is_some(),
             buffers,
         }
     }
@@ -708,6 +744,28 @@ enum Step {
         id: BufferId,
         force: bool,
     },
+}
+
+impl Step {
+    /// Whether this step would change the active buffer's text, and so must be
+    /// refused on a read-only buffer (SPEC §10.3).
+    ///
+    /// Matched exhaustively rather than with a `_` arm on purpose: a new step that
+    /// edits the buffer has to state which side it is on here, instead of silently
+    /// defaulting to "allowed" and becoming the one way to write to a read-only
+    /// file. Saving is not listed - it changes the *file*, not the buffer, and
+    /// [`save_file`] holds that guard, where the refusal is a `FileError`.
+    fn edits_buffer(&self) -> bool {
+        match self {
+            Step::Edit(_) | Step::Undo | Step::Redo => true,
+            Step::Republish
+            | Step::Open(_)
+            | Step::Save
+            | Step::SaveAs(_)
+            | Step::Switch(_)
+            | Step::Close { .. } => false,
+        }
+    }
 }
 
 /// What the actor loop woke up for. The LSP arms exist so a server can push work
@@ -1225,6 +1283,26 @@ async fn run(
             Action::Quit => break,
         };
 
+        // One choke point for read-only (SPEC §10.3): every text change funnels
+        // through a `Step`, so refusing here cannot be bypassed by an action the
+        // guard forgot about. `Copy`/`Cut` have already filled the register above -
+        // deliberately, since yanking out of a file you cannot write is not a
+        // mutation, and only `Cut`'s deletion half is refused.
+        if let Some(reason) = session.active().read_only
+            && step.edits_buffer()
+        {
+            let doc = session.active();
+            let _ = notifications.try_send(Notification::EditRejected {
+                buffer_id: doc.id,
+                version: doc.version,
+                message: reason.message().to_string(),
+            });
+            if !snapshots.publish(session.snapshot(None)) {
+                break;
+            }
+            continue;
+        }
+
         let alive = match step {
             Step::Edit(edits) => {
                 apply_edit(&mut session, edits, &deltas, &snapshots, &notifications).await
@@ -1463,10 +1541,39 @@ async fn open_file(
         return switch_to(session, index, snapshots, notifications);
     }
 
+    // Stat before reading. A FIFO or a character device answers a read by blocking
+    // until someone writes - on the actor thread, that is the whole editor hung with
+    // no way out (SPEC §10.3). `metadata` follows symlinks, so a link to a regular
+    // file is one; a dangling link reports `NotFound` and takes the missing-file
+    // path below, where the first save writes through the link.
+    let metadata = match std::fs::metadata(&path) {
+        Ok(metadata) => Some(metadata),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => None,
+        Err(err) => {
+            return report_file_error(
+                session,
+                Some(path),
+                &err.to_string(),
+                snapshots,
+                notifications,
+            );
+        }
+    };
+    if let Some(metadata) = &metadata
+        && !metadata.is_file()
+    {
+        let kind = if metadata.is_dir() {
+            "is a directory"
+        } else {
+            "not a regular file"
+        };
+        return report_file_error(session, Some(path), kind, snapshots, notifications);
+    }
+
     // Read bytes, not a `String`: the file decides its own encoding, and
     // `read_to_string` would reject everything that is not UTF-8 outright
     // (SPEC §10.1). `file::load` decodes it and reports the format to write back.
-    let (contents, format, existed) = match std::fs::read(&path) {
+    let (contents, format, read_only, existed) = match std::fs::read(&path) {
         Ok(bytes) if crate::file::is_binary(&bytes) => {
             // Refused rather than opened as mojibake: every byte would round-trip
             // until the first edit, which would corrupt the file (SPEC §10.3).
@@ -1479,12 +1586,21 @@ async fn open_file(
             );
         }
         Ok(bytes) => {
-            let (text, format) = crate::file::load(&bytes);
-            (text, format, true)
+            let loaded = crate::file::load(&bytes);
+            let read_only = if loaded.lossy {
+                Some(ReadOnly::Undecodable)
+            } else if !is_writable(&path) {
+                Some(ReadOnly::Permissions)
+            } else {
+                None
+            };
+            (loaded.text, loaded.format, read_only, true)
         }
         // Missing file: open an empty buffer bound to the path (created on save).
+        // Nothing to be read-only about - there is no file yet, and whether its
+        // directory will accept one is the save's answer to give.
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-            (String::new(), FileFormat::default(), false)
+            (String::new(), FileFormat::default(), None, false)
         }
         Err(err) => {
             return report_file_error(
@@ -1542,6 +1658,7 @@ async fn open_file(
     // The buffer now *is* this file, so it saves in this file's form - including
     // when a scratch buffer was reused and had been carrying the default.
     doc.format = format;
+    doc.read_only = read_only;
     doc.history = History::new();
     // Decorations describe the *previous* file's text; keeping them would paint
     // squiggles at meaningless offsets until a producer refreshes.
@@ -1570,6 +1687,29 @@ async fn open_file(
     // The path changed, so the cached entry for this buffer is stale.
     session.buffers_stale = true;
     snapshots.publish(session.snapshot(dirty))
+}
+
+/// Whether this process can actually write `path` (SPEC §10.3).
+///
+/// Opening for append is the probe rather than reading the permission bits,
+/// because the bits are not the question: a mode-644 file owned by someone else is
+/// unwritable to us while `Permissions::readonly()` reports it writable, and the
+/// same goes for a read-only mount or a file the OS has locked. Opening with
+/// `append` asks the kernel the real question and changes nothing - no truncation,
+/// no write, not even an mtime bump - and the file is known to be regular by the
+/// time this runs, so there is no device or FIFO here to block on.
+///
+/// Only a permission-shaped failure means read-only. Any other error (out of file
+/// descriptors, a race with a delete) leaves the buffer editable and lets the save
+/// report the real problem, which beats locking a file the user can in fact write.
+fn is_writable(path: &Path) -> bool {
+    match std::fs::OpenOptions::new().append(true).open(path) {
+        Ok(_) => true,
+        Err(err) => !matches!(
+            err.kind(),
+            std::io::ErrorKind::PermissionDenied | std::io::ErrorKind::ReadOnlyFilesystem
+        ),
+    }
 }
 
 /// Make `index` the active document and tell the frontend (SPEC §6). A switch
@@ -1678,6 +1818,20 @@ async fn save_file(
             notifications,
         );
     };
+    // A read-only buffer has nothing to save - it cannot have been edited - and for
+    // an undecodable file writing it back would replace the bytes that did not
+    // decode with U+FFFD (SPEC §8). `SaveAs` is deliberately still allowed: writing
+    // the buffer somewhere else is the escape hatch, and it leaves the original
+    // untouched.
+    if let Some(reason) = session.active().read_only {
+        return report_file_error(
+            session,
+            Some(path),
+            reason.message(),
+            snapshots,
+            notifications,
+        );
+    }
 
     let bytes = match session.active().encode_for_save() {
         Ok(bytes) => bytes,
@@ -1725,16 +1879,31 @@ async fn save_as_file(
     // create, arrived at from the other direction, and the one where the next save
     // discards the other buffer's work. Refused before the write, so nothing is
     // touched on disk (SPEC §8).
-    if let Some(index) = session.index_of_path(&path)
-        && index != session.active
-    {
-        return report_file_error(
-            session,
-            Some(path),
-            "already open in another buffer",
-            snapshots,
-            notifications,
-        );
+    if let Some(index) = session.index_of_path(&path) {
+        if index != session.active {
+            return report_file_error(
+                session,
+                Some(path),
+                "already open in another buffer",
+                snapshots,
+                notifications,
+            );
+        }
+        // Aimed at this buffer's own file, a save-as *is* a save, so it inherits
+        // the read-only guard `save_file` holds. Without this, "save as" over the
+        // same name would be the way around a read-only buffer - and for an
+        // undecodable file that means writing U+FFFD over the bytes that did not
+        // decode. Compared by file identity, so a different spelling of the same
+        // path does not slip past (SPEC §10.3).
+        if let Some(reason) = session.active().read_only {
+            return report_file_error(
+                session,
+                Some(path),
+                reason.message(),
+                snapshots,
+                notifications,
+            );
+        }
     }
 
     // A save-as keeps the source file's form: writing a CRLF latin-1 file out under
@@ -1756,6 +1925,10 @@ async fn save_as_file(
     let id = doc.id;
     if renamed {
         doc.lsp_dirty = true;
+        // This is the way out of a read-only buffer (SPEC §10.3): the write just
+        // proved the new file writable, and the buffer now matches it exactly - so
+        // whichever of the two reasons applied, it no longer does.
+        doc.read_only = None;
     }
     doc.path = Some(path.clone());
     // The write is now the on-disk state (SPEC §2.4, §8): undoing back to this node

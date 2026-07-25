@@ -5,13 +5,13 @@ use encoding_rs::SHIFT_JIS;
 /// `load` then `encode` with the default final-newline policy off - the shape
 /// almost every test here asserts on, since preservation *is* the contract.
 fn roundtrip(bytes: &[u8]) -> Vec<u8> {
-    let (text, format) = load(bytes);
+    let Loaded { text, format, .. } = load(bytes);
     format.encode(&text, false).expect("re-encodes")
 }
 
 #[test]
 fn plain_utf8_lf_file_loads_and_roundtrips() {
-    let (text, format) = load(b"one\ntwo\n");
+    let Loaded { text, format, .. } = load(b"one\ntwo\n");
     assert_eq!(text, "one\ntwo\n");
     assert_eq!(format.encoding_name(), "UTF-8");
     assert_eq!(format.eol, LineEnding::Lf);
@@ -21,7 +21,7 @@ fn plain_utf8_lf_file_loads_and_roundtrips() {
 
 #[test]
 fn empty_file_is_utf8_lf_and_stays_empty() {
-    let (text, format) = load(b"");
+    let Loaded { text, format, .. } = load(b"");
     assert_eq!(text, "");
     assert_eq!(format, FileFormat::default());
     // Even with the final-newline policy on: "ensure" must not mean "create".
@@ -30,7 +30,7 @@ fn empty_file_is_utf8_lf_and_stays_empty() {
 
 #[test]
 fn crlf_is_normalized_on_load_and_restored_on_save() {
-    let (text, format) = load(b"one\r\ntwo\r\n");
+    let Loaded { text, format, .. } = load(b"one\r\ntwo\r\n");
     // The rope only ever holds LF, so every motion and column rule sees one shape.
     assert_eq!(text, "one\ntwo\n");
     assert_eq!(format.eol, LineEnding::Crlf);
@@ -40,10 +40,10 @@ fn crlf_is_normalized_on_load_and_restored_on_save() {
 #[test]
 fn dominant_line_ending_wins_a_mixed_file() {
     // Two CRLF against one LF: the file is a CRLF file with a stray line.
-    assert_eq!(load(b"a\r\nb\nc\r\n").1.eol, LineEnding::Crlf);
+    assert_eq!(load(b"a\r\nb\nc\r\n").format.eol, LineEnding::Crlf);
     // ...and the other way, which is the tie-break case too (1 vs 1 -> LF).
-    assert_eq!(load(b"a\r\nb\nc\n").1.eol, LineEnding::Lf);
-    assert_eq!(load(b"no newlines at all").1.eol, LineEnding::Lf);
+    assert_eq!(load(b"a\r\nb\nc\n").format.eol, LineEnding::Lf);
+    assert_eq!(load(b"no newlines at all").format.eol, LineEnding::Lf);
 }
 
 #[test]
@@ -61,7 +61,7 @@ fn saving_a_crlf_file_does_not_double_the_carriage_returns() {
 #[test]
 fn utf8_bom_is_preserved() {
     let bytes = b"\xEF\xBB\xBFhello";
-    let (text, format) = load(bytes);
+    let Loaded { text, format, .. } = load(bytes);
     assert_eq!(text, "hello"); // the BOM is not editable content
     assert_eq!(format.encoding_name(), "UTF-8");
     assert!(format.bom);
@@ -75,7 +75,7 @@ fn utf16le_file_roundtrips_byte_for_byte() {
     for unit in "hi\n".encode_utf16() {
         bytes.extend_from_slice(&unit.to_le_bytes());
     }
-    let (text, format) = load(&bytes);
+    let Loaded { text, format, .. } = load(&bytes);
     assert_eq!(text, "hi\n");
     assert_eq!(format.encoding_name(), "UTF-16LE");
     assert_eq!(roundtrip(&bytes), bytes);
@@ -87,7 +87,7 @@ fn utf16be_file_roundtrips_byte_for_byte() {
     for unit in "hi\n".encode_utf16() {
         bytes.extend_from_slice(&unit.to_be_bytes());
     }
-    let (text, format) = load(&bytes);
+    let Loaded { text, format, .. } = load(&bytes);
     assert_eq!(text, "hi\n");
     assert_eq!(format.encoding_name(), "UTF-16BE");
     assert_eq!(roundtrip(&bytes), bytes);
@@ -99,7 +99,7 @@ fn utf16_crlf_survives_both_conversions_at_once() {
     for unit in "a\r\nb".encode_utf16() {
         bytes.extend_from_slice(&unit.to_le_bytes());
     }
-    let (text, format) = load(&bytes);
+    let Loaded { text, format, .. } = load(&bytes);
     assert_eq!(text, "a\nb");
     assert_eq!(format.eol, LineEnding::Crlf);
     assert_eq!(roundtrip(&bytes), bytes);
@@ -111,7 +111,7 @@ fn an_unrecognized_encoding_falls_back_to_windows_1252_and_keeps_every_byte() {
     // statistical detector. It must still open (as mojibake) and save unchanged,
     // rather than being refused or rewritten as UTF-8 (SPEC §10.1).
     let bytes = b"\x93\xFA\x96\x7B\n";
-    let (text, format) = load(bytes);
+    let Loaded { text, format, .. } = load(bytes);
     assert_eq!(format.encoding_name(), "windows-1252");
     assert!(!text.is_empty());
     assert_eq!(roundtrip(bytes), bytes);
@@ -133,7 +133,7 @@ fn non_utf8_past_the_sample_window_still_keeps_its_bytes() {
     // and taking the decode's word for it is what keeps the byte intact.
     let mut bytes = vec![b'a'; SAMPLE + 16];
     bytes.push(0xE9); // 'é' in latin-1
-    let (_, format) = load(&bytes);
+    let Loaded { format, .. } = load(&bytes);
     assert_eq!(format.encoding_name(), "windows-1252");
     assert_eq!(roundtrip(&bytes), bytes);
 }
@@ -144,7 +144,7 @@ fn a_multibyte_character_split_by_the_sample_window_is_still_utf8() {
     // incomplete tail, which is the sampler's fault and says nothing about the file.
     let mut bytes = vec![b'a'; SAMPLE - 1];
     bytes.extend_from_slice("語".as_bytes());
-    let (text, format) = load(&bytes);
+    let Loaded { text, format, .. } = load(&bytes);
     assert_eq!(format.encoding_name(), "UTF-8");
     assert!(text.ends_with('語'));
 }
@@ -154,9 +154,20 @@ fn a_corrupt_bom_file_is_left_as_decoded_rather_than_reinterpreted() {
     // A BOM is a statement of fact: an unpaired surrogate makes this file corrupt,
     // not secretly windows-1252, so the fallback must not fire.
     let bytes = [0xFF, 0xFE, 0x00, 0xD8]; // BOM + a lone high surrogate
-    let (text, format) = load(&bytes);
-    assert_eq!(format.encoding_name(), "UTF-16LE");
-    assert_eq!(text, "\u{FFFD}");
+    let loaded = load(&bytes);
+    assert_eq!(loaded.format.encoding_name(), "UTF-16LE");
+    assert_eq!(loaded.text, "\u{FFFD}");
+    // ...and it says so, so the caller can open it read-only rather than let a
+    // save write that replacement character over the original bytes.
+    assert!(loaded.lossy);
+}
+
+#[test]
+fn a_file_that_decodes_cleanly_is_never_marked_lossy() {
+    assert!(!load(b"plain\n").lossy);
+    assert!(!load(b"\xEF\xBB\xBFwith a bom\n").lossy);
+    // The windows-1252 fallback cannot fail, so a file that lands there is exact.
+    assert!(!load(b"caf\xE9\n").lossy);
 }
 
 #[test]

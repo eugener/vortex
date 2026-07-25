@@ -598,6 +598,291 @@ fn open_binary_file_errors_and_leaves_buffer_unchanged() {
     }
 }
 
+/// Drop `path`'s write permission, returning whether it took - a test running as
+/// root can write anything, so the read-only tests skip rather than fail there.
+#[cfg(unix)]
+fn make_unwritable(path: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o444)).unwrap();
+    !is_writable(path)
+}
+
+#[cfg(unix)]
+#[test]
+fn a_file_this_process_cannot_write_opens_read_only() {
+    let dir = TempDir::new();
+    let path = dir.file("locked.txt");
+    std::fs::write(&path, "look but do not touch\n").unwrap();
+    if !make_unwritable(&path) {
+        return; // running as root: the permission bits do not bind
+    }
+
+    let mut e = Session::new();
+    let h = Harness::new();
+    assert!(smol::block_on(open_file(
+        &mut e,
+        path,
+        &h.delta_tx,
+        &h.snapshots,
+        &h.note_tx,
+    )));
+
+    assert_eq!(e.active().read_only, Some(ReadOnly::Permissions));
+    assert!(h.snapshot().read_only); // the frontend can mark it
+    assert_eq!(
+        e.active().buffer.text().to_string(),
+        "look but do not touch\n"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn a_read_only_buffer_refuses_edits_and_saves_but_still_yields_to_save_as() {
+    let dir = TempDir::new();
+    let path = dir.file("locked.txt");
+    std::fs::write(&path, "original\n").unwrap();
+    if !make_unwritable(&path) {
+        return;
+    }
+
+    let target = dir.file("mine.txt");
+    let (snap, notes) = run_seam(&[
+        Action::Open(path.clone()),
+        Action::Insert("nope".into()),
+        Action::Save,
+        Action::SaveAs(target.clone()),
+        Action::Insert("yes".into()),
+    ]);
+
+    // The edit and the save were both refused, and the file never changed.
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), "original\n");
+    assert!(
+        notes
+            .iter()
+            .any(|n| matches!(n, Notification::EditRejected { message, .. } if message.contains("read-only"))),
+        "expected an EditRejected, got {notes:?}"
+    );
+    assert!(
+        notes
+            .iter()
+            .any(|n| matches!(n, Notification::FileError { message, .. } if message.contains("read-only"))),
+        "expected a FileError for the save, got {notes:?}"
+    );
+    // Save-as is the way out: the copy is writable, so the buffer is editable again
+    // and the trailing insert landed.
+    assert!(!snap.read_only);
+    assert_eq!(snap.path, Some(target.clone()));
+    assert_eq!(snap.text.to_string(), "yesoriginal\n");
+    assert_eq!(std::fs::read_to_string(&target).unwrap(), "original\n");
+}
+
+#[test]
+fn a_file_that_did_not_fully_decode_opens_read_only() {
+    // A BOM claiming UTF-16 over bytes that are not: the text carries replacement
+    // characters, so saving it back would overwrite what did not decode (SPEC §8).
+    let dir = TempDir::new();
+    let path = dir.file("truncated.txt");
+    std::fs::write(&path, [0xFF, 0xFE, b'a', 0x00, 0x00, 0xD8]).unwrap();
+
+    let mut e = Session::new();
+    let h = Harness::new();
+    smol::block_on(open_file(
+        &mut e,
+        path,
+        &h.delta_tx,
+        &h.snapshots,
+        &h.note_tx,
+    ));
+
+    assert_eq!(e.active().read_only, Some(ReadOnly::Undecodable));
+    assert!(h.snapshot().read_only);
+    // And the refusal explains itself with the reason that applies, rather than
+    // claiming a permission problem the file does not have.
+    let message = e.active().read_only.unwrap().message();
+    assert!(
+        message.contains("could not be decoded"),
+        "message: {message}"
+    );
+}
+
+#[test]
+fn save_as_onto_a_read_only_buffers_own_file_is_still_refused() {
+    // Regression: "save as" over the same name is a plain save, and must not be the
+    // way around the guard. For this buffer that would write U+FFFD over the bytes
+    // that never decoded.
+    let dir = TempDir::new();
+    let path = dir.file("truncated.txt");
+    let original = [0xFF, 0xFE, b'a', 0x00, 0x00, 0xD8];
+    std::fs::write(&path, original).unwrap();
+
+    let mut e = Session::new();
+    let h = Harness::new();
+    smol::block_on(open_file(
+        &mut e,
+        path.clone(),
+        &h.delta_tx,
+        &h.snapshots,
+        &h.note_tx,
+    ));
+    assert!(e.active().read_only.is_some());
+
+    // The same file, spelled differently, so identity is what has to catch it.
+    let spelled_differently = dir.path.join(".").join("truncated.txt");
+    assert!(smol::block_on(save_as_file(
+        &mut e,
+        spelled_differently,
+        &h.snapshots,
+        &h.note_tx
+    )));
+    assert_eq!(std::fs::read(&path).unwrap(), original); // untouched
+    let notes: Vec<_> = std::iter::from_fn(|| h.note_rx.try_recv().ok()).collect();
+    assert!(
+        notes.iter().any(|n| matches!(
+            n,
+            Notification::FileError { message, .. } if message.contains("decoded")
+        )),
+        "expected a read-only FileError, got {notes:?}"
+    );
+}
+
+#[test]
+fn a_path_that_runs_through_a_file_is_an_error_not_a_new_buffer() {
+    // `dir/notes.txt/deeper` is not "missing", it is impossible - the stat fails
+    // with something that is not NotFound, which must not be mistaken for the
+    // open-an-empty-buffer case.
+    let dir = TempDir::new();
+    let file = dir.file("notes.txt");
+    std::fs::write(&file, "hello\n").unwrap();
+
+    let mut e = Session::new();
+    let h = Harness::new();
+    assert!(smol::block_on(open_file(
+        &mut e,
+        file.join("deeper"),
+        &h.delta_tx,
+        &h.snapshots,
+        &h.note_tx,
+    )));
+
+    assert_eq!(e.active().path, None); // nothing was bound
+    assert!(matches!(
+        h.note_rx.try_recv(),
+        Ok(Notification::FileError { .. })
+    ));
+}
+
+#[cfg(unix)]
+#[test]
+fn a_file_that_cannot_even_be_read_is_an_error() {
+    // Mode 000: the stat succeeds and says regular file, so the failure lands on
+    // the read - the one error path the type check above cannot pre-empt.
+    use std::os::unix::fs::PermissionsExt;
+    let dir = TempDir::new();
+    let path = dir.file("secret.txt");
+    std::fs::write(&path, "classified\n").unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
+    if std::fs::read(&path).is_ok() {
+        return; // running as root: the permission bits do not bind
+    }
+
+    let mut e = session_with("keep me", SelectionSet::at_origin());
+    let h = Harness::new();
+    assert!(smol::block_on(open_file(
+        &mut e,
+        path,
+        &h.delta_tx,
+        &h.snapshots,
+        &h.note_tx,
+    )));
+
+    assert_eq!(e.active().buffer.text().to_string(), "keep me");
+    assert!(matches!(
+        h.note_rx.try_recv(),
+        Ok(Notification::FileError { .. })
+    ));
+}
+
+#[test]
+fn every_step_declares_whether_it_edits_the_buffer() {
+    // The read-only guard sits on the step, so this is the table it consults. Undo
+    // and redo are on the blocked side because they change text just as much as an
+    // insert does - a read-only buffer walked backwards would still be a read-only
+    // file rewritten.
+    assert!(Step::Edit(Vec::new()).edits_buffer());
+    assert!(Step::Undo.edits_buffer());
+    assert!(Step::Redo.edits_buffer());
+    // Save is not listed: it writes the file, not the buffer, and `save_file` holds
+    // that guard so the refusal can be a `FileError` instead of an `EditRejected`.
+    assert!(!Step::Save.edits_buffer());
+    assert!(!Step::SaveAs(PathBuf::from("x")).edits_buffer());
+    assert!(!Step::Republish.edits_buffer());
+    assert!(!Step::Open(PathBuf::from("x")).edits_buffer());
+    assert!(!Step::Switch(BufferId(0)).edits_buffer());
+    assert!(
+        !Step::Close {
+            id: BufferId(0),
+            force: false
+        }
+        .edits_buffer()
+    );
+}
+
+#[test]
+fn opening_a_directory_is_an_error_not_an_empty_buffer() {
+    let dir = TempDir::new();
+    let mut e = session_with("keep me", SelectionSet::at_origin());
+    let h = Harness::new();
+    assert!(smol::block_on(open_file(
+        &mut e,
+        dir.path.clone(),
+        &h.delta_tx,
+        &h.snapshots,
+        &h.note_tx,
+    )));
+
+    assert_eq!(e.active().buffer.text().to_string(), "keep me");
+    assert_eq!(e.active().path, None);
+    match h.note_rx.try_recv() {
+        Ok(Notification::FileError { message, .. }) => {
+            assert!(message.contains("directory"), "message: {message}");
+        }
+        other => panic!("expected FileError, got {other:?}"),
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn opening_a_fifo_is_refused_rather_than_blocking_the_actor() {
+    // Reading a FIFO blocks until a writer appears. On the actor thread that is the
+    // whole editor hung with no way out, which is why the type check happens before
+    // the read (SPEC §10.3). If this test ever hangs, the guard is gone.
+    let dir = TempDir::new();
+    let path = dir.file("pipe");
+    let status = std::process::Command::new("mkfifo")
+        .arg(&path)
+        .status()
+        .expect("mkfifo");
+    assert!(status.success());
+
+    let mut e = Session::new();
+    let h = Harness::new();
+    assert!(smol::block_on(open_file(
+        &mut e,
+        path,
+        &h.delta_tx,
+        &h.snapshots,
+        &h.note_tx,
+    )));
+
+    assert_eq!(e.active().path, None);
+    match h.note_rx.try_recv() {
+        Ok(Notification::FileError { message, .. }) => {
+            assert!(message.contains("regular file"), "message: {message}");
+        }
+        other => panic!("expected FileError, got {other:?}"),
+    }
+}
+
 #[test]
 fn open_non_utf8_text_file_loads_and_saves_back_unchanged() {
     // The other half of the binary guard: a file that is merely not UTF-8 is text

@@ -39,8 +39,9 @@ proptest! {
                 !starts_with_bom(b) && !b.contains(&b'\r')
             })
     ) {
-        let (text, format) = load(&bytes);
-        let written = format.encode(&text, false).expect("what loaded must re-encode");
+        let loaded = load(&bytes);
+        prop_assert!(!loaded.lossy, "a file with no BOM always decodes exactly");
+        let written = loaded.format.encode(&loaded.text, false).expect("what loaded must re-encode");
         prop_assert_eq!(written, bytes);
     }
 
@@ -58,9 +59,10 @@ proptest! {
             file.push_str(eol);
         }
 
-        let (text, format) = load(file.as_bytes());
+        let loaded = load(file.as_bytes());
+        let text = loaded.text;
         prop_assert!(!text.contains('\r'), "the buffer is always LF: {text:?}");
-        let written = format.encode(&text, false).expect("what loaded must re-encode");
+        let written = loaded.format.encode(&text, false).expect("what loaded must re-encode");
         prop_assert_eq!(String::from_utf8(written).unwrap(), file);
     }
 }

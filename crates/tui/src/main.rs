@@ -1416,6 +1416,7 @@ fn paint_status_bar(frame: &mut Frame, area: Rect, snapshot: &ViewSnapshot, stat
         snapshot.text.byte_len(),
         snapshot.version,
         snapshot.format,
+        snapshot.read_only,
     );
     let bar = layout::fit_bar(&left, &right, area.width as usize);
     frame.render_widget(Paragraph::new(bar).style(status.style), area);
