@@ -504,11 +504,11 @@ adopt a component framework.**
 | **Buffer view** | base | reads snapshot | text + decorations (§5), selections, viewport (frontend-owned) |
 | **Gutter** | base | reads decorations | line numbers (absolute/relative), diagnostic severity, git signs, fold marks |
 | **Status line** | base | reads snapshot | mode, position, selection count, version, diagnostic counts, LSP status |
-| **Head / tab bar** | base | reads snapshot | buffer name + modified marker today; a **bufferline** (tabs) once multi-buffer lands |
+| **Head / tab bar** | base | reads snapshot | **built (M7).** bufferline: one tab per open buffer with its modified marker, windowed around the active tab when they overflow, clickable to switch; line count keeps the right end |
 | **Message / toast area** | transient layer | consumes `Notification` | **built (M6).** errors, save/LSP status, external-change notices - a real surface, not a status-bar hijack |
 | **Prompt line** | overlay | emits `Action` on submit | single-line input: save-as path, search query, `:command`. Submit/cancel are the only seam traffic |
 | **Command palette** | overlay | emits `Action` on pick | **built (M7).** fuzzy list of commands; nav/filter pure frontend, only the chosen intent hits the core |
-| **Pickers** (file / theme / buffer / global-search / symbol) | overlay | emits `Action` on pick | **file + theme built (M7).** fuzzy list + optional preview pane; large lists stream in without blocking |
+| **Pickers** (file / theme / buffer / global-search / symbol) | overlay | emits `Action` on pick | **file + theme + buffer built (M7).** fuzzy list + optional preview pane; large lists stream in without blocking |
 | **Theme picker** | overlay | **none** | **built (M7).** the one surface whose commit never crosses the seam at all - chrome is frontend-owned, so it also *previews* as the highlight moves (§10.5) |
 | **Which-key popup** | overlay | none | after a prefix key, show the available continuations from the keymap (§10.5) - pure frontend introspection of the binding table |
 | **Completion popup** | overlay | emits `Action`, reads decorations | LSP completion menu; ghost-preview of the selected item as a `VirtualText` decoration |
@@ -1001,14 +1001,21 @@ Incremental build order so the risky assumptions are validated early, not at the
   intent becomes an `Action`. *Verify:* save-as via a prompt, an error toast from a failed
   save, and a stacked overlay that dismisses top-first - in a real terminal, with no core
   round-trip for navigation.
-- **M7 - Pickers + palette + which-key.** *(in progress: file picker, command palette, and
-  the theme picker with live preview + TOML theme files (§10.5) have landed.)* `nucleo`
-  fuzzy matching (§3 addition); file /
+- **M7 - Pickers + palette + which-key.** *(in progress: file picker, command palette, the
+  theme picker with live preview + TOML theme files (§10.5), and **multi-buffer** with its
+  bufferline and buffer picker have landed.)* `nucleo` fuzzy matching (§3 addition); file /
   global-search / buffer pickers with a preview pane; a command palette over the §10.5
-  command identifiers; a which-key popup driven by the keymap. Brings **multi-buffer** (the
-  core already keys everything by `BufferId`; only one buffer is live today) + a bufferline -
-  the one core change in this arc, since buffer-switching needs it. *Verify:* open a file via
-  the picker, switch buffers, run a command via the palette - in-terminal.
+  command identifiers; a which-key popup driven by the keymap. Multi-buffer was the one core
+  change in this arc, since buffer-switching needs it: `Session` owns many `Document`s,
+  `Open` switches to an already-open path, and `SwitchBuffer`/`CloseBuffer` join the
+  vocabulary - with the close guard in the *core* so no frontend can discard unsaved work by
+  forgetting to ask (§8). It also made two latent bugs live, both fixed with the arc: syntax
+  batches now carry the buffer they were parsed against (versions are per-buffer, so a
+  version-only guard painted the wrong buffer), and diagnostics route by path to whichever
+  document owns them rather than only the active one.
+  **Still open in M7:** global-search picker, picker preview pane, which-key popup.
+  *Verify:* open a file via the picker, switch buffers, run a command via the palette -
+  in-terminal.
 - **M8 - Chrome + polish.** Git diff signs (a git-diff task feeding `GutterMark`s; its git
   source - `gix` / `git2` - is a §3 stack addition to raise), indent guides, relative line
   numbers, scrollbar, sticky context (tree-sitter), cursor-shape-per-mode, rulers. *Verify:*

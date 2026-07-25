@@ -41,6 +41,7 @@ use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 use ratatui::{Frame, Terminal, TerminalOptions, Viewport};
+use unicode_width::UnicodeWidthStr;
 
 use vortex_core::{Action, BufferId, BufferInfo, Core, ViewSnapshot};
 
@@ -48,7 +49,8 @@ use vortex_tui::command::{self, Command};
 use vortex_tui::compositor::{Compositor, EventResult};
 use vortex_tui::toast::{self, Toasts};
 use vortex_tui::{
-    config, filepicker, grammar, keymap, layout, osc52, palette, prompt, theme, themepicker,
+    bufferpicker, config, filepicker, grammar, keymap, layout, osc52, palette, prompt, theme,
+    themepicker,
 };
 
 /// Default tab stop width for display-column layout (SPEC §4). Config in M5.
@@ -743,6 +745,33 @@ fn event_loop(
                     // sweeps out a selection.
                     MouseEventKind::Down(MouseButton::Left)
                     | MouseEventKind::Drag(MouseButton::Left) => {
+                        // A press on the bufferline selects that tab's buffer rather
+                        // than placing a caret: row 0 is chrome, not text. Resolved
+                        // against the same fitted strip that was painted, so the tab
+                        // under the pointer is the one that gets picked. A drag is
+                        // ignored here - dragging across tabs is not a gesture.
+                        let tab_press =
+                            matches!(mouse.kind, MouseEventKind::Down(_)) && mouse.row == 0;
+                        if tab_press && let Some(snap) = &latest {
+                            let tabs = layout::head_bar_tabs(
+                                &snap.buffers,
+                                snap.buffer_id,
+                                layout::display_line_count(&snap.text),
+                                terminal.size()?.width as usize,
+                            );
+                            // A click on an overflow marker, the padding, or the line
+                            // count selects nothing and is simply swallowed.
+                            if let Some(id) = layout::tab_at_column(&tabs, mouse.column as usize)
+                                && id != snap.buffer_id
+                                && handle
+                                    .actions
+                                    .send_blocking(Action::SwitchBuffer { id })
+                                    .is_err()
+                            {
+                                return Ok(());
+                            }
+                            continue;
+                        }
                         if let Some(snap) = &latest {
                             let is_press = matches!(mouse.kind, MouseEventKind::Down(_));
                             let extend = matches!(mouse.kind, MouseEventKind::Drag(_))
@@ -852,6 +881,14 @@ fn dispatch_command(command: Command, handle: &vortex_core::CoreHandle, ui: &mut
         Command::OpenThemePicker => ui
             .overlays
             .push(themepicker::open(&ui.config.theme, &ui.config.theme_name)),
+        // No I/O and no round trip: the rows come from the snapshot's buffer list.
+        // Nothing to pick from before the first snapshot, so it simply does not open.
+        Command::OpenBufferPicker => {
+            if let Some(active) = ui.active {
+                ui.overlays
+                    .push(bufferpicker::open(&ui.config.theme, ui.buffers, active));
+            }
+        }
         // The save-as prompt pre-fills the current path (if any) so a save-as is a
         // quick edit of the existing name; its committed path returns as SaveAs.
         Command::OpenSavePrompt => ui.overlays.push(prompt::save_as(&ui.config.theme, ui.path)),
@@ -1039,7 +1076,7 @@ fn paint(frame: &mut Frame, snapshot: &ViewSnapshot, inputs: PaintInputs) -> Vie
     }
     .min(max_h_scroll);
 
-    paint_head_bar(frame, head_area, snapshot, theme.head_bar);
+    paint_head_bar(frame, head_area, snapshot, &theme);
     paint_body(
         frame,
         body_area,
@@ -1089,11 +1126,39 @@ fn paint(frame: &mut Frame, snapshot: &ViewSnapshot, inputs: PaintInputs) -> Vie
 /// Paint the top head bar (buffer name left, line count right) as one filled row.
 /// The name is the bound file's name plus a modified marker (SPEC §8, §10), read
 /// straight from the snapshot so painting needs no core round-trip (SPEC §5).
-fn paint_head_bar(frame: &mut Frame, area: Rect, snapshot: &ViewSnapshot, style: Style) {
-    let name = layout::buffer_display_name(snapshot.path.as_deref(), snapshot.modified);
-    let (left, right) = layout::head_bar(&name, layout::display_line_count(&snapshot.text));
-    let bar = layout::fit_bar(&left, &right, area.width as usize);
-    frame.render_widget(Paragraph::new(bar).style(style), area);
+fn paint_head_bar(frame: &mut Frame, area: Rect, snapshot: &ViewSnapshot, theme: &config::Theme) {
+    let width = area.width as usize;
+    // The line count keeps the right end; the tab strip gets what is left. With one
+    // buffer open that reads exactly as the pre-bufferline head bar did.
+    let line_count = layout::display_line_count(&snapshot.text);
+    let count = layout::line_count_label(line_count);
+    let count_width = count.width();
+    let tabs = layout::head_bar_tabs(&snapshot.buffers, snapshot.buffer_id, line_count, width);
+
+    let mut spans: Vec<Span> = Vec::with_capacity(tabs.len() + 2);
+    let mut used = 0;
+    for tab in tabs {
+        used += tab.label.width();
+        let style = if tab.active {
+            theme.head_bar
+        } else {
+            theme.head_bar_inactive
+        };
+        spans.push(Span::styled(tab.label, style));
+    }
+    // Pad between the strip and the count so the count sits flush right.
+    if let Some(gap) = width.checked_sub(used + count_width)
+        && gap > 0
+    {
+        spans.push(Span::styled(" ".repeat(gap), theme.head_bar));
+    }
+    if used + count_width <= width {
+        spans.push(Span::styled(count, theme.head_bar));
+    }
+    frame.render_widget(
+        Paragraph::new(Line::from(spans)).style(theme.head_bar),
+        area,
+    );
 }
 
 /// The resolved geometry for painting the text body, computed once in [`paint`]
@@ -1648,6 +1713,32 @@ mod tests {
         let head_bg = config::Theme::default().head_bar.bg;
         assert_eq!(buf.cell((0, 0)).unwrap().bg, head_bg.unwrap());
         assert_eq!(buf.cell((39, 0)).unwrap().bg, head_bg.unwrap());
+    }
+
+    #[test]
+    fn the_bufferline_shows_a_tab_per_buffer_with_the_active_one_highlighted() {
+        // The head bar is a tab strip once several buffers are open (SPEC §7.5:507).
+        let (dir, opens) = two_open_files();
+        let snap = snapshot_after(&opens);
+        assert_eq!(snap.buffers.len(), 2);
+        let buf = render(&snap, 60, 10);
+        let head = row_text(&buf, 0);
+        assert!(head.contains("one.txt"), "bufferline: {head:?}");
+        assert!(head.contains("two.txt"), "bufferline: {head:?}");
+        // The line count keeps the right end of the bar.
+        assert!(head.contains("line"), "bufferline: {head:?}");
+
+        // The inactive tab is dimmed and the active one is not, so the buffer being
+        // edited reads as current. Asserted against the theme rather than literals,
+        // so a retheme is not a test edit.
+        let theme = config::Theme::default();
+        let column_of = |needle: &str| head.find(needle).expect("tab is present") as u16;
+        let inactive_fg = buf.cell((column_of("one.txt"), 0)).unwrap().fg;
+        let active_fg = buf.cell((column_of("two.txt"), 0)).unwrap().fg;
+        assert_eq!(inactive_fg, theme.head_bar_inactive.fg.unwrap());
+        assert_eq!(active_fg, theme.head_bar.fg.unwrap());
+        assert_ne!(inactive_fg, active_fg);
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]

@@ -9,6 +9,7 @@
 
 text             = { fg = "#c9ced2", bg = "#141719" }
 head_bar         = { fg = "#eef2f4", bold = true }
+head_bar_inactive = { fg = "#78838a" }
 status_bar       = { fg = "#78838a" }
 gutter           = { fg = "#4e575e" }
 gutter_current   = { fg = "#eef2f4", bold = true }

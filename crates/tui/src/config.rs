@@ -55,8 +55,14 @@ pub struct Theme {
     /// every row, so a theme is not at the mercy of the user's terminal background
     /// (a light theme in a black terminal would otherwise be unreadable).
     pub text: Style,
-    /// Top bar: buffer name (left) and line count (right).
+    /// Top bar: the bufferline's tab strip (left) and line count (right). This is
+    /// the style of the *active* tab and of the bar itself.
     pub head_bar: Style,
+    /// Tabs in the bufferline other than the active one - dimmed so the buffer you
+    /// are actually editing reads as the current one at a glance. Its own slot
+    /// rather than a modifier applied to [`Self::head_bar`], because which pair of
+    /// colors separates "current" from "background" is a theme's call (§10.5).
+    pub head_bar_inactive: Style,
     /// Bottom bar: cursor position (left) and buffer metrics (right).
     pub status_bar: Style,
     /// Gutter line numbers away from the cursor - dimmed so they recede.
@@ -169,6 +175,9 @@ impl Default for Theme {
                 .fg(Color::Rgb(0xcc, 0xd2, 0xe4))
                 .bg(Color::Rgb(0x11, 0x14, 0x1d))
                 .add_modifier(Modifier::BOLD),
+            head_bar_inactive: Style::new()
+                .fg(Color::Rgb(0x6b, 0x74, 0x96))
+                .bg(Color::Rgb(0x11, 0x14, 0x1d)),
             status_bar: Style::new()
                 .fg(Color::Rgb(0x8a, 0x93, 0xb5))
                 .bg(Color::Rgb(0x11, 0x14, 0x1d)),
@@ -277,6 +286,7 @@ mod tests {
         let slots = [
             ("text", t.text),
             ("head_bar", t.head_bar),
+            ("head_bar_inactive", t.head_bar_inactive),
             ("status_bar", t.status_bar),
             ("gutter", t.gutter),
             ("gutter_current", t.gutter_current),

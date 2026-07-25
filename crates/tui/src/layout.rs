@@ -17,7 +17,7 @@ use ratatui::style::Style;
 use ratatui::text::Span;
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
-use vortex_core::{Selection, Text};
+use vortex_core::{BufferId, BufferInfo, Selection, Text};
 
 /// Shown in the head bar when the buffer has no bound file (SPEC §10 lifecycle).
 pub const NO_NAME: &str = "[No Name]";
@@ -490,18 +490,168 @@ pub fn buffer_display_name(path: Option<&Path>, modified: bool) -> String {
     }
 }
 
-/// Head-bar segments `(left, right)` = (buffer display name, line count). Composed
-/// to full width by [`fit_bar`] at paint time. `name` is [`buffer_display_name`]
-/// (already carries any modified marker); `line_count` is the display count (see
-/// [`display_line_count`], always >= 1); the `.max(1)` is a defensive floor so a
+/// The head bar's right-hand segment: the buffer's display line count (see
+/// [`display_line_count`], always >= 1). The `.max(1)` is a defensive floor so a
 /// stray 0 still reads "1 line" rather than an empty count.
-pub fn head_bar(name: &str, line_count: usize) -> (String, String) {
-    let left = format!(" {name}");
-    let right = match line_count.max(1) {
+pub fn line_count_label(line_count: usize) -> String {
+    match line_count.max(1) {
         1 => "1 line ".to_string(),
         n => format!("{n} lines "),
+    }
+}
+
+/// Marker shown where the tab strip continues past the visible window.
+const TAB_OVERFLOW: &str = "›";
+/// …and on the left-hand side.
+const TAB_OVERFLOW_LEFT: &str = "‹";
+
+/// One segment of the painted bufferline.
+///
+/// Carries the buffer it stands for, not just its text, so a pointer landing on it
+/// can be resolved back to a `SwitchBuffer` without the caller re-deriving the
+/// layout it just painted ([`tab_at_column`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Tab {
+    /// The text to paint, already padded and fitted.
+    pub label: String,
+    /// Whether this is the buffer currently on screen.
+    pub active: bool,
+    /// The buffer this segment selects; `None` for an overflow marker, which is
+    /// chrome rather than a target.
+    pub id: Option<BufferId>,
+}
+
+/// The bufferline's tab strip fitted to `width` display cells: each visible tab as
+/// `(label, is_active)`, in buffer order (SPEC §7.5 head/tab bar).
+///
+/// Every tab is shown when they all fit. When they do not, the strip is windowed
+/// **around the active tab** - which is the only tab guaranteed to be worth seeing -
+/// with `‹`/`›` markers where it continues. Scrolling to follow the active buffer
+/// rather than truncating from the right is what keeps the current file visible once
+/// more buffers are open than the terminal is wide.
+///
+/// Widths are display cells throughout (SPEC §4), so CJK names and emoji in
+/// filenames account for the columns they really occupy. The returned labels never
+/// sum past `width`.
+pub fn bufferline(buffers: &[BufferInfo], active: BufferId, width: usize) -> Vec<Tab> {
+    if width == 0 || buffers.is_empty() {
+        return Vec::new();
+    }
+    let labels: Vec<String> = buffers
+        .iter()
+        .map(|info| {
+            format!(
+                " {} ",
+                buffer_display_name(info.path.as_deref(), info.modified)
+            )
+        })
+        .collect();
+    let widths: Vec<usize> = labels.iter().map(|l| l.width()).collect();
+    // An `active` not in the list (a snapshot older than a close) falls back to the
+    // first tab rather than panicking or showing nothing.
+    let active_index = buffers.iter().position(|b| b.id == active).unwrap_or(0);
+
+    if widths.iter().sum::<usize>() <= width {
+        return labels
+            .into_iter()
+            .enumerate()
+            .map(|(i, label)| Tab {
+                label,
+                active: i == active_index,
+                id: Some(buffers[i].id),
+            })
+            .collect();
+    }
+
+    // Grow a window outward from the active tab, preferring to reveal what follows
+    // it, and always leaving room for the overflow markers the window will need.
+    let (mut first, mut last) = (active_index, active_index);
+    let mut used = widths[active_index].min(width);
+    loop {
+        let markers = usize::from(first > 0) + usize::from(last + 1 < buffers.len());
+        let fits = |extra: usize| used + markers + extra <= width;
+        if last + 1 < buffers.len() && fits(widths[last + 1]) {
+            used += widths[last + 1];
+            last += 1;
+        } else if first > 0 && fits(widths[first - 1]) {
+            used += widths[first - 1];
+            first -= 1;
+        } else {
+            break;
+        }
+    }
+
+    let mut strip = Vec::new();
+    let mut remaining = width;
+    if first > 0 {
+        strip.push(Tab {
+            label: TAB_OVERFLOW_LEFT.to_string(),
+            active: false,
+            id: None,
+        });
+        remaining -= TAB_OVERFLOW_LEFT.width();
+    }
+    // Reserved so the trailing marker cannot be squeezed out by a wide tab.
+    let reserve = if last + 1 < buffers.len() {
+        TAB_OVERFLOW.width()
+    } else {
+        0
     };
-    (left, right)
+    for (index, label) in labels.iter().enumerate().take(last + 1).skip(first) {
+        if remaining <= reserve {
+            break;
+        }
+        // Truncate rather than overflow: a single tab can be wider than the bar.
+        let (text, cells) = truncate_to_cells(label, remaining - reserve);
+        if cells == 0 {
+            break;
+        }
+        strip.push(Tab {
+            label: text,
+            active: index == active_index,
+            id: Some(buffers[index].id),
+        });
+        remaining -= cells;
+    }
+    if reserve > 0 && remaining > 0 {
+        strip.push(Tab {
+            label: TAB_OVERFLOW.to_string(),
+            active: false,
+            id: None,
+        });
+    }
+    strip
+}
+
+/// The head bar's tab strip at terminal `width`, with the line-count segment's
+/// cells reserved on the right.
+///
+/// The single place that reservation is applied, so the painter and the pointer
+/// handler cannot disagree about where a tab sits - a click resolving against a
+/// differently-fitted strip would select the wrong buffer.
+pub fn head_bar_tabs(
+    buffers: &[BufferInfo],
+    active: BufferId,
+    line_count: usize,
+    width: usize,
+) -> Vec<Tab> {
+    let count_width = line_count_label(line_count).width();
+    bufferline(buffers, active, width.saturating_sub(count_width))
+}
+
+/// The buffer whose tab covers display `column` of the head bar, or `None` for a
+/// column past the strip or on an overflow marker (SPEC §5: the frontend owns
+/// screen->intent mapping, so the core sees only the chosen buffer).
+pub fn tab_at_column(tabs: &[Tab], column: usize) -> Option<BufferId> {
+    let mut start = 0;
+    for tab in tabs {
+        let end = start + tab.label.width();
+        if column < end {
+            return tab.id;
+        }
+        start = end;
+    }
+    None
 }
 
 /// A byte count as a compact human-readable size: plain bytes under 1 KB, then
@@ -1138,14 +1288,204 @@ mod tests {
     }
 
     #[test]
-    fn head_bar_pluralizes_line_count() {
-        assert_eq!(
-            head_bar("[No Name]", 1),
-            (" [No Name]".into(), "1 line ".into())
-        );
-        assert_eq!(head_bar("f.rs", 4), (" f.rs".into(), "4 lines ".into()));
+    fn line_count_label_pluralizes() {
+        assert_eq!(line_count_label(1), "1 line ");
+        assert_eq!(line_count_label(4), "4 lines ");
         // Empty buffer reads as one line, matching the single rendered row.
-        assert_eq!(head_bar("x", 0).1, "1 line ");
+        assert_eq!(line_count_label(0), "1 line ");
+    }
+
+    // --- Bufferline (SPEC §7.5) ----------------------------------------------
+
+    fn buffers(specs: &[(u64, Option<&str>, bool)]) -> Vec<BufferInfo> {
+        specs
+            .iter()
+            .map(|&(id, path, modified)| BufferInfo {
+                id: BufferId(id),
+                path: path.map(std::path::PathBuf::from),
+                modified,
+            })
+            .collect()
+    }
+
+    /// Total display width of a rendered strip - what the painter will occupy.
+    fn strip_width(strip: &[Tab]) -> usize {
+        strip.iter().map(|tab| tab.label.width()).sum()
+    }
+
+    /// The strip's labels, for asserting on text without the ids.
+    fn strip_labels(strip: &[Tab]) -> Vec<&str> {
+        strip.iter().map(|tab| tab.label.as_str()).collect()
+    }
+
+    #[test]
+    fn every_tab_shows_when_they_all_fit() {
+        let list = buffers(&[(1, Some("a.rs"), false), (2, Some("b.rs"), false)]);
+        let strip = bufferline(&list, BufferId(2), 40);
+        assert_eq!(strip_labels(&strip), vec![" a.rs ", " b.rs "]);
+        assert_eq!(strip[0].id, Some(BufferId(1)));
+        assert_eq!(strip[1].id, Some(BufferId(2)));
+        assert_eq!((strip[0].active, strip[1].active), (false, true));
+    }
+
+    #[test]
+    fn the_active_tab_is_the_only_one_flagged() {
+        let list = buffers(&[
+            (1, Some("a.rs"), false),
+            (2, Some("b.rs"), false),
+            (3, Some("c.rs"), false),
+        ]);
+        let flags: Vec<bool> = bufferline(&list, BufferId(2), 40)
+            .into_iter()
+            .map(|tab| tab.active)
+            .collect();
+        assert_eq!(flags, vec![false, true, false]);
+    }
+
+    #[test]
+    fn a_modified_buffer_shows_its_marker_on_its_tab() {
+        let list = buffers(&[(1, Some("a.rs"), true)]);
+        assert_eq!(bufferline(&list, BufferId(1), 40)[0].label, " ● a.rs ");
+    }
+
+    #[test]
+    fn an_unnamed_buffer_gets_the_placeholder_tab() {
+        let list = buffers(&[(1, None, false)]);
+        assert_eq!(bufferline(&list, BufferId(1), 40)[0].label, " [No Name] ");
+    }
+
+    #[test]
+    fn a_narrow_bar_windows_around_the_active_tab() {
+        // Eight buffers, room for two or three: the active one must be visible, which
+        // is the whole reason the strip scrolls instead of truncating from the right.
+        let specs: Vec<(u64, Option<&str>, bool)> =
+            (1..=8).map(|i| (i, Some("file.rs"), false)).collect();
+        let list = buffers(&specs);
+        let strip = bufferline(&list, BufferId(6), 24);
+        assert!(
+            strip.iter().any(|tab| tab.active),
+            "the active tab must be in the window: {strip:?}"
+        );
+        assert!(strip_width(&strip) <= 24, "overflowed the bar: {strip:?}");
+    }
+
+    #[test]
+    fn a_windowed_strip_marks_where_it_continues() {
+        let specs: Vec<(u64, Option<&str>, bool)> =
+            (1..=8).map(|i| (i, Some("file.rs"), false)).collect();
+        let list = buffers(&specs);
+        // Active in the middle: the strip continues in both directions.
+        let strip = bufferline(&list, BufferId(4), 24);
+        assert_eq!(strip.first().map(|t| t.label.as_str()), Some("‹"));
+        assert_eq!(strip.last().map(|t| t.label.as_str()), Some("›"));
+
+        // Active at the very start: nothing precedes it, so no leading marker.
+        let strip = bufferline(&list, BufferId(1), 24);
+        assert_ne!(strip.first().map(|t| t.label.as_str()), Some("‹"));
+        assert_eq!(strip.last().map(|t| t.label.as_str()), Some("›"));
+    }
+
+    #[test]
+    fn a_tab_wider_than_the_bar_is_truncated_not_overflowed() {
+        let list = buffers(&[(1, Some("an-extremely-long-file-name.rs"), false)]);
+        let strip = bufferline(&list, BufferId(1), 10);
+        assert!(strip_width(&strip) <= 10, "overflowed: {strip:?}");
+    }
+
+    #[test]
+    fn wide_glyph_names_are_measured_in_display_cells() {
+        // CJK names occupy two cells each (SPEC §4); measuring in chars would let the
+        // strip overrun the bar.
+        let list = buffers(&[(1, Some("日本語.rs"), false), (2, Some("한글.rs"), false)]);
+        let strip = bufferline(&list, BufferId(1), 14);
+        assert!(strip_width(&strip) <= 14, "overflowed: {strip:?}");
+    }
+
+    #[test]
+    fn a_zero_width_bar_or_empty_session_draws_nothing() {
+        let list = buffers(&[(1, Some("a.rs"), false)]);
+        assert!(bufferline(&list, BufferId(1), 0).is_empty());
+        assert!(bufferline(&[], BufferId(1), 40).is_empty());
+    }
+
+    #[test]
+    fn a_column_resolves_to_the_tab_it_lands_on() {
+        // Clicking a tab selects that buffer, so every cell of a tab - including its
+        // padding - has to resolve to it, and the boundary must not be off by one.
+        let list = buffers(&[(1, Some("a.rs"), false), (2, Some("b.rs"), false)]);
+        let strip = bufferline(&list, BufferId(1), 40);
+        // " a.rs " is columns 0..6, " b.rs " is 6..12.
+        assert_eq!(tab_at_column(&strip, 0), Some(BufferId(1)));
+        assert_eq!(tab_at_column(&strip, 3), Some(BufferId(1)));
+        assert_eq!(tab_at_column(&strip, 5), Some(BufferId(1)));
+        assert_eq!(tab_at_column(&strip, 6), Some(BufferId(2)));
+        assert_eq!(tab_at_column(&strip, 11), Some(BufferId(2)));
+        // Past the strip is the empty bar, which selects nothing.
+        assert_eq!(tab_at_column(&strip, 12), None);
+        assert_eq!(tab_at_column(&strip, 999), None);
+    }
+
+    #[test]
+    fn a_column_on_an_overflow_marker_selects_nothing() {
+        // The markers are chrome, not targets: clicking one must not switch to some
+        // arbitrary neighbouring buffer.
+        let specs: Vec<(u64, Option<&str>, bool)> =
+            (1..=8).map(|i| (i, Some("file.rs"), false)).collect();
+        let list = buffers(&specs);
+        let strip = bufferline(&list, BufferId(4), 24);
+        assert_eq!(strip[0].label, "‹");
+        assert_eq!(tab_at_column(&strip, 0), None);
+        let last = strip_width(&strip) - 1;
+        assert_eq!(strip.last().unwrap().label, "›");
+        assert_eq!(tab_at_column(&strip, last), None);
+    }
+
+    #[test]
+    fn a_column_over_a_wide_glyph_tab_resolves_to_that_buffer() {
+        // Cells, not characters: a CJK name occupies two columns per glyph, and a
+        // click on its second cell must still land on that tab.
+        let list = buffers(&[(1, Some("日本.rs"), false), (2, Some("b.rs"), false)]);
+        let strip = bufferline(&list, BufferId(1), 40);
+        let first_width = strip[0].label.width();
+        assert_eq!(tab_at_column(&strip, first_width - 1), Some(BufferId(1)));
+        assert_eq!(tab_at_column(&strip, first_width), Some(BufferId(2)));
+    }
+
+    #[test]
+    fn an_empty_strip_resolves_no_column() {
+        assert_eq!(tab_at_column(&[], 0), None);
+    }
+
+    #[test]
+    fn head_bar_tabs_reserves_room_for_the_line_count() {
+        // The painter and the pointer handler share this, so the reservation has to
+        // live in one place: a strip fitted to the full width would put every tab a
+        // few cells right of where a click resolves it.
+        let list = buffers(&[(1, Some("a.rs"), false), (2, Some("b.rs"), false)]);
+        let full = bufferline(&list, BufferId(1), 40);
+        let reserved = head_bar_tabs(&list, BufferId(1), 7, 40);
+        // Both fit here, so the strips match; the difference shows when they cannot.
+        assert_eq!(full, reserved);
+
+        let specs: Vec<(u64, Option<&str>, bool)> =
+            (1..=8).map(|i| (i, Some("file.rs"), false)).collect();
+        let many = buffers(&specs);
+        let count_cells = line_count_label(7).width();
+        let strip = head_bar_tabs(&many, BufferId(1), 7, 40);
+        assert!(
+            strip_width(&strip) <= 40 - count_cells,
+            "the tab strip must not run under the line count: {strip:?}"
+        );
+    }
+
+    #[test]
+    fn an_unknown_active_buffer_still_renders_the_strip() {
+        // A snapshot older than a close can name a buffer no longer listed; the strip
+        // falls back to the first tab rather than panicking or blanking.
+        let list = buffers(&[(1, Some("a.rs"), false), (2, Some("b.rs"), false)]);
+        let strip = bufferline(&list, BufferId(99), 40);
+        assert_eq!(strip.len(), 2);
+        assert!(strip[0].active, "fell back to marking the first tab");
     }
 
     #[test]

@@ -21,6 +21,7 @@ use crate::picker::{Item, Picker};
 /// Motions and text entry are deliberately absent: they are not palette-worthy.
 const PALETTE: &[(&str, Bindable)] = &[
     ("Find File…", Bindable::OpenFilePicker),
+    ("Switch Buffer…", Bindable::OpenBufferPicker),
     ("Change Theme…", Bindable::OpenThemePicker),
     ("Save File", Bindable::Save),
     ("Save As…", Bindable::SaveAs),

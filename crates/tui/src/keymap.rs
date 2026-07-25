@@ -206,6 +206,8 @@ pub enum Command {
     OpenFilePicker,
     /// Open the theme-picker overlay (frontend-local).
     OpenThemePicker,
+    /// Open the buffer-picker overlay (frontend-local).
+    OpenBufferPicker,
     /// Focus the next buffer in the bufferline, wrapping at the end.
     ///
     /// Frontend-local *resolution*, not a frontend-local effect: the core has no
@@ -289,6 +291,7 @@ impl Command {
             "open_palette" => Command::OpenPalette,
             "open_file_picker" => Command::OpenFilePicker,
             "open_theme_picker" => Command::OpenThemePicker,
+            "open_buffer_picker" => Command::OpenBufferPicker,
             "next_buffer" => Command::NextBuffer,
             "prev_buffer" => Command::PrevBuffer,
             "close_buffer" => Command::CloseBuffer,
@@ -304,6 +307,7 @@ impl Command {
             Command::OpenPalette => return FrontendCommand::OpenPalette,
             Command::OpenFilePicker => return FrontendCommand::OpenFilePicker,
             Command::OpenThemePicker => return FrontendCommand::OpenThemePicker,
+            Command::OpenBufferPicker => return FrontendCommand::OpenBufferPicker,
             Command::SaveAs => return FrontendCommand::OpenSavePrompt,
             // Resolved against the live buffer list at dispatch, where it is known.
             Command::NextBuffer => return FrontendCommand::NextBuffer,
@@ -398,6 +402,7 @@ const DEFAULT_BINDINGS: &[(&str, &str)] = &[
     ("ctrl+pagedown", "next_buffer"),
     ("ctrl+pageup", "prev_buffer"),
     ("ctrl+w", "close_buffer"),
+    ("ctrl+b", "open_buffer_picker"),
 ];
 
 /// Bindings on the platform's native command modifier: Cmd on macOS (crossterm
@@ -619,6 +624,10 @@ mod tests {
         assert_eq!(
             command_for_key(&km, ctrl(KeyCode::Char('w')), page),
             Some(FrontendCommand::CloseBuffer)
+        );
+        assert_eq!(
+            command_for_key(&km, ctrl(KeyCode::Char('b')), page),
+            Some(FrontendCommand::OpenBufferPicker)
         );
     }
 

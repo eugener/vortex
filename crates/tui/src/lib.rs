@@ -16,6 +16,7 @@
 //! on a library target, so the display-column hot paths in [`layout`] are
 //! benchmarkable precisely because they live here.
 
+pub mod bufferpicker;
 pub mod command;
 pub mod compositor;
 pub mod config;
