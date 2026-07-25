@@ -349,6 +349,98 @@ fn open_beside_a_used_buffer_creates_a_second_one() {
 }
 
 #[test]
+fn opening_the_same_file_by_a_different_spelling_switches_to_it() {
+    // REGRESSION (code review, M7): the already-open check compared raw `PathBuf`s,
+    // so the two ways a path reaches the core - argv passes what the user typed, the
+    // file picker always sends an absolute path - never matched each other. Launching
+    // on `notes.txt` and then picking that same file opened a *second* buffer over
+    // it, with its own history, and whichever was saved last discarded the other's
+    // edits. Exactly the hazard `Action::Open`'s contract promises to prevent.
+    let dir = TempDir::new();
+    let path = dir.file("notes.txt");
+    std::fs::write(&path, "shared").unwrap();
+    let h = Harness::new();
+    let mut e = Session::new();
+
+    smol::block_on(open_file(
+        &mut e,
+        path.clone(),
+        &h.delta_tx,
+        &h.snapshots,
+        &h.note_tx,
+    ));
+    let first = e.active().id;
+
+    // The same file reached by a different spelling. A `..` hop is used because
+    // `PathBuf` equality already folds away `.` components but cannot fold `..`
+    // without consulting the filesystem - which is precisely the gap canonicalizing
+    // closes. (The case that bites in practice is argv's relative path against the
+    // picker's absolute one; that needs a process-wide cwd change, so it is not
+    // hermetic enough for a test and is covered by the same code path here.)
+    std::fs::create_dir(dir.file("sub")).unwrap();
+    let indirect = dir.file("sub").join("..").join("notes.txt");
+    assert_ne!(indirect, path, "the premise: a different spelling");
+    smol::block_on(open_file(
+        &mut e,
+        indirect,
+        &h.delta_tx,
+        &h.snapshots,
+        &h.note_tx,
+    ));
+
+    assert_eq!(e.docs.len(), 1, "one file must mean one buffer");
+    assert_eq!(e.active().id, first, "and it is the buffer already open");
+}
+
+#[test]
+fn saving_as_a_file_another_buffer_holds_is_refused() {
+    // The same duplicate-buffer hazard from the other direction: adopting a path a
+    // second buffer already owns would leave both claiming one file. Refused before
+    // the write, so the target on disk is untouched (SPEC §8).
+    let dir = TempDir::new();
+    let (first, second) = (dir.file("a.txt"), dir.file("b.txt"));
+    std::fs::write(&first, "first").unwrap();
+    std::fs::write(&second, "second").unwrap();
+    let h = Harness::new();
+    let mut e = Session::new();
+    for path in [first.clone(), second.clone()] {
+        smol::block_on(open_file(
+            &mut e,
+            path,
+            &h.delta_tx,
+            &h.snapshots,
+            &h.note_tx,
+        ));
+    }
+    assert_eq!(e.docs.len(), 2);
+    while h.note_rx.try_recv().is_ok() {}
+
+    // b.txt is active; try to save it over a.txt, which the other buffer holds.
+    let alive = smol::block_on(save_as_file(
+        &mut e,
+        first.clone(),
+        &h.snapshots,
+        &h.note_tx,
+    ));
+
+    assert!(alive);
+    assert!(
+        matches!(h.note_rx.try_recv(), Ok(Notification::FileError { .. })),
+        "the clash must be surfaced, not silently allowed"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&first).unwrap(),
+        "first",
+        "the other buffer's file must not have been overwritten"
+    );
+    assert_eq!(
+        e.active().path.as_deref(),
+        Some(second.as_path()),
+        "and the rejected save-as leaves the binding alone"
+    );
+}
+
+#[test]
 fn open_into_an_untouched_scratch_reuses_it() {
     // Launching bare and then opening a file must not strand an empty tab: an
     // unnamed, empty, unmodified buffer is loaded into rather than left behind.

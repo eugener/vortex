@@ -232,6 +232,20 @@ impl Session {
         self.docs.iter().position(|d| d.id == id)
     }
 
+    /// The index of the document bound to `path`, comparing files rather than
+    /// spellings (see [`file_identity`]).
+    ///
+    /// Resolves each open document's path per call rather than caching one on the
+    /// document: this runs on `Open`/`SaveAs` - discrete user actions over a handful
+    /// of buffers - never on the keystroke path, and a cached identity would go stale
+    /// the moment a file is moved or a symlink is repointed underneath us.
+    fn index_of_path(&self, path: &Path) -> Option<usize> {
+        let identity = file_identity(path);
+        self.docs
+            .iter()
+            .position(|d| d.path.as_deref().map(file_identity) == Some(identity.clone()))
+    }
+
     /// The cached buffer list, rebuilt only when it would differ.
     ///
     /// The cheap check is sound because **only the active document can change
@@ -748,6 +762,25 @@ async fn recv_attach<H>(attach: &Receiver<H>) -> H {
     }
 }
 
+/// The form a path is compared in to decide whether two buffers are the same *file*
+/// rather than the same spelling of one (SPEC §12.2).
+///
+/// Canonicalized when the file exists, so `notes.md`, `./notes.md` and
+/// `/abs/notes.md` all resolve to one identity - and a symlink resolves to its
+/// target. This matters because the two ways a path reaches the core disagree by
+/// construction: argv passes what the user typed, while the file picker always sends
+/// an absolute path. Without this, launching on a relative path and then opening the
+/// same file from the picker yields two buffers over one file, each with its own
+/// history, and whichever is saved last silently discards the other's edits.
+///
+/// A path that does not exist yet has nothing to resolve against, so it falls back to
+/// itself: two different spellings of the same *not-yet-created* file can still
+/// duplicate. That is the residue of doing this without touching the filesystem for
+/// files that are not on it, and it self-corrects at the first save.
+fn file_identity(path: &Path) -> PathBuf {
+    path.canonicalize().unwrap_or_else(|_| path.to_path_buf())
+}
+
 /// The LSP `languageId` for a path (the protocol's own identifiers, which are
 /// not simply the file extension). An unknown extension falls back to the
 /// extension itself: servers ignore documents they do not claim, so guessing
@@ -947,26 +980,38 @@ async fn run(
         .await;
         let action = match incoming {
             Incoming::Stopped => break,
-            // A (new) server attached: swap in both channel ends and re-announce
-            // the current buffer to it (a fresh `didOpen`), so a file already open
-            // when the server arrives is analyzed too. Replacing an earlier server
-            // drops its channels, which stops its client loop (SPEC §8).
+            // A (new) server attached: swap in both channel ends and re-announce the
+            // open buffers to it (a fresh `didOpen`), so a file already open when the
+            // server arrives is analyzed too. Replacing an earlier server drops its
+            // channels, which stops its client loop (SPEC §8).
+            //
+            // **Every** document, not just the active one: `lsp_sync` is session-wide
+            // while `lsp_opened` is per-document, so a document still flagged as
+            // opened would send the new server a `didChange` for a file it has never
+            // seen - which the client drops, leaving that buffer silently unanalyzed
+            // for as long as it stays open. Marking them all dirty means each
+            // announces itself when it next becomes active.
             Incoming::Attach(handle) => {
                 session.lsp_sync = Some(handle.sync);
                 lsp_events = Some(handle.events);
-                let doc = session.active_mut();
-                doc.lsp_opened = false;
-                doc.lsp_dirty = true;
+                for doc in &mut session.docs {
+                    doc.lsp_opened = false;
+                    doc.lsp_dirty = true;
+                }
                 continue;
             }
             // The server died, or its task ended. That must never take the editor
             // with it (SPEC §8): fall back to the no-LSP path, which is also what
             // keeps `select` from spinning on a permanently-ready closed channel.
             // Drop the send side too, so a stale sync never targets a dead server.
+            // Clearing `lsp_opened` session-wide for the same reason as the attach
+            // arm: whatever attaches next has seen none of these documents.
             Incoming::LspClosed => {
                 lsp_events = None;
                 session.lsp_sync = None;
-                session.active_mut().lsp_opened = false;
+                for doc in &mut session.docs {
+                    doc.lsp_opened = false;
+                }
                 continue;
             }
             Incoming::Lsp(LspEvent::Diagnostics { path, diagnostics }) => {
@@ -1360,11 +1405,7 @@ async fn open_file(
     notifications: &Sender<Notification>,
 ) -> bool {
     // Already open: focus it. No read, no delta - the buffer on screen is the file.
-    if let Some(index) = session
-        .docs
-        .iter()
-        .position(|d| d.path == Some(path.clone()))
-    {
+    if let Some(index) = session.index_of_path(&path) {
         return switch_to(session, index, snapshots, notifications);
     }
 
@@ -1592,6 +1633,23 @@ async fn save_as_file(
     snapshots: &SnapshotSink,
     notifications: &Sender<Notification>,
 ) -> bool {
+    // Saving *onto* a file another buffer holds would leave two documents claiming
+    // one file, each with its own history - the same hazard `open_file` refuses to
+    // create, arrived at from the other direction, and the one where the next save
+    // discards the other buffer's work. Refused before the write, so nothing is
+    // touched on disk (SPEC §8).
+    if let Some(index) = session.index_of_path(&path)
+        && index != session.active
+    {
+        return report_file_error(
+            session,
+            Some(path),
+            "already open in another buffer",
+            snapshots,
+            notifications,
+        );
+    }
+
     let contents = session.active().buffer.text().to_string();
     if let Err(message) = write_atomic(&path, contents.as_bytes()) {
         return report_file_error(session, Some(path), &message, snapshots, notifications);

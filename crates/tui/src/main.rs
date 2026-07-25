@@ -24,6 +24,7 @@ use std::collections::HashMap;
 use std::ffi::OsString;
 use std::io::{self, Stdout};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -261,6 +262,18 @@ struct GrammarManager {
     /// A `Language` is a pointer into an image that stays mapped for the process, so
     /// caching it is sound by construction and re-attaching becomes near-free.
     loaded: Arc<Mutex<HashMap<&'static str, tree_sitter::Language>>>,
+    /// Bumped once per attach, so a loader thread can tell on finishing whether it is
+    /// still the attach the editor wants.
+    ///
+    /// Loads race: they run on their own threads and take wildly different times - a
+    /// cold `dlopen` is ~200ms while a cached one returns at once. Switching
+    /// rust -> go -> rust inside that window would otherwise let the slow Go load land
+    /// *after* the fast cached Rust one and replace it, leaving the core parsing a
+    /// `.rs` file with the Go grammar. Nothing would correct it either: `current`
+    /// already reads `rust`, so no further switch to Rust re-attaches, and the spans
+    /// carry the right `buffer_id`/`version` so the core accepts them. The file just
+    /// stays wrong.
+    generation: Arc<AtomicU64>,
 }
 
 impl GrammarManager {
@@ -268,6 +281,7 @@ impl GrammarManager {
         Self {
             current: None,
             loaded: Arc::new(Mutex::new(HashMap::new())),
+            generation: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -288,20 +302,26 @@ impl GrammarManager {
     /// grammar, so moving focus to a buffer of another language has to re-attach.
     /// That is what makes the grammar cache load-bearing rather than an optimization -
     /// alternating between two languages would otherwise reload on every switch.
-    fn ensure(&mut self, path: &Path, handle: &vortex_core::CoreHandle) {
+    /// Returns whether an attach was actually started, which is the caller's signal
+    /// that a fresh highlight batch is on its way and worth briefly waiting for.
+    fn ensure(&mut self, path: &Path, handle: &vortex_core::CoreHandle) -> bool {
         let Some(lang) = grammar::grammar_target(path) else {
-            return;
+            return false;
         };
         // Same language as the running (or already-loading) highlighter: its resync
         // covers the newly opened file, so do not load the grammar again.
         if self.current == Some(lang) {
-            return;
+            return false;
         }
         self.current = Some(lang);
-        // Only the syntax-attach sender and the shared cache cross to the thread (both
+        // Claim this attach. A loader that finishes after a later one started is
+        // stale and must not overwrite it (see `generation`).
+        let mine = self.generation.fetch_add(1, Ordering::SeqCst) + 1;
+        // Only the syntax-attach sender and the shared state cross to the thread (all
         // cheap clones); the render loop keeps the receivers.
         let syntax_tx = handle.syntax.clone();
         let loaded = Arc::clone(&self.loaded);
+        let generation = Arc::clone(&self.generation);
         let _ = std::thread::Builder::new()
             .name("vortex-syntax".into())
             .spawn(move || {
@@ -324,6 +344,12 @@ impl GrammarManager {
                         language
                     }
                 };
+                // Another attach started while this one was loading, so it owns the
+                // highlighter now: drop this grammar rather than replace what the
+                // editor is currently using with a language it has moved off.
+                if generation.load(Ordering::SeqCst) != mine {
+                    return;
+                }
                 let (syntax_handle, syntax_loop) = vortex_core::highlighter(
                     language,
                     lang,
@@ -337,6 +363,7 @@ impl GrammarManager {
                     let _ = smol::block_on(syntax_loop);
                 }
             });
+        true
     }
 }
 
@@ -565,17 +592,26 @@ fn event_loop(
             // another language has to re-attach exactly as an open does. Keyed off the
             // core's own notifications so there is one path for every way a buffer can
             // become current, carrying the path the core actually has.
+            // An open always re-parses (the core marks the freshly loaded buffer
+            // dirty), so colours are certainly coming. A switch does not: it leaves
+            // the buffer's existing decorations in place deliberately, so a batch
+            // arrives only when the language changed and a grammar was attached.
             let arriving = match &note {
-                vortex_core::Notification::FileOpened { path, .. } => Some(path.clone()),
-                vortex_core::Notification::BufferSwitched { path, .. } => path.clone(),
+                vortex_core::Notification::FileOpened { path, .. } => Some((path.clone(), true)),
+                vortex_core::Notification::BufferSwitched { path, .. } => {
+                    path.clone().map(|path| (path, false))
+                }
                 _ => None,
             };
-            if let Some(path) = arriving {
+            if let Some((path, reparse_certain)) = arriving {
                 lsp.ensure(&path, handle);
-                grammars.ensure(&path, handle);
-                // If this file type highlights, hold its first paint for the colors
-                // (below). No grammar -> nothing to wait for, paint as usual.
-                if grammar::grammar_target(&path).is_some() {
+                let attached = grammars.ensure(&path, handle);
+                // Hold the first paint for the colours only when a batch is genuinely
+                // on its way. Arming it on a same-language switch would stall the
+                // frame for the whole `HIGHLIGHT_WAIT` waiting for something nothing
+                // was going to send - visible on any buffer that has no decorations
+                // yet, such as an empty file.
+                if (reparse_certain && grammar::grammar_target(&path).is_some()) || attached {
                     awaiting_highlight = Some(Instant::now());
                 }
             }
@@ -2023,6 +2059,38 @@ mod tests {
         let mut manager = GrammarManager::new();
         manager.ensure(Path::new("notes.txt"), &handle);
         assert_eq!(manager.current, None);
+    }
+
+    #[test]
+    fn ensure_reports_whether_it_started_an_attach() {
+        // The return value is what arms the paint hold: only a real attach means a
+        // fresh highlight batch is coming, and holding the frame for one that is not
+        // on its way stalls a buffer switch for the whole `HIGHLIGHT_WAIT`.
+        //
+        // It also drives the stale-attach guard, which counts one generation per
+        // attach. The *other* half of that guard - a slow loader finding its
+        // generation superseded and dropping its grammar - needs two languages to
+        // race, and `grammar_target` knows only Rust today, so it cannot be reached
+        // from a test; `ensure` is in the documented-untestable `dlopen` glue
+        // (CLAUDE.md) for the same reason.
+        let Core { handle, run: _run } = vortex_core::new(16);
+        let mut manager = GrammarManager::new();
+
+        // Nothing to attach for a file type with no grammar, so nothing to wait for
+        // and no generation spent.
+        assert!(!manager.ensure(Path::new("notes.txt"), &handle));
+        assert_eq!(manager.generation.load(Ordering::SeqCst), 0);
+
+        // A language with a grammar: an attach starts and claims a generation.
+        assert!(manager.ensure(Path::new("a.rs"), &handle));
+        assert_eq!(manager.current, Some("rust"));
+        assert_eq!(manager.generation.load(Ordering::SeqCst), 1);
+
+        // Another file of the same language reuses the running highlighter. No second
+        // attach, and critically no second generation - bumping here would invalidate
+        // the in-flight loader that is about to serve this very buffer.
+        assert!(!manager.ensure(Path::new("b.rs"), &handle));
+        assert_eq!(manager.generation.load(Ordering::SeqCst), 1);
     }
 
     #[test]

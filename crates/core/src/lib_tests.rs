@@ -1103,6 +1103,43 @@ fn a_second_file_opened_into_an_attached_server_is_announced() {
 // `syntax::engine`; here we prove the editor wires a highlighter's output onto the
 // snapshot's decoration channel and survives it attaching, closing, and repeating.
 
+/// Attach a fake language server over `CoreHandle::lsp`, the runtime path a frontend
+/// takes once it has spawned a client for a file type. A second call replaces the
+/// first, as re-rooting on a different workspace does.
+async fn attach_lsp(h: &CoreHandle) -> FakeServer {
+    let (sync_tx, sync_rx) = async_channel::bounded(16);
+    let (event_tx, event_rx) = async_channel::bounded(16);
+    h.lsp
+        .send(LspHandle {
+            sync: sync_tx,
+            events: event_rx,
+        })
+        .await
+        .unwrap();
+    FakeServer {
+        sync: sync_rx,
+        events: event_tx,
+    }
+}
+
+/// The **next** document sync this server is sent, or `None` if none arrives.
+///
+/// Deliberately the first message rather than the newest: what a server is told
+/// *first* about a document is the whole question for the `didOpen`/`didChange`
+/// split, and a later change would mask an opening that never happened.
+///
+/// Yields so the actor gets turns to flush - it syncs at the top of a loop turn, not
+/// in response to a message, so there is nothing to await on directly.
+async fn next_sync(server: &FakeServer) -> Option<crate::lsp::DocumentSync> {
+    for _ in 0..64 {
+        smol::future::yield_now().await;
+        if let Ok(message) = server.sync.try_recv() {
+            return Some(message);
+        }
+    }
+    None
+}
+
 /// The highlighter side of the seam: the text the editor sent us, and a way to
 /// push highlight batches back.
 struct FakeHighlighter {
@@ -1515,6 +1552,58 @@ fn the_snapshot_buffer_list_tracks_opens_closes_and_edits() {
             .find(|i| i.id == ids[1])
             .expect("the edited buffer is listed");
         assert!(entry.modified, "the list shows the unsaved marker");
+    });
+}
+
+#[test]
+fn a_replacement_server_is_told_about_every_open_buffer() {
+    // REGRESSION (code review, M7): `lsp_sync` is session-wide but `lsp_opened` is
+    // per-document, and the attach arm cleared it only on the active buffer. A
+    // background buffer therefore stayed flagged as opened, so its next sync sent the
+    // *new* server a `didChange` for a file that server had never seen - which the
+    // client drops, leaving that buffer silently unanalyzed for as long as it is open.
+    //
+    // Currently unreachable through the UI (only one language server is known, and it
+    // is keyed so it attaches once), which is exactly why it needs pinning here: it
+    // goes live the moment a second server joins the table.
+    drive(|h| async move {
+        let dir = TempDir::new();
+        let ids = open_files(&h, &dir, 2).await;
+
+        // Both buffers must be *known* to the first server, or the second server
+        // would be the first to hear about the background one either way and the
+        // stale flag could not show itself. Focus each in turn so each is announced.
+        step(&h, Action::SwitchBuffer { id: ids[0] }).await;
+        let first = attach_lsp(&h).await;
+        assert!(matches!(
+            next_sync(&first).await,
+            Some(DocumentSync::Opened { .. })
+        ));
+        step(&h, Action::SwitchBuffer { id: ids[1] }).await;
+        assert!(matches!(
+            next_sync(&first).await,
+            Some(DocumentSync::Opened { .. })
+        ));
+
+        // A replacement server arrives - re-rooting on another workspace, or simply a
+        // second language server. It has seen neither document.
+        let second = attach_lsp(&h).await;
+        let announced = next_sync(&second).await;
+        assert!(
+            matches!(&announced, Some(DocumentSync::Opened { .. })),
+            "the active buffer must re-open against the new server, got {announced:?}"
+        );
+
+        // The background buffer, which the *old* server had opened, must open against
+        // this one too. Sending a change for a document it never opened is what the
+        // client drops on the floor, silently ending analysis for that file.
+        step(&h, Action::SwitchBuffer { id: ids[0] }).await;
+        step(&h, Action::Insert("edit".into())).await;
+        let announced = next_sync(&second).await;
+        assert!(
+            matches!(&announced, Some(DocumentSync::Opened { .. })),
+            "the background buffer must open, not change, got {announced:?}"
+        );
     });
 }
 
