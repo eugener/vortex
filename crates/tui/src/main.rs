@@ -539,8 +539,11 @@ fn event_loop(
     // Where each buffer was scrolled to, so switching away and back returns to the
     // same place instead of snapping to the top. Frontend-owned: the viewport is not
     // core state (SPEC §5), so the core neither knows nor needs to know about this.
-    // Keyed by `BufferId`, and entries for closed buffers are dropped as the buffer
-    // list shrinks, so this cannot grow without bound over a long session.
+    //
+    // Only written when focus leaves a buffer, and dropped on the core's own
+    // `BufferClosed`, so it neither costs a map write per frame nor grows without
+    // bound. The live `viewport` below is always the active buffer's, so there is
+    // nothing to store for it until it stops being active.
     let mut viewports: HashMap<BufferId, ViewState> = HashMap::new();
     // The buffer the last painted frame belonged to, so a switch can be noticed.
     let mut painted: Option<BufferId> = None;
@@ -596,22 +599,22 @@ fn event_loop(
             // dirty), so colours are certainly coming. A switch does not: it leaves
             // the buffer's existing decorations in place deliberately, so a batch
             // arrives only when the language changed and a grammar was attached.
-            let arriving = match &note {
-                vortex_core::Notification::FileOpened { path, .. } => Some((path.clone(), true)),
-                vortex_core::Notification::BufferSwitched { path, .. } => {
-                    path.clone().map(|path| (path, false))
-                }
+            let arriving: Option<(&Path, bool)> = match &note {
+                vortex_core::Notification::FileOpened { path, .. } => Some((path, true)),
+                vortex_core::Notification::BufferSwitched {
+                    path: Some(path), ..
+                } => Some((path, false)),
                 _ => None,
             };
             if let Some((path, reparse_certain)) = arriving {
-                lsp.ensure(&path, handle);
-                let attached = grammars.ensure(&path, handle);
+                lsp.ensure(path, handle);
+                let attached = grammars.ensure(path, handle);
                 // Hold the first paint for the colours only when a batch is genuinely
                 // on its way. Arming it on a same-language switch would stall the
                 // frame for the whole `HIGHLIGHT_WAIT` waiting for something nothing
                 // was going to send - visible on any buffer that has no decorations
                 // yet, such as an empty file.
-                if (reparse_certain && grammar::grammar_target(&path).is_some()) || attached {
+                if (reparse_certain && grammar::grammar_target(path).is_some()) || attached {
                     awaiting_highlight = Some(Instant::now());
                 }
             }
@@ -625,6 +628,11 @@ fn event_loop(
                     path.as_deref(),
                 ));
                 needs_redraw = true;
+            }
+            // The buffer is gone, so its parked scroll position is too. Keyed off the
+            // core's own event rather than inferred from the list shrinking.
+            if let vortex_core::Notification::BufferClosed { buffer_id } = &note {
+                viewports.remove(buffer_id);
             }
             // A copy/cut asks us to mirror the register to the OS clipboard. We push
             // it over OSC 52 (clipboard-over-terminal), which works locally and over
@@ -683,12 +691,6 @@ fn event_loop(
                 &overlays,
                 &toasts,
             )?;
-            viewports.insert(snap.buffer_id, viewport);
-            // Forget closed buffers so a long session cannot accumulate their scroll
-            // positions. Only worth walking when the map has outgrown the buffer list.
-            if viewports.len() > snap.buffers.len() {
-                viewports.retain(|id, _| snap.buffers.iter().any(|info| info.id == *id));
-            }
             needs_redraw = false;
             awaiting_highlight = None;
             // Default back to caret-follow; only a wheel scroll opts out, and only
@@ -722,9 +724,7 @@ fn event_loop(
                                 overlays: &mut overlays,
                                 config: &mut config,
                                 toasts: &mut toasts,
-                                path: latest.as_ref().and_then(|s| s.path.as_deref()),
-                                buffers: latest.as_ref().map_or(&[], |s| &s.buffers),
-                                active: latest.as_ref().map(|s| s.buffer_id),
+                                snapshot: latest.as_ref(),
                             };
                             if !dispatch_command(command, handle, &mut ui) {
                                 return Ok(());
@@ -761,9 +761,7 @@ fn event_loop(
                             overlays: &mut overlays,
                             config: &mut config,
                             toasts: &mut toasts,
-                            path: latest.as_ref().and_then(|s| s.path.as_deref()),
-                            buffers: latest.as_ref().map_or(&[], |s| &s.buffers),
-                            active: latest.as_ref().map(|s| s.buffer_id),
+                            snapshot: latest.as_ref(),
                         };
                         if !dispatch_command(command, handle, &mut ui) {
                             return Ok(());
@@ -781,18 +779,21 @@ fn event_loop(
                     // sweeps out a selection.
                     MouseEventKind::Down(MouseButton::Left)
                     | MouseEventKind::Drag(MouseButton::Left) => {
+                        let Some(snap) = &latest else { continue };
+                        let is_press = matches!(mouse.kind, MouseEventKind::Down(_));
                         // A press on the bufferline selects that tab's buffer rather
                         // than placing a caret: row 0 is chrome, not text. Resolved
                         // against the same fitted strip that was painted, so the tab
                         // under the pointer is the one that gets picked. A drag is
                         // ignored here - dragging across tabs is not a gesture.
-                        let tab_press =
-                            matches!(mouse.kind, MouseEventKind::Down(_)) && mouse.row == 0;
-                        if tab_press && let Some(snap) = &latest {
+                        if is_press && mouse.row == 0 {
+                            let count_width =
+                                layout::line_count_label(layout::display_line_count(&snap.text))
+                                    .width();
                             let tabs = layout::head_bar_tabs(
                                 &snap.buffers,
                                 snap.buffer_id,
-                                layout::display_line_count(&snap.text),
+                                count_width,
                                 terminal.size()?.width as usize,
                             );
                             // A click on an overflow marker, the padding, or the line
@@ -808,24 +809,20 @@ fn event_loop(
                             }
                             continue;
                         }
-                        if let Some(snap) = &latest {
-                            let is_press = matches!(mouse.kind, MouseEventKind::Down(_));
-                            let extend = matches!(mouse.kind, MouseEventKind::Drag(_))
-                                || mouse.modifiers.contains(KeyModifiers::SHIFT);
-                            let offset = pointer_offset(snap, viewport, mouse.column, mouse.row);
-                            // Alt+click adds a cursor without collapsing the set
-                            // (SPEC §2.2 multi-cursor); a plain click/drag places or
-                            // extends the single caret. Alt only adds on a fresh
-                            // press, never mid-drag.
-                            let action = if is_press && mouse.modifiers.contains(KeyModifiers::ALT)
-                            {
-                                Action::AddCursorAt { offset }
-                            } else {
-                                Action::PlaceCursor { offset, extend }
-                            };
-                            if handle.actions.send_blocking(action).is_err() {
-                                return Ok(());
-                            }
+                        let extend = matches!(mouse.kind, MouseEventKind::Drag(_))
+                            || mouse.modifiers.contains(KeyModifiers::SHIFT);
+                        let offset = pointer_offset(snap, viewport, mouse.column, mouse.row);
+                        // Alt+click adds a cursor without collapsing the set
+                        // (SPEC §2.2 multi-cursor); a plain click/drag places or
+                        // extends the single caret. Alt only adds on a fresh
+                        // press, never mid-drag.
+                        let action = if is_press && mouse.modifiers.contains(KeyModifiers::ALT) {
+                            Action::AddCursorAt { offset }
+                        } else {
+                            Action::PlaceCursor { offset, extend }
+                        };
+                        if handle.actions.send_blocking(action).is_err() {
+                            return Ok(());
                         }
                     }
                     // Wheel scrolls the viewport without moving the caret (follow
@@ -872,23 +869,37 @@ struct Frontend<'a> {
     overlays: &'a mut Compositor,
     config: &'a mut config::Config,
     toasts: &'a mut Toasts,
-    /// The current buffer's file path (from the latest snapshot), so the save-as
-    /// prompt can pre-fill it. `None` before any file is bound.
-    path: Option<&'a std::path::Path>,
-    /// Every open buffer in bufferline order, and which one is active, from the
-    /// latest snapshot. This is what lets "next buffer" be resolved here rather than
-    /// in the core: the frontend already holds the order, so it names the neighbor
-    /// and only the committed `SwitchBuffer { id }` crosses the seam (SPEC §7.5).
-    buffers: &'a [BufferInfo],
-    active: Option<BufferId>,
+    /// The newest snapshot, or `None` before the first one arrives. Held whole rather
+    /// than as pre-extracted fields: the commands need three different projections of
+    /// it, and every new one would otherwise mean another field threaded through
+    /// every construction site.
+    snapshot: Option<&'a ViewSnapshot>,
 }
 
 impl Frontend<'_> {
+    /// The active buffer's file path, so the save-as prompt can pre-fill it.
+    fn path(&self) -> Option<&std::path::Path> {
+        self.snapshot?.path.as_deref()
+    }
+
+    /// Every open buffer in bufferline order.
+    fn buffers(&self) -> &[BufferInfo] {
+        self.snapshot.map_or(&[], |s| &s.buffers)
+    }
+
+    /// The buffer on screen.
+    fn active(&self) -> Option<BufferId> {
+        Some(self.snapshot?.buffer_id)
+    }
+
     /// The buffer `offset` positions from the active one, or `None` when there is
-    /// nothing to switch to (no snapshot yet, or a single buffer). The wrapping lives
-    /// in [`command::neighbor_buffer`], which is pure and unit-tested.
+    /// nothing to switch to (no snapshot yet, or a single buffer). This is what lets
+    /// "next buffer" be resolved here rather than in the core: the frontend already
+    /// holds the order, so it names the neighbor and only the committed
+    /// `SwitchBuffer { id }` crosses the seam (SPEC §7.5). The wrapping lives in
+    /// [`command::neighbor_buffer`], which is pure and unit-tested.
     fn neighbor(&self, offset: isize) -> Option<BufferId> {
-        command::neighbor_buffer(self.buffers, self.active?, offset)
+        command::neighbor_buffer(self.buffers(), self.active()?, offset)
     }
 }
 
@@ -920,40 +931,33 @@ fn dispatch_command(command: Command, handle: &vortex_core::CoreHandle, ui: &mut
         // No I/O and no round trip: the rows come from the snapshot's buffer list.
         // Nothing to pick from before the first snapshot, so it simply does not open.
         Command::OpenBufferPicker => {
-            if let Some(active) = ui.active {
+            if let Some(active) = ui.active() {
+                let buffers = ui.buffers();
                 ui.overlays
-                    .push(bufferpicker::open(&ui.config.theme, ui.buffers, active));
+                    .push(bufferpicker::open(&ui.config.theme, buffers, active));
             }
         }
         // The save-as prompt pre-fills the current path (if any) so a save-as is a
         // quick edit of the existing name; its committed path returns as SaveAs.
-        Command::OpenSavePrompt => ui.overlays.push(prompt::save_as(&ui.config.theme, ui.path)),
-        // Buffer motion is resolved here, against the list the snapshot carries, and
-        // only the chosen buffer crosses the seam. With one buffer open there is no
-        // neighbor, so the key does nothing rather than round-tripping a no-op.
-        Command::NextBuffer | Command::PrevBuffer => {
-            let offset = if command == Command::NextBuffer {
-                1
-            } else {
-                -1
+        Command::OpenSavePrompt => ui
+            .overlays
+            .push(prompt::save_as(&ui.config.theme, ui.path())),
+        // The buffer commands resolve against the list the snapshot carries and then
+        // share one send below, since each is "work out which buffer, then say so".
+        // Nothing to say (one buffer open, or no snapshot yet) is a no-op rather than
+        // a round trip.
+        Command::NextBuffer | Command::PrevBuffer | Command::CloseBuffer => {
+            let action = match command {
+                Command::NextBuffer => ui.neighbor(1).map(|id| Action::SwitchBuffer { id }),
+                Command::PrevBuffer => ui.neighbor(-1).map(|id| Action::SwitchBuffer { id }),
+                // Unforced: the core refuses if there is unsaved work, and its
+                // `CloseRejected` is what raises the confirmation (SPEC §8).
+                _ => ui
+                    .active()
+                    .map(|id| Action::CloseBuffer { id, force: false }),
             };
-            if let Some(id) = ui.neighbor(offset)
-                && handle
-                    .actions
-                    .send_blocking(Action::SwitchBuffer { id })
-                    .is_err()
-            {
-                return false;
-            }
-        }
-        // Unforced: the core refuses if there is unsaved work, and its `CloseRejected`
-        // is what raises the confirmation (SPEC §8).
-        Command::CloseBuffer => {
-            if let Some(id) = ui.active
-                && handle
-                    .actions
-                    .send_blocking(Action::CloseBuffer { id, force: false })
-                    .is_err()
+            if let Some(action) = action
+                && handle.actions.send_blocking(action).is_err()
             {
                 return false;
             }
@@ -1166,31 +1170,29 @@ fn paint_head_bar(frame: &mut Frame, area: Rect, snapshot: &ViewSnapshot, theme:
     let width = area.width as usize;
     // The line count keeps the right end; the tab strip gets what is left. With one
     // buffer open that reads exactly as the pre-bufferline head bar did.
-    let line_count = layout::display_line_count(&snapshot.text);
-    let count = layout::line_count_label(line_count);
+    let count = layout::line_count_label(layout::display_line_count(&snapshot.text));
     let count_width = count.width();
-    let tabs = layout::head_bar_tabs(&snapshot.buffers, snapshot.buffer_id, line_count, width);
+    let tabs = layout::head_bar_tabs(&snapshot.buffers, snapshot.buffer_id, count_width, width);
 
     let mut spans: Vec<Span> = Vec::with_capacity(tabs.len() + 2);
     let mut used = 0;
     for tab in tabs {
-        used += tab.label.width();
-        // Three kinds of segment: the filled current tab, the tabs behind it, and
-        // the chrome (separators and overflow markers) that divides them.
-        let style = match (tab.is_tab(), tab.active) {
-            (true, true) => theme.head_bar_active,
-            (true, false) => theme.head_bar_inactive,
-            _ => theme.head_bar_separator,
+        // Each segment already knows its width; re-measuring the label here would be
+        // the third walk over the same text in one frame.
+        used += tab.cells;
+        let style = match tab.kind {
+            layout::Segment::Tab { active: true, .. } => theme.head_bar_active,
+            layout::Segment::Tab { active: false, .. } => theme.head_bar_inactive,
+            layout::Segment::Chrome => theme.head_bar_separator,
         };
         spans.push(Span::styled(tab.label, style));
     }
-    // Pad between the strip and the count so the count sits flush right.
-    if let Some(gap) = width.checked_sub(used + count_width)
-        && gap > 0
-    {
-        spans.push(Span::styled(" ".repeat(gap), theme.head_bar));
-    }
-    if used + count_width <= width {
+    // Pad between the strip and the count so the count sits flush right. The pad and
+    // the count are governed by the same "does it fit" question.
+    if let Some(gap) = width.checked_sub(used + count_width) {
+        if gap > 0 {
+            spans.push(Span::styled(" ".repeat(gap), theme.head_bar));
+        }
         spans.push(Span::styled(count, theme.head_bar));
     }
     frame.render_widget(
@@ -1560,9 +1562,7 @@ mod tests {
                         overlays: &mut overlays,
                         config: &mut config,
                         toasts: &mut toasts,
-                        path: latest.as_ref().and_then(|s| s.path.as_deref()),
-                        buffers: latest.as_ref().map_or(&[], |s| &s.buffers),
-                        active: latest.as_ref().map(|s| s.buffer_id),
+                        snapshot: latest.as_ref(),
                     };
                     assert!(dispatch_command(command.clone(), &handle, &mut ui));
                 }
@@ -1585,19 +1585,15 @@ mod tests {
 
     /// Two temp files, opened as two buffers. Returns the dir (kept alive by the
     /// caller: dropping it deletes the files) and the open actions.
-    fn two_open_files() -> (std::path::PathBuf, Vec<Action>) {
-        let dir = std::env::temp_dir().join(format!(
-            "vortex-tui-mb-{}-{:?}",
-            std::process::id(),
-            std::thread::current().id()
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
-        let mut actions = Vec::new();
-        for name in ["one.txt", "two.txt"] {
-            let path = dir.join(name);
-            std::fs::write(&path, format!("body of {name}")).unwrap();
-            actions.push(Action::Open(path));
-        }
+    fn two_open_files() -> (TempDir, Vec<Action>) {
+        let dir = TempDir::new();
+        let actions = ["one.txt", "two.txt"]
+            .into_iter()
+            .map(|name| {
+                dir.file(name, &format!("body of {name}"));
+                Action::Open(dir.path.join(name))
+            })
+            .collect();
         (dir, actions)
     }
 
@@ -1605,7 +1601,7 @@ mod tests {
     fn next_buffer_resolves_the_neighbor_from_the_snapshot_list() {
         // The core has no "next": the frontend reads the ordered list off the
         // snapshot, names the neighbor, and sends `SwitchBuffer { id }` (SPEC §7.5).
-        let (dir, opens) = two_open_files();
+        let (_dir, opens) = two_open_files();
         let (snap, _) = dispatch_against_core(&opens, &[Command::NextBuffer]);
         // Two buffers, the second active after opening: next wraps to the first.
         assert_eq!(snap.buffers.len(), 2);
@@ -1615,7 +1611,6 @@ mod tests {
         // And back the other way.
         let (snap, _) = dispatch_against_core(&opens, &[Command::NextBuffer, Command::PrevBuffer]);
         assert_eq!(snap.buffer_id, snap.buffers[1].id);
-        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]
@@ -1633,7 +1628,7 @@ mod tests {
     #[test]
     fn close_buffer_sends_an_unforced_close_so_the_core_can_refuse() {
         // Clean buffer: it just closes.
-        let (dir, opens) = two_open_files();
+        let (_dir, opens) = two_open_files();
         let (snap, _) = dispatch_against_core(&opens, &[Command::CloseBuffer]);
         assert_eq!(snap.buffers.len(), 1);
 
@@ -1649,7 +1644,6 @@ mod tests {
                 .any(|n| matches!(n, vortex_core::Notification::CloseRejected { .. })),
             "expected the core to refuse, got {notes:?}"
         );
-        let _ = std::fs::remove_dir_all(dir);
     }
 
     /// Default per-frame paint inputs for tests: fresh view state, default theme,
@@ -1766,7 +1760,7 @@ mod tests {
     #[test]
     fn the_bufferline_shows_a_tab_per_buffer_with_the_active_one_highlighted() {
         // The head bar is a tab strip once several buffers are open (SPEC §7.5:507).
-        let (dir, opens) = two_open_files();
+        let (_dir, opens) = two_open_files();
         let snap = snapshot_after(&opens);
         assert_eq!(snap.buffers.len(), 2);
         let buf = render(&snap, 60, 10);
@@ -1797,7 +1791,6 @@ mod tests {
         // The divider is chrome: dimmer than either tab's text.
         let separator = buf.cell((head.find('│').unwrap() as u16, 0)).unwrap();
         assert_eq!(separator.fg, theme.head_bar_separator.fg.unwrap());
-        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]

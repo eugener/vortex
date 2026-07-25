@@ -801,7 +801,12 @@ fn save_as_to_a_new_path_reannounces_to_the_language_server() {
 
     let mut e = session_with("fn main() {}", SelectionSet::at_origin());
     e.active_mut().path = Some(old.clone());
-    e.active_mut().lsp_opened = true;
+    let id = e.active().id;
+    // Announced to a connected server, and up to date with it.
+    let (tx, _rx) = async_channel::bounded(4);
+    let mut lsp = LspConnection::new(tx);
+    lsp.opened.insert(id);
+    e.lsp = Some(lsp);
     e.active_mut().lsp_dirty = false;
 
     let h = Harness::new();
@@ -812,13 +817,13 @@ fn save_as_to_a_new_path_reannounces_to_the_language_server() {
         &h.note_tx,
     ));
     assert!(
-        !e.active().lsp_opened,
+        !e.lsp.as_ref().unwrap().opened.contains(&id),
         "a renamed document must be re-opened to the server"
     );
     assert!(e.active().lsp_dirty, "the new identity must be re-synced");
 
     // Saving-as again to the same (now current) path is a plain save: no re-announce.
-    e.active_mut().lsp_opened = true;
+    e.lsp.as_mut().unwrap().opened.insert(id);
     e.active_mut().lsp_dirty = false;
     smol::block_on(save_as_file(
         &mut e,
@@ -827,7 +832,7 @@ fn save_as_to_a_new_path_reannounces_to_the_language_server() {
         &h.note_tx,
     ));
     assert!(
-        e.active().lsp_opened,
+        e.lsp.as_ref().unwrap().opened.contains(&id),
         "same-path save-as must not reset the announce state"
     );
     assert!(!e.active().lsp_dirty);
@@ -970,6 +975,25 @@ fn two_buffers(first: &str, second: &str) -> (Session, BufferId, BufferId, TempD
     while h.note_rx.try_recv().is_ok() {}
     let (a, b) = (e.docs[0].id, e.docs[1].id);
     (e, a, b, dir, h)
+}
+
+#[test]
+fn closing_a_buffer_drops_it_from_the_connection() {
+    // Ids are never reused, so a leftover entry could not mis-target a later buffer,
+    // but it would accumulate for the session's life. The connection owns the set, so
+    // closing a document is the one place that can prune it.
+    let (mut e, a, b, _dir, h) = two_buffers("alpha", "beta");
+    let (tx, _rx) = async_channel::bounded(4);
+    let mut lsp = LspConnection::new(tx);
+    lsp.opened.insert(a);
+    lsp.opened.insert(b);
+    e.lsp = Some(lsp);
+
+    assert!(close_buffer(&mut e, a, false, &h.snapshots, &h.note_tx));
+
+    let opened = &e.lsp.as_ref().unwrap().opened;
+    assert!(!opened.contains(&a), "the closed buffer is forgotten");
+    assert!(opened.contains(&b), "the surviving one is not");
 }
 
 #[test]
@@ -1953,7 +1977,7 @@ fn sync_lsp_says_nothing_about_an_unnamed_buffer() {
     // the buffer then.
     let (tx, rx) = async_channel::bounded::<DocumentSync>(4);
     let mut s = session_with("typed but never saved", SelectionSet::at_origin());
-    s.lsp_sync = Some(tx);
+    s.lsp = Some(LspConnection::new(tx));
     s.active_mut().lsp_dirty = true;
 
     s.sync_lsp();
@@ -1970,7 +1994,7 @@ fn sync_lsp_opens_then_changes_the_same_document() {
     // not re-send unchanged text.
     let (tx, rx) = async_channel::bounded::<DocumentSync>(4);
     let mut s = session_with("fn main() {}", SelectionSet::at_origin());
-    s.lsp_sync = Some(tx);
+    s.lsp = Some(LspConnection::new(tx));
     s.active_mut().path = Some(PathBuf::from("/tmp/x.rs"));
     s.active_mut().lsp_dirty = true;
 
@@ -1990,7 +2014,8 @@ fn sync_lsp_opens_then_changes_the_same_document() {
         other => panic!("expected Opened, got {other:?}"),
     }
     assert!(!s.active().lsp_dirty);
-    assert!(s.active().lsp_opened);
+    let id = s.active().id;
+    assert!(s.lsp.as_ref().unwrap().opened.contains(&id));
 
     // Nothing outstanding: a second call is a no-op rather than a redundant resend.
     s.sync_lsp();

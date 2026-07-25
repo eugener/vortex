@@ -15,6 +15,13 @@
 //!   The gap between the two is the win from resolving highlights in one pass,
 //!   quantified rather than asserted.
 //!
+//! - **`bufferline`** - fitting the head bar's tab strip, which repaints every
+//!   frame and allocates per open buffer. Measured across buffer counts and at
+//!   both widths that matter: `fits` (every tab shown, the common case) and
+//!   `windowed` (a narrow bar, which runs the window-growing loop as well). Use it
+//!   before adding anything per-tab to this path, and to decide whether the strip
+//!   ever needs caching between frames.
+//!
 //! Running and the loop's `--test` smoke mode: see the header of
 //! `vortex-core/benches/hot_paths.rs`. Timings are a human-read A/B tool against a
 //! saved baseline, never gated.
@@ -24,6 +31,7 @@ use std::ops::Range;
 
 use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 use ratatui::style::{Color, Style};
+use vortex_core::{BufferId, BufferInfo};
 use vortex_tui::layout::{self, ColumnWalker};
 
 fn render_line_overlays(c: &mut Criterion) {
@@ -101,5 +109,32 @@ fn span_columns(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, render_line_overlays, span_columns);
+/// The bufferline is refitted on every frame, so its cost scales with how many
+/// buffers are open, not with how often they change. Both widths are measured: one
+/// where every tab fits (the fast path) and one narrow enough to force the window to
+/// be grown around the active tab.
+fn bufferline(c: &mut Criterion) {
+    let mut group = c.benchmark_group("bufferline");
+    for &n in &[2usize, 8, 32] {
+        let buffers: Vec<BufferInfo> = (0..n)
+            .map(|i| BufferInfo {
+                id: BufferId(i as u64),
+                path: Some(format!("/project/src/module_{i}.rs").into()),
+                modified: i % 3 == 0,
+            })
+            .collect();
+        // Active in the middle, so the windowed case grows in both directions.
+        let active = BufferId((n / 2) as u64);
+
+        group.bench_with_input(BenchmarkId::new("fits", n), &n, |b, _| {
+            b.iter(|| black_box(layout::bufferline(black_box(&buffers), active, 400)))
+        });
+        group.bench_with_input(BenchmarkId::new("windowed", n), &n, |b, _| {
+            b.iter(|| black_box(layout::bufferline(black_box(&buffers), active, 60)))
+        });
+    }
+    group.finish();
+}
+
+criterion_group!(benches, render_line_overlays, span_columns, bufferline);
 criterion_main!(benches);

@@ -223,10 +223,12 @@ pub fn confirm_close(
     id: vortex_core::BufferId,
     path: Option<&std::path::Path>,
 ) -> Box<dyn Layer> {
-    let name = path
-        .and_then(|p| p.file_name())
-        .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_else(|| "this buffer".to_string());
+    // The unnamed case reads "this buffer" rather than the `[No Name]` placeholder,
+    // because this is a sentence rather than a label.
+    let name = path.map_or_else(
+        || "this buffer".to_string(),
+        |p| crate::layout::buffer_display_name(Some(p), false),
+    );
     Box::new(Confirm::new(
         format!("{name} has unsaved changes. Close anyway? (y/N) "),
         vec![Command::Editor(Action::CloseBuffer { id, force: true })],
