@@ -14,6 +14,7 @@ use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
 
 use crate::selection::Motion;
+use crate::view::BufferId;
 
 /// A single intent from a frontend to the core.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -80,11 +81,19 @@ pub enum Action {
     Redo,
     /// Request an immediate `ViewSnapshot` without changing state.
     RequestSnapshot,
-    /// Replace the buffer with the contents of `path` and remember it as the
-    /// buffer's file (SPEC §12.2 file lifecycle). A missing file is not an error:
-    /// it opens an empty buffer bound to `path`, created on the first `Save`
-    /// (Vim's behavior). The load is expressed as one `Delta` replacing the whole
-    /// buffer, so the delta/snapshot invariant (SPEC §5) still holds.
+    /// Open `path` and make it the active buffer (SPEC §12.2 file lifecycle).
+    ///
+    /// If `path` is already open this switches to that buffer instead of loading a
+    /// second copy - two buffers over one file would each carry their own history
+    /// and could overwrite each other's saves. Otherwise the file loads into the
+    /// active buffer when it is an untouched scratch (unnamed, empty, unmodified),
+    /// so launching bare and then opening does not strand an empty tab, and into a
+    /// newly created buffer when it is not.
+    ///
+    /// A missing file is not an error: it opens an empty buffer bound to `path`,
+    /// created on the first `Save` (Vim's behavior). A load is expressed as one
+    /// `Delta` replacing the whole (empty or reused) buffer, so the delta/snapshot
+    /// invariant (SPEC §5) still holds.
     Open(PathBuf),
     /// Write the buffer to its associated file (set by `Open`). Fails with a
     /// `Notification` if no path is set - write to an explicit target with
@@ -100,6 +109,23 @@ pub enum Action {
     /// document to the language server (a fresh `didOpen`, possibly a new
     /// `languageId`) since its identity changed.
     SaveAs(PathBuf),
+    /// Make `id` the active buffer - the one every other action applies to. A no-op
+    /// for an unknown id or the already-active buffer. Switching is pure state: no
+    /// text changes, so no delta and no version bump, but the snapshot that follows
+    /// describes a different buffer entirely.
+    ///
+    /// Next/previous buffer are deliberately *not* actions: the frontend already
+    /// holds the ordered buffer list to paint its bufferline, so it resolves the
+    /// neighbor itself and sends this. The core's vocabulary stays intent about
+    /// *which* buffer, not how the user got there.
+    SwitchBuffer { id: BufferId },
+    /// Close buffer `id`. Refused with a `Notification::CloseRejected` when the
+    /// buffer has unsaved edits, unless `force` (SPEC §8: work is never discarded
+    /// without the user saying so, and the *core* enforces that so a non-terminal
+    /// frontend cannot skip the check). Closing the active buffer moves focus to a
+    /// neighbor; closing the last one leaves a fresh empty buffer, since a session
+    /// always has somewhere to type.
+    CloseBuffer { id: BufferId, force: bool },
     /// Shut the editor down cleanly. The core drains and stops its loop.
     Quit,
 }

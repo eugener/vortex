@@ -73,34 +73,31 @@ impl Harness {
 // from a message script - the machinery is built now (SPEC §2.2) so M3's
 // multi-cursor rides on tested code.
 
-fn editor_with(text: &str, selections: SelectionSet) -> Document {
-    let mut e = Document::new(BufferId(0));
-    e.buffer = RopeBuffer::from(text);
-    e.selections = selections;
-    e
-}
-
-/// A session whose single active document holds `text`/`selections` - for the
-/// clipboard paths, which read the active document but own the register at the
-/// session level (a yank is not tied to a buffer, SPEC §11).
+/// A session holding one document with `text`/`selections`. The file and edit
+/// paths take the whole session (a snapshot names the active buffer *and* lists
+/// the others), so this is what nearly every test drives.
 fn session_with(text: &str, selections: SelectionSet) -> Session {
     let mut s = Session::new();
-    *s.active_mut() = editor_with(text, selections);
+    let doc = s.active_mut();
+    doc.buffer = RopeBuffer::from(text);
+    doc.selections = selections;
     s
 }
 
-/// Put the editor in the "modified" state by recording a dummy revision, moving
-/// history off its saved node - the same state a real edit leaves behind
+/// Put the active document in the "modified" state by recording a dummy revision,
+/// moving history off its saved node - the same state a real edit leaves behind
 /// (`modified` is derived from the history, not stored).
-fn mark_dirty(e: &mut Document) {
-    e.history.record(
+fn mark_dirty(e: &mut Session) {
+    let doc = e.active_mut();
+    let selections = doc.selections.clone();
+    doc.history.record(
         vec![Change {
             start: 0,
             removed: String::new(),
             inserted: "x".into(),
         }],
-        e.selections.clone(),
-        e.selections.clone(),
+        selections.clone(),
+        selections,
     );
 }
 
@@ -109,8 +106,8 @@ fn plan_insert_over_two_cursors_is_descending() {
     // Two cursors; an insert plans one edit each, sorted descending by start
     // so back-to-front application keeps offsets stable.
     let set = SelectionSet::from_sorted_cursors(vec![Selection::cursor(1), Selection::cursor(4)]);
-    let e = editor_with("abcdef", set);
-    let edits = e.plan_edit(EditKind::Insert("X".into()));
+    let e = session_with("abcdef", set);
+    let edits = e.active().plan_edit(EditKind::Insert("X".into()));
     assert_eq!(edits.len(), 2);
     assert_eq!(edits[0].0.start, 4); // later cursor first
     assert_eq!(edits[1].0.start, 1);
@@ -165,8 +162,8 @@ fn selections_after_edits_keeps_a_no_op_cursor() {
 #[test]
 fn plan_delete_backward_over_two_cursors() {
     let set = SelectionSet::from_sorted_cursors(vec![Selection::cursor(2), Selection::cursor(5)]);
-    let e = editor_with("abcdef", set);
-    let edits = e.plan_edit(EditKind::DeleteBackward);
+    let e = session_with("abcdef", set);
+    let edits = e.active().plan_edit(EditKind::DeleteBackward);
     // Each cursor deletes the grapheme before it: ranges 4..5 and 1..2.
     assert_eq!(edits.len(), 2);
     assert_eq!(edits[0].0, 4..5);
@@ -175,29 +172,32 @@ fn plan_delete_backward_over_two_cursors() {
 
 #[test]
 fn move_cursor_helper_maps_over_buffer() {
-    let mut e = editor_with("hello", SelectionSet::at_origin());
-    e.move_cursor(Motion::Right, false);
-    assert_eq!(e.selections.primary().head, 1);
+    let mut e = session_with("hello", SelectionSet::at_origin());
+    e.active_mut().move_cursor(Motion::Right, false);
+    assert_eq!(e.active().selections.primary().head, 1);
 }
 
 #[test]
 fn place_cursor_helper_sets_and_extends_caret() {
-    let mut e = editor_with("hello", SelectionSet::at_origin());
+    let mut e = session_with("hello", SelectionSet::at_origin());
     // A plain click places a cursor at the offset.
-    e.place_cursor(3, false);
-    assert_eq!(*e.selections.primary(), Selection::cursor(3));
+    e.active_mut().place_cursor(3, false);
+    assert_eq!(*e.active().selections.primary(), Selection::cursor(3));
     // A drag/extend keeps the anchor and moves only the head.
-    e.place_cursor(5, true);
-    assert_eq!(*e.selections.primary(), Selection::new(3, 5));
+    e.active_mut().place_cursor(5, true);
+    assert_eq!(*e.active().selections.primary(), Selection::new(3, 5));
 }
 
 #[test]
 fn snapshot_reflects_state() {
-    let e = editor_with("hi", SelectionSet::single(Selection::cursor(2)));
+    let mut e = session_with("hi", SelectionSet::single(Selection::cursor(2)));
     let snap = e.snapshot(Some(0..2));
     assert_eq!(snap.text.to_string(), "hi");
     assert_eq!(snap.dirty, Some(0..2));
     assert_eq!(snap.selections.as_ref(), &[Selection::cursor(2)]);
+    // The snapshot names the active buffer and lists every open one (SPEC §5).
+    assert_eq!(snap.buffers.len(), 1);
+    assert_eq!(snap.buffers[0].id, snap.buffer_id);
 }
 
 #[test]
@@ -207,17 +207,17 @@ fn multi_cursor_insert_merges_dirty_range() {
     // edit applied. Reachable only via apply_edit with >1 selection - the path
     // the single-selection message seam cannot exercise until M3 multi-cursor.
     let set = SelectionSet::from_sorted_cursors(vec![Selection::cursor(1), Selection::cursor(4)]);
-    let mut e = editor_with("abcdef", set);
+    let mut e = session_with("abcdef", set);
     let (delta_tx, delta_rx) = async_channel::bounded::<Delta>(16);
     let (snap_tx, snap_rx) = async_channel::bounded::<ViewSnapshot>(1);
     let (note_tx, _note_rx) = async_channel::bounded::<Notification>(16);
     let snapshots = SnapshotSink { tx: snap_tx };
 
-    let edits = e.plan_edit(EditKind::Insert("X".into()));
+    let edits = e.active().plan_edit(EditKind::Insert("X".into()));
     let alive = smol::block_on(apply_edit(&mut e, edits, &delta_tx, &snapshots, &note_tx));
 
     assert!(alive);
-    assert_eq!(e.buffer.text().to_string(), "aXbcdXef");
+    assert_eq!(e.active().buffer.text().to_string(), "aXbcdXef");
     assert_eq!(delta_rx.len(), 2); // one delta per cursor
     let snap = snap_rx.try_recv().unwrap();
     // Merged hint spans from the earliest edit's start to past the latest's.
@@ -234,24 +234,24 @@ fn rejected_edit_is_surfaced_and_leaves_state_unchanged() {
     // cursor past the buffer end. When EVERY edit is rejected, nothing changed,
     // so the version must NOT advance - a version bump with no delta would
     // diverge a remote frontend replaying the delta stream (SPEC §5 invariant).
-    let mut e = editor_with("abc", SelectionSet::single(Selection::cursor(99)));
+    let mut e = session_with("abc", SelectionSet::single(Selection::cursor(99)));
     let (delta_tx, delta_rx) = async_channel::bounded::<Delta>(16);
     let (snap_tx, _snap_rx) = async_channel::bounded::<ViewSnapshot>(1);
     let (note_tx, note_rx) = async_channel::bounded::<Notification>(16);
     let snapshots = SnapshotSink { tx: snap_tx };
 
-    let edits = e.plan_edit(EditKind::Insert("X".into()));
+    let edits = e.active().plan_edit(EditKind::Insert("X".into()));
     let alive = smol::block_on(apply_edit(&mut e, edits, &delta_tx, &snapshots, &note_tx));
 
     assert!(alive);
-    assert_eq!(e.buffer.text().to_string(), "abc"); // untouched
+    assert_eq!(e.active().buffer.text().to_string(), "abc"); // untouched
     assert!(delta_rx.is_empty()); // no delta for a rejected edit
-    assert_eq!(e.version, 0); // no applied edit => no version bump
+    assert_eq!(e.active().version, 0); // no applied edit => no version bump
     match note_rx.try_recv() {
         Ok(Notification::EditRejected {
             buffer_id, message, ..
         }) => {
-            assert_eq!(buffer_id, e.id);
+            assert_eq!(buffer_id, e.active().id);
             assert!(message.contains("out of bounds"), "message: {message}");
         }
         other => panic!("expected EditRejected, got {other:?}"),
@@ -262,10 +262,10 @@ fn rejected_edit_is_surfaced_and_leaves_state_unchanged() {
 fn edit_sets_modified_flag() {
     // The modified axis is independent of version: a fresh buffer is clean; the
     // first applied edit marks it dirty (SPEC §8).
-    let mut e = editor_with("abc", SelectionSet::single(Selection::cursor(3)));
-    assert!(!e.modified());
+    let mut e = session_with("abc", SelectionSet::single(Selection::cursor(3)));
+    assert!(!e.active().modified());
     let h = Harness::new();
-    let edits = e.plan_edit(EditKind::Insert("d".into()));
+    let edits = e.active().plan_edit(EditKind::Insert("d".into()));
     smol::block_on(apply_edit(
         &mut e,
         edits,
@@ -273,7 +273,7 @@ fn edit_sets_modified_flag() {
         &h.snapshots,
         &h.note_tx,
     ));
-    assert!(e.modified());
+    assert!(e.active().modified());
 }
 
 #[test]
@@ -282,7 +282,7 @@ fn open_existing_file_loads_contents_and_binds_path() {
     let path = dir.file("hello.txt");
     std::fs::write(&path, "line one\nline two").unwrap();
 
-    let mut e = Document::new(BufferId(0));
+    let mut e = Session::new();
     let h = Harness::new();
     let alive = smol::block_on(open_file(
         &mut e,
@@ -293,11 +293,11 @@ fn open_existing_file_loads_contents_and_binds_path() {
     ));
 
     assert!(alive);
-    assert_eq!(e.buffer.text().to_string(), "line one\nline two");
-    assert_eq!(e.path, Some(path.clone()));
-    assert!(!e.modified()); // a freshly opened buffer matches disk
-    assert_eq!(e.version, 1); // one whole-buffer delta was emitted
-    assert_eq!(e.selections.primary().head, 0); // cursor resets to origin
+    assert_eq!(e.active().buffer.text().to_string(), "line one\nline two");
+    assert_eq!(e.active().path, Some(path.clone()));
+    assert!(!e.active().modified()); // a freshly opened buffer matches disk
+    assert_eq!(e.active().version, 1); // one whole-buffer delta was emitted
+    assert_eq!(e.active().selections.primary().head, 0); // cursor resets to origin
 
     // The load is one whole-buffer delta (SPEC §5): replace 0..0 with the file.
     let delta = h.delta_rx.try_recv().unwrap();
@@ -316,15 +316,17 @@ fn open_existing_file_loads_contents_and_binds_path() {
 }
 
 #[test]
-fn open_replaces_existing_buffer_as_one_delta() {
-    // Opening over a non-empty buffer replaces its whole contents with a single
-    // delta whose range spans the old buffer - so the delta stream still
-    // reproduces the snapshot (SPEC §5 invariant).
+fn open_beside_a_used_buffer_creates_a_second_one() {
+    // The active buffer holds work, so an open must not clobber it: a new buffer is
+    // created and focused, and the original is still there to switch back to. The
+    // load is one whole-buffer delta naming the *new* buffer, so the delta stream
+    // still reproduces the snapshot (SPEC §5 invariant).
     let dir = TempDir::new();
-    let path = dir.file("replace.txt");
+    let path = dir.file("second.txt");
     std::fs::write(&path, "fresh").unwrap();
 
-    let mut e = editor_with("stale contents", SelectionSet::single(Selection::cursor(5)));
+    let mut e = session_with("existing work", SelectionSet::single(Selection::cursor(5)));
+    let first = e.active().id;
     let h = Harness::new();
     smol::block_on(open_file(
         &mut e,
@@ -334,10 +336,92 @@ fn open_replaces_existing_buffer_as_one_delta() {
         &h.note_tx,
     ));
 
-    assert_eq!(e.buffer.text().to_string(), "fresh");
+    assert_eq!(e.docs.len(), 2);
+    assert_eq!(e.active().buffer.text().to_string(), "fresh");
+    assert_ne!(e.active().id, first);
+    // The original buffer is untouched, contents and all.
+    assert_eq!(e.docs[0].buffer.text().to_string(), "existing work");
+
     let delta = h.delta_rx.try_recv().unwrap();
-    assert_eq!(delta.range, 0.."stale contents".len());
+    assert_eq!(delta.buffer_id, e.active().id);
+    assert_eq!(delta.range, 0..0); // the new buffer started empty
     assert_eq!(delta.new_text, "fresh");
+}
+
+#[test]
+fn open_into_an_untouched_scratch_reuses_it() {
+    // Launching bare and then opening a file must not strand an empty tab: an
+    // unnamed, empty, unmodified buffer is loaded into rather than left behind.
+    let dir = TempDir::new();
+    let path = dir.file("only.txt");
+    std::fs::write(&path, "contents").unwrap();
+
+    let mut e = Session::new();
+    let scratch = e.active().id;
+    let h = Harness::new();
+    smol::block_on(open_file(
+        &mut e,
+        path,
+        &h.delta_tx,
+        &h.snapshots,
+        &h.note_tx,
+    ));
+
+    assert_eq!(e.docs.len(), 1, "the scratch was reused, not added to");
+    assert_eq!(e.active().id, scratch);
+    assert_eq!(e.active().buffer.text().to_string(), "contents");
+}
+
+#[test]
+fn opening_an_already_open_file_switches_to_it() {
+    // Two buffers over one path would each carry their own history and could
+    // overwrite each other's saves, so a repeat open is a switch: no second buffer,
+    // no reload, and the buffer's own edits survive.
+    let dir = TempDir::new();
+    let path = dir.file("shared.txt");
+    std::fs::write(&path, "on disk").unwrap();
+
+    let mut e = Session::new();
+    let h = Harness::new();
+    let open = |e: &mut Session| {
+        smol::block_on(open_file(
+            e,
+            path.clone(),
+            &h.delta_tx,
+            &h.snapshots,
+            &h.note_tx,
+        ))
+    };
+    open(&mut e);
+    let first = e.active().id;
+    // Type into it, then open a different file so it is no longer active.
+    e.active_mut().buffer = RopeBuffer::from("edited");
+    let other = dir.file("other.txt");
+    std::fs::write(&other, "other").unwrap();
+    smol::block_on(open_file(
+        &mut e,
+        other,
+        &h.delta_tx,
+        &h.snapshots,
+        &h.note_tx,
+    ));
+    assert_ne!(e.active().id, first);
+
+    // Re-opening the first path returns to that same buffer, edits intact.
+    open(&mut e);
+    assert_eq!(e.docs.len(), 2, "no third buffer was created");
+    assert_eq!(e.active().id, first);
+    assert_eq!(e.active().buffer.text().to_string(), "edited");
+
+    // A switch announces itself so the frontend can re-attach server and grammar.
+    let notes: Vec<_> = std::iter::from_fn(|| h.note_rx.try_recv().ok()).collect();
+    assert!(
+        notes.iter().any(|n| matches!(
+            n,
+            Notification::BufferSwitched { buffer_id, .. } if *buffer_id == first
+        )),
+        "expected a BufferSwitched for the reopened buffer, got {notes:?}"
+    );
 }
 
 #[test]
@@ -347,7 +431,7 @@ fn open_missing_file_opens_empty_buffer_bound_to_path() {
     let dir = TempDir::new();
     let path = dir.file("does-not-exist.txt");
 
-    let mut e = Document::new(BufferId(0));
+    let mut e = Session::new();
     let h = Harness::new();
     let alive = smol::block_on(open_file(
         &mut e,
@@ -358,10 +442,10 @@ fn open_missing_file_opens_empty_buffer_bound_to_path() {
     ));
 
     assert!(alive);
-    assert!(e.buffer.text().is_empty());
-    assert_eq!(e.path, Some(path.clone()));
-    assert!(!e.modified());
-    assert_eq!(e.version, 0); // empty->empty: no delta, no version bump
+    assert!(e.active().buffer.text().is_empty());
+    assert_eq!(e.active().path, Some(path.clone()));
+    assert!(!e.active().modified());
+    assert_eq!(e.active().version, 0); // empty->empty: no delta, no version bump
     assert!(h.delta_rx.is_empty());
     // No edit happened, so the repaint hint is None (not a spurious Some(0..0)).
     assert_eq!(h.snapshot().dirty, None);
@@ -379,7 +463,7 @@ fn open_nonempty_file_reports_dirty_hint() {
     let path = dir.file("has-text.txt");
     std::fs::write(&path, "abcde").unwrap();
 
-    let mut e = Document::new(BufferId(0));
+    let mut e = Session::new();
     let h = Harness::new();
     smol::block_on(open_file(
         &mut e,
@@ -397,7 +481,7 @@ fn open_non_utf8_file_errors_and_leaves_buffer_unchanged() {
     let path = dir.file("binary.bin");
     std::fs::write(&path, [0xff, 0xfe, 0x00]).unwrap();
 
-    let mut e = editor_with("keep me", SelectionSet::single(Selection::cursor(0)));
+    let mut e = session_with("keep me", SelectionSet::single(Selection::cursor(0)));
     let h = Harness::new();
     let alive = smol::block_on(open_file(
         &mut e,
@@ -408,8 +492,8 @@ fn open_non_utf8_file_errors_and_leaves_buffer_unchanged() {
     ));
 
     assert!(alive);
-    assert_eq!(e.buffer.text().to_string(), "keep me"); // untouched
-    assert_eq!(e.path, None); // binding not changed on a failed open
+    assert_eq!(e.active().buffer.text().to_string(), "keep me"); // untouched
+    assert_eq!(e.active().path, None); // binding not changed on a failed open
     assert!(h.delta_rx.is_empty());
     match h.note_rx.try_recv() {
         Ok(Notification::FileError {
@@ -427,8 +511,8 @@ fn save_writes_buffer_to_bound_file_and_clears_modified() {
     let dir = TempDir::new();
     let path = dir.file("out.txt");
 
-    let mut e = editor_with("saved text", SelectionSet::at_origin());
-    e.path = Some(path.clone());
+    let mut e = session_with("saved text", SelectionSet::at_origin());
+    e.active_mut().path = Some(path.clone());
     mark_dirty(&mut e);
 
     let h = Harness::new();
@@ -436,7 +520,7 @@ fn save_writes_buffer_to_bound_file_and_clears_modified() {
 
     assert!(alive);
     assert_eq!(std::fs::read_to_string(&path).unwrap(), "saved text");
-    assert!(!e.modified()); // clean after a successful save
+    assert!(!e.active().modified()); // clean after a successful save
     match h.note_rx.try_recv() {
         Ok(Notification::FileSaved { path: p, .. }) => assert_eq!(p, path),
         other => panic!("expected FileSaved, got {other:?}"),
@@ -460,14 +544,14 @@ fn has_temp_file(dir: &std::path::Path) -> bool {
 fn save_without_path_errors_and_keeps_buffer_dirty() {
     // Save with no bound file: surfaced as FileError, buffer stays dirty so no
     // work is lost (SPEC §8). Save-as (a target path) lands with the prompt UI.
-    let mut e = editor_with("unsaved", SelectionSet::at_origin());
+    let mut e = session_with("unsaved", SelectionSet::at_origin());
     mark_dirty(&mut e);
 
     let h = Harness::new();
     let alive = smol::block_on(save_file(&mut e, &h.snapshots, &h.note_tx));
 
     assert!(alive);
-    assert!(e.modified()); // still dirty
+    assert!(e.active().modified()); // still dirty
     match h.note_rx.try_recv() {
         Ok(Notification::FileError { path, message, .. }) => {
             assert_eq!(path, None);
@@ -486,15 +570,15 @@ fn save_failure_keeps_buffer_dirty_and_does_not_corrupt_original() {
     let path = dir.file("a-directory");
     std::fs::create_dir(&path).unwrap();
 
-    let mut e = editor_with("new work", SelectionSet::at_origin());
-    e.path = Some(path.clone());
+    let mut e = session_with("new work", SelectionSet::at_origin());
+    e.active_mut().path = Some(path.clone());
     mark_dirty(&mut e);
 
     let h = Harness::new();
     let alive = smol::block_on(save_file(&mut e, &h.snapshots, &h.note_tx));
 
     assert!(alive);
-    assert!(e.modified()); // failed save keeps the buffer dirty
+    assert!(e.active().modified()); // failed save keeps the buffer dirty
     assert!(path.is_dir()); // the target directory is intact, not clobbered
     match h.note_rx.try_recv() {
         Ok(Notification::FileError { path: p, .. }) => assert_eq!(p, Some(path.clone())),
@@ -512,7 +596,7 @@ fn open_then_edit_then_save_round_trips_through_disk() {
     let path = dir.file("round.txt");
     std::fs::write(&path, "abc").unwrap();
 
-    let mut e = Document::new(BufferId(0));
+    let mut e = Session::new();
     let h = Harness::new();
 
     smol::block_on(open_file(
@@ -523,8 +607,8 @@ fn open_then_edit_then_save_round_trips_through_disk() {
         &h.note_tx,
     ));
     // Move to end and append "d".
-    e.selections = SelectionSet::single(Selection::cursor(3));
-    let edits = e.plan_edit(EditKind::Insert("d".into()));
+    e.active_mut().selections = SelectionSet::single(Selection::cursor(3));
+    let edits = e.active().plan_edit(EditKind::Insert("d".into()));
     smol::block_on(apply_edit(
         &mut e,
         edits,
@@ -532,10 +616,10 @@ fn open_then_edit_then_save_round_trips_through_disk() {
         &h.snapshots,
         &h.note_tx,
     ));
-    assert!(e.modified());
+    assert!(e.active().modified());
     smol::block_on(save_file(&mut e, &h.snapshots, &h.note_tx));
 
-    assert!(!e.modified());
+    assert!(!e.active().modified());
     assert_eq!(std::fs::read_to_string(&path).unwrap(), "abcd");
 }
 
@@ -546,8 +630,8 @@ fn save_as_writes_to_target_adopts_it_and_clears_modified() {
     let dir = TempDir::new();
     let target = dir.file("as.txt");
 
-    let mut e = editor_with("save-as body", SelectionSet::at_origin());
-    assert!(e.path.is_none());
+    let mut e = session_with("save-as body", SelectionSet::at_origin());
+    assert!(e.active().path.is_none());
     mark_dirty(&mut e);
 
     let h = Harness::new();
@@ -560,15 +644,15 @@ fn save_as_writes_to_target_adopts_it_and_clears_modified() {
 
     assert!(alive);
     assert_eq!(std::fs::read_to_string(&target).unwrap(), "save-as body");
-    assert_eq!(e.path.as_deref(), Some(target.as_path())); // adopted
-    assert!(!e.modified()); // clean after a successful save-as
+    assert_eq!(e.active().path.as_deref(), Some(target.as_path())); // adopted
+    assert!(!e.active().modified()); // clean after a successful save-as
     match h.note_rx.try_recv() {
         Ok(Notification::FileSaved { path: p, .. }) => assert_eq!(p, target),
         other => panic!("expected FileSaved, got {other:?}"),
     }
     // The adopted path is now bound: a subsequent plain Save writes to it.
-    e.selections = SelectionSet::single(Selection::cursor(12));
-    let edits = e.plan_edit(EditKind::Insert("!".into()));
+    e.active_mut().selections = SelectionSet::single(Selection::cursor(12));
+    let edits = e.active().plan_edit(EditKind::Insert("!".into()));
     smol::block_on(apply_edit(
         &mut e,
         edits,
@@ -591,8 +675,8 @@ fn save_as_failure_keeps_old_path_and_stays_dirty() {
     let target = dir.file("a-directory");
     std::fs::create_dir(&target).unwrap();
 
-    let mut e = editor_with("in progress", SelectionSet::at_origin());
-    e.path = Some(old.clone());
+    let mut e = session_with("in progress", SelectionSet::at_origin());
+    e.active_mut().path = Some(old.clone());
     mark_dirty(&mut e);
 
     let h = Harness::new();
@@ -604,8 +688,8 @@ fn save_as_failure_keeps_old_path_and_stays_dirty() {
     ));
 
     assert!(alive);
-    assert_eq!(e.path.as_deref(), Some(old.as_path())); // binding unchanged
-    assert!(e.modified()); // still dirty
+    assert_eq!(e.active().path.as_deref(), Some(old.as_path())); // binding unchanged
+    assert!(e.active().modified()); // still dirty
     assert!(target.is_dir()); // the target directory is intact, not clobbered
     match h.note_rx.try_recv() {
         Ok(Notification::FileError { path: p, .. }) => assert_eq!(p, Some(target.clone())),
@@ -623,10 +707,10 @@ fn save_as_to_a_new_path_reannounces_to_the_language_server() {
     let old = dir.file("a.rs");
     let renamed = dir.file("b.rs");
 
-    let mut e = editor_with("fn main() {}", SelectionSet::at_origin());
-    e.path = Some(old.clone());
-    e.lsp_opened = true;
-    e.lsp_dirty = false;
+    let mut e = session_with("fn main() {}", SelectionSet::at_origin());
+    e.active_mut().path = Some(old.clone());
+    e.active_mut().lsp_opened = true;
+    e.active_mut().lsp_dirty = false;
 
     let h = Harness::new();
     smol::block_on(save_as_file(
@@ -636,14 +720,14 @@ fn save_as_to_a_new_path_reannounces_to_the_language_server() {
         &h.note_tx,
     ));
     assert!(
-        !e.lsp_opened,
+        !e.active().lsp_opened,
         "a renamed document must be re-opened to the server"
     );
-    assert!(e.lsp_dirty, "the new identity must be re-synced");
+    assert!(e.active().lsp_dirty, "the new identity must be re-synced");
 
     // Saving-as again to the same (now current) path is a plain save: no re-announce.
-    e.lsp_opened = true;
-    e.lsp_dirty = false;
+    e.active_mut().lsp_opened = true;
+    e.active_mut().lsp_dirty = false;
     smol::block_on(save_as_file(
         &mut e,
         renamed.clone(),
@@ -651,10 +735,10 @@ fn save_as_to_a_new_path_reannounces_to_the_language_server() {
         &h.note_tx,
     ));
     assert!(
-        e.lsp_opened,
+        e.active().lsp_opened,
         "same-path save-as must not reset the announce state"
     );
-    assert!(!e.lsp_dirty);
+    assert!(!e.active().lsp_dirty);
 }
 
 #[test]
@@ -663,7 +747,7 @@ fn save_writes_to_a_new_file_that_did_not_exist() {
     let dir = TempDir::new();
     let path = dir.file("created-on-save.txt");
 
-    let mut e = Document::new(BufferId(0));
+    let mut e = Session::new();
     let h = Harness::new();
     smol::block_on(open_file(
         &mut e,
@@ -672,8 +756,8 @@ fn save_writes_to_a_new_file_that_did_not_exist() {
         &h.snapshots,
         &h.note_tx,
     ));
-    e.selections = SelectionSet::at_origin();
-    let edits = e.plan_edit(EditKind::Insert("brand new".into()));
+    e.active_mut().selections = SelectionSet::at_origin();
+    let edits = e.active().plan_edit(EditKind::Insert("brand new".into()));
     smol::block_on(apply_edit(
         &mut e,
         edits,
@@ -689,8 +773,8 @@ fn save_writes_to_a_new_file_that_did_not_exist() {
 
 #[test]
 fn snapshot_carries_path_and_modified() {
-    let mut e = editor_with("x", SelectionSet::at_origin());
-    e.path = Some(PathBuf::from("/tmp/demo.txt"));
+    let mut e = session_with("x", SelectionSet::at_origin());
+    e.active_mut().path = Some(PathBuf::from("/tmp/demo.txt"));
     mark_dirty(&mut e);
     let snap = e.snapshot(None);
     assert_eq!(snap.path, Some(PathBuf::from("/tmp/demo.txt")));
@@ -703,7 +787,7 @@ fn open_unreadable_path_errors_and_leaves_buffer_unchanged() {
     // FileError via the general read-error arm (not the NotFound arm) and leaves
     // the buffer untouched (SPEC §8).
     let dir = TempDir::new();
-    let mut e = editor_with("keep me", SelectionSet::single(Selection::cursor(0)));
+    let mut e = session_with("keep me", SelectionSet::single(Selection::cursor(0)));
     let h = Harness::new();
     let alive = smol::block_on(open_file(
         &mut e,
@@ -714,8 +798,8 @@ fn open_unreadable_path_errors_and_leaves_buffer_unchanged() {
     ));
 
     assert!(alive);
-    assert_eq!(e.buffer.text().to_string(), "keep me"); // untouched
-    assert_eq!(e.path, None);
+    assert_eq!(e.active().buffer.text().to_string(), "keep me"); // untouched
+    assert_eq!(e.active().path, None);
     assert!(matches!(
         h.note_rx.try_recv(),
         Ok(Notification::FileError { .. })
@@ -729,15 +813,15 @@ fn save_into_missing_directory_errors_and_keeps_buffer_dirty() {
     // temp file leaks (covers the write-failure cleanup arm).
     let dir = TempDir::new();
     let path = dir.path.join("no-such-subdir").join("file.txt");
-    let mut e = editor_with("work", SelectionSet::at_origin());
-    e.path = Some(path.clone());
+    let mut e = session_with("work", SelectionSet::at_origin());
+    e.active_mut().path = Some(path.clone());
     mark_dirty(&mut e);
 
     let h = Harness::new();
     let alive = smol::block_on(save_file(&mut e, &h.snapshots, &h.note_tx));
 
     assert!(alive);
-    assert!(e.modified());
+    assert!(e.active().modified());
     assert!(matches!(
         h.note_rx.try_recv(),
         Ok(Notification::FileError { .. })
@@ -766,6 +850,107 @@ fn run_seam(script: &[Action]) -> (ViewSnapshot, Vec<Notification>) {
         }
         (snap.expect("script must have an action"), notes)
     }))
+}
+
+// --- Multi-buffer (M7) --------------------------------------------------------
+
+/// A session with two buffers open, both bound to real files: buffer 0 holds
+/// `first`, buffer 1 holds `second`, and buffer 1 is active (the open order).
+/// Returns the session, the two ids, and the temp dir the files live in (kept
+/// alive by the caller, since dropping it deletes them).
+fn two_buffers(first: &str, second: &str) -> (Session, BufferId, BufferId, TempDir, Harness) {
+    let dir = TempDir::new();
+    let h = Harness::new();
+    let mut e = Session::new();
+    for (name, body) in [("a.txt", first), ("b.txt", second)] {
+        let path = dir.file(name);
+        std::fs::write(&path, body).unwrap();
+        smol::block_on(open_file(
+            &mut e,
+            path,
+            &h.delta_tx,
+            &h.snapshots,
+            &h.note_tx,
+        ));
+    }
+    // Drain so tests assert only on what they trigger themselves.
+    while h.delta_rx.try_recv().is_ok() {}
+    while h.note_rx.try_recv().is_ok() {}
+    let (a, b) = (e.docs[0].id, e.docs[1].id);
+    (e, a, b, dir, h)
+}
+
+#[test]
+fn each_buffer_keeps_its_own_version_history_and_selections() {
+    // The core invariant multi-buffer rests on (SPEC §5): an edit in one buffer
+    // must not touch another's version, undo tree, or carets.
+    let (mut e, a, _b, _dir, h) = two_buffers("alpha", "beta");
+    let before = (e.docs[0].version, e.docs[0].selections.clone());
+
+    let edits = e.active().plan_edit(EditKind::Insert("!".into()));
+    smol::block_on(apply_edit(
+        &mut e,
+        edits,
+        &h.delta_tx,
+        &h.snapshots,
+        &h.note_tx,
+    ));
+
+    assert_eq!(e.active().buffer.text().to_string(), "!beta");
+    assert_eq!(
+        e.docs[0].version, before.0,
+        "the background buffer's version must not move"
+    );
+    assert_eq!(e.docs[0].buffer.text().to_string(), "alpha");
+    assert_eq!(e.docs[0].selections, before.1);
+
+    // Undo in the active buffer does not reach across into the other's history.
+    let reverted = e.active_mut().history.undo();
+    smol::block_on(reapply(
+        &mut e,
+        reverted,
+        &h.delta_tx,
+        &h.snapshots,
+        &h.note_tx,
+    ));
+    assert_eq!(e.active().buffer.text().to_string(), "beta");
+    assert_eq!(e.docs[0].buffer.text().to_string(), "alpha");
+    assert_eq!(e.index_of(a), Some(0));
+}
+
+#[test]
+fn the_snapshot_lists_every_open_buffer() {
+    let (mut e, a, b, _dir, _h) = two_buffers("alpha", "beta");
+    let snap = e.snapshot(None);
+
+    assert_eq!(snap.buffer_id, b, "the active buffer names the snapshot");
+    let ids: Vec<_> = snap.buffers.iter().map(|i| i.id).collect();
+    assert_eq!(ids, vec![a, b], "in open order");
+    assert!(snap.buffers.iter().all(|i| !i.modified));
+    assert!(snap.buffers.iter().all(|i| i.path.is_some()));
+}
+
+#[test]
+fn the_buffer_list_is_cached_but_tracks_the_active_buffer() {
+    // The list is rebuilt only when it would differ, so a repeat publish shares the
+    // same allocation (it is cloned per frame). A change to the active buffer's own
+    // entry still has to be caught, which is what the cheap comparison is for.
+    let (mut e, _a, _b, _dir, _h) = two_buffers("alpha", "beta");
+    let first = e.snapshot(None).buffers;
+    let again = e.snapshot(None).buffers;
+    assert!(
+        Arc::ptr_eq(&first, &again),
+        "an unchanged list must not be rebuilt"
+    );
+
+    mark_dirty(&mut e);
+    let after = e.snapshot(None).buffers;
+    assert!(
+        !Arc::ptr_eq(&first, &after),
+        "the active buffer became modified, so the list must be rebuilt"
+    );
+    assert!(after[1].modified);
+    assert!(!after[0].modified);
 }
 
 #[test]
@@ -853,7 +1038,7 @@ fn open_with_delta_receiver_dropped_reports_frontend_gone() {
     let path = dir.file("has-content.txt");
     std::fs::write(&path, "content").unwrap();
 
-    let mut e = Document::new(BufferId(0));
+    let mut e = Session::new();
     let h = Harness::new();
     drop(h.delta_rx); // frontend hung up the lossless delta channel
     let alive = smol::block_on(open_file(
@@ -947,10 +1132,10 @@ fn multi_cursor_undo_restores_every_cursor() {
     // only via apply_edit + reapply with >1 selection - the multi-cursor path the
     // single-selection message seam cannot yet drive.
     let set = SelectionSet::from_sorted_cursors(vec![Selection::cursor(1), Selection::cursor(4)]);
-    let mut e = editor_with("abcdef", set);
+    let mut e = session_with("abcdef", set);
     let h = Harness::new();
 
-    let edits = e.plan_edit(EditKind::Insert("X".into()));
+    let edits = e.active().plan_edit(EditKind::Insert("X".into()));
     smol::block_on(apply_edit(
         &mut e,
         edits,
@@ -958,9 +1143,9 @@ fn multi_cursor_undo_restores_every_cursor() {
         &h.snapshots,
         &h.note_tx,
     ));
-    assert_eq!(e.buffer.text().to_string(), "aXbcdXef");
+    assert_eq!(e.active().buffer.text().to_string(), "aXbcdXef");
 
-    let reverted = e.history.undo();
+    let reverted = e.active_mut().history.undo();
     let alive = smol::block_on(reapply(
         &mut e,
         reverted,
@@ -970,13 +1155,13 @@ fn multi_cursor_undo_restores_every_cursor() {
     ));
     assert!(alive);
     assert_eq!(
-        e.buffer.text().to_string(),
+        e.active().buffer.text().to_string(),
         "abcdef",
         "both cursors' inserts undone"
     );
     // Selections restored to the two original carets.
     assert_eq!(
-        e.selections.all(),
+        e.active().selections.all(),
         &[Selection::cursor(1), Selection::cursor(4)]
     );
 }
@@ -1188,10 +1373,10 @@ fn undo_reports_frontend_gone_when_the_delta_channel_is_closed() {
     // Undo emits a delta (it is an edit on the wire); if the frontend dropped the
     // lossless delta receiver, the send fails and `reapply` returns false so the
     // actor loop can stop cleanly - the same contract as an ordinary edit.
-    let mut e = editor_with("abc", SelectionSet::single(Selection::cursor(3)));
+    let mut e = session_with("abc", SelectionSet::single(Selection::cursor(3)));
     let h = Harness::new();
     // Record an edit so there is something to undo.
-    let edits = e.plan_edit(EditKind::Insert("d".into()));
+    let edits = e.active().plan_edit(EditKind::Insert("d".into()));
     smol::block_on(apply_edit(
         &mut e,
         edits,
@@ -1201,7 +1386,7 @@ fn undo_reports_frontend_gone_when_the_delta_channel_is_closed() {
     ));
     drop(h.delta_rx); // frontend hangs up the delta channel
 
-    let reverted = e.history.undo();
+    let reverted = e.active_mut().history.undo();
     let alive = smol::block_on(reapply(
         &mut e,
         reverted,
@@ -1562,12 +1747,17 @@ mod atomic_write {
     fn delete_selection_editkind_skips_bare_cursors() {
         // The cut edit deletes only non-empty selections; a bare cursor contributes
         // nothing (unlike backspace/delete, which step a grapheme at a cursor).
-        let cursor = editor_with("abc", SelectionSet::single(Selection::cursor(1)));
-        assert!(cursor.plan_edit(EditKind::DeleteSelection).is_empty());
+        let cursor = session_with("abc", SelectionSet::single(Selection::cursor(1)));
+        assert!(
+            cursor
+                .active()
+                .plan_edit(EditKind::DeleteSelection)
+                .is_empty()
+        );
 
-        let selected = editor_with("abc", SelectionSet::single(Selection::new(0, 2)));
+        let selected = session_with("abc", SelectionSet::single(Selection::new(0, 2)));
         assert_eq!(
-            selected.plan_edit(EditKind::DeleteSelection),
+            selected.active().plan_edit(EditKind::DeleteSelection),
             vec![(0..2, String::new())]
         );
     }
@@ -1585,7 +1775,7 @@ mod atomic_write {
         let edits = e.plan_paste();
         let h = Harness::new();
         smol::block_on(apply_edit(
-            e.active_mut(),
+            &mut e,
             edits,
             &h.delta_tx,
             &h.snapshots,
@@ -1606,7 +1796,7 @@ mod atomic_write {
         let edits = e.active().plan_edit(EditKind::DeleteSelection);
         let h = Harness::new();
         smol::block_on(apply_edit(
-            e.active_mut(),
+            &mut e,
             edits,
             &h.delta_tx,
             &h.snapshots,

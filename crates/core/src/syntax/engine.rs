@@ -113,7 +113,11 @@ async fn run(
         while let Ok(newer) = sync.try_recv() {
             msg = newer;
         }
-        let SyntaxSync { version, text } = msg;
+        let SyntaxSync {
+            buffer_id,
+            version,
+            text,
+        } = msg;
         // Materialize the rope into contiguous bytes here, on the highlighter's own
         // thread - never on the editor actor (#1). tree-sitter needs a contiguous
         // slice, so this copy is unavoidable, but it is off the keystroke path.
@@ -132,7 +136,11 @@ async fn run(
         };
 
         if events
-            .send(SyntaxEvent::Highlights { version, spans })
+            .send(SyntaxEvent::Highlights {
+                buffer_id,
+                version,
+                spans,
+            })
             .await
             .is_err()
         {

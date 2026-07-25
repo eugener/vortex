@@ -32,6 +32,7 @@ pub(crate) mod highlight;
 
 use crate::buffer::{ByteRange, Text};
 use crate::decoration::HighlightKind;
+use crate::view::BufferId;
 
 pub use engine::{SyntaxError, SyntaxHandle, highlighter};
 
@@ -40,12 +41,18 @@ pub use engine::{SyntaxError, SyntaxHandle, highlighter};
 /// [`crate::lsp::BoxLspLoop`].
 pub type BoxSyntaxLoop = crate::editor::BoxFuture<Result<(), SyntaxError>>;
 
-/// editor -> highlighter: the buffer text to reparse and the version it is
-/// (SPEC §5). Full-document, for the "cannot desync" reason in the module doc;
-/// the version rides along so a highlight batch is recognizable as the version it
-/// was computed against, the same role it plays for LSP `didChange`.
+/// editor -> highlighter: the buffer text to reparse, and which buffer at which
+/// version it is (SPEC §5). Full-document, for the "cannot desync" reason in the
+/// module doc; the identity rides along so a highlight batch is recognizable as
+/// what it was computed against, the same role it plays for LSP `didChange`.
+///
+/// The `buffer_id` is echoed back on [`SyntaxEvent::Highlights`] and is not
+/// redundant with the version: versions are **per-buffer** (SPEC §5), so two open
+/// documents are routinely at the same version, and a batch parsed against one
+/// would otherwise be indistinguishable from a current batch for the other.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SyntaxSync {
+    pub buffer_id: BufferId,
     pub version: u64,
     /// The buffer text as the core's cheap `Arc`-backed handle. It becomes owned
     /// bytes only inside the highlighter loop, on the highlighter's own thread -
@@ -71,6 +78,12 @@ pub struct HighlightSpan {
 #[non_exhaustive]
 pub enum SyntaxEvent {
     Highlights {
+        /// Which buffer these spans were parsed against, echoed from the
+        /// [`SyntaxSync`] that produced them. The editor drops a batch whose
+        /// `(buffer_id, version)` no longer matches: applying one to the wrong
+        /// buffer would *misplace* spans, not merely leave them a frame stale,
+        /// which the SPEC §5 overlay contract forbids.
+        buffer_id: BufferId,
         version: u64,
         spans: Vec<HighlightSpan>,
     },

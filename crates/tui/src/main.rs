@@ -1543,13 +1543,18 @@ mod tests {
                 while handle.deltas.try_recv().is_ok() {}
                 snap = Some(handle.snapshots.recv().await.unwrap());
             }
-            let version = snap
-                .expect("script must contain at least one action")
-                .version;
+            // The batch has to name the buffer *and* version it was parsed against,
+            // or the core drops it as stale (versions alone are per-buffer).
+            let snap = snap.expect("script must contain at least one action");
+            let (buffer_id, version) = (snap.buffer_id, snap.version);
             // Keep the highlighter's sync channel drained so the actor never blocks.
             while sync_rx.try_recv().is_ok() {}
             event_tx
-                .send(SyntaxEvent::Highlights { version, spans })
+                .send(SyntaxEvent::Highlights {
+                    buffer_id,
+                    version,
+                    spans,
+                })
                 .await
                 .unwrap();
             handle.snapshots.recv().await.unwrap()

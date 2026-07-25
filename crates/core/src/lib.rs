@@ -25,7 +25,7 @@ pub use editor::{Core, CoreHandle, new, with_lsp};
 pub use lsp::{Diagnostic, DocumentSync, LspEvent, LspHandle};
 pub use selection::{Motion, Selection, SelectionSet};
 pub use syntax::{HighlightSpan, SyntaxEvent, SyntaxHandle, SyntaxSync, highlighter};
-pub use view::{BufferId, Delta, Notification, ViewSnapshot};
+pub use view::{BufferId, BufferInfo, Delta, Notification, ViewSnapshot};
 
 #[cfg(test)]
 #[path = "lib_tests.rs"]
