@@ -568,10 +568,10 @@ fn open_nonempty_file_reports_dirty_hint() {
 }
 
 #[test]
-fn open_non_utf8_file_errors_and_leaves_buffer_unchanged() {
+fn open_binary_file_errors_and_leaves_buffer_unchanged() {
     let dir = TempDir::new();
-    let path = dir.file("binary.bin");
-    std::fs::write(&path, [0xff, 0xfe, 0x00]).unwrap();
+    let path = dir.file("image.png");
+    std::fs::write(&path, [0x89, b'P', b'N', b'G', 0x00, 0x1a]).unwrap();
 
     let mut e = session_with("keep me", SelectionSet::single(Selection::cursor(0)));
     let h = Harness::new();
@@ -592,10 +592,81 @@ fn open_non_utf8_file_errors_and_leaves_buffer_unchanged() {
             message, path: p, ..
         }) => {
             assert_eq!(p, Some(path));
-            assert!(message.contains("UTF-8"), "message: {message}");
+            assert!(message.contains("binary"), "message: {message}");
         }
         other => panic!("expected FileError, got {other:?}"),
     }
+}
+
+#[test]
+fn open_non_utf8_text_file_loads_and_saves_back_unchanged() {
+    // The other half of the binary guard: a file that is merely not UTF-8 is text
+    // and must open (SPEC §10.1), where before M5 it was rejected outright. Saving
+    // it reproduces its bytes rather than rewriting it as UTF-8.
+    let dir = TempDir::new();
+    let path = dir.file("latin1.txt");
+    let original = b"caf\xE9 cr\xE8me\r\n"; // latin-1 "café crème", CRLF
+    std::fs::write(&path, original).unwrap();
+
+    let mut e = Session::new();
+    let h = Harness::new();
+    assert!(smol::block_on(open_file(
+        &mut e,
+        path.clone(),
+        &h.delta_tx,
+        &h.snapshots,
+        &h.note_tx,
+    )));
+
+    let snap = h.snapshot();
+    assert_eq!(snap.format.encoding_name(), "windows-1252");
+    assert_eq!(snap.format.eol, crate::file::LineEnding::Crlf);
+    assert!(!snap.text.to_string().contains('\r')); // the buffer is always LF
+
+    assert!(smol::block_on(save_file(&mut e, &h.snapshots, &h.note_tx)));
+    assert_eq!(std::fs::read(&path).unwrap(), original);
+}
+
+#[test]
+fn saving_a_character_the_files_encoding_cannot_hold_is_refused() {
+    // A latin-1 file that gains an emoji: writing it would either mangle the
+    // character or rewrite the whole file as UTF-8. Refuse, keep the buffer dirty,
+    // and leave the file untouched so the work can go somewhere else (SPEC §8).
+    let dir = TempDir::new();
+    let path = dir.file("latin1.txt");
+    let original = b"caf\xE9\n";
+    std::fs::write(&path, original).unwrap();
+
+    let mut e = Session::new();
+    let h = Harness::new();
+    smol::block_on(open_file(
+        &mut e,
+        path.clone(),
+        &h.delta_tx,
+        &h.snapshots,
+        &h.note_tx,
+    ));
+    e.active_mut().selections = SelectionSet::at_origin();
+    let edits = e.active().plan_edit(EditKind::Insert("😀".into()));
+    smol::block_on(apply_edit(
+        &mut e,
+        edits,
+        &h.delta_tx,
+        &h.snapshots,
+        &h.note_tx,
+    ));
+
+    assert!(smol::block_on(save_file(&mut e, &h.snapshots, &h.note_tx)));
+    assert!(e.active().modified()); // still dirty: nothing was saved
+    assert_eq!(std::fs::read(&path).unwrap(), original); // file untouched
+    let notes: Vec<_> = std::iter::from_fn(|| h.note_rx.try_recv().ok()).collect();
+    assert!(
+        notes.iter().any(|n| matches!(
+            n,
+            Notification::FileError { message, .. } if message.contains("windows-1252")
+        )),
+        "expected an encoding FileError, got {notes:?}"
+    );
 }
 
 #[test]
@@ -611,7 +682,10 @@ fn save_writes_buffer_to_bound_file_and_clears_modified() {
     let alive = smol::block_on(save_file(&mut e, &h.snapshots, &h.note_tx));
 
     assert!(alive);
-    assert_eq!(std::fs::read_to_string(&path).unwrap(), "saved text");
+    // The trailing newline is the POSIX final-newline policy (SPEC §10.1), applied
+    // to the bytes written and never to the buffer - which is why the document is
+    // clean below rather than dirtied by its own save.
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), "saved text\n");
     assert!(!e.active().modified()); // clean after a successful save
     match h.note_rx.try_recv() {
         Ok(Notification::FileSaved { path: p, .. }) => assert_eq!(p, path),
@@ -712,7 +786,7 @@ fn open_then_edit_then_save_round_trips_through_disk() {
     smol::block_on(save_file(&mut e, &h.snapshots, &h.note_tx));
 
     assert!(!e.active().modified());
-    assert_eq!(std::fs::read_to_string(&path).unwrap(), "abcd");
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), "abcd\n");
 }
 
 #[test]
@@ -735,7 +809,7 @@ fn save_as_writes_to_target_adopts_it_and_clears_modified() {
     ));
 
     assert!(alive);
-    assert_eq!(std::fs::read_to_string(&target).unwrap(), "save-as body");
+    assert_eq!(std::fs::read_to_string(&target).unwrap(), "save-as body\n");
     assert_eq!(e.active().path.as_deref(), Some(target.as_path())); // adopted
     assert!(!e.active().modified()); // clean after a successful save-as
     match h.note_rx.try_recv() {
@@ -753,8 +827,55 @@ fn save_as_writes_to_target_adopts_it_and_clears_modified() {
         &h.note_tx,
     ));
     smol::block_on(save_file(&mut e, &h.snapshots, &h.note_tx));
-    assert_eq!(std::fs::read_to_string(&target).unwrap(), "save-as body!");
+    assert_eq!(std::fs::read_to_string(&target).unwrap(), "save-as body!\n");
     assert!(!has_temp_file(&dir.path), "leftover .vortex-tmp file");
+}
+
+#[test]
+fn save_as_is_refused_when_the_text_does_not_fit_the_files_encoding() {
+    // Save-as keeps the source file's encoding, so it inherits the same refusal a
+    // plain save gets - and refuses *before* the write, leaving no half-written
+    // target behind (SPEC §8).
+    let dir = TempDir::new();
+    let source = dir.file("latin1.txt");
+    std::fs::write(&source, b"caf\xE9\n").unwrap();
+    let target = dir.file("copy.txt");
+
+    let mut e = Session::new();
+    let h = Harness::new();
+    smol::block_on(open_file(
+        &mut e,
+        source,
+        &h.delta_tx,
+        &h.snapshots,
+        &h.note_tx,
+    ));
+    e.active_mut().selections = SelectionSet::at_origin();
+    let edits = e.active().plan_edit(EditKind::Insert("😀".into()));
+    smol::block_on(apply_edit(
+        &mut e,
+        edits,
+        &h.delta_tx,
+        &h.snapshots,
+        &h.note_tx,
+    ));
+
+    assert!(smol::block_on(save_as_file(
+        &mut e,
+        target.clone(),
+        &h.snapshots,
+        &h.note_tx
+    )));
+    assert!(!target.exists(), "nothing should have been written");
+    assert!(e.active().modified()); // still dirty
+    let notes: Vec<_> = std::iter::from_fn(|| h.note_rx.try_recv().ok()).collect();
+    assert!(
+        notes.iter().any(|n| matches!(
+            n,
+            Notification::FileError { message, .. } if message.contains("windows-1252")
+        )),
+        "expected an encoding FileError, got {notes:?}"
+    );
 }
 
 #[test]
@@ -865,7 +986,7 @@ fn save_writes_to_a_new_file_that_did_not_exist() {
     smol::block_on(save_file(&mut e, &h.snapshots, &h.note_tx));
 
     assert!(path.exists());
-    assert_eq!(std::fs::read_to_string(&path).unwrap(), "brand new");
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), "brand new\n");
 }
 
 #[test]
@@ -1204,7 +1325,7 @@ fn open_then_save_through_the_actor_loop() {
 
     assert_eq!(snap.path, Some(path.clone()));
     assert!(!snap.modified); // clean after the save
-    assert_eq!(std::fs::read_to_string(&path).unwrap(), "Zabc");
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), "Zabc\n");
     // The loop emitted both a FileOpened and a FileSaved for this path.
     assert!(
         notes
@@ -1233,7 +1354,7 @@ fn save_as_through_the_actor_loop() {
 
     assert_eq!(snap.path, Some(target.clone()));
     assert!(!snap.modified); // clean after the save-as
-    assert_eq!(std::fs::read_to_string(&target).unwrap(), "hello");
+    assert_eq!(std::fs::read_to_string(&target).unwrap(), "hello\n");
     assert!(
         notes
             .iter()

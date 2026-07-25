@@ -115,6 +115,12 @@ pub struct ViewSnapshot {
     /// `dirty` (the repaint hint): this is purely "is there unsaved work". The
     /// frontend paints a modified marker from it (SPEC §8, §10).
     pub modified: bool,
+    /// How the active buffer's file is stored on disk - encoding, BOM, line
+    /// terminator (SPEC §10.1). Detected on load and reproduced on save; the
+    /// frontend shows it in the status bar, which is the only way a user can tell
+    /// that opening a CRLF latin-1 file did not quietly convert it. `Copy` and two
+    /// words wide, so carrying it per frame costs nothing.
+    pub format: crate::file::FileFormat,
     /// Every open buffer, in the order a bufferline lists them, including the
     /// active one (identified by `buffer_id`). `Arc`-shared and rebuilt only when
     /// the set actually changes, so carrying it costs a ref-count bump per frame

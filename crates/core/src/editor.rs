@@ -31,11 +31,21 @@ use crate::action::Action;
 use crate::anchor::{Anchor, Edit};
 use crate::buffer::{Buffer, RopeBuffer};
 use crate::decoration::DecorationSet;
+use crate::file::FileFormat;
 use crate::history::{Change, History, Reverted};
 use crate::lsp::{Diagnostic, DocumentSync, LspEvent, LspHandle, convert};
 use crate::selection::{Selection, SelectionSet};
 use crate::syntax::{HighlightSpan, SyntaxEvent, SyntaxHandle, SyntaxSync};
 use crate::view::{BufferId, BufferInfo, Delta, Notification, ViewSnapshot};
+
+/// Whether a save appends a trailing newline to a buffer that lacks one - SPEC
+/// §10.1's POSIX-style default. The buffer itself is never touched, so this can
+/// never surface as a spurious unsaved change.
+///
+/// A constant rather than a setting because configuration is frontend-owned and its
+/// loader is still to come (§10.5); this is the default that loader will fall back
+/// to when the file says nothing.
+const ENSURE_FINAL_NEWLINE: bool = true;
 
 /// Channels the frontend uses to talk to a running core (SPEC §6).
 pub struct CoreHandle {
@@ -123,6 +133,11 @@ struct Document {
     version: u64,
     /// The file this buffer is bound to (`Open`/`Save`), or `None` if unnamed.
     path: Option<PathBuf>,
+    /// How this buffer's file is laid out on disk - encoding, BOM, line
+    /// terminator (SPEC §10.1). Detected on load and applied on save, so a
+    /// CRLF latin-1 file is written back as one rather than silently converted
+    /// to LF UTF-8. An unnamed buffer carries the default (UTF-8, LF).
+    format: FileFormat,
     /// The undo tree (SPEC §2.4). Owns the reversible change history and the
     /// coalescing state; reset on a file open (undo does not cross a load).
     history: History,
@@ -321,6 +336,7 @@ impl Document {
             selections: SelectionSet::at_origin(),
             version: 0,
             path: None,
+            format: FileFormat::default(),
             history: History::new(),
             decorations: Arc::new(DecorationSet::new()),
             lsp_dirty: false,
@@ -349,8 +365,20 @@ impl Document {
             decorations: Arc::clone(&self.decorations),
             path: self.path.clone(),
             modified: self.modified(),
+            format: self.format,
             buffers,
         }
+    }
+
+    /// The bytes to write for this buffer: the rope's UTF-8/LF text converted back
+    /// into the file's own encoding and line terminator (SPEC §10.1).
+    ///
+    /// Fails when the text holds a character the file's encoding cannot represent;
+    /// the caller surfaces that as a `FileError` and leaves the buffer dirty, so the
+    /// work is still there to save elsewhere (SPEC §8).
+    fn encode_for_save(&self) -> Result<Vec<u8>, String> {
+        self.format
+            .encode(&self.buffer.text().to_string(), ENSURE_FINAL_NEWLINE)
     }
 
     /// Whether the buffer differs from its on-disk file. Derived from `history`'s
@@ -1435,13 +1463,29 @@ async fn open_file(
         return switch_to(session, index, snapshots, notifications);
     }
 
-    // `read_to_string` folds read + UTF-8 decode into one step: it errors with
-    // `InvalidData` ("stream did not contain valid UTF-8") on non-text input, so a
-    // single match covers missing / unreadable / non-UTF-8 without a nested one.
-    let (contents, existed) = match std::fs::read_to_string(&path) {
-        Ok(text) => (text, true),
+    // Read bytes, not a `String`: the file decides its own encoding, and
+    // `read_to_string` would reject everything that is not UTF-8 outright
+    // (SPEC §10.1). `file::load` decodes it and reports the format to write back.
+    let (contents, format, existed) = match std::fs::read(&path) {
+        Ok(bytes) if crate::file::is_binary(&bytes) => {
+            // Refused rather than opened as mojibake: every byte would round-trip
+            // until the first edit, which would corrupt the file (SPEC §10.3).
+            return report_file_error(
+                session,
+                Some(path),
+                "binary file (contains NUL bytes)",
+                snapshots,
+                notifications,
+            );
+        }
+        Ok(bytes) => {
+            let (text, format) = crate::file::load(&bytes);
+            (text, format, true)
+        }
         // Missing file: open an empty buffer bound to the path (created on save).
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => (String::new(), false),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            (String::new(), FileFormat::default(), false)
+        }
         Err(err) => {
             return report_file_error(
                 session,
@@ -1495,6 +1539,9 @@ async fn open_file(
     // content, which is the saved state (SPEC §2.4).
     doc.selections = SelectionSet::at_origin();
     doc.path = Some(path.clone());
+    // The buffer now *is* this file, so it saves in this file's form - including
+    // when a scratch buffer was reused and had been carrying the default.
+    doc.format = format;
     doc.history = History::new();
     // Decorations describe the *previous* file's text; keeping them would paint
     // squiggles at meaningless offsets until a producer refreshes.
@@ -1632,8 +1679,13 @@ async fn save_file(
         );
     };
 
-    let contents = session.active().buffer.text().to_string();
-    if let Err(message) = write_atomic(&path, contents.as_bytes()) {
+    let bytes = match session.active().encode_for_save() {
+        Ok(bytes) => bytes,
+        Err(message) => {
+            return report_file_error(session, Some(path), &message, snapshots, notifications);
+        }
+    };
+    if let Err(message) = write_atomic(&path, &bytes) {
         return report_file_error(session, Some(path), &message, snapshots, notifications);
     }
 
@@ -1685,8 +1737,15 @@ async fn save_as_file(
         );
     }
 
-    let contents = session.active().buffer.text().to_string();
-    if let Err(message) = write_atomic(&path, contents.as_bytes()) {
+    // A save-as keeps the source file's form: writing a CRLF latin-1 file out under
+    // a new name should produce the same kind of file, not silently convert it.
+    let bytes = match session.active().encode_for_save() {
+        Ok(bytes) => bytes,
+        Err(message) => {
+            return report_file_error(session, Some(path), &message, snapshots, notifications);
+        }
+    };
+    if let Err(message) = write_atomic(&path, &bytes) {
         return report_file_error(session, Some(path), &message, snapshots, notifications);
     }
 
