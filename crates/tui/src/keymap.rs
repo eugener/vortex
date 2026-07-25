@@ -206,6 +206,18 @@ pub enum Command {
     OpenFilePicker,
     /// Open the theme-picker overlay (frontend-local).
     OpenThemePicker,
+    /// Focus the next buffer in the bufferline, wrapping at the end.
+    ///
+    /// Frontend-local *resolution*, not a frontend-local effect: the core has no
+    /// "next" action, because the frontend already holds the ordered buffer list to
+    /// paint its bufferline and so can name the neighbor itself (SPEC §7.5 - only the
+    /// committed intent, `SwitchBuffer { id }`, crosses the seam).
+    NextBuffer,
+    /// Focus the previous buffer, wrapping at the start. See [`Command::NextBuffer`].
+    PrevBuffer,
+    /// Close the active buffer. Resolved against the live buffer list like the two
+    /// above; the core refuses if there is unsaved work, and the frontend then asks.
+    CloseBuffer,
 }
 
 /// A motion with the page size left abstract, so a binding is frame-independent;
@@ -277,6 +289,9 @@ impl Command {
             "open_palette" => Command::OpenPalette,
             "open_file_picker" => Command::OpenFilePicker,
             "open_theme_picker" => Command::OpenThemePicker,
+            "next_buffer" => Command::NextBuffer,
+            "prev_buffer" => Command::PrevBuffer,
+            "close_buffer" => Command::CloseBuffer,
             _ => return None,
         })
     }
@@ -290,6 +305,10 @@ impl Command {
             Command::OpenFilePicker => return FrontendCommand::OpenFilePicker,
             Command::OpenThemePicker => return FrontendCommand::OpenThemePicker,
             Command::SaveAs => return FrontendCommand::OpenSavePrompt,
+            // Resolved against the live buffer list at dispatch, where it is known.
+            Command::NextBuffer => return FrontendCommand::NextBuffer,
+            Command::PrevBuffer => return FrontendCommand::PrevBuffer,
+            Command::CloseBuffer => return FrontendCommand::CloseBuffer,
             Command::Quit => Action::Quit,
             Command::Save => Action::Save,
             Command::Undo => Action::Undo,
@@ -373,6 +392,12 @@ const DEFAULT_BINDINGS: &[(&str, &str)] = &[
     ("ctrl+o", "open_file_picker"),
     ("ctrl+p", "open_palette"),
     ("ctrl+t", "open_theme_picker"),
+    // Buffer switching (M7). Ctrl+PageUp/PageDown is the widely shared "next/previous
+    // tab" chord and is reported by classic terminals, unlike the Ctrl+Alt chords
+    // above; the plain and shift+ page keys stay motions, so nothing is shadowed.
+    ("ctrl+pagedown", "next_buffer"),
+    ("ctrl+pageup", "prev_buffer"),
+    ("ctrl+w", "close_buffer"),
 ];
 
 /// Bindings on the platform's native command modifier: Cmd on macOS (crossterm
@@ -573,6 +598,60 @@ mod tests {
     fn default_keymap_builds_without_panicking() {
         // Guards the `expect` in `Keymap::default` - proves DEFAULT_BINDINGS parses.
         let _ = Keymap::default();
+    }
+
+    #[test]
+    fn buffer_switching_is_bound_and_stays_frontend_local() {
+        // Next/previous/close resolve to frontend-local commands, not core actions:
+        // the core has no notion of "next", so the frontend names the buffer from the
+        // list it already holds and only `SwitchBuffer { id }` crosses the seam.
+        let km = Keymap::default();
+        let page = PAGE;
+        let ctrl = |code| with_mods(code, KeyModifiers::CONTROL);
+        assert_eq!(
+            command_for_key(&km, ctrl(KeyCode::PageDown), page),
+            Some(FrontendCommand::NextBuffer)
+        );
+        assert_eq!(
+            command_for_key(&km, ctrl(KeyCode::PageUp), page),
+            Some(FrontendCommand::PrevBuffer)
+        );
+        assert_eq!(
+            command_for_key(&km, ctrl(KeyCode::Char('w')), page),
+            Some(FrontendCommand::CloseBuffer)
+        );
+    }
+
+    #[test]
+    fn the_plain_page_keys_still_move_the_cursor() {
+        // Ctrl+PageUp/PageDown were added for buffer switching; the unmodified and
+        // shift+ page keys must be unaffected.
+        assert_eq!(
+            act(press(KeyCode::PageDown)),
+            Some(Action::MoveCursor {
+                motion: Motion::PageDown(PAGE),
+                extend: false,
+            })
+        );
+        assert_eq!(
+            act(with_mods(KeyCode::PageUp, KeyModifiers::SHIFT)),
+            Some(Action::MoveCursor {
+                motion: Motion::PageUp(PAGE),
+                extend: true,
+            })
+        );
+    }
+
+    #[test]
+    fn buffer_command_names_parse_and_have_shortcuts() {
+        assert_eq!(Command::parse("next_buffer"), Some(Command::NextBuffer));
+        assert_eq!(Command::parse("prev_buffer"), Some(Command::PrevBuffer));
+        assert_eq!(Command::parse("close_buffer"), Some(Command::CloseBuffer));
+        // The palette shows these, so the reverse lookup has to find them.
+        let km = Keymap::default();
+        assert!(km.shortcut_for(Command::NextBuffer).is_some());
+        assert!(km.shortcut_for(Command::PrevBuffer).is_some());
+        assert!(km.shortcut_for(Command::CloseBuffer).is_some());
     }
 
     #[test]

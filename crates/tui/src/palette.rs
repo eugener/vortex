@@ -32,6 +32,9 @@ const PALETTE: &[(&str, Bindable)] = &[
     ("Add Cursor Above", Bindable::AddCursorAbove),
     ("Add Cursor Below", Bindable::AddCursorBelow),
     ("Collapse Selections", Bindable::CollapseSelections),
+    ("Next Buffer", Bindable::NextBuffer),
+    ("Previous Buffer", Bindable::PrevBuffer),
+    ("Close Buffer", Bindable::CloseBuffer),
     ("Quit", Bindable::Quit),
 ];
 

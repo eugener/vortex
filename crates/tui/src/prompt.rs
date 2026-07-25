@@ -149,6 +149,91 @@ pub fn save_as(theme: &Theme, current_path: Option<&std::path::Path>) -> Box<dyn
     }))
 }
 
+/// A yes/no confirmation on the prompt line: a question plus a single keypress.
+///
+/// The sibling of [`Prompt`] rather than a special case of it - a confirmation is
+/// answered with one key, not typed and submitted, and making the destructive answer
+/// require Enter would be the wrong shape for "are you sure". `y` commits, anything
+/// else (`n`, Esc, a stray key) cancels, so the safe answer is every answer but one.
+pub struct Confirm {
+    question: String,
+    /// Emitted if the user says yes; dropped otherwise.
+    on_yes: Vec<Command>,
+    style: Style,
+    finished: bool,
+    outbox: Vec<Command>,
+}
+
+impl Confirm {
+    pub fn new(question: impl Into<String>, on_yes: Vec<Command>, style: Style) -> Self {
+        Self {
+            question: question.into(),
+            on_yes,
+            style,
+            finished: false,
+            outbox: Vec::new(),
+        }
+    }
+}
+
+impl Layer for Confirm {
+    fn render(&self, screen: Rect, buf: &mut Buffer) {
+        let Some(row) = Prompt::row(screen) else {
+            return;
+        };
+        buf.set_style(row, self.style);
+        buf.set_stringn(row.x, row.y, &self.question, row.width as usize, self.style);
+    }
+
+    fn handle_key(&mut self, key: KeyEvent) -> EventResult {
+        // A Ctrl/Cmd chord is a shortcut, deferred as in `Prompt` so the keymap stays
+        // the single source of bindings.
+        if key.modifiers.contains(KeyModifiers::CONTROL)
+            || key.modifiers.contains(KeyModifiers::SUPER)
+        {
+            return EventResult::Ignored;
+        }
+        if matches!(key.code, KeyCode::Char('y') | KeyCode::Char('Y')) {
+            self.outbox.append(&mut self.on_yes);
+        }
+        // Every other key answers no. Nothing is swallowed silently into a "keep
+        // asking" state: one keypress always closes the question.
+        self.finished = true;
+        EventResult::Consumed
+    }
+
+    fn take_commands(&mut self) -> Vec<Command> {
+        std::mem::take(&mut self.outbox)
+    }
+
+    fn is_finished(&self) -> bool {
+        self.finished
+    }
+
+    fn restyle(&mut self, theme: &Theme) {
+        self.style = theme.palette;
+    }
+}
+
+/// Ask whether to close a buffer with unsaved changes, committing a forced
+/// [`Action::CloseBuffer`] if the user accepts (SPEC §8: the core refused the
+/// unforced close precisely so this question gets asked).
+pub fn confirm_close(
+    theme: &Theme,
+    id: vortex_core::BufferId,
+    path: Option<&std::path::Path>,
+) -> Box<dyn Layer> {
+    let name = path
+        .and_then(|p| p.file_name())
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "this buffer".to_string());
+    Box::new(Confirm::new(
+        format!("{name} has unsaved changes. Close anyway? (y/N) "),
+        vec![Command::Editor(Action::CloseBuffer { id, force: true })],
+        theme.palette,
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -326,6 +411,114 @@ mod tests {
         type_str(&mut p, "a-very-long-path-that-overflows");
         // On a 10-wide screen the caret cannot leave the row: it clamps to col 9.
         assert_eq!(p.cursor(Rect::new(0, 0, 10, 3)), Some(Position::new(9, 2)));
+    }
+
+    // --- Confirm (the close guard's other half, SPEC §8) ---------------------
+
+    fn close_confirm() -> Box<dyn Layer> {
+        confirm_close(
+            &Theme::default(),
+            vortex_core::BufferId(7),
+            Some(std::path::Path::new("dir/notes.md")),
+        )
+    }
+
+    #[test]
+    fn confirming_a_close_commits_a_forced_close_for_that_buffer() {
+        let mut layer = close_confirm();
+        assert_eq!(layer.handle_key(key('y')), EventResult::Consumed);
+        assert!(layer.is_finished());
+        assert_eq!(
+            layer.take_commands(),
+            vec![Command::Editor(Action::CloseBuffer {
+                id: vortex_core::BufferId(7),
+                force: true,
+            })]
+        );
+    }
+
+    #[test]
+    fn an_uppercase_yes_confirms_too() {
+        let mut layer = close_confirm();
+        layer.handle_key(key('Y'));
+        assert_eq!(layer.take_commands().len(), 1);
+    }
+
+    #[test]
+    fn anything_but_yes_cancels_the_close() {
+        // The destructive answer is exactly one key; every other key - the explicit
+        // no, Esc, or a mistyped letter - closes the question having discarded nothing.
+        for cancel in [
+            key('n'),
+            press(KeyCode::Esc),
+            key('q'),
+            press(KeyCode::Enter),
+        ] {
+            let mut layer = close_confirm();
+            assert_eq!(layer.handle_key(cancel), EventResult::Consumed);
+            assert!(layer.is_finished(), "one keypress always answers");
+            assert!(
+                layer.take_commands().is_empty(),
+                "no close was committed for {cancel:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_ctrl_chord_over_the_confirm_is_deferred() {
+        // Same rule as the prompt: a shortcut is not an answer, so the keymap stays
+        // the single source of bindings.
+        let mut layer = close_confirm();
+        let ctrl_s = KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL);
+        assert_eq!(layer.handle_key(ctrl_s), EventResult::Ignored);
+        assert!(!layer.is_finished());
+        assert!(layer.take_commands().is_empty());
+    }
+
+    #[test]
+    fn the_confirm_names_the_file_it_would_discard() {
+        // The question has to say *what* is about to be lost, not just ask.
+        let layer = close_confirm();
+        let mut terminal = Terminal::new(TestBackend::new(60, 4)).unwrap();
+        terminal
+            .draw(|frame| layer.render(frame.area(), frame.buffer_mut()))
+            .unwrap();
+        let row = crate::testutil::row_text(&terminal.backend().buffer().clone(), 3);
+        assert!(row.contains("notes.md"), "confirm row: {row:?}");
+        assert!(row.contains("y/N"), "confirm row: {row:?}");
+        // A confirmation takes no text, so it shows no caret.
+        assert_eq!(layer.cursor(Rect::new(0, 0, 60, 4)), None);
+    }
+
+    #[test]
+    fn an_unnamed_buffer_still_gets_a_readable_question() {
+        let layer = confirm_close(&Theme::default(), vortex_core::BufferId(1), None);
+        let mut terminal = Terminal::new(TestBackend::new(60, 3)).unwrap();
+        terminal
+            .draw(|frame| layer.render(frame.area(), frame.buffer_mut()))
+            .unwrap();
+        let row = crate::testutil::row_text(&terminal.backend().buffer().clone(), 2);
+        assert!(row.contains("this buffer"), "confirm row: {row:?}");
+    }
+
+    #[test]
+    fn a_zero_height_screen_draws_no_confirm() {
+        let layer = close_confirm();
+        let screen = Rect::new(0, 0, 0, 0);
+        let mut buf = Buffer::empty(screen);
+        layer.render(screen, &mut buf);
+        assert_eq!(buf, Buffer::empty(screen));
+    }
+
+    #[test]
+    fn restyling_the_confirm_adopts_the_new_palette() {
+        let mut layer = Confirm::new("ok? ", Vec::new(), Style::default());
+        let theme = Theme {
+            palette: Style::new().bg(Color::Rgb(1, 2, 3)),
+            ..Theme::default()
+        };
+        layer.restyle(&theme);
+        assert_eq!(layer.style, theme.palette);
     }
 
     #[test]
