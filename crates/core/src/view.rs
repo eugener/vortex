@@ -121,6 +121,11 @@ pub struct ViewSnapshot {
     /// that opening a CRLF latin-1 file did not quietly convert it. `Copy` and two
     /// words wide, so carrying it per frame costs nothing.
     pub format: crate::file::FileFormat,
+    /// Whether the buffer refuses edits (SPEC §10.3): the file cannot be written,
+    /// or parts of it did not decode and saving would overwrite them. The frontend
+    /// marks it in the status bar; the core is what actually enforces it, so a
+    /// frontend that ignores this cannot write to the file anyway.
+    pub read_only: bool,
     /// Every open buffer, in the order a bufferline lists them, including the
     /// active one (identified by `buffer_id`). `Arc`-shared and rebuilt only when
     /// the set actually changes, so carrying it costs a ref-count bump per frame

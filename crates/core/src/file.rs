@@ -167,6 +167,24 @@ pub fn is_binary(bytes: &[u8]) -> bool {
     Encoding::for_bom(bytes).is_none() && bytes[..bytes.len().min(SAMPLE)].contains(&0)
 }
 
+/// A decoded file: the editable text, the format that writes it back, and whether
+/// anything was lost getting here.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Loaded {
+    /// UTF-8 with LF terminators - the one shape the buffer ever holds.
+    pub text: String,
+    /// What [`FileFormat::encode`] needs to reproduce the file.
+    pub format: FileFormat,
+    /// The decode hit bytes it could not interpret and substituted U+FFFD, so
+    /// `text` is **not** a faithful copy of the file and encoding it would not
+    /// reproduce those bytes. Only reachable for a file whose BOM declares an
+    /// encoding it then violates (a truncated UTF-16 file): everything else either
+    /// decodes cleanly or falls back to windows-1252, which cannot fail. The caller
+    /// opens such a buffer read-only rather than letting a save overwrite the bytes
+    /// that did not survive (SPEC §8, §10.3).
+    pub lossy: bool,
+}
+
 /// Decode `bytes` into editable UTF-8/LF text plus the [`FileFormat`] that writes
 /// it back unchanged (SPEC §10.1).
 ///
@@ -178,7 +196,7 @@ pub fn is_binary(bytes: &[u8]) -> bool {
 /// (as mojibake) instead of refusing to open at all, which is what the core did
 /// before. A statistical detector (`chardetng`) would name more of them correctly;
 /// it is a dependency this has not needed to justify yet.
-pub fn load(bytes: &[u8]) -> (String, FileFormat) {
+pub fn load(bytes: &[u8]) -> Loaded {
     let (encoding, from_bom) = match Encoding::for_bom(bytes) {
         Some((encoding, _)) => (encoding, true),
         None => (sniff(bytes), false),
@@ -190,11 +208,16 @@ pub fn load(bytes: &[u8]) -> (String, FileFormat) {
     // Re-reading it as windows-1252 keeps every byte, where the replacement
     // characters a lossy decode leaves behind would be written back over the
     // user's data on the next save. A BOM'd file is left as decoded: a corrupt
-    // UTF-16 file is corrupt, and reinterpreting it as bytes would be nonsense.
-    let (text, encoding) = if malformed && !from_bom {
-        (WINDOWS_1252.decode_with_bom_removal(bytes).0, WINDOWS_1252)
+    // UTF-16 file is corrupt, and reinterpreting it as bytes would be nonsense -
+    // it opens read-only instead, so what did not survive is never written back.
+    let (text, encoding, lossy) = if malformed && !from_bom {
+        (
+            WINDOWS_1252.decode_with_bom_removal(bytes).0,
+            WINDOWS_1252,
+            false,
+        )
     } else {
-        (text, encoding)
+        (text, encoding, malformed)
     };
 
     let eol = line_ending(&text);
@@ -202,14 +225,15 @@ pub fn load(bytes: &[u8]) -> (String, FileFormat) {
         LineEnding::Crlf => text.replace("\r\n", "\n"),
         LineEnding::Lf => text.into_owned(),
     };
-    (
+    Loaded {
         text,
-        FileFormat {
+        format: FileFormat {
             encoding,
             bom: from_bom,
             eol,
         },
-    )
+        lossy,
+    }
 }
 
 /// The encoding of a file with no BOM: UTF-8 if a bounded prefix decodes as UTF-8,
