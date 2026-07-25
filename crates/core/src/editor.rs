@@ -35,7 +35,7 @@ use crate::history::{Change, History, Reverted};
 use crate::lsp::{Diagnostic, DocumentSync, LspEvent, LspHandle, convert};
 use crate::selection::{Selection, SelectionSet};
 use crate::syntax::{HighlightSpan, SyntaxEvent, SyntaxHandle, SyntaxSync};
-use crate::view::{BufferId, Delta, Notification, ViewSnapshot};
+use crate::view::{BufferId, BufferInfo, Delta, Notification, ViewSnapshot};
 
 /// Channels the frontend uses to talk to a running core (SPEC §6).
 pub struct CoreHandle {
@@ -181,6 +181,18 @@ struct Session {
     /// distinction - every message is the full text - so it needs no `opened`
     /// flag, only the per-document dirty flag.
     syntax_sync: Option<Sender<SyntaxSync>>,
+    /// The id the next document will get. Monotonic and never reused, so a stale
+    /// `BufferId` held by a frontend (a picker entry for a buffer closed meanwhile)
+    /// resolves to nothing rather than silently to a different buffer.
+    next_id: u64,
+    /// The buffer list carried on every snapshot, cached (SPEC §5). Rebuilt only
+    /// when it would actually differ - see [`Self::buffer_list`] - because building
+    /// it clones a `PathBuf` per open buffer, which must not happen per keystroke.
+    buffers: Arc<[BufferInfo]>,
+    /// Set when the *set* of documents changed (open, close, switch). Changes to a
+    /// single document's own entry are caught by comparison instead, so nothing has
+    /// to remember to raise this on every edit.
+    buffers_stale: bool,
 }
 
 impl Session {
@@ -191,6 +203,9 @@ impl Session {
             register: Vec::new(),
             lsp_sync: None,
             syntax_sync: None,
+            next_id: 1,
+            buffers: Arc::from(Vec::new()),
+            buffers_stale: true,
         }
     }
 
@@ -202,6 +217,54 @@ impl Session {
 
     fn active_mut(&mut self) -> &mut Document {
         &mut self.docs[self.active]
+    }
+
+    /// Allocate the next buffer id.
+    fn next_buffer_id(&mut self) -> BufferId {
+        let id = BufferId(self.next_id);
+        self.next_id += 1;
+        id
+    }
+
+    /// The index of the document with `id`, or `None` if it is not open (a stale id
+    /// from a frontend that has not seen a close yet).
+    fn index_of(&self, id: BufferId) -> Option<usize> {
+        self.docs.iter().position(|d| d.id == id)
+    }
+
+    /// The cached buffer list, rebuilt only when it would differ.
+    ///
+    /// The cheap check is sound because **only the active document can change
+    /// between two publishes**: nothing edits, saves, renames or reorders a
+    /// background buffer, so comparing the active document against its cached entry
+    /// catches every change the `buffers_stale` flag does not (that flag covers
+    /// membership and order). One comparison per publish, versus a `PathBuf` clone
+    /// per open buffer per keystroke.
+    fn buffer_list(&mut self) -> Arc<[BufferInfo]> {
+        if !self.buffers_stale {
+            let doc = &self.docs[self.active];
+            let cached = &self.buffers[self.active];
+            if cached.id == doc.id && cached.modified == doc.modified() && cached.path == doc.path {
+                return Arc::clone(&self.buffers);
+            }
+        }
+        self.buffers = self
+            .docs
+            .iter()
+            .map(|d| BufferInfo {
+                id: d.id,
+                path: d.path.clone(),
+                modified: d.modified(),
+            })
+            .collect();
+        self.buffers_stale = false;
+        Arc::clone(&self.buffers)
+    }
+
+    /// A snapshot of the active document, carrying the session's buffer list.
+    fn snapshot(&mut self, dirty: Option<std::ops::Range<usize>>) -> ViewSnapshot {
+        let buffers = self.buffer_list();
+        self.active().snapshot(dirty, buffers)
     }
 }
 
@@ -227,7 +290,11 @@ impl Document {
     /// trivial for M1's single selection. When M3 adds many cursors, hold the
     /// selection set as an `Arc<[Selection]>` internally so this becomes an `Arc`
     /// bump too, matching the SPEC §5 O(1)-snapshot goal for every field.
-    fn snapshot(&self, dirty: Option<std::ops::Range<usize>>) -> ViewSnapshot {
+    fn snapshot(
+        &self,
+        dirty: Option<std::ops::Range<usize>>,
+        buffers: Arc<[BufferInfo]>,
+    ) -> ViewSnapshot {
         ViewSnapshot {
             buffer_id: self.id,
             version: self.version,
@@ -238,6 +305,7 @@ impl Document {
             decorations: Arc::clone(&self.decorations),
             path: self.path.clone(),
             modified: self.modified(),
+            buffers,
         }
     }
 
@@ -502,6 +570,7 @@ impl Session {
             return;
         }
         let message = SyntaxSync {
+            buffer_id: doc.id,
             version: doc.version,
             text: doc.buffer.text(),
         };
@@ -557,6 +626,11 @@ enum Step {
     Open(PathBuf),
     Save,
     SaveAs(PathBuf),
+    Switch(BufferId),
+    Close {
+        id: BufferId,
+        force: bool,
+    },
 }
 
 /// What the actor loop woke up for. The LSP arms exist so a server can push work
@@ -896,13 +970,24 @@ async fn run(
                 continue;
             }
             Incoming::Lsp(LspEvent::Diagnostics { path, diagnostics }) => {
+                // Route by path across every open document, not just the active one:
+                // a server analyzes the whole workspace and publishes for any file in
+                // it, so a batch routinely belongs to a buffer sitting in the
+                // background. Delivering it there means switching to that buffer shows
+                // its diagnostics immediately instead of waiting for a republish.
+                // `apply_diagnostics` self-guards on the path, so it is the routing
+                // predicate as well as the application.
+                let active = session.active;
+                let mut repaint = false;
+                for (index, doc) in session.docs.iter_mut().enumerate() {
+                    if doc.apply_diagnostics(&path, &diagnostics) && index == active {
+                        repaint = true;
+                    }
+                }
                 // Republish only when the screen would actually differ: a server
-                // re-sending an identical batch (common while indexing) must not
-                // cost a frame.
-                let doc = session.active_mut();
-                if doc.apply_diagnostics(&path, &diagnostics)
-                    && !snapshots.publish(doc.snapshot(None))
-                {
+                // re-sending an identical batch (common while indexing), or one for an
+                // off-screen buffer, must not cost a frame.
+                if repaint && !snapshots.publish(session.snapshot(None)) {
                     break;
                 }
                 continue;
@@ -925,9 +1010,13 @@ async fn run(
                 session.syntax_sync = None;
                 continue;
             }
-            Incoming::Syntax(SyntaxEvent::Highlights { version, spans }) => {
-                // Apply only a batch computed against the *current* buffer. The spans
-                // are byte offsets in the version the highlighter parsed; if the
+            Incoming::Syntax(SyntaxEvent::Highlights {
+                buffer_id,
+                version,
+                spans,
+            }) => {
+                // Apply only a batch computed against the buffer and version it
+                // actually parsed. The spans are byte offsets in that text; if the
                 // buffer has advanced since (an edit landed while the parse was in
                 // flight), installing them verbatim would place them at stale
                 // offsets - misplaced, not merely a frame behind. A stale batch is
@@ -935,14 +1024,26 @@ async fn run(
                 // transform them (`transform_decorations`), and `sync_syntax` keeps
                 // re-sending the newest text, so a fresh matching batch lands the
                 // moment typing pauses. This is the "overlays trail text, never
-                // misplace it" contract (SPEC §5); the `version` on the event exists
-                // for exactly this guard. Republish only when the set actually
-                // changed, so an identical reparse costs no frame.
-                let doc = session.active_mut();
-                if version == doc.version
-                    && doc.apply_highlights(spans)
-                    && !snapshots.publish(doc.snapshot(None))
-                {
+                // misplace it" contract (SPEC §5).
+                //
+                // **Both halves of the identity are required.** Versions are
+                // per-buffer, so two open documents sit at the same version all the
+                // time; matching on version alone would paint one buffer's tokens onto
+                // another's text the moment the user switches mid-parse. The batch is
+                // applied to whichever document it belongs to, background or not - its
+                // highlights are correct for that buffer, and it repaints when focused.
+                let target = session.index_of(buffer_id);
+                let repaint = match target {
+                    Some(index) => {
+                        let active = session.active;
+                        let doc = &mut session.docs[index];
+                        version == doc.version && doc.apply_highlights(spans) && index == active
+                    }
+                    None => false, // parsed for a buffer that has since been closed
+                };
+                // Republish only when the set actually changed, so an identical
+                // reparse (an edit that left tokens intact) costs no frame.
+                if repaint && !snapshots.publish(session.snapshot(None)) {
                     break;
                 }
                 continue;
@@ -1020,44 +1121,39 @@ async fn run(
             Action::Open(path) => Step::Open(path),
             Action::Save => Step::Save,
             Action::SaveAs(path) => Step::SaveAs(path),
+            Action::SwitchBuffer { id } => Step::Switch(id),
+            Action::CloseBuffer { id, force } => Step::Close { id, force },
             Action::Quit => break,
         };
 
         let alive = match step {
             Step::Edit(edits) => {
-                apply_edit(
-                    session.active_mut(),
-                    edits,
-                    &deltas,
-                    &snapshots,
-                    &notifications,
-                )
-                .await
+                apply_edit(&mut session, edits, &deltas, &snapshots, &notifications).await
             }
             Step::Undo => {
-                let doc = session.active_mut();
-                let reverted = doc.history.undo();
-                reapply(doc, reverted, &deltas, &snapshots, &notifications).await
+                let reverted = session.active_mut().history.undo();
+                reapply(&mut session, reverted, &deltas, &snapshots, &notifications).await
             }
             Step::Redo => {
-                let doc = session.active_mut();
-                let reverted = doc.history.redo();
-                reapply(doc, reverted, &deltas, &snapshots, &notifications).await
+                let reverted = session.active_mut().history.redo();
+                reapply(&mut session, reverted, &deltas, &snapshots, &notifications).await
             }
-            Step::Republish => snapshots.publish(session.active().snapshot(None)),
+            Step::Republish => snapshots.publish(session.snapshot(None)),
             Step::Open(path) => {
-                open_file(
-                    session.active_mut(),
-                    path,
-                    &deltas,
-                    &snapshots,
-                    &notifications,
-                )
-                .await
+                open_file(&mut session, path, &deltas, &snapshots, &notifications).await
             }
-            Step::Save => save_file(session.active_mut(), &snapshots, &notifications).await,
+            Step::Save => save_file(&mut session, &snapshots, &notifications).await,
             Step::SaveAs(path) => {
-                save_as_file(session.active_mut(), path, &snapshots, &notifications).await
+                save_as_file(&mut session, path, &snapshots, &notifications).await
+            }
+            // An unknown id is a no-op republish: a frontend may hold a stale id from
+            // a picker entry whose buffer was closed since.
+            Step::Switch(id) => match session.index_of(id) {
+                Some(index) => switch_to(&mut session, index, &snapshots, &notifications),
+                None => snapshots.publish(session.snapshot(None)),
+            },
+            Step::Close { id, force } => {
+                close_buffer(&mut session, id, force, &snapshots, &notifications)
             }
         };
         if !alive {
@@ -1083,7 +1179,7 @@ async fn run(
 /// ranges come from the current selection set and the buffer they are validated
 /// against, rejection is not expected in M1, but the path is handled not panicked.
 async fn apply_edit(
-    doc: &mut Document,
+    session: &mut Session,
     edits: Vec<(std::ops::Range<usize>, String)>,
     deltas: &Sender<Delta>,
     snapshots: &SnapshotSink,
@@ -1092,12 +1188,13 @@ async fn apply_edit(
     if edits.is_empty() {
         // No-op (e.g. backspace at buffer start): republish so the frontend's
         // view stays current, but do not bump the version or emit a delta.
-        return snapshots.publish(doc.snapshot(None));
+        return snapshots.publish(session.snapshot(None));
     }
 
     // Snapshot the selections *before* the edit so undo can restore them.
-    let before = doc.selections.clone();
-    let Some((changes, dirty)) = apply_change_list(doc, &edits, deltas, notifications).await else {
+    let before = session.active().selections.clone();
+    let Some((changes, dirty)) = apply_change_list(session, &edits, deltas, notifications).await
+    else {
         return false; // frontend gone mid-stream
     };
 
@@ -1105,13 +1202,14 @@ async fn apply_edit(
     // do not bump the version or record history (a version bump with no delta
     // would diverge a remote frontend replaying the delta stream, SPEC §5).
     if changes.is_empty() {
-        return snapshots.publish(doc.snapshot(None));
+        return snapshots.publish(session.snapshot(None));
     }
 
     // Build the anchor-transform edit list once and share it: both the selection
     // remap and the decoration remap need the identical batch, so computing it twice
     // (a sort + allocation each) was pure waste on the keystroke path (#5).
     let edits = edits_from_changes(&changes);
+    let doc = session.active_mut();
     // Remap selections by transforming each pre-edit caret through the applied
     // edits (SPEC §2.1 anchors): a cursor lands after its own inserted text / at its
     // deletion point, and every other cursor shifts by the edits around it.
@@ -1127,7 +1225,7 @@ async fn apply_edit(
     // `sync_syntax` re-send before the next park.
     doc.lsp_dirty = true;
     doc.syntax_dirty = true;
-    snapshots.publish(doc.snapshot(dirty))
+    snapshots.publish(session.snapshot(dirty))
 }
 
 /// Apply an undo or redo, sharing the "apply edits + restore selections + publish"
@@ -1138,7 +1236,7 @@ async fn apply_edit(
 /// like any change, so a remote frontend replaying the log converges (SPEC §5) - it
 /// has no notion of "undo", only more buffer edits moving forward in version time.
 async fn reapply(
-    doc: &mut Document,
+    session: &mut Session,
     reverted: Option<Reverted>,
     deltas: &Sender<Delta>,
     snapshots: &SnapshotSink,
@@ -1146,14 +1244,15 @@ async fn reapply(
 ) -> bool {
     let Some(reverted) = reverted else {
         // Nothing to undo/redo: republish so the view stays current, no version bump.
-        return snapshots.publish(doc.snapshot(None));
+        return snapshots.publish(session.snapshot(None));
     };
 
     let Some((changes, dirty)) =
-        apply_change_list(doc, &reverted.edits, deltas, notifications).await
+        apply_change_list(session, &reverted.edits, deltas, notifications).await
     else {
         return false; // frontend gone
     };
+    let doc = session.active_mut();
     // Inverse/forward edits derived from a consistent history over this buffer
     // always apply cleanly, so `changes` is non-empty here; guard the version bump
     // anyway so a would-be no-op never advances the version without a delta.
@@ -1164,7 +1263,7 @@ async fn reapply(
     doc.lsp_dirty = true;
     doc.syntax_dirty = true;
     doc.selections = reverted.selections;
-    snapshots.publish(doc.snapshot(dirty))
+    snapshots.publish(session.snapshot(dirty))
 }
 
 /// Apply `edits` (each `(range, replacement)`, pre-sorted DESCENDING by start so
@@ -1176,11 +1275,12 @@ async fn reapply(
 /// degenerate delta or revision. Version and selection updates are the caller's job
 /// - `apply_edit` remaps to the edit ends, undo/redo restore saved selections.
 async fn apply_change_list(
-    doc: &mut Document,
+    session: &mut Session,
     edits: &[(std::ops::Range<usize>, String)],
     deltas: &Sender<Delta>,
     notifications: &Sender<Notification>,
 ) -> Option<(Vec<Change>, Option<std::ops::Range<usize>>)> {
+    let doc = session.active_mut();
     // Deltas are expressed against the pre-edit version; no edit here bumps it
     // (the caller does, once, after this returns), so read it once up front.
     let base_version = doc.version;
@@ -1230,24 +1330,44 @@ async fn apply_change_list(
     Some((changes, dirty))
 }
 
-/// Load `path` into the buffer, replacing its contents (SPEC §12.2 file
-/// lifecycle). Expressed as one whole-buffer `Delta` so the delta stream still
-/// reproduces the snapshot (SPEC §5). A missing file is not an error: it binds
-/// the path to a fresh empty buffer, created on the first `Save` (Vim's
-/// behavior). Any other read failure (permissions, non-UTF-8) is surfaced as a
-/// `Notification` and leaves state unchanged (SPEC §8). Returns `false` if the
-/// frontend has hung up.
+/// Open `path` (SPEC §12.2 file lifecycle), which with several buffers live means
+/// one of three things:
+///
+/// - **already open** - switch to that buffer rather than loading a second copy of
+///   the file. Two documents over one path would each carry their own history and
+///   could silently overwrite each other's saves.
+/// - **the active buffer is an untouched scratch** (unnamed, empty, unmodified) -
+///   load into it, so launching bare and then opening a file does not strand an
+///   empty tab.
+/// - otherwise - create a new buffer and make it active.
+///
+/// The load itself is expressed as one whole-buffer `Delta` so the delta stream
+/// still reproduces the snapshot (SPEC §5). A missing file is not an error: it binds
+/// the path to a fresh empty buffer, created on the first `Save` (Vim's behavior).
+/// Any other read failure (permissions, non-UTF-8) is surfaced as a `Notification`
+/// and creates no buffer at all - the read happens *before* anything is allocated,
+/// so a failed open leaves the session exactly as it was (SPEC §8). Returns `false`
+/// if the frontend has hung up.
 ///
 /// File I/O is blocking `std::fs` on the actor thread: acceptable for a discrete
 /// user action (not the per-keystroke hot path). Moving large loads off the
 /// critical path via a background read (SPEC §2.3) is an M5 refinement.
 async fn open_file(
-    doc: &mut Document,
+    session: &mut Session,
     path: PathBuf,
     deltas: &Sender<Delta>,
     snapshots: &SnapshotSink,
     notifications: &Sender<Notification>,
 ) -> bool {
+    // Already open: focus it. No read, no delta - the buffer on screen is the file.
+    if let Some(index) = session
+        .docs
+        .iter()
+        .position(|d| d.path == Some(path.clone()))
+    {
+        return switch_to(session, index, snapshots, notifications);
+    }
+
     // `read_to_string` folds read + UTF-8 decode into one step: it errors with
     // `InvalidData` ("stream did not contain valid UTF-8") on non-text input, so a
     // single match covers missing / unreadable / non-UTF-8 without a nested one.
@@ -1256,9 +1376,29 @@ async fn open_file(
         // Missing file: open an empty buffer bound to the path (created on save).
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => (String::new(), false),
         Err(err) => {
-            return report_file_error(doc, Some(path), &err.to_string(), snapshots, notifications);
+            return report_file_error(
+                session,
+                Some(path),
+                &err.to_string(),
+                snapshots,
+                notifications,
+            );
         }
     };
+
+    // The read succeeded, so it is safe to commit to a buffer now. Reuse an
+    // untouched scratch; otherwise open a new document beside the existing ones.
+    let scratch = {
+        let doc = session.active();
+        doc.path.is_none() && doc.buffer.byte_len() == 0 && !doc.modified()
+    };
+    if !scratch {
+        let id = session.next_buffer_id();
+        session.docs.push(Document::new(id));
+        session.active = session.docs.len() - 1;
+        session.buffers_stale = true;
+    }
+    let doc = session.active_mut();
 
     // Replace the whole buffer as one Delta. Skip the delta/version bump when
     // nothing actually changes (empty buffer, empty file) so `version` still
@@ -1308,7 +1448,93 @@ async fn open_file(
     // emitted (a missing/empty file); reporting a spurious `Some(0..0)` would tell
     // a frontend an edit happened where none did (view.rs contract).
     let dirty = changed.then(|| 0..doc.buffer.byte_len());
-    snapshots.publish(doc.snapshot(dirty))
+    // The path changed, so the cached entry for this buffer is stale.
+    session.buffers_stale = true;
+    snapshots.publish(session.snapshot(dirty))
+}
+
+/// Make `index` the active document and tell the frontend (SPEC §6). A switch
+/// changes no text, so it emits no delta and bumps no version - but the snapshot
+/// that follows describes a different buffer, with its own selections, decorations
+/// and history, all of which were preserved while it sat in the background.
+///
+/// Deliberately does *not* re-sync the producers. The newly active document keeps
+/// the decorations it had, and nothing edited it while it was inactive, so they are
+/// still correct rather than merely stale. The frontend re-attaching a grammar for a
+/// different language raises `syntax_dirty` on its own (the `SyntaxAttach` arm), so
+/// forcing a reparse here would only duplicate work on same-language switches.
+fn switch_to(
+    session: &mut Session,
+    index: usize,
+    snapshots: &SnapshotSink,
+    notifications: &Sender<Notification>,
+) -> bool {
+    if index != session.active {
+        session.active = index;
+        session.buffers_stale = true;
+    }
+    // Announced even when the buffer was already active: the frontend uses this to
+    // attach the right server and grammar, and an `Open` of the focused file is a
+    // reasonable way to ask for exactly that.
+    let doc = session.active();
+    let _ = notifications.try_send(Notification::BufferSwitched {
+        buffer_id: doc.id,
+        path: doc.path.clone(),
+    });
+    snapshots.publish(session.snapshot(None))
+}
+
+/// Close buffer `id` (SPEC §8). A modified buffer is refused unless `force`, with a
+/// `CloseRejected` the frontend turns into a confirmation prompt: the *core* holds
+/// this guard so no frontend can discard work by forgetting to ask.
+///
+/// Closing the active buffer moves focus to the one that takes its index (or the new
+/// last, if it was the last); closing the final buffer leaves a fresh empty one, so
+/// the session always has somewhere to type and `active` always resolves.
+fn close_buffer(
+    session: &mut Session,
+    id: BufferId,
+    force: bool,
+    snapshots: &SnapshotSink,
+    notifications: &Sender<Notification>,
+) -> bool {
+    // An unknown id is a stale reference from a frontend that has not seen an
+    // earlier close yet - a no-op, not an error.
+    let Some(index) = session.index_of(id) else {
+        return snapshots.publish(session.snapshot(None));
+    };
+    if session.docs[index].modified() && !force {
+        let _ = notifications.try_send(Notification::CloseRejected {
+            buffer_id: id,
+            path: session.docs[index].path.clone(),
+        });
+        return snapshots.publish(session.snapshot(None));
+    }
+
+    session.docs.remove(index);
+    session.buffers_stale = true;
+    let _ = notifications.try_send(Notification::BufferClosed { buffer_id: id });
+
+    if session.docs.is_empty() {
+        // Never leave the session with nowhere to type.
+        let fresh = session.next_buffer_id();
+        session.docs.push(Document::new(fresh));
+        session.active = 0;
+        return switch_to(session, 0, snapshots, notifications);
+    }
+    if index < session.active {
+        // Focus is unchanged, but every index after the hole shifted down.
+        session.active -= 1;
+        return snapshots.publish(session.snapshot(None));
+    }
+    if index == session.active {
+        // The active buffer is gone: focus whatever slid into its place.
+        let next = session.active.min(session.docs.len() - 1);
+        session.active = next;
+        return switch_to(session, next, snapshots, notifications);
+    }
+    // Closed a buffer after the active one: focus and indices are untouched.
+    snapshots.publish(session.snapshot(None))
 }
 
 /// Write the buffer to its bound file atomically (SPEC §8). Fails with a
@@ -1316,13 +1542,13 @@ async fn open_file(
 /// write fails; on failure the buffer stays dirty so no work is lost. Returns
 /// `false` if the frontend has hung up.
 async fn save_file(
-    doc: &mut Document,
+    session: &mut Session,
     snapshots: &SnapshotSink,
     notifications: &Sender<Notification>,
 ) -> bool {
-    let Some(path) = doc.path.clone() else {
+    let Some(path) = session.active().path.clone() else {
         return report_file_error(
-            doc,
+            session,
             None,
             "no file name (save-as not available yet)",
             snapshots,
@@ -1330,11 +1556,12 @@ async fn save_file(
         );
     };
 
-    let contents = doc.buffer.text().to_string();
+    let contents = session.active().buffer.text().to_string();
     if let Err(message) = write_atomic(&path, contents.as_bytes()) {
-        return report_file_error(doc, Some(path), &message, snapshots, notifications);
+        return report_file_error(session, Some(path), &message, snapshots, notifications);
     }
 
+    let doc = session.active_mut();
     // Mark the current history node as the on-disk state, so undoing back to it
     // later clears the modified marker (SPEC §2.4, §8).
     doc.history.mark_saved();
@@ -1342,7 +1569,7 @@ async fn save_file(
         buffer_id: doc.id,
         path,
     });
-    snapshots.publish(doc.snapshot(None))
+    snapshots.publish(session.snapshot(None))
 }
 
 /// Write the buffer to `path` and adopt it as the buffer's file (the save-as the
@@ -1360,16 +1587,17 @@ async fn save_file(
 /// forced; a save-as that changes the *language* still needs the frontend to attach
 /// the new grammar, deferred with per-buffer grammar (M7).
 async fn save_as_file(
-    doc: &mut Document,
+    session: &mut Session,
     path: PathBuf,
     snapshots: &SnapshotSink,
     notifications: &Sender<Notification>,
 ) -> bool {
-    let contents = doc.buffer.text().to_string();
+    let contents = session.active().buffer.text().to_string();
     if let Err(message) = write_atomic(&path, contents.as_bytes()) {
-        return report_file_error(doc, Some(path), &message, snapshots, notifications);
+        return report_file_error(session, Some(path), &message, snapshots, notifications);
     }
 
+    let doc = session.active_mut();
     // A different target is a different document to the server; re-announce it so
     // diagnostics track the new name rather than the old one.
     if doc.path.as_deref() != Some(path.as_path()) {
@@ -1384,25 +1612,25 @@ async fn save_as_file(
         buffer_id: doc.id,
         path,
     });
-    snapshots.publish(doc.snapshot(None))
+    snapshots.publish(session.snapshot(None))
 }
 
 /// Emit a `FileError` and republish current state, leaving the buffer untouched
 /// (SPEC §8: a failed file op never loses work). Returns the publish's liveness so
 /// callers can `return report_file_error(...)` directly.
 fn report_file_error(
-    doc: &Document,
+    session: &mut Session,
     path: Option<PathBuf>,
     message: &str,
     snapshots: &SnapshotSink,
     notifications: &Sender<Notification>,
 ) -> bool {
     let _ = notifications.try_send(Notification::FileError {
-        buffer_id: doc.id,
+        buffer_id: session.active().id,
         path,
         message: message.to_string(),
     });
-    snapshots.publish(doc.snapshot(None))
+    snapshots.publish(session.snapshot(None))
 }
 
 /// Write `bytes` to `path` atomically: write a sibling temp file, flush it, then

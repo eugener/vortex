@@ -29,6 +29,22 @@ use crate::selection::Selection;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct BufferId(pub u64);
 
+/// One entry in the snapshot's list of open buffers - what a bufferline or buffer
+/// picker paints, for the buffers that are *not* on screen (SPEC §7.5).
+///
+/// Carried on [`ViewSnapshot`] rather than fetched, for the same reason its `path`
+/// and `modified` are: a local frontend paints the whole strip with zero round
+/// trips (SPEC §5). The core rebuilds this list only when it actually changes, so
+/// an edit does not re-clone every open buffer's path per keystroke.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BufferInfo {
+    pub id: BufferId,
+    /// The file this buffer is bound to, or `None` for an unnamed buffer.
+    pub path: Option<PathBuf>,
+    /// Whether it has unsaved edits - the modified marker on its tab.
+    pub modified: bool,
+}
+
 /// The authoritative "what changed" message: replace `range` (byte offsets in the
 /// pre-edit buffer) with `new_text` (SPEC §5). This is the exact shape of the
 /// buffer's edit primitive, and applying the delta stream from version N to a
@@ -99,6 +115,11 @@ pub struct ViewSnapshot {
     /// `dirty` (the repaint hint): this is purely "is there unsaved work". The
     /// frontend paints a modified marker from it (SPEC §8, §10).
     pub modified: bool,
+    /// Every open buffer, in the order a bufferline lists them, including the
+    /// active one (identified by `buffer_id`). `Arc`-shared and rebuilt only when
+    /// the set actually changes, so carrying it costs a ref-count bump per frame
+    /// (SPEC §5). Never empty: a session always holds at least one buffer.
+    pub buffers: Arc<[BufferInfo]>,
 }
 
 /// Discrete core -> frontend events (errors, status, prompts). Self-contained on
@@ -141,6 +162,25 @@ pub enum Notification {
     /// in the core for a `Paste` round-trip. Serializable so it rides the remote
     /// seam too (a remote frontend bridges to *its* clipboard).
     SetClipboard { text: String },
+    /// The active buffer changed (an `Open` of an already-open file, a
+    /// `SwitchBuffer`, or the buffer that inherited focus after a close). Carries
+    /// the newly active buffer's path so the frontend can attach the right language
+    /// server and grammar for it, the same way it does off `FileOpened` - a switch
+    /// changes the *language* on screen just as much as an open does.
+    BufferSwitched {
+        buffer_id: BufferId,
+        path: Option<PathBuf>,
+    },
+    /// A buffer was closed and is gone from the snapshot's buffer list.
+    BufferClosed { buffer_id: BufferId },
+    /// A close was refused because the buffer has unsaved edits (SPEC §8: never
+    /// silently lose work). The frontend confirms with the user and, if they accept,
+    /// re-sends the close with `force`. Carries the path so the prompt can name the
+    /// file it is about to discard.
+    CloseRejected {
+        buffer_id: BufferId,
+        path: Option<PathBuf>,
+    },
     /// The core has stopped its loop and will send nothing further.
     ShuttingDown,
 }

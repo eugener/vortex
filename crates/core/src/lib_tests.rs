@@ -730,6 +730,7 @@ fn a_diagnostic_and_a_highlight_both_reach_the_snapshot() {
             .unwrap();
         sx_event_tx
             .send(SyntaxEvent::Highlights {
+                buffer_id: BufferId(0),
                 version: 1,
                 spans: vec![HighlightSpan {
                     range: 0..3,
@@ -1157,6 +1158,7 @@ fn a_highlight_batch_lands_on_the_snapshot_decorations() {
         // it directly to test the editor's plumbing, not the parser.
         fake.events
             .send(SyntaxEvent::Highlights {
+                buffer_id: BufferId(0),
                 version: snap.version,
                 spans: vec![HighlightSpan {
                     range: 0..2,
@@ -1182,6 +1184,7 @@ fn re_publishing_an_identical_batch_changes_nothing() {
         let fake = attach_syntax(&h).await;
         let snap = step(&h, Action::Insert("fn f() {}".into())).await;
         let batch = || SyntaxEvent::Highlights {
+            buffer_id: BufferId(0),
             version: snap.version,
             spans: vec![HighlightSpan {
                 range: 0..2,
@@ -1217,6 +1220,7 @@ fn a_highlight_batch_for_a_stale_version_is_dropped() {
         // A batch tagged with the old version 0.
         fake.events
             .send(SyntaxEvent::Highlights {
+                buffer_id: BufferId(0),
                 version: 0,
                 spans: vec![HighlightSpan {
                     range: 0..2,
@@ -1231,6 +1235,390 @@ fn a_highlight_batch_for_a_stale_version_is_dropped() {
         assert!(
             after.decorations.is_empty(),
             "a stale-version batch must not install any highlights"
+        );
+    });
+}
+
+/// Every notification the core has emitted and not yet been read.
+fn drain_notifications(h: &CoreHandle) -> Vec<Notification> {
+    std::iter::from_fn(|| h.notifications.try_recv().ok()).collect()
+}
+
+/// Open `count` files through the seam, returning their buffer ids in open order.
+/// The last one is left active, as opening does.
+async fn open_files(h: &CoreHandle, dir: &TempDir, count: usize) -> Vec<BufferId> {
+    let mut ids = Vec::new();
+    for n in 0..count {
+        let path = dir.0.join(format!("file{n}.txt"));
+        std::fs::write(&path, format!("contents {n}")).unwrap();
+        ids.push(step(h, Action::Open(path)).await.buffer_id);
+    }
+    ids
+}
+
+#[test]
+fn switching_buffers_restores_that_buffers_own_state() {
+    // A background buffer keeps its text, carets and history untouched, so switching
+    // back is a return to exactly what was left - the whole point of multi-buffer.
+    drive(|h| async move {
+        let dir = TempDir::new();
+        let ids = open_files(&h, &dir, 2).await;
+
+        // Type in the second buffer, then go back to the first.
+        step(&h, Action::Insert("edited ".into())).await;
+        let back = step(&h, Action::SwitchBuffer { id: ids[0] }).await;
+        assert_eq!(back.buffer_id, ids[0]);
+        assert_eq!(back.text.to_string(), "contents 0");
+        assert!(!back.modified);
+
+        let forward = step(&h, Action::SwitchBuffer { id: ids[1] }).await;
+        assert_eq!(forward.text.to_string(), "edited contents 1");
+        assert!(forward.modified, "its unsaved edit survived the round trip");
+        // Undo still works against that buffer's own history.
+        let undone = step(&h, Action::Undo).await;
+        assert_eq!(undone.text.to_string(), "contents 1");
+    });
+}
+
+#[test]
+fn switching_to_an_unknown_buffer_is_a_no_op() {
+    // A frontend can hold a stale id (a picker entry for a buffer closed since).
+    // It must not panic or silently focus the wrong buffer.
+    drive(|h| async move {
+        let dir = TempDir::new();
+        let ids = open_files(&h, &dir, 1).await;
+        let after = step(&h, Action::SwitchBuffer { id: BufferId(9999) }).await;
+        assert_eq!(after.buffer_id, ids[0], "focus is unchanged");
+    });
+}
+
+#[test]
+fn closing_a_modified_buffer_is_refused_until_forced() {
+    // SPEC §8: the core will not discard unsaved work, and it is the core that
+    // enforces it - a frontend cannot skip the check by forgetting to ask.
+    drive(|h| async move {
+        let dir = TempDir::new();
+        let ids = open_files(&h, &dir, 2).await;
+        step(&h, Action::Insert("dirty".into())).await;
+
+        let after = step(
+            &h,
+            Action::CloseBuffer {
+                id: ids[1],
+                force: false,
+            },
+        )
+        .await;
+        assert_eq!(after.buffers.len(), 2, "nothing was closed");
+        assert_eq!(after.buffer_id, ids[1], "and it is still focused");
+        let notes = drain_notifications(&h);
+        assert!(
+            notes.iter().any(|n| matches!(
+                n,
+                Notification::CloseRejected { buffer_id, .. } if *buffer_id == ids[1]
+            )),
+            "expected CloseRejected, got {notes:?}"
+        );
+
+        // Forcing discards the work, which is the user's call to make.
+        let after = step(
+            &h,
+            Action::CloseBuffer {
+                id: ids[1],
+                force: true,
+            },
+        )
+        .await;
+        assert_eq!(after.buffers.len(), 1);
+        assert_eq!(after.buffer_id, ids[0], "focus fell back to the neighbor");
+    });
+}
+
+#[test]
+fn closing_an_unmodified_buffer_needs_no_force() {
+    drive(|h| async move {
+        let dir = TempDir::new();
+        let ids = open_files(&h, &dir, 2).await;
+        let after = step(
+            &h,
+            Action::CloseBuffer {
+                id: ids[0],
+                force: false,
+            },
+        )
+        .await;
+        assert_eq!(after.buffers.len(), 1);
+        assert_eq!(after.buffers[0].id, ids[1]);
+        // Closing a *background* buffer leaves focus alone.
+        assert_eq!(after.buffer_id, ids[1]);
+        let notes = drain_notifications(&h);
+        assert!(
+            notes.iter().any(|n| matches!(
+                n,
+                Notification::BufferClosed { buffer_id } if *buffer_id == ids[0]
+            )),
+            "expected BufferClosed, got {notes:?}"
+        );
+    });
+}
+
+#[test]
+fn closing_the_last_buffer_leaves_a_fresh_one() {
+    // The session must always have somewhere to type, so the final close yields an
+    // empty unnamed buffer rather than an empty session (which `active` could not
+    // resolve against).
+    drive(|h| async move {
+        let dir = TempDir::new();
+        let ids = open_files(&h, &dir, 1).await;
+        let after = step(
+            &h,
+            Action::CloseBuffer {
+                id: ids[0],
+                force: false,
+            },
+        )
+        .await;
+        assert_eq!(after.buffers.len(), 1);
+        assert_ne!(after.buffer_id, ids[0], "a different, fresh buffer");
+        assert!(after.text.is_empty());
+        assert!(after.path.is_none());
+        assert!(!after.modified);
+        // Still live: it accepts edits like any buffer.
+        let typed = step(&h, Action::Insert("hello".into())).await;
+        assert_eq!(typed.text.to_string(), "hello");
+    });
+}
+
+#[test]
+fn closing_a_buffer_before_the_active_one_keeps_focus() {
+    // Removing an earlier entry shifts every later index down; focus must follow the
+    // buffer, not the index it happened to sit at.
+    drive(|h| async move {
+        let dir = TempDir::new();
+        let ids = open_files(&h, &dir, 3).await;
+        assert_eq!(ids.len(), 3);
+        let after = step(
+            &h,
+            Action::CloseBuffer {
+                id: ids[0],
+                force: false,
+            },
+        )
+        .await;
+        assert_eq!(after.buffer_id, ids[2], "still the buffer that was active");
+        assert_eq!(after.text.to_string(), "contents 2");
+        let listed: Vec<_> = after.buffers.iter().map(|i| i.id).collect();
+        assert_eq!(listed, vec![ids[1], ids[2]]);
+    });
+}
+
+#[test]
+fn closing_a_buffer_after_the_active_one_changes_nothing() {
+    // The mirror of the shift case: removing a later entry leaves both focus and
+    // every earlier index alone.
+    drive(|h| async move {
+        let dir = TempDir::new();
+        let ids = open_files(&h, &dir, 3).await;
+        step(&h, Action::SwitchBuffer { id: ids[1] }).await;
+        let after = step(
+            &h,
+            Action::CloseBuffer {
+                id: ids[2],
+                force: false,
+            },
+        )
+        .await;
+        assert_eq!(after.buffer_id, ids[1], "focus is untouched");
+        let listed: Vec<_> = after.buffers.iter().map(|i| i.id).collect();
+        assert_eq!(listed, vec![ids[0], ids[1]]);
+    });
+}
+
+#[test]
+fn closing_an_unknown_buffer_is_a_no_op() {
+    // The close twin of a stale switch: a frontend may still hold an id for a buffer
+    // closed by some other path. Nothing to close is not an error.
+    drive(|h| async move {
+        let dir = TempDir::new();
+        let ids = open_files(&h, &dir, 1).await;
+        let after = step(
+            &h,
+            Action::CloseBuffer {
+                id: BufferId(9999),
+                force: false,
+            },
+        )
+        .await;
+        assert_eq!(after.buffers.len(), 1);
+        assert_eq!(after.buffer_id, ids[0]);
+    });
+}
+
+#[test]
+fn a_highlight_batch_for_a_closed_buffer_is_dropped() {
+    // A parse can outlive the buffer it was for: the user closes a file while its
+    // reparse is in flight. The batch has nowhere to land and must be discarded
+    // without touching whatever is on screen now.
+    drive(|h| async move {
+        let dir = TempDir::new();
+        let fake = attach_syntax(&h).await;
+        let ids = open_files(&h, &dir, 2).await;
+        let closed = ids[0];
+        step(
+            &h,
+            Action::CloseBuffer {
+                id: closed,
+                force: false,
+            },
+        )
+        .await;
+
+        fake.events
+            .send(SyntaxEvent::Highlights {
+                buffer_id: closed,
+                version: 0,
+                spans: vec![HighlightSpan {
+                    range: 0..2,
+                    kind: HighlightKind::Keyword,
+                }],
+            })
+            .await
+            .unwrap();
+
+        let after = step(&h, Action::RequestSnapshot).await;
+        assert_eq!(after.buffer_id, ids[1]);
+        assert!(
+            after.decorations.is_empty(),
+            "a batch for a closed buffer must not paint the survivor"
+        );
+    });
+}
+
+#[test]
+fn the_snapshot_buffer_list_tracks_opens_closes_and_edits() {
+    drive(|h| async move {
+        let dir = TempDir::new();
+        let first = step(&h, Action::RequestSnapshot).await;
+        assert_eq!(first.buffers.len(), 1, "the session starts with a scratch");
+
+        let ids = open_files(&h, &dir, 2).await;
+        let after = step(&h, Action::RequestSnapshot).await;
+        // The first open reused the untouched scratch, the second added a buffer.
+        assert_eq!(after.buffers.len(), 2);
+        assert!(after.buffers.iter().all(|i| i.path.is_some()));
+        assert!(after.buffers.iter().all(|i| !i.modified));
+
+        let edited = step(&h, Action::Insert("x".into())).await;
+        let entry = edited
+            .buffers
+            .iter()
+            .find(|i| i.id == ids[1])
+            .expect("the edited buffer is listed");
+        assert!(entry.modified, "the list shows the unsaved marker");
+    });
+}
+
+#[test]
+fn a_highlight_batch_never_paints_a_different_buffer() {
+    // REGRESSION (M7): the batch guard used to be `version` alone. Versions are
+    // per-buffer (SPEC §5), so two open documents sit at the same version all the
+    // time - a batch parsed against one would then install its spans into whichever
+    // buffer happened to be active, at offsets that mean nothing in that text. That
+    // is a *misplacement*, which the overlay contract forbids outright (overlays may
+    // trail the text, never mislead about it).
+    //
+    // Both buffers here are at the same version, so a version-only guard passes and
+    // the spans land on the wrong file.
+    drive(|h| async move {
+        let dir = TempDir::new();
+        let fake = attach_syntax(&h).await;
+
+        let first = dir.0.join("first.rs");
+        std::fs::write(&first, "fn alpha() {}").unwrap();
+        let opened = step(&h, Action::Open(first)).await;
+        let background = opened.buffer_id;
+
+        let second = dir.0.join("second.rs");
+        std::fs::write(&second, "fn beta() {}").unwrap();
+        let active = step(&h, Action::Open(second)).await;
+        assert_ne!(active.buffer_id, background, "two buffers are open");
+        assert_eq!(
+            active.version, opened.version,
+            "the premise: both are at the same version"
+        );
+
+        // A batch belonging to the *background* buffer, at the version both share.
+        fake.events
+            .send(SyntaxEvent::Highlights {
+                buffer_id: background,
+                version: active.version,
+                spans: vec![HighlightSpan {
+                    range: 0..2,
+                    kind: HighlightKind::Keyword,
+                }],
+            })
+            .await
+            .unwrap();
+
+        let after = step(&h, Action::RequestSnapshot).await;
+        assert_eq!(after.buffer_id, active.buffer_id);
+        assert!(
+            after.decorations.is_empty(),
+            "a batch parsed against another buffer must not paint the active one"
+        );
+
+        // It is not merely dropped: switching to the buffer it belongs to shows it.
+        let switched = step(&h, Action::SwitchBuffer { id: background }).await;
+        assert_eq!(
+            switched
+                .decorations
+                .highlights_in(0..13)
+                .collect::<Vec<_>>(),
+            vec![(0..2, HighlightKind::Keyword)],
+            "the batch belongs to this buffer and must have landed here"
+        );
+    });
+}
+
+#[test]
+fn diagnostics_reach_a_buffer_that_is_not_on_screen() {
+    // REGRESSION (M7): diagnostics were applied to the active document only, so a
+    // server publishing for another file in the workspace - which it does constantly,
+    // that is what a workspace-wide analysis *is* - had its batch dropped on the
+    // floor. Switching to that buffer then showed a clean file that is not clean.
+    drive_lsp(|h, server| async move {
+        let dir = TempDir::new();
+        let background = dir.0.join("first.rs");
+        std::fs::write(&background, "let x = 1").unwrap();
+        let opened = step(&h, Action::Open(background.clone())).await;
+        let background_id = opened.buffer_id;
+
+        let front = dir.0.join("second.rs");
+        std::fs::write(&front, "let y = 2").unwrap();
+        let active = step(&h, Action::Open(front)).await;
+        assert_ne!(active.buffer_id, background_id);
+
+        // The server reports on the file that is *not* on screen.
+        server
+            .events
+            .send(LspEvent::Diagnostics {
+                path: background,
+                diagnostics: vec![diag(0, 4, 5, Severity::Error)],
+            })
+            .await
+            .unwrap();
+
+        let after = step(&h, Action::RequestSnapshot).await;
+        assert!(
+            after.decorations.is_empty(),
+            "another buffer's diagnostics must not appear on this one"
+        );
+
+        let switched = step(&h, Action::SwitchBuffer { id: background_id }).await;
+        assert_eq!(
+            switched.decorations.underlines_in(0..9).count(),
+            1,
+            "the diagnostic must be waiting on the buffer it was published for"
         );
     });
 }
@@ -1260,6 +1648,7 @@ fn attaching_a_second_highlighter_replaces_the_first() {
         second
             .events
             .send(SyntaxEvent::Highlights {
+                buffer_id: BufferId(0),
                 version: snap.version,
                 spans: vec![HighlightSpan {
                     range: 0..2,
@@ -1294,6 +1683,7 @@ fn a_highlight_batch_that_cannot_be_published_stops_the_actor() {
         // stops.
         fake.events
             .send(SyntaxEvent::Highlights {
+                buffer_id: BufferId(0),
                 version: 0,
                 spans: vec![HighlightSpan {
                     range: 0..2,

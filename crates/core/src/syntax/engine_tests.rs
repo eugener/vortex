@@ -3,6 +3,8 @@ use std::future::Future;
 use async_channel::{Receiver, Sender};
 use tree_sitter::Language;
 
+use crate::view::BufferId;
+
 use super::{SyntaxError, SyntaxHandle, highlighter};
 use crate::decoration::HighlightKind;
 use crate::syntax::{HighlightSpan, SyntaxEvent, SyntaxSync};
@@ -49,12 +51,13 @@ fn parses_text_and_emits_highlights_for_its_version() {
     let source = "fn main() {}";
     let (spans, version) = drive_rust(|sync, events| async move {
         sync.send(SyntaxSync {
+            buffer_id: BufferId(0),
             version: 7,
             text: source.into(),
         })
         .await
         .unwrap();
-        let SyntaxEvent::Highlights { version, spans } = events.recv().await.unwrap();
+        let SyntaxEvent::Highlights { version, spans, .. } = events.recv().await.unwrap();
         (spans, version)
     });
     // The batch is tagged with the version it parsed, so the editor can reason
@@ -79,11 +82,13 @@ fn coalesces_to_the_newest_queued_text() {
     // so the first event we see is the *second* version, never the first.
     let version = drive_rust(|sync, events| async move {
         sync.try_send(SyntaxSync {
+            buffer_id: BufferId(0),
             version: 1,
             text: "fn old() {}".into(),
         })
         .unwrap();
         sync.try_send(SyntaxSync {
+            buffer_id: BufferId(0),
             version: 2,
             text: "fn new() {}".into(),
         })
@@ -101,6 +106,7 @@ fn coalesces_to_the_newest_queued_text() {
 fn an_empty_buffer_highlights_nothing() {
     let spans = drive_rust(|sync, events| async move {
         sync.send(SyntaxSync {
+            buffer_id: BufferId(0),
             version: 1,
             text: "".into(),
         })
@@ -120,6 +126,7 @@ fn successive_edits_each_produce_a_fresh_batch() {
         let mut seen = Vec::new();
         for (v, text) in [(1u64, "fn a() {}"), (2, "fn ab() {}"), (3, "fn abc() {}")] {
             sync.send(SyntaxSync {
+                buffer_id: BufferId(0),
                 version: v,
                 text: text.into(),
             })
@@ -164,6 +171,7 @@ fn the_editor_dropping_the_event_channel_stops_the_loop() {
     let result = smol::block_on(ex.run(async move {
         let SyntaxHandle { sync, events } = handle;
         sync.send(SyntaxSync {
+            buffer_id: BufferId(0),
             version: 1,
             text: "fn a() {}".into(),
         })
@@ -174,6 +182,7 @@ fn the_editor_dropping_the_event_channel_stops_the_loop() {
         events.recv().await.unwrap();
         drop(events);
         sync.send(SyntaxSync {
+            buffer_id: BufferId(0),
             version: 2,
             text: "fn b() {}".into(),
         })
