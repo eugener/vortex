@@ -16,6 +16,7 @@ pub mod lsp;
 pub mod selection;
 pub mod syntax;
 pub mod view;
+pub mod watch;
 
 pub use action::Action;
 pub use buffer::{Buffer, ByteRange, EditError, Position, RopeBuffer, Text, Utf16Position};
@@ -28,6 +29,7 @@ pub use lsp::{Diagnostic, DocumentSync, LspEvent, LspHandle};
 pub use selection::{Motion, Selection, SelectionSet};
 pub use syntax::{HighlightSpan, SyntaxEvent, SyntaxHandle, SyntaxSync, highlighter};
 pub use view::{BufferId, BufferInfo, Delta, Notification, ViewSnapshot};
+pub use watch::{FileEvent, WatchHandle, WatchRequest};
 
 #[cfg(test)]
 #[path = "lib_tests.rs"]

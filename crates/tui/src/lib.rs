@@ -31,6 +31,7 @@ pub mod prompt;
 pub mod theme;
 pub mod themepicker;
 pub mod toast;
+pub mod watcher;
 
 // Shared unit-test helpers. Compiled only under `cfg(test)`, so nothing test-only
 // ships in a release build; the binary keeps its own `#[cfg(test)] mod testutil`

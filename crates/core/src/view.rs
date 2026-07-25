@@ -184,6 +184,28 @@ pub enum Notification {
     },
     /// A buffer was closed and is gone from the snapshot's buffer list.
     BufferClosed { buffer_id: BufferId },
+    /// The file behind a clean buffer changed on disk and the buffer was brought
+    /// up to date with it (SPEC §8). There was no unsaved work to weigh against
+    /// it, so the reload is silent rather than a question - the frontend shows it
+    /// as status, not a prompt.
+    FileReloaded { buffer_id: BufferId, path: PathBuf },
+    /// The file behind a buffer changed on disk and the core did **not** act on
+    /// it, so the user must (SPEC §8: never silently overwrite either side).
+    ///
+    /// Either the buffer has unsaved edits - reloading would discard them, keeping
+    /// them would discard the file's - or the file is gone. The frontend prompts;
+    /// `Action::Reload` takes the disk side, and doing nothing keeps the buffer.
+    ExternalChange {
+        buffer_id: BufferId,
+        path: PathBuf,
+        /// The file no longer exists. Nothing to reload from: the buffer is the
+        /// only copy left, and saving it writes the file back.
+        removed: bool,
+    },
+    /// A reload was refused because the buffer has unsaved edits, the twin of
+    /// [`Notification::CloseRejected`] and for the same reason: discarding work
+    /// takes the user saying so, and the *core* is where that cannot be skipped.
+    ReloadRejected { buffer_id: BufferId, path: PathBuf },
     /// A close was refused because the buffer has unsaved edits (SPEC §8: never
     /// silently lose work). The frontend confirms with the user and, if they accept,
     /// re-sends the close with `force`. Carries the path so the prompt can name the

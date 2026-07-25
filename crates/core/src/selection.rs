@@ -174,6 +174,30 @@ impl SelectionSet {
         }
     }
 
+    /// Pull every selection back inside a buffer of `len` bytes, keeping the ones
+    /// that already fit exactly where they are.
+    ///
+    /// For a reload (SPEC §10.2), where the text is replaced wholesale by a
+    /// version the anchors know nothing about: the file usually changed somewhere
+    /// other than where the user was looking, so collapsing every caret to the
+    /// origin would throw away their place for no reason. Clamping keeps it
+    /// wherever it is still a position at all.
+    ///
+    /// Selections that clamp onto the same offset merge, so the sorted-disjoint
+    /// invariant holds; a set clamped to an empty buffer is one cursor at 0.
+    pub(crate) fn clamp_to(&mut self, len: usize) {
+        if self.selections.iter().all(|s| s.end() <= len) {
+            return;
+        }
+        let primary_head = self.primary().head.min(len);
+        let clamped = self
+            .selections
+            .iter()
+            .map(|s| Selection::new(s.anchor.min(len), s.head.min(len)))
+            .collect();
+        self.normalize(clamped, primary_head);
+    }
+
     /// The selections, in sorted order.
     pub fn all(&self) -> &[Selection] {
         &self.selections

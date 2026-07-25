@@ -126,6 +126,20 @@ pub enum Action {
     /// neighbor; closing the last one leaves a fresh empty buffer, since a session
     /// always has somewhere to type.
     CloseBuffer { id: BufferId, force: bool },
+    /// Re-read buffer `id` from its file, discarding the buffer's own contents
+    /// (SPEC §10.2). Sent when the user resolves the conflict a
+    /// `Notification::ExternalChange` raised by taking the disk side.
+    ///
+    /// Refused with a `Notification::ReloadRejected` when the buffer has unsaved
+    /// edits, unless `force` - the same guard `CloseBuffer` carries, for the same
+    /// reason: a reload discards work just as thoroughly as a close, so the *core*
+    /// holds the check rather than trusting every frontend to ask first (SPEC §8).
+    /// A buffer with no file bound, or an unknown id, is a no-op.
+    ///
+    /// Selections are clamped to the new text rather than reset: the file usually
+    /// changed somewhere other than where the user was looking, and sending the
+    /// caret home would be its own kind of lost work.
+    Reload { id: BufferId, force: bool },
     /// Shut the editor down cleanly. The core drains and stops its loop.
     Quit,
 }

@@ -705,6 +705,540 @@ fn a_file_that_did_not_fully_decode_opens_read_only() {
     );
 }
 
+// --- External changes (SPEC §10.2) --------------------------------------------
+
+/// A session with `path` open, plus a channel standing in for the frontend's
+/// watcher so the tests can assert on what the core asked it to watch.
+fn watching(path: &Path, h: &Harness) -> (Session, Receiver<WatchRequest>) {
+    let (watch_tx, watch_rx) = async_channel::bounded::<WatchRequest>(16);
+    let mut e = Session::new();
+    e.watch = Some(watch_tx);
+    assert!(smol::block_on(open_file(
+        &mut e,
+        path.to_path_buf(),
+        &h.delta_tx,
+        &h.snapshots,
+        &h.note_tx,
+    )));
+    let _ = h.snapshot(); // drain the open's snapshot
+    while h.delta_rx.try_recv().is_ok() {} // ...and the delta that loaded it
+    (e, watch_rx)
+}
+
+/// Every notification queued so far.
+fn drain_notes(h: &Harness) -> Vec<Notification> {
+    std::iter::from_fn(|| h.note_rx.try_recv().ok()).collect()
+}
+
+#[test]
+fn a_clean_buffer_follows_its_file() {
+    let dir = TempDir::new();
+    let path = dir.file("notes.txt");
+    std::fs::write(&path, "before\n").unwrap();
+
+    let h = Harness::new();
+    let (mut e, _watch) = watching(&path, &h);
+    let _ = drain_notes(&h);
+
+    std::fs::write(&path, "after the change\n").unwrap();
+    assert!(smol::block_on(external_change(
+        &mut e,
+        &path,
+        &h.delta_tx,
+        &h.snapshots,
+        &h.note_tx,
+    )));
+
+    assert_eq!(e.active().buffer.text().to_string(), "after the change\n");
+    assert!(!e.active().modified(), "a reload is the on-disk state");
+    let notes = drain_notes(&h);
+    assert!(
+        notes
+            .iter()
+            .any(|n| matches!(n, Notification::FileReloaded { .. })),
+        "expected FileReloaded, got {notes:?}"
+    );
+    // The reload is one whole-buffer delta, so a remote frontend replaying the
+    // stream still lands on the same text (SPEC §5).
+    let delta = h.delta_rx.try_recv().expect("a delta for the reload");
+    assert_eq!(delta.new_text, "after the change\n");
+}
+
+#[test]
+fn a_modified_buffer_asks_instead_of_following() {
+    let dir = TempDir::new();
+    let path = dir.file("notes.txt");
+    std::fs::write(&path, "before\n").unwrap();
+
+    let h = Harness::new();
+    let (mut e, _watch) = watching(&path, &h);
+    mark_dirty(&mut e);
+    let _ = drain_notes(&h);
+
+    std::fs::write(&path, "someone else's version\n").unwrap();
+    assert!(smol::block_on(external_change(
+        &mut e,
+        &path,
+        &h.delta_tx,
+        &h.snapshots,
+        &h.note_tx,
+    )));
+
+    // Neither side was overwritten: the buffer is untouched and so is the file.
+    assert_eq!(e.active().buffer.text().to_string(), "before\n");
+    assert_eq!(
+        std::fs::read_to_string(&path).unwrap(),
+        "someone else's version\n"
+    );
+    let notes = drain_notes(&h);
+    assert!(
+        notes
+            .iter()
+            .any(|n| matches!(n, Notification::ExternalChange { removed: false, .. })),
+        "expected an ExternalChange, got {notes:?}"
+    );
+}
+
+#[test]
+fn the_editors_own_save_is_not_an_external_change() {
+    // The loudest source of change events is this editor writing the file. Reading
+    // that back as someone else's edit would make the feature unusable.
+    let dir = TempDir::new();
+    let path = dir.file("notes.txt");
+    std::fs::write(&path, "before\n").unwrap();
+
+    let h = Harness::new();
+    let (mut e, _watch) = watching(&path, &h);
+    e.active_mut().selections = SelectionSet::at_origin();
+    let edits = e.active().plan_edit(EditKind::Insert("typed ".into()));
+    smol::block_on(apply_edit(
+        &mut e,
+        edits,
+        &h.delta_tx,
+        &h.snapshots,
+        &h.note_tx,
+    ));
+    assert!(smol::block_on(save_file(&mut e, &h.snapshots, &h.note_tx)));
+    let _ = drain_notes(&h);
+
+    assert!(smol::block_on(external_change(
+        &mut e,
+        &path,
+        &h.delta_tx,
+        &h.snapshots,
+        &h.note_tx,
+    )));
+    assert_eq!(
+        drain_notes(&h),
+        Vec::new(),
+        "our own write must raise nothing"
+    );
+}
+
+#[test]
+fn one_external_write_raises_one_prompt_however_many_events_arrive() {
+    // Platforms send several events for a single write. The stamp is advanced when
+    // the conflict is reported, so the repeats find nothing new to say.
+    let dir = TempDir::new();
+    let path = dir.file("notes.txt");
+    std::fs::write(&path, "before\n").unwrap();
+
+    let h = Harness::new();
+    let (mut e, _watch) = watching(&path, &h);
+    mark_dirty(&mut e);
+    let _ = drain_notes(&h);
+
+    std::fs::write(&path, "changed by someone else\n").unwrap();
+    for _ in 0..3 {
+        assert!(smol::block_on(external_change(
+            &mut e,
+            &path,
+            &h.delta_tx,
+            &h.snapshots,
+            &h.note_tx,
+        )));
+    }
+
+    let conflicts = drain_notes(&h)
+        .iter()
+        .filter(|n| matches!(n, Notification::ExternalChange { .. }))
+        .count();
+    assert_eq!(conflicts, 1);
+}
+
+#[test]
+fn a_removed_file_keeps_the_buffer_that_is_now_its_only_copy() {
+    let dir = TempDir::new();
+    let path = dir.file("notes.txt");
+    std::fs::write(&path, "precious\n").unwrap();
+
+    let h = Harness::new();
+    let (mut e, _watch) = watching(&path, &h);
+    let _ = drain_notes(&h);
+
+    std::fs::remove_file(&path).unwrap();
+    assert!(smol::block_on(external_change(
+        &mut e,
+        &path,
+        &h.delta_tx,
+        &h.snapshots,
+        &h.note_tx,
+    )));
+
+    // Emphatically not reloaded to empty.
+    assert_eq!(e.active().buffer.text().to_string(), "precious\n");
+    let notes = drain_notes(&h);
+    assert!(
+        notes
+            .iter()
+            .any(|n| matches!(n, Notification::ExternalChange { removed: true, .. })),
+        "expected a removal, got {notes:?}"
+    );
+}
+
+#[test]
+fn an_event_for_a_file_no_buffer_holds_is_ignored() {
+    // Directories are watched, not files, so events about the neighbours arrive as
+    // a matter of course.
+    let dir = TempDir::new();
+    let path = dir.file("notes.txt");
+    std::fs::write(&path, "mine\n").unwrap();
+    let stranger = dir.file("theirs.txt");
+    std::fs::write(&stranger, "not mine\n").unwrap();
+
+    let h = Harness::new();
+    let (mut e, _watch) = watching(&path, &h);
+    let _ = drain_notes(&h);
+
+    assert!(smol::block_on(external_change(
+        &mut e,
+        &stranger,
+        &h.delta_tx,
+        &h.snapshots,
+        &h.note_tx,
+    )));
+    assert_eq!(drain_notes(&h), Vec::new());
+}
+
+#[test]
+fn a_reload_keeps_the_cursor_where_the_text_still_reaches() {
+    let dir = TempDir::new();
+    let path = dir.file("log.txt");
+    std::fs::write(&path, "one\ntwo\nthree\n").unwrap();
+
+    let h = Harness::new();
+    let (mut e, _watch) = watching(&path, &h);
+    e.active_mut().selections = SelectionSet::single(Selection::cursor(9));
+
+    // A file that grew: the caret is still a valid position, so it does not move.
+    std::fs::write(&path, "one\ntwo\nthree\nfour\n").unwrap();
+    smol::block_on(external_change(
+        &mut e,
+        &path,
+        &h.delta_tx,
+        &h.snapshots,
+        &h.note_tx,
+    ));
+    assert_eq!(e.active().selections.primary().head, 9);
+
+    // A file that shrank past the caret: clamped to the end, not sent home.
+    std::fs::write(&path, "one\n").unwrap();
+    smol::block_on(external_change(
+        &mut e,
+        &path,
+        &h.delta_tx,
+        &h.snapshots,
+        &h.note_tx,
+    ));
+    assert_eq!(e.active().selections.primary().head, 4);
+}
+
+#[test]
+fn a_reload_that_finds_the_same_bytes_emits_nothing() {
+    // Idempotence is what makes a burst of duplicate events harmless.
+    let dir = TempDir::new();
+    let path = dir.file("notes.txt");
+    std::fs::write(&path, "unchanged\n").unwrap();
+
+    let h = Harness::new();
+    let (mut e, _watch) = watching(&path, &h);
+    let version = e.active().version;
+    let _ = drain_notes(&h);
+    while h.delta_rx.try_recv().is_ok() {}
+
+    assert!(smol::block_on(reload(
+        &mut e,
+        0,
+        path,
+        &h.delta_tx,
+        &h.snapshots,
+        &h.note_tx,
+    )));
+    assert_eq!(
+        e.active().version,
+        version,
+        "no version bump without a delta"
+    );
+    assert!(h.delta_rx.is_empty());
+}
+
+#[test]
+fn reload_is_refused_on_a_modified_buffer_unless_forced() {
+    let dir = TempDir::new();
+    let path = dir.file("notes.txt");
+    std::fs::write(&path, "on disk\n").unwrap();
+
+    let h = Harness::new();
+    let (mut e, _watch) = watching(&path, &h);
+    mark_dirty(&mut e);
+    let id = e.active().id;
+    let _ = drain_notes(&h);
+
+    assert!(smol::block_on(reload_buffer(
+        &mut e,
+        id,
+        false,
+        &h.delta_tx,
+        &h.snapshots,
+        &h.note_tx,
+    )));
+    assert!(e.active().modified(), "the buffer is untouched");
+    let notes = drain_notes(&h);
+    assert!(
+        notes
+            .iter()
+            .any(|n| matches!(n, Notification::ReloadRejected { .. })),
+        "expected ReloadRejected, got {notes:?}"
+    );
+
+    // Forced - what the frontend sends once the user has confirmed.
+    assert!(smol::block_on(reload_buffer(
+        &mut e,
+        id,
+        true,
+        &h.delta_tx,
+        &h.snapshots,
+        &h.note_tx,
+    )));
+    assert_eq!(e.active().buffer.text().to_string(), "on disk\n");
+    assert!(!e.active().modified());
+}
+
+#[test]
+fn reloading_an_unknown_or_unbound_buffer_is_a_no_op() {
+    let mut e = session_with("scratch", SelectionSet::at_origin());
+    let h = Harness::new();
+    let id = e.active().id;
+
+    // No file bound: nothing to re-read, and not an error either.
+    assert!(smol::block_on(reload_buffer(
+        &mut e,
+        id,
+        true,
+        &h.delta_tx,
+        &h.snapshots,
+        &h.note_tx,
+    )));
+    assert_eq!(e.active().buffer.text().to_string(), "scratch");
+    // A stale id from a frontend that has not seen a close yet.
+    assert!(smol::block_on(reload_buffer(
+        &mut e,
+        BufferId(999),
+        true,
+        &h.delta_tx,
+        &h.snapshots,
+        &h.note_tx,
+    )));
+    assert_eq!(drain_notes(&h), Vec::new());
+}
+
+#[test]
+fn a_reload_whose_file_has_gone_reports_it_and_keeps_the_buffer() {
+    // The user confirms a reload, and the file is deleted before it runs. The
+    // buffer is the only copy again, so it is kept and the failure surfaces.
+    let dir = TempDir::new();
+    let path = dir.file("notes.txt");
+    std::fs::write(&path, "still here\n").unwrap();
+
+    let h = Harness::new();
+    let (mut e, _watch) = watching(&path, &h);
+    let id = e.active().id;
+    std::fs::remove_file(&path).unwrap();
+    let _ = drain_notes(&h);
+
+    assert!(smol::block_on(reload_buffer(
+        &mut e,
+        id,
+        true,
+        &h.delta_tx,
+        &h.snapshots,
+        &h.note_tx,
+    )));
+    assert_eq!(e.active().buffer.text().to_string(), "still here\n");
+    let notes = drain_notes(&h);
+    assert!(
+        notes
+            .iter()
+            .any(|n| matches!(n, Notification::FileError { .. })),
+        "expected a FileError, got {notes:?}"
+    );
+}
+
+#[test]
+fn a_reload_re_detects_the_files_form_and_whether_it_can_be_written() {
+    // Whoever rewrote the file may have changed its encoding, its line endings, or
+    // its permissions. A reload that kept the old answers would save it back wrong.
+    let dir = TempDir::new();
+    let path = dir.file("notes.txt");
+    std::fs::write(&path, "plain\n").unwrap();
+
+    let h = Harness::new();
+    let (mut e, _watch) = watching(&path, &h);
+    assert_eq!(e.active().format.encoding_name(), "UTF-8");
+    assert_eq!(e.active().format.eol, crate::file::LineEnding::Lf);
+    assert!(e.active().read_only.is_none());
+
+    // Rewritten as CRLF latin-1, and truncated mid-UTF-16 - two different answers.
+    std::fs::write(&path, b"caf\xE9\r\nmore\r\n").unwrap();
+    smol::block_on(external_change(
+        &mut e,
+        &path,
+        &h.delta_tx,
+        &h.snapshots,
+        &h.note_tx,
+    ));
+    assert_eq!(e.active().format.encoding_name(), "windows-1252");
+    assert_eq!(e.active().format.eol, crate::file::LineEnding::Crlf);
+    assert!(e.active().read_only.is_none());
+
+    std::fs::write(&path, [0xFF, 0xFE, b'a', 0x00, 0x00, 0xD8]).unwrap();
+    smol::block_on(external_change(
+        &mut e,
+        &path,
+        &h.delta_tx,
+        &h.snapshots,
+        &h.note_tx,
+    ));
+    assert_eq!(
+        e.active().read_only,
+        Some(ReadOnly::Undecodable),
+        "a file that stopped decoding stops being editable"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn a_file_that_became_unwritable_stops_being_editable_on_reload() {
+    // The counterpart to re-detecting the encoding: whoever rewrote the file may
+    // have changed its permissions, and a buffer that kept the old answer would let
+    // the user type into a file the save is going to refuse.
+    let dir = TempDir::new();
+    let path = dir.file("notes.txt");
+    std::fs::write(&path, "writable\n").unwrap();
+
+    let h = Harness::new();
+    let (mut e, _watch) = watching(&path, &h);
+    assert!(e.active().read_only.is_none());
+
+    std::fs::write(&path, "locked down now\n").unwrap();
+    if !make_unwritable(&path) {
+        return; // running as root: the permission bits do not bind
+    }
+    smol::block_on(external_change(
+        &mut e,
+        &path,
+        &h.delta_tx,
+        &h.snapshots,
+        &h.note_tx,
+    ));
+    assert_eq!(e.active().read_only, Some(ReadOnly::Permissions));
+    assert_eq!(e.active().buffer.text().to_string(), "locked down now\n");
+}
+
+#[test]
+fn a_file_replaced_by_a_binary_one_is_reported_not_loaded() {
+    let dir = TempDir::new();
+    let path = dir.file("notes.txt");
+    std::fs::write(&path, "text\n").unwrap();
+
+    let h = Harness::new();
+    let (mut e, _watch) = watching(&path, &h);
+    let _ = drain_notes(&h);
+
+    std::fs::write(&path, [0x89, b'P', b'N', b'G', 0x00]).unwrap();
+    assert!(smol::block_on(external_change(
+        &mut e,
+        &path,
+        &h.delta_tx,
+        &h.snapshots,
+        &h.note_tx,
+    )));
+
+    assert_eq!(e.active().buffer.text().to_string(), "text\n");
+    let notes = drain_notes(&h);
+    assert!(
+        notes.iter().any(|n| matches!(
+            n,
+            Notification::FileError { message, .. } if message.contains("binary")
+        )),
+        "expected a binary FileError, got {notes:?}"
+    );
+}
+
+#[test]
+fn the_core_asks_the_watcher_to_follow_the_files_it_holds() {
+    let dir = TempDir::new();
+    let path = dir.file("notes.txt");
+    std::fs::write(&path, "hello\n").unwrap();
+
+    let h = Harness::new();
+    let (mut e, watch) = watching(&path, &h);
+    assert_eq!(
+        watch.try_recv(),
+        Ok(WatchRequest::Watch(path.clone())),
+        "opening a file starts watching it"
+    );
+
+    // A save-as moves the watch with the buffer: the old file is no longer ours.
+    let target = dir.file("renamed.txt");
+    smol::block_on(save_as_file(
+        &mut e,
+        target.clone(),
+        &h.snapshots,
+        &h.note_tx,
+    ));
+    assert_eq!(watch.try_recv(), Ok(WatchRequest::Unwatch(path)));
+    assert_eq!(watch.try_recv(), Ok(WatchRequest::Watch(target.clone())));
+
+    // ...and closing releases it.
+    let id = e.active().id;
+    close_buffer(&mut e, id, true, &h.snapshots, &h.note_tx);
+    assert_eq!(watch.try_recv(), Ok(WatchRequest::Unwatch(target)));
+}
+
+#[test]
+fn a_watcher_attaching_late_is_told_about_the_files_already_open() {
+    let dir = TempDir::new();
+    let path = dir.file("notes.txt");
+    std::fs::write(&path, "hello\n").unwrap();
+
+    let h = Harness::new();
+    let mut e = Session::new();
+    smol::block_on(open_file(
+        &mut e,
+        path.clone(),
+        &h.delta_tx,
+        &h.snapshots,
+        &h.note_tx,
+    ));
+
+    // The watcher arrives after the file did - which is the ordering at startup.
+    let (watch_tx, watch_rx) = async_channel::bounded::<WatchRequest>(16);
+    e.watch = Some(watch_tx);
+    e.announce_watched();
+    assert_eq!(watch_rx.try_recv(), Ok(WatchRequest::Watch(path)));
+}
+
 #[test]
 fn save_as_onto_a_read_only_buffers_own_file_is_still_refused() {
     // Regression: "save as" over the same name is a plain save, and must not be the

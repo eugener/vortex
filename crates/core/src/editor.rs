@@ -37,6 +37,7 @@ use crate::lsp::{Diagnostic, DocumentSync, LspEvent, LspHandle, convert};
 use crate::selection::{Selection, SelectionSet};
 use crate::syntax::{HighlightSpan, SyntaxEvent, SyntaxHandle, SyntaxSync};
 use crate::view::{BufferId, BufferInfo, Delta, Notification, ViewSnapshot};
+use crate::watch::{FileEvent, WatchHandle, WatchRequest};
 
 /// Whether a save appends a trailing newline to a buffer that lacks one - SPEC
 /// §10.1's POSIX-style default. The buffer itself is never touched, so this can
@@ -64,6 +65,12 @@ pub struct CoreHandle {
     /// A later handle replaces an earlier one, so opening a file in a different
     /// workspace re-roots the server. Bounded and low-volume (one per attach).
     pub lsp: Sender<LspHandle>,
+    /// frontend -> core, a file watcher to attach at runtime (SPEC §10.2). The
+    /// third of the same shape as [`Self::lsp`] and [`Self::syntax`]: the frontend
+    /// owns `notify` and its OS threads and sends the [`WatchHandle`] here; the
+    /// core swaps it in and announces every open file to it, so attaching partway
+    /// through a session needs no special case. Bounded and low-volume.
+    pub watch: Sender<WatchHandle>,
     /// frontend -> core, a syntax highlighter to attach at runtime (M4). The exact
     /// twin of [`Self::lsp`]: the frontend loads a grammar, spawns the highlighter
     /// loop on its own executor, and sends the [`SyntaxHandle`] here; the core
@@ -142,6 +149,16 @@ struct Document {
     /// Decided at load time and never inferred later, so the reason is available
     /// to explain the refusal rather than only the fact of it.
     read_only: Option<ReadOnly>,
+    /// The state of the file the last time this document accounted for it - after
+    /// a load, a save, or a reload (SPEC §10.2). `None` when no file is bound or
+    /// it does not exist.
+    ///
+    /// This is what makes external-change detection usable rather than maddening:
+    /// the editor's own save is by far the loudest source of change events, and a
+    /// notification whose stamp matches what we just wrote is our own echo. It is
+    /// also updated when a conflict is *reported*, so one external write raises one
+    /// prompt however many events the platform decides to send for it.
+    disk: Option<DiskStamp>,
     /// The undo tree (SPEC §2.4). Owns the reversible change history and the
     /// coalescing state; reset on a file open (undo does not cross a load).
     history: History,
@@ -165,6 +182,37 @@ struct Document {
     /// current buffer subsumes every missed state, so a dropped sync can never
     /// mis-color, and the actor never awaits the sync channel.
     syntax_dirty: bool,
+}
+
+/// What a file looked like the last time a document accounted for it: modification
+/// time and length (SPEC §10.2).
+///
+/// Two cheap fields rather than a hash of the contents, which would mean reading
+/// the whole file on every change notification. Length catches the same-second
+/// rewrite that mtime alone would miss; a same-second rewrite of exactly the same
+/// length still slips through, which is the residue of not hashing and is why the
+/// stamp decides only whether to *ask*, never whether the buffer is correct.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct DiskStamp {
+    modified: std::time::SystemTime,
+    len: u64,
+}
+
+impl DiskStamp {
+    /// The stamp of an already-stat'd file, or `None` where the platform does not
+    /// report a modification time - in which case nothing is ever suppressed,
+    /// which costs a redundant reload of an unchanged buffer and no correctness.
+    fn of(metadata: &std::fs::Metadata) -> Option<Self> {
+        Some(Self {
+            modified: metadata.modified().ok()?,
+            len: metadata.len(),
+        })
+    }
+
+    /// Stat `path` and stamp it. `None` if it cannot be stat'd at all (it is gone).
+    fn read(path: &Path) -> Option<Self> {
+        Self::of(&std::fs::metadata(path).ok()?)
+    }
 }
 
 /// Why a buffer will not accept edits (SPEC §10.3). Both reasons are decided when
@@ -253,6 +301,10 @@ struct Session {
     /// Everything LSP-related is an `Option` rather than a separate code path so a
     /// session with no server pays nothing and behaves identically.
     lsp: Option<LspConnection>,
+    /// core -> file watcher, or `None` when none is attached (SPEC §10.2). Carries
+    /// which files the session wants watched; the events come back on the channel
+    /// held by the actor loop, the same split the LSP connection uses.
+    watch: Option<Sender<WatchRequest>>,
     /// editor -> syntax highlighter, or `None` when none is attached (M4). The
     /// twin of [`Self::lsp_sync`] and, like it, an `Option` so a session with no
     /// highlighter pays nothing. The highlighter has no `didOpen`/`didChange`
@@ -280,6 +332,7 @@ impl Session {
             active: 0,
             register: Vec::new(),
             lsp: None,
+            watch: None,
             syntax_sync: None,
             next_id: 1,
             buffers: Arc::from(Vec::new()),
@@ -355,6 +408,30 @@ impl Session {
         Arc::clone(&self.buffers)
     }
 
+    /// Ask the watcher to start or stop watching `path` (SPEC §10.2).
+    ///
+    /// `try_send` and drop on failure, never await: the actor must not block on a
+    /// producer's channel (the deadlock [`Document::lsp_dirty`] exists to avoid).
+    /// A dropped request costs one file's change detection, not correctness -
+    /// nothing else depends on the watcher being up to date, and the request
+    /// channel is sized so a full one means the watcher has stopped anyway.
+    fn watch_request(&self, request: WatchRequest) {
+        if let Some(watch) = &self.watch {
+            let _ = watch.try_send(request);
+        }
+    }
+
+    /// Announce every open file to a newly attached watcher. A fresh watcher knows
+    /// nothing, and the documents it needs to hear about were opened before it
+    /// arrived - the same re-announce a new language server gets.
+    fn announce_watched(&self) {
+        for doc in &self.docs {
+            if let Some(path) = &doc.path {
+                self.watch_request(WatchRequest::Watch(path.clone()));
+            }
+        }
+    }
+
     /// A snapshot of the active document, carrying the session's buffer list.
     fn snapshot(&mut self, dirty: Option<std::ops::Range<usize>>) -> ViewSnapshot {
         let buffers = self.buffer_list();
@@ -372,6 +449,7 @@ impl Document {
             path: None,
             format: FileFormat::default(),
             read_only: None,
+            disk: None,
             history: History::new(),
             decorations: Arc::new(DecorationSet::new()),
             lsp_dirty: false,
@@ -744,6 +822,10 @@ enum Step {
         id: BufferId,
         force: bool,
     },
+    Reload {
+        id: BufferId,
+        force: bool,
+    },
 }
 
 impl Step {
@@ -758,7 +840,11 @@ impl Step {
     fn edits_buffer(&self) -> bool {
         match self {
             Step::Edit(_) | Step::Undo | Step::Redo => true,
-            Step::Republish
+            // A reload replaces the buffer wholesale, but it is not blocked here:
+            // it is how a read-only buffer catches up with its file, and it can
+            // only ever move the buffer *towards* what is on disk.
+            Step::Reload { .. }
+            | Step::Republish
             | Step::Open(_)
             | Step::Save
             | Step::SaveAs(_)
@@ -779,6 +865,13 @@ enum Incoming {
     Attach(LspHandle),
     /// The LSP *event* channel closed - the server or its task is gone.
     LspClosed,
+    /// A watched file changed on disk (SPEC §10.2).
+    Watch(FileEvent),
+    /// A file watcher to attach. Replaces any current one, which drops its
+    /// channels and stops it.
+    WatchAttach(WatchHandle),
+    /// The watcher's *event* channel closed - it or its task is gone.
+    WatchClosed,
     /// A highlight batch from the syntax producer (M4).
     Syntax(SyntaxEvent),
     /// A syntax highlighter to attach (the frontend loaded a grammar and spawned
@@ -806,6 +899,8 @@ async fn next_incoming(
     lsp_attach: &Receiver<LspHandle>,
     syntax: Option<&Receiver<SyntaxEvent>>,
     syntax_attach: &Receiver<SyntaxHandle>,
+    watch: Option<&Receiver<FileEvent>>,
+    watch_attach: &Receiver<WatchHandle>,
     syntax_first: bool,
 ) -> Incoming {
     // Race the frontend action against the two producer sides (LSP and syntax),
@@ -857,6 +952,25 @@ async fn next_incoming(
             None => Incoming::SyntaxAttach(recv_attach(syntax_attach).await),
         }
     });
+    // The watcher is outside the fairness rotation, polled after both. It is the
+    // one producer that cannot burst in a way that matters - a file changes on
+    // disk at human speed, not at indexing speed - and a reload that lands a
+    // moment late is not a defect, where a highlight batch that does is visible.
+    // It is only ever *delayed* by a busy producer, never dropped: whichever
+    // future loses is re-created next call with its message still queued.
+    let watch_side: Side = Box::pin(async {
+        match watch {
+            Some(events) => {
+                let event = std::pin::pin!(events.recv());
+                let attach = std::pin::pin!(recv_attach(watch_attach));
+                match futures::future::select(event, attach).await {
+                    Either::Left((e, _)) => e.map_or(Incoming::WatchClosed, Incoming::Watch),
+                    Either::Right((h, _)) => Incoming::WatchAttach(h),
+                }
+            }
+            None => Incoming::WatchAttach(recv_attach(watch_attach).await),
+        }
+    });
     // Poll the two producers in the turn's order; the action channel still wins any
     // tie (input stays responsive), and both inner arms yield an `Incoming` so the
     // order only affects *fairness*, never the result.
@@ -865,9 +979,11 @@ async fn next_incoming(
     } else {
         (lsp_side, syntax_side)
     };
-    match futures::future::select(action, futures::future::select(first, second)).await {
+    let producers = futures::future::select(futures::future::select(first, second), watch_side);
+    match futures::future::select(action, producers).await {
         Either::Left((a, _)) => a.map_or(Incoming::Stopped, Incoming::Action),
-        Either::Right((Either::Left((incoming, _)), _)) => incoming,
+        Either::Right((Either::Left((Either::Left((incoming, _)), _)), _)) => incoming,
+        Either::Right((Either::Left((Either::Right((incoming, _)), _)), _)) => incoming,
         Either::Right((Either::Right((incoming, _)), _)) => incoming,
     }
 }
@@ -985,6 +1101,9 @@ const LSP_ATTACH_CAP: usize = 4;
 /// Syntax-attach channel bound: a highlighter is attached rarely (once per file
 /// type, on demand), the same profile as the LSP attach.
 const SYNTAX_ATTACH_CAP: usize = 4;
+/// Watch-attach channel bound: one watcher per session in practice, so the same
+/// small bound as the other two attach channels.
+const WATCH_ATTACH_CAP: usize = 4;
 
 /// Create a core. Returns a [`CoreHandle`] and the actor loop to spawn.
 ///
@@ -1021,6 +1140,7 @@ fn build(action_capacity: usize, lsp: Option<LspHandle>) -> Core {
     let (note_tx, note_rx) = async_channel::bounded::<Notification>(NOTIFICATION_CAP);
     let (lsp_tx, lsp_rx) = async_channel::bounded::<LspHandle>(LSP_ATTACH_CAP);
     let (syntax_tx, syntax_rx) = async_channel::bounded::<SyntaxHandle>(SYNTAX_ATTACH_CAP);
+    let (watch_tx, watch_rx) = async_channel::bounded::<WatchHandle>(WATCH_ATTACH_CAP);
 
     // Seed an initial server, if given, down the same channel a runtime attach
     // uses. `try_send` cannot fail: the channel is fresh and bounded >= 1.
@@ -1035,6 +1155,7 @@ fn build(action_capacity: usize, lsp: Option<LspHandle>) -> Core {
             snapshots: SnapshotCell { rx: snapshot_rx },
             notifications: note_rx,
             lsp: lsp_tx,
+            watch: watch_tx,
             syntax: syntax_tx,
         },
         run: Box::pin(run(
@@ -1044,6 +1165,7 @@ fn build(action_capacity: usize, lsp: Option<LspHandle>) -> Core {
             note_tx,
             lsp_rx,
             syntax_rx,
+            watch_rx,
         )),
     }
 }
@@ -1069,6 +1191,7 @@ async fn run(
     notifications: Sender<Notification>,
     lsp_attach: Receiver<LspHandle>,
     syntax_attach: Receiver<SyntaxHandle>,
+    watch_attach: Receiver<WatchHandle>,
 ) {
     let mut session = Session::new();
     // The event side of the attached server, or `None` until one attaches. The
@@ -1076,6 +1199,8 @@ async fn run(
     let mut lsp_events: Option<Receiver<LspEvent>> = None;
     // The syntax producer's event side, swapped in the same way (M4).
     let mut syntax_events: Option<Receiver<SyntaxEvent>> = None;
+    // The file watcher's event side; the request side lives on `session.watch`.
+    let mut watch_events: Option<Receiver<FileEvent>> = None;
     // Alternates the LSP/syntax poll order each turn so neither producer starves the
     // other during a burst (see `next_incoming`).
     let mut syntax_first = false;
@@ -1096,6 +1221,8 @@ async fn run(
             &lsp_attach,
             syntax_events.as_ref(),
             &syntax_attach,
+            watch_events.as_ref(),
+            &watch_attach,
             syntax_first,
         )
         .await;
@@ -1143,6 +1270,32 @@ async fn run(
                 // re-sending an identical batch (common while indexing), or one for an
                 // off-screen buffer, must not cost a frame.
                 if repaint && !snapshots.publish(session.snapshot(None)) {
+                    break;
+                }
+                continue;
+            }
+            // A watcher attached: swap in both ends and tell it about every file
+            // already open, since it starts knowing nothing and those files were
+            // opened before it existed (SPEC §10.2).
+            Incoming::WatchAttach(handle) => {
+                session.watch = Some(handle.requests);
+                watch_events = Some(handle.events);
+                session.announce_watched();
+                continue;
+            }
+            // The watcher died or its task ended. As with the other producers that
+            // must never take the editor with it (SPEC §8): drop both ends, which
+            // also stops `select` spinning on a permanently-ready closed channel.
+            // External changes simply go unnoticed from here, which is the state
+            // every session was in before a watcher was attachable at all.
+            Incoming::WatchClosed => {
+                watch_events = None;
+                session.watch = None;
+                continue;
+            }
+            Incoming::Watch(FileEvent::Changed(path)) => {
+                if !external_change(&mut session, &path, &deltas, &snapshots, &notifications).await
+                {
                     break;
                 }
                 continue;
@@ -1280,6 +1433,7 @@ async fn run(
             Action::SaveAs(path) => Step::SaveAs(path),
             Action::SwitchBuffer { id } => Step::Switch(id),
             Action::CloseBuffer { id, force } => Step::Close { id, force },
+            Action::Reload { id, force } => Step::Reload { id, force },
             Action::Quit => break,
         };
 
@@ -1331,6 +1485,9 @@ async fn run(
             },
             Step::Close { id, force } => {
                 close_buffer(&mut session, id, force, &snapshots, &notifications)
+            }
+            Step::Reload { id, force } => {
+                reload_buffer(&mut session, id, force, &deltas, &snapshots, &notifications).await
             }
         };
         if !alive {
@@ -1587,13 +1744,7 @@ async fn open_file(
         }
         Ok(bytes) => {
             let loaded = crate::file::load(&bytes);
-            let read_only = if loaded.lossy {
-                Some(ReadOnly::Undecodable)
-            } else if !is_writable(&path) {
-                Some(ReadOnly::Permissions)
-            } else {
-                None
-            };
+            let read_only = read_only_reason(&loaded, &path);
             (loaded.text, loaded.format, read_only, true)
         }
         // Missing file: open an empty buffer bound to the path (created on save).
@@ -1655,10 +1806,16 @@ async fn open_file(
     // content, which is the saved state (SPEC §2.4).
     doc.selections = SelectionSet::at_origin();
     doc.path = Some(path.clone());
+    let path_for_watch = path.clone();
     // The buffer now *is* this file, so it saves in this file's form - including
     // when a scratch buffer was reused and had been carrying the default.
     doc.format = format;
     doc.read_only = read_only;
+    // Stamped from the stat taken *before* the read, deliberately: a write that
+    // lands between the two leaves us with an older stamp than the bytes we hold,
+    // which costs a redundant reload. The other order would leave a newer stamp
+    // than the bytes and miss the change entirely (SPEC §10.2).
+    doc.disk = metadata.as_ref().and_then(DiskStamp::of);
     doc.history = History::new();
     // Decorations describe the *previous* file's text; keeping them would paint
     // squiggles at meaningless offsets until a producer refreshes.
@@ -1686,7 +1843,225 @@ async fn open_file(
     }
     // The path changed, so the cached entry for this buffer is stale.
     session.buffers_stale = true;
+    session.watch_request(WatchRequest::Watch(path_for_watch));
     snapshots.publish(session.snapshot(dirty))
+}
+
+/// Decide what a change to `path` on disk means for the buffer holding it
+/// (SPEC §8, §10.2). Returns `false` if the frontend has hung up.
+///
+/// The rule is the one SPEC §8 states: **never silently overwrite either side.**
+/// A clean buffer has no side of its own, so it follows the file. A modified one
+/// does, so the two versions are the user's to reconcile and the core only reports
+/// the collision.
+///
+/// Most events that arrive here are the editor's own save coming back around, and
+/// the stamp is what tells them apart from a real change. The stamp is also
+/// advanced when a conflict is *reported*, so a platform that sends three events
+/// for one write raises one prompt rather than three.
+async fn external_change(
+    session: &mut Session,
+    path: &Path,
+    deltas: &Sender<Delta>,
+    snapshots: &SnapshotSink,
+    notifications: &Sender<Notification>,
+) -> bool {
+    // A watcher watches whole directories (a rename-over-the-file save would
+    // otherwise slip out from under a per-file watch), so events for paths no
+    // buffer holds are routine and not an error.
+    let Some(index) = session.index_of_path(path) else {
+        return true;
+    };
+
+    let stamp = DiskStamp::read(path);
+    let doc = &mut session.docs[index];
+    if stamp == doc.disk {
+        // Our own save echoing back, or an event about something that did not
+        // change the file (a metadata touch, a sibling in the same directory).
+        return true;
+    }
+    // Accounted for either way: whether this reloads or asks, the same disk state
+    // must not come back a second time.
+    doc.disk = stamp;
+    let id = doc.id;
+
+    if stamp.is_none() {
+        // The file is gone. There is nothing to reload from and the buffer is now
+        // the only copy - so hold onto it and say so, rather than helpfully
+        // emptying the buffer to match (SPEC §8).
+        let _ = notifications.try_send(Notification::ExternalChange {
+            buffer_id: id,
+            path: path.to_path_buf(),
+            removed: true,
+        });
+        return snapshots.publish(session.snapshot(None));
+    }
+
+    if doc.modified() {
+        let _ = notifications.try_send(Notification::ExternalChange {
+            buffer_id: id,
+            path: path.to_path_buf(),
+            removed: false,
+        });
+        return snapshots.publish(session.snapshot(None));
+    }
+    reload(
+        session,
+        index,
+        path.to_path_buf(),
+        deltas,
+        snapshots,
+        notifications,
+    )
+    .await
+}
+
+/// Handle `Action::Reload` - the user taking the disk side of a conflict
+/// (SPEC §10.2). Returns `false` if the frontend has hung up.
+///
+/// Refuses a modified buffer without `force`, exactly as [`close_buffer`] does: a
+/// reload discards unsaved work as completely as a close, so the guard lives here
+/// rather than in whichever frontend happens to remember to ask (SPEC §8).
+async fn reload_buffer(
+    session: &mut Session,
+    id: BufferId,
+    force: bool,
+    deltas: &Sender<Delta>,
+    snapshots: &SnapshotSink,
+    notifications: &Sender<Notification>,
+) -> bool {
+    // A stale id from a frontend that has not seen a close yet: a no-op, not an
+    // error - the same treatment `close_buffer` gives it.
+    let Some(index) = session.index_of(id) else {
+        return snapshots.publish(session.snapshot(None));
+    };
+    // Nothing to re-read from. Not an error either: a scratch buffer is a
+    // legitimate thing to have aimed a reload at by mistake.
+    let Some(path) = session.docs[index].path.clone() else {
+        return snapshots.publish(session.snapshot(None));
+    };
+    if session.docs[index].modified() && !force {
+        let _ = notifications.try_send(Notification::ReloadRejected {
+            buffer_id: id,
+            path,
+        });
+        return snapshots.publish(session.snapshot(None));
+    }
+    reload(session, index, path, deltas, snapshots, notifications).await
+}
+
+/// Replace document `index`'s contents with its file's, as one whole-buffer
+/// `Delta` (SPEC §5). Returns `false` if the frontend has hung up.
+///
+/// Nearly everything a fresh open does, and for the same reasons - the file's
+/// encoding and read-only state are re-detected, because whoever rewrote it may
+/// have changed either - with two deliberate differences:
+///
+/// - **Selections are clamped, not reset.** The change is usually somewhere other
+///   than where the user is looking (a `git checkout`, a formatter), and throwing
+///   the caret back to the top of a 4000-line file would be its own lost work.
+/// - **An identical file is not a change.** Comparing before replacing costs one
+///   string compare and buys idempotence, which is what makes the several events
+///   a platform emits for one write harmless.
+///
+/// History is reset, as on any load: the undo tree describes edits to text that is
+/// no longer there, and undoing across a reload would reconstruct a file that
+/// never existed (SPEC §2.4).
+async fn reload(
+    session: &mut Session,
+    index: usize,
+    path: PathBuf,
+    deltas: &Sender<Delta>,
+    snapshots: &SnapshotSink,
+    notifications: &Sender<Notification>,
+) -> bool {
+    let bytes = match std::fs::read(&path) {
+        Ok(bytes) if crate::file::is_binary(&bytes) => {
+            return report_file_error(
+                session,
+                Some(path),
+                "binary file (contains NUL bytes)",
+                snapshots,
+                notifications,
+            );
+        }
+        Ok(bytes) => bytes,
+        Err(err) => {
+            return report_file_error(
+                session,
+                Some(path),
+                &err.to_string(),
+                snapshots,
+                notifications,
+            );
+        }
+    };
+
+    let loaded = crate::file::load(&bytes);
+    let read_only = read_only_reason(&loaded, &path);
+    let doc = &mut session.docs[index];
+    doc.format = loaded.format;
+    doc.read_only = read_only;
+
+    let old_len = doc.buffer.byte_len();
+    let changed = doc.buffer.text().to_string() != loaded.text;
+    if changed {
+        let base_version = doc.version;
+        let new_len = loaded.text.len();
+        doc.buffer = RopeBuffer::from(loaded.text.as_str());
+        let delta = Delta {
+            buffer_id: doc.id,
+            base_version,
+            range: 0..old_len,
+            new_text: loaded.text,
+        };
+        if deltas.send(delta).await.is_err() {
+            return false; // frontend gone
+        }
+        doc.version += 1;
+        // Every caret survives, moved only as far as it has to be: a file that grew
+        // leaves them exactly where they were.
+        doc.selections.clamp_to(new_len);
+        // The decorations describe the old text. Producers refresh them from the
+        // flags below; until then, none beats misplaced ones (SPEC §5).
+        doc.decorations = Arc::new(DecorationSet::new());
+        doc.lsp_dirty = true;
+        doc.syntax_dirty = true;
+    }
+    // The buffer now *is* the file, whether or not anything moved: a reload of a
+    // buffer that had been edited back to matching disk is still clean afterwards.
+    doc.history = History::new();
+
+    let id = doc.id;
+    let dirty = changed.then(|| 0..doc.buffer.byte_len());
+    let _ = notifications.try_send(Notification::FileReloaded {
+        buffer_id: id,
+        path,
+    });
+    // The modified marker in the buffer list changes with the reload, and it is
+    // this document's entry that may be stale even if it is not the active one.
+    session.buffers_stale = true;
+    snapshots.publish(session.snapshot(dirty))
+}
+
+/// Why a freshly loaded file refuses edits, or `None` if it does not (SPEC §10.3).
+///
+/// One definition for both the open and the reload paths: a file that changed on
+/// disk gets exactly the judgement it would get if it were being opened now, and
+/// the two cannot drift into disagreeing about what read-only means.
+///
+/// Order matters. A file that did not fully decode is read-only whatever its
+/// permissions say, because the problem is that the *buffer* is not the file -
+/// checking writability first would report a fixable-looking reason for something
+/// no `chmod` will fix.
+fn read_only_reason(loaded: &crate::file::Loaded, path: &Path) -> Option<ReadOnly> {
+    if loaded.lossy {
+        Some(ReadOnly::Undecodable)
+    } else if !is_writable(path) {
+        Some(ReadOnly::Permissions)
+    } else {
+        None
+    }
 }
 
 /// Whether this process can actually write `path` (SPEC §10.3).
@@ -1770,8 +2145,14 @@ fn close_buffer(
         return snapshots.publish(session.snapshot(None));
     }
 
-    session.docs.remove(index);
+    let closed = session.docs.remove(index);
     session.buffers_stale = true;
+    // Nothing left to reload into, so stop hearing about it - otherwise a session
+    // that opens and closes its way around a tree accumulates watches on files no
+    // buffer holds.
+    if let Some(path) = closed.path {
+        session.watch_request(WatchRequest::Unwatch(path));
+    }
     // Ids are never reused, so a leftover entry could not mis-target a later buffer -
     // but it would accumulate for the session's life, so drop it with the document.
     if let Some(lsp) = &mut session.lsp {
@@ -1844,6 +2225,10 @@ async fn save_file(
     }
 
     let doc = session.active_mut();
+    // The file is now exactly what we just wrote. Recording that here is what
+    // stops the watcher's report of *this* write from being read as someone
+    // else's change (SPEC §10.2).
+    doc.disk = DiskStamp::read(&path);
     // Mark the current history node as the on-disk state, so undoing back to it
     // later clears the modified marker (SPEC §2.4, §8).
     doc.history.mark_saved();
@@ -1922,7 +2307,9 @@ async fn save_as_file(
     // A different target is a different document to the server; re-announce it so
     // diagnostics track the new name rather than the old one.
     let renamed = doc.path.as_deref() != Some(path.as_path());
+    let dropped = renamed.then(|| doc.path.clone()).flatten();
     let id = doc.id;
+    doc.disk = DiskStamp::read(&path);
     if renamed {
         doc.lsp_dirty = true;
         // This is the way out of a read-only buffer (SPEC §10.3): the write just
@@ -1931,6 +2318,7 @@ async fn save_as_file(
         doc.read_only = None;
     }
     doc.path = Some(path.clone());
+    let watched = path.clone();
     // The write is now the on-disk state (SPEC §2.4, §8): undoing back to this node
     // later clears the modified marker, exactly as a plain save.
     doc.history.mark_saved();
@@ -1940,6 +2328,12 @@ async fn save_as_file(
     });
     if renamed && let Some(lsp) = &mut session.lsp {
         lsp.forget(id);
+    }
+    if let Some(dropped) = dropped {
+        session.watch_request(WatchRequest::Unwatch(dropped));
+    }
+    if renamed {
+        session.watch_request(WatchRequest::Watch(watched));
     }
     snapshots.publish(session.snapshot(None))
 }
