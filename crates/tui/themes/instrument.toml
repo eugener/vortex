@@ -9,7 +9,7 @@
 
 text             = { fg = "#c9ced2", bg = "#141719" }
 head_bar         = { fg = "#eef2f4", bold = true }
-head_bar_active    = { fg = "#141719", bg = "#e04b3c", bold = true }
+head_bar_active    = { fg = "#eef2f4", bold = true }
 head_bar_inactive  = { fg = "#78838a" }
 head_bar_separator = { fg = "#3a4247" }
 status_bar       = { fg = "#78838a" }
