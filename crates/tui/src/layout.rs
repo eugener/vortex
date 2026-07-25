@@ -504,25 +504,47 @@ pub fn line_count_label(line_count: usize) -> String {
 const TAB_OVERFLOW: &str = "›";
 /// …and on the left-hand side.
 const TAB_OVERFLOW_LEFT: &str = "‹";
+/// Divider painted between adjacent tabs. One cell, so it costs a column per gap;
+/// padding alone was not enough to keep adjacent names from reading as one string.
+const TAB_SEPARATOR: &str = "│";
 
 /// One segment of the painted bufferline.
 ///
 /// Carries the buffer it stands for, not just its text, so a pointer landing on it
 /// can be resolved back to a `SwitchBuffer` without the caller re-deriving the
 /// layout it just painted ([`tab_at_column`]).
+///
+/// A segment with no `id` is chrome - a separator or an overflow marker - which the
+/// painter dims and the pointer ignores. That one field carries both distinctions,
+/// so there is no way to paint a segment as a tab but have it select nothing.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Tab {
     /// The text to paint, already padded and fitted.
     pub label: String,
     /// Whether this is the buffer currently on screen.
     pub active: bool,
-    /// The buffer this segment selects; `None` for an overflow marker, which is
-    /// chrome rather than a target.
+    /// The buffer this segment selects; `None` for chrome.
     pub id: Option<BufferId>,
 }
 
-/// The bufferline's tab strip fitted to `width` display cells: each visible tab as
-/// `(label, is_active)`, in buffer order (SPEC §7.5 head/tab bar).
+impl Tab {
+    /// A non-selectable segment: a separator or an overflow marker.
+    fn chrome(label: &str) -> Self {
+        Self {
+            label: label.to_string(),
+            active: false,
+            id: None,
+        }
+    }
+
+    /// Whether this segment is a buffer's tab rather than chrome.
+    pub fn is_tab(&self) -> bool {
+        self.id.is_some()
+    }
+}
+
+/// The bufferline's tab strip fitted to `width` display cells, in buffer order,
+/// with a [`TAB_SEPARATOR`] between adjacent tabs (SPEC §7.5 head/tab bar).
 ///
 /// Every tab is shown when they all fit. When they do not, the strip is windowed
 /// **around the active tab** - which is the only tab guaranteed to be worth seeing -
@@ -530,9 +552,13 @@ pub struct Tab {
 /// rather than truncating from the right is what keeps the current file visible once
 /// more buffers are open than the terminal is wide.
 ///
+/// The active tab is returned flagged, not styled: the painter fills it with the
+/// theme's accent, which is what separates "current" from "open" at a glance without
+/// depending on foreground brightness alone.
+///
 /// Widths are display cells throughout (SPEC §4), so CJK names and emoji in
-/// filenames account for the columns they really occupy. The returned labels never
-/// sum past `width`.
+/// filenames account for the columns they really occupy. The returned labels,
+/// separators and markers never sum past `width`.
 pub fn bufferline(buffers: &[BufferInfo], active: BufferId, width: usize) -> Vec<Tab> {
     if width == 0 || buffers.is_empty() {
         return Vec::new();
@@ -547,34 +573,43 @@ pub fn bufferline(buffers: &[BufferInfo], active: BufferId, width: usize) -> Vec
         })
         .collect();
     let widths: Vec<usize> = labels.iter().map(|l| l.width()).collect();
+    let separator = TAB_SEPARATOR.width();
     // An `active` not in the list (a snapshot older than a close) falls back to the
     // first tab rather than panicking or showing nothing.
     let active_index = buffers.iter().position(|b| b.id == active).unwrap_or(0);
 
-    if widths.iter().sum::<usize>() <= width {
-        return labels
-            .into_iter()
-            .enumerate()
-            .map(|(i, label)| Tab {
-                label,
-                active: i == active_index,
-                id: Some(buffers[i].id),
-            })
-            .collect();
+    let tab = |index: usize, label: String| Tab {
+        label,
+        active: index == active_index,
+        id: Some(buffers[index].id),
+    };
+
+    // n tabs need n-1 separators, so the gaps are part of what has to fit.
+    let gaps = separator * buffers.len().saturating_sub(1);
+    if widths.iter().sum::<usize>() + gaps <= width {
+        let mut strip = Vec::with_capacity(buffers.len() * 2);
+        for (index, label) in labels.into_iter().enumerate() {
+            if index > 0 {
+                strip.push(Tab::chrome(TAB_SEPARATOR));
+            }
+            strip.push(tab(index, label));
+        }
+        return strip;
     }
 
     // Grow a window outward from the active tab, preferring to reveal what follows
     // it, and always leaving room for the overflow markers the window will need.
+    // Each tab admitted brings its own separator with it.
     let (mut first, mut last) = (active_index, active_index);
     let mut used = widths[active_index].min(width);
     loop {
         let markers = usize::from(first > 0) + usize::from(last + 1 < buffers.len());
         let fits = |extra: usize| used + markers + extra <= width;
-        if last + 1 < buffers.len() && fits(widths[last + 1]) {
-            used += widths[last + 1];
+        if last + 1 < buffers.len() && fits(widths[last + 1] + separator) {
+            used += widths[last + 1] + separator;
             last += 1;
-        } else if first > 0 && fits(widths[first - 1]) {
-            used += widths[first - 1];
+        } else if first > 0 && fits(widths[first - 1] + separator) {
+            used += widths[first - 1] + separator;
             first -= 1;
         } else {
             break;
@@ -584,11 +619,7 @@ pub fn bufferline(buffers: &[BufferInfo], active: BufferId, width: usize) -> Vec
     let mut strip = Vec::new();
     let mut remaining = width;
     if first > 0 {
-        strip.push(Tab {
-            label: TAB_OVERFLOW_LEFT.to_string(),
-            active: false,
-            id: None,
-        });
+        strip.push(Tab::chrome(TAB_OVERFLOW_LEFT));
         remaining -= TAB_OVERFLOW_LEFT.width();
     }
     // Reserved so the trailing marker cannot be squeezed out by a wide tab.
@@ -598,6 +629,15 @@ pub fn bufferline(buffers: &[BufferInfo], active: BufferId, width: usize) -> Vec
         0
     };
     for (index, label) in labels.iter().enumerate().take(last + 1).skip(first) {
+        // A separator is only worth its cell if a tab can follow it, so it needs
+        // room for itself plus at least one cell of name.
+        if index > first {
+            if remaining < reserve + separator + 1 {
+                break;
+            }
+            strip.push(Tab::chrome(TAB_SEPARATOR));
+            remaining -= separator;
+        }
         if remaining <= reserve {
             break;
         }
@@ -606,19 +646,11 @@ pub fn bufferline(buffers: &[BufferInfo], active: BufferId, width: usize) -> Vec
         if cells == 0 {
             break;
         }
-        strip.push(Tab {
-            label: text,
-            active: index == active_index,
-            id: Some(buffers[index].id),
-        });
+        strip.push(tab(index, text));
         remaining -= cells;
     }
     if reserve > 0 && remaining > 0 {
-        strip.push(Tab {
-            label: TAB_OVERFLOW.to_string(),
-            active: false,
-            id: None,
-        });
+        strip.push(Tab::chrome(TAB_OVERFLOW));
     }
     strip
 }
@@ -1322,10 +1354,14 @@ mod tests {
     fn every_tab_shows_when_they_all_fit() {
         let list = buffers(&[(1, Some("a.rs"), false), (2, Some("b.rs"), false)]);
         let strip = bufferline(&list, BufferId(2), 40);
-        assert_eq!(strip_labels(&strip), vec![" a.rs ", " b.rs "]);
+        assert_eq!(strip_labels(&strip), vec![" a.rs ", "\u{2502}", " b.rs "]);
         assert_eq!(strip[0].id, Some(BufferId(1)));
-        assert_eq!(strip[1].id, Some(BufferId(2)));
-        assert_eq!((strip[0].active, strip[1].active), (false, true));
+        assert_eq!(strip[1].id, None, "the divider selects nothing");
+        assert_eq!(strip[2].id, Some(BufferId(2)));
+        assert_eq!(
+            (strip[0].active, strip[1].active, strip[2].active),
+            (false, false, true)
+        );
     }
 
     #[test]
@@ -1337,6 +1373,7 @@ mod tests {
         ]);
         let flags: Vec<bool> = bufferline(&list, BufferId(2), 40)
             .into_iter()
+            .filter(|tab| tab.is_tab())
             .map(|tab| tab.active)
             .collect();
         assert_eq!(flags, vec![false, true, false]);
@@ -1352,6 +1389,68 @@ mod tests {
     fn an_unnamed_buffer_gets_the_placeholder_tab() {
         let list = buffers(&[(1, None, false)]);
         assert_eq!(bufferline(&list, BufferId(1), 40)[0].label, " [No Name] ");
+    }
+
+    #[test]
+    fn a_lone_buffer_gets_no_separator() {
+        // Nothing to divide it from, so the divider would be noise.
+        let list = buffers(&[(1, Some("only.rs"), false)]);
+        let strip = bufferline(&list, BufferId(1), 40);
+        assert_eq!(strip.len(), 1);
+        assert!(strip[0].is_tab());
+    }
+
+    #[test]
+    fn separators_sit_between_every_pair_of_tabs() {
+        let list = buffers(&[
+            (1, Some("a.rs"), false),
+            (2, Some("b.rs"), false),
+            (3, Some("c.rs"), false),
+        ]);
+        let strip = bufferline(&list, BufferId(1), 60);
+        // tab, sep, tab, sep, tab - never two dividers running together, and never a
+        // leading or trailing one.
+        assert_eq!(
+            strip.iter().map(|t| t.is_tab()).collect::<Vec<_>>(),
+            vec![true, false, true, false, true]
+        );
+    }
+
+    #[test]
+    fn separators_are_counted_when_the_strip_has_to_fit() {
+        // The dividers cost a column each, so a strip that fits only when they are
+        // ignored must still be windowed. Without counting them the bar overflows by
+        // one cell per gap - invisible with two buffers, obvious with eight.
+        let specs: Vec<(u64, Option<&str>, bool)> =
+            (1..=6).map(|i| (i, Some("file.rs"), false)).collect();
+        let list = buffers(&specs);
+        for width in 8..60 {
+            let strip = bufferline(&list, BufferId(3), width);
+            assert!(
+                strip_width(&strip) <= width,
+                "width {width} overflowed: {:?}",
+                strip_labels(&strip)
+            );
+        }
+    }
+
+    #[test]
+    fn a_windowed_strip_never_ends_on_a_dangling_separator() {
+        // A divider with no tab after it is a cell spent on nothing.
+        let specs: Vec<(u64, Option<&str>, bool)> =
+            (1..=8).map(|i| (i, Some("file.rs"), false)).collect();
+        let list = buffers(&specs);
+        for width in 6..40 {
+            let strip = bufferline(&list, BufferId(4), width);
+            if let Some(last) = strip.last() {
+                assert_ne!(
+                    last.label,
+                    "│",
+                    "width {width} left a dangling divider: {:?}",
+                    strip_labels(&strip)
+                );
+            }
+        }
     }
 
     #[test]
@@ -1414,14 +1513,19 @@ mod tests {
         // padding - has to resolve to it, and the boundary must not be off by one.
         let list = buffers(&[(1, Some("a.rs"), false), (2, Some("b.rs"), false)]);
         let strip = bufferline(&list, BufferId(1), 40);
-        // " a.rs " is columns 0..6, " b.rs " is 6..12.
+        // " a.rs " is columns 0..6, the divider is column 6, " b.rs " is 7..13.
         assert_eq!(tab_at_column(&strip, 0), Some(BufferId(1)));
         assert_eq!(tab_at_column(&strip, 3), Some(BufferId(1)));
         assert_eq!(tab_at_column(&strip, 5), Some(BufferId(1)));
-        assert_eq!(tab_at_column(&strip, 6), Some(BufferId(2)));
-        assert_eq!(tab_at_column(&strip, 11), Some(BufferId(2)));
+        assert_eq!(
+            tab_at_column(&strip, 6),
+            None,
+            "the divider is not a target"
+        );
+        assert_eq!(tab_at_column(&strip, 7), Some(BufferId(2)));
+        assert_eq!(tab_at_column(&strip, 12), Some(BufferId(2)));
         // Past the strip is the empty bar, which selects nothing.
-        assert_eq!(tab_at_column(&strip, 12), None);
+        assert_eq!(tab_at_column(&strip, 13), None);
         assert_eq!(tab_at_column(&strip, 999), None);
     }
 
@@ -1448,7 +1552,8 @@ mod tests {
         let strip = bufferline(&list, BufferId(1), 40);
         let first_width = strip[0].label.width();
         assert_eq!(tab_at_column(&strip, first_width - 1), Some(BufferId(1)));
-        assert_eq!(tab_at_column(&strip, first_width), Some(BufferId(2)));
+        assert_eq!(tab_at_column(&strip, first_width), None, "the divider");
+        assert_eq!(tab_at_column(&strip, first_width + 1), Some(BufferId(2)));
     }
 
     #[test]
@@ -1484,7 +1589,7 @@ mod tests {
         // falls back to the first tab rather than panicking or blanking.
         let list = buffers(&[(1, Some("a.rs"), false), (2, Some("b.rs"), false)]);
         let strip = bufferline(&list, BufferId(99), 40);
-        assert_eq!(strip.len(), 2);
+        assert_eq!(strip.iter().filter(|t| t.is_tab()).count(), 2);
         assert!(strip[0].active, "fell back to marking the first tab");
     }
 

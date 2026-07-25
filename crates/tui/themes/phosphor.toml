@@ -6,8 +6,10 @@
 # selection and the secondary carets are all the same move at different scales.
 
 text             = { fg = "#ffb000", bg = "#150f06" }
-head_bar         = { fg = "#150f06", bg = "#ffb000", bold = true }
-head_bar_inactive = { fg = "#150f06", bg = "#c48700" }
+head_bar         = { fg = "#150f06", bg = "#c48700", bold = true }
+head_bar_active    = { fg = "#150f06", bg = "#ffb000", bold = true }
+head_bar_inactive  = { fg = "#3d2a00", bg = "#c48700" }
+head_bar_separator = { fg = "#8a5f00", bg = "#c48700" }
 status_bar       = { fg = "#150f06", bg = "#c48700" }
 gutter           = { fg = "#7a5200" }
 gutter_current   = { fg = "#ffd980", bold = true }
