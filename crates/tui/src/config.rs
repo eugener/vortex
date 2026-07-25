@@ -58,11 +58,15 @@ pub struct Theme {
     /// Top bar: the bufferline's tab strip (left) and line count (right). This is
     /// the style of the *active* tab and of the bar itself.
     pub head_bar: Style,
-    /// The active buffer's tab: **filled** with the theme's "you are here" accent as
-    /// a background, so the current buffer is legible as a block rather than as a
-    /// slightly brighter word. Carrying it in the background is what keeps it
-    /// readable on a washed-out terminal, where foreground brightness is the first
-    /// distinction to disappear.
+    /// The active buffer's tab. Two jobs, and a theme is expected to use both: the
+    /// tab is a **surface that has come forward**, so it takes a lifted ground, and
+    /// it is **where you are**, so it takes the theme's state accent on its text.
+    ///
+    /// Carrying part of it in the background matters because foreground brightness
+    /// is the first distinction to wash out on a poor terminal. Carrying only *part*
+    /// of it there matters too: flooding a permanently-visible strip with a reserved
+    /// accent spends on chrome what a theme saves for signals, and leaves the tab
+    /// out-shouting the selection and the error toast.
     pub head_bar_active: Style,
     /// Tabs in the bufferline other than the active one - dimmed so they recede
     /// behind the filled one. Its own slot rather than a modifier applied to
@@ -185,11 +189,13 @@ impl Default for Theme {
                 .fg(Color::Rgb(0xcc, 0xd2, 0xe4))
                 .bg(Color::Rgb(0x11, 0x14, 0x1d))
                 .add_modifier(Modifier::BOLD),
-            // The accent undertow reserves for "you are here" (§10.5), spent here on
-            // the one tab that is.
+            // Undertow's two rules, both applied: the ground is lifted one step above
+            // the bar (depth is carried by blue), and the accent it reserves for
+            // "you are here" is spent on the text rather than flooding the strip. The
+            // lift stops below `selection`, so the tab never comes forward of it.
             head_bar_active: Style::new()
-                .fg(Color::Rgb(0x15, 0x18, 0x23))
-                .bg(Color::Rgb(0x63, 0xd2, 0xc3))
+                .fg(Color::Rgb(0x63, 0xd2, 0xc3))
+                .bg(Color::Rgb(0x22, 0x28, 0x3c))
                 .add_modifier(Modifier::BOLD),
             head_bar_inactive: Style::new()
                 .fg(Color::Rgb(0x6b, 0x74, 0x96))
