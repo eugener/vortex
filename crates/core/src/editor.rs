@@ -27,7 +27,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use async_channel::{Receiver, Sender};
 use futures::future::Either;
 
-use crate::action::Action;
+use crate::action::{Action, CoreOptions};
 use crate::anchor::{Anchor, Edit};
 use crate::buffer::{Buffer, RopeBuffer};
 use crate::decoration::DecorationSet;
@@ -38,15 +38,6 @@ use crate::selection::{Selection, SelectionSet};
 use crate::syntax::{HighlightSpan, SyntaxEvent, SyntaxHandle, SyntaxSync};
 use crate::view::{BufferId, BufferInfo, Delta, Notification, ViewSnapshot};
 use crate::watch::{FileEvent, WatchHandle, WatchRequest};
-
-/// Whether a save appends a trailing newline to a buffer that lacks one - SPEC
-/// §10.1's POSIX-style default. The buffer itself is never touched, so this can
-/// never surface as a spurious unsaved change.
-///
-/// A constant rather than a setting because configuration is frontend-owned and its
-/// loader is still to come (§10.5); this is the default that loader will fall back
-/// to when the file says nothing.
-const ENSURE_FINAL_NEWLINE: bool = true;
 
 /// Channels the frontend uses to talk to a running core (SPEC §6).
 pub struct CoreHandle {
@@ -323,6 +314,10 @@ struct Session {
     /// single document's own entry are caught by comparison instead, so nothing has
     /// to remember to raise this on every edit.
     buffers_stale: bool,
+    /// What the frontend's config file asked the core to do (SPEC §10.5). Starts at
+    /// the built-in defaults, so a frontend that never sends `Action::Configure`
+    /// behaves exactly as before it existed.
+    options: CoreOptions,
 }
 
 impl Session {
@@ -337,6 +332,7 @@ impl Session {
             next_id: 1,
             buffers: Arc::from(Vec::new()),
             buffers_stale: true,
+            options: CoreOptions::default(),
         }
     }
 
@@ -490,9 +486,9 @@ impl Document {
     /// Fails when the text holds a character the file's encoding cannot represent;
     /// the caller surfaces that as a `FileError` and leaves the buffer dirty, so the
     /// work is still there to save elsewhere (SPEC §8).
-    fn encode_for_save(&self) -> Result<Vec<u8>, String> {
+    fn encode_for_save(&self, options: &CoreOptions) -> Result<Vec<u8>, String> {
         self.format
-            .encode(&self.buffer.text().to_string(), ENSURE_FINAL_NEWLINE)
+            .encode(&self.buffer.text().to_string(), options.final_newline)
     }
 
     /// Whether the buffer differs from its on-disk file. Derived from `history`'s
@@ -1434,6 +1430,12 @@ async fn run(
             Action::SwitchBuffer { id } => Step::Switch(id),
             Action::CloseBuffer { id, force } => Step::Close { id, force },
             Action::Reload { id, force } => Step::Reload { id, force },
+            // Settings are not an edit and not a file op: swap them in and let the
+            // republish carry on, the same as a motion.
+            Action::Configure(options) => {
+                session.options = options;
+                Step::Republish
+            }
             Action::Quit => break,
         };
 
@@ -2214,7 +2216,7 @@ async fn save_file(
         );
     }
 
-    let bytes = match session.active().encode_for_save() {
+    let bytes = match session.active().encode_for_save(&session.options) {
         Ok(bytes) => bytes,
         Err(message) => {
             return report_file_error(session, Some(path), &message, snapshots, notifications);
@@ -2293,7 +2295,7 @@ async fn save_as_file(
 
     // A save-as keeps the source file's form: writing a CRLF latin-1 file out under
     // a new name should produce the same kind of file, not silently convert it.
-    let bytes = match session.active().encode_for_save() {
+    let bytes = match session.active().encode_for_save(&session.options) {
         Ok(bytes) => bytes,
         Err(message) => {
             return report_file_error(session, Some(path), &message, snapshots, notifications);

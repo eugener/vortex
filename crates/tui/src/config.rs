@@ -1,23 +1,38 @@
 //! Frontend configuration - the seam where user settings enter the TUI.
 //!
-//! Styling is the first setting to become a real file: a [`Theme`] is loaded from a
-//! TOML file by [`crate::theme`], and the theme picker swaps one in at runtime. The
-//! keymap is still a hardcoded [`Default`]; M5 adds `Config::load(path)` reading the
-//! user's config file over the same `toml` seam (SPEC §3 "Config" row, §10.5) for
-//! the rest. Everything downstream already reads from a [`Config`] value, so that
-//! change touches only this module.
+//! One resolved [`Config`] is built at startup from the user's `config.toml` and
+//! threaded into the render and input paths (SPEC §10.5). Everything downstream
+//! already read from this value while it was still the built-in `Default`, which is
+//! why adding the file touched only this module.
 //!
-//! Scope is deliberately frontend-only: styling and the keymap (key→intent is
-//! frontend-owned per SPEC §2.2/§12.2). The core stays config-free - chrome and key
-//! bindings never cross the seam.
+//! **Every field is optional and falls back to the built-in default**, so a config
+//! file can be one line. **An unknown key is an error**, not a silent no-op - the
+//! same rule theme files follow, and for the same reason: a typo must be reported,
+//! or the user stares at a setting that "did not apply" with nothing to go on.
+//! Because the config resolves before the terminal is even in raw mode, a broken
+//! file cannot be reported as a toast; it degrades to the defaults and the message
+//! is shown once the screen exists.
+//!
+//! Scope is *nearly* frontend-only: styling, tab width, and the keymap (key→intent
+//! is frontend-owned per SPEC §2.2/§12.2) never cross the seam. The one exception is
+//! the handful of settings the core is what acts on, which travel to it as
+//! [`CoreOptions`](vortex_core::action::CoreOptions) - see [`Config::core_options`].
+
+use std::path::{Path, PathBuf};
 
 use ratatui::style::{Color, Modifier, Style};
+use serde::Deserialize;
+use vortex_core::action::CoreOptions;
 
 use crate::keymap::Keymap;
 
-/// All user-configurable frontend settings, resolved once at startup and threaded
-/// into the render and input paths. Grows as configurable surfaces land, so it is
-/// passed as a whole rather than field-by-field (SPEC §10.5).
+/// Default display width of a tab stop (SPEC §4), when the config file says
+/// nothing. Four is the width the editor used before it was configurable.
+pub const DEFAULT_TAB_WIDTH: usize = 4;
+
+/// All user-configurable settings, resolved once at startup and threaded into the
+/// render and input paths. Grows as configurable surfaces land, so it is passed as
+/// a whole rather than field-by-field (SPEC §10.5).
 #[derive(Debug, Clone)]
 pub struct Config {
     /// Colors/attributes for the non-text chrome.
@@ -25,9 +40,16 @@ pub struct Config {
     /// Which theme [`Self::theme`] came from, so the picker can highlight the one
     /// in use and restore it when a preview is cancelled.
     pub theme_name: String,
-    /// Key -> intent bindings (`Default` is the built-in map; a config file's
-    /// `[keymap]` table will replace it via [`Keymap::from_pairs`]).
+    /// Key -> intent bindings: the built-in map with the config file's `[keys]`
+    /// table applied over it.
     pub keymap: Keymap,
+    /// Display width of a tab stop (SPEC §4). Frontend-owned because a tab's width
+    /// is a rendering question - the buffer holds one byte either way.
+    pub tab_width: usize,
+    /// Append a trailing newline on save when the buffer lacks one (SPEC §10.1).
+    /// Held here because this is where the user's file is read, and handed to the
+    /// core, which is what acts on it.
+    pub final_newline: bool,
 }
 
 impl Default for Config {
@@ -36,8 +58,149 @@ impl Default for Config {
             theme: Theme::default(),
             theme_name: crate::theme::DEFAULT.to_string(),
             keymap: Keymap::default(),
+            tab_width: DEFAULT_TAB_WIDTH,
+            final_newline: CoreOptions::default().final_newline,
         }
     }
+}
+
+impl Config {
+    /// The settings the *core* acts on, to send it as `Action::Configure`
+    /// (SPEC §10.5). Split out here rather than assembled at the call site so the
+    /// answer to "which settings cross the seam" lives with the settings.
+    pub fn core_options(&self) -> CoreOptions {
+        // Built from the default and adjusted, rather than named field by field:
+        // `CoreOptions` is non-exhaustive, so a setting added there is a compile
+        // error here only when it is one this side is meant to be sending.
+        let mut options = CoreOptions::default();
+        options.final_newline = self.final_newline;
+        options
+    }
+}
+
+/// The config file as written: every key optional, unknown keys rejected.
+///
+/// A separate type from [`Config`] because the two have genuinely different shapes.
+/// The file names a theme; the resolved config carries the loaded [`Theme`] as well,
+/// and a name that failed to load must still leave a working editor.
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ConfigFile {
+    theme: Option<String>,
+    tab_width: Option<usize>,
+    final_newline: Option<bool>,
+    /// Chord → command name, merged over the built-in bindings rather than
+    /// replacing them: a user who binds one key keeps the other fifty. Binding a
+    /// chord that already exists overrides it, which is the whole point.
+    #[serde(default)]
+    keys: std::collections::BTreeMap<String, String>,
+}
+
+/// The user's config file: `$XDG_CONFIG_HOME/vortex/config.toml`, else
+/// `$HOME/.config/vortex/config.toml`. `None` in an environment with no home to
+/// speak of, which simply means built-in defaults.
+///
+/// XDG on every platform, macOS included - the same rule the themes directory
+/// follows, and what keeps a dotfiles repo portable.
+pub fn user_path() -> Option<PathBuf> {
+    let non_empty = |v: std::ffi::OsString| (!v.is_empty()).then_some(v);
+    config_path(
+        std::env::var_os("XDG_CONFIG_HOME").and_then(non_empty),
+        std::env::var_os("HOME").and_then(non_empty),
+    )
+}
+
+/// [`user_path`]'s rule, with the environment passed in - the environment is
+/// process-global, and a test that sets it races every other test in the binary.
+fn config_path(
+    xdg: Option<std::ffi::OsString>,
+    home: Option<std::ffi::OsString>,
+) -> Option<PathBuf> {
+    if let Some(xdg) = xdg {
+        return Some(PathBuf::from(xdg).join("vortex").join("config.toml"));
+    }
+    Some(
+        PathBuf::from(home?)
+            .join(".config")
+            .join("vortex")
+            .join("config.toml"),
+    )
+}
+
+/// Resolve the config for this session: the file at `path` if it is there, else the
+/// built-in defaults. Returns the config plus a message to show once there is a
+/// screen to show it on.
+///
+/// **A broken config never stops the editor starting** (SPEC §8). A missing file is
+/// not an error at all - it is the normal state of a fresh install. A file that
+/// exists but does not parse, or that names a theme that will not load, degrades to
+/// the defaults *for the parts that failed* and reports why.
+pub fn load(path: &Path) -> (Config, Option<String>) {
+    let text = match std::fs::read_to_string(path) {
+        Ok(text) => text,
+        // No config file is the overwhelmingly common case, not a problem.
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return (Config::default(), None),
+        Err(err) => {
+            return (
+                Config::default(),
+                Some(format!("{}: {err}", path.display())),
+            );
+        }
+    };
+    parse(&text)
+}
+
+/// [`load`]'s pure half: config text in, resolved config plus any complaint out.
+fn parse(text: &str) -> (Config, Option<String>) {
+    let file: ConfigFile = match toml::from_str(text) {
+        Ok(file) => file,
+        Err(err) => {
+            return (
+                Config::default(),
+                Some(crate::theme::one_line(&err.to_string())),
+            );
+        }
+    };
+
+    let mut config = Config::default();
+    let mut problem = None;
+    if let Some(width) = file.tab_width {
+        // Zero would divide the display-column math by nothing and collapse every
+        // tab onto the previous glyph; there is no sane reading of it.
+        if width == 0 {
+            problem = Some("tab_width must be at least 1".to_string());
+        } else {
+            config.tab_width = width;
+        }
+    }
+    if let Some(final_newline) = file.final_newline {
+        config.final_newline = final_newline;
+    }
+    if let Some(name) = file.theme {
+        // A theme that will not load leaves the built-in one in place: a bad color
+        // in a config file must not mean an editor with no colors at all.
+        match crate::theme::load_named(&name) {
+            Ok(theme) => {
+                config.theme = theme;
+                config.theme_name = name;
+            }
+            Err(err) => problem = Some(err),
+        }
+    }
+    if !file.keys.is_empty() {
+        let pairs: Vec<(&str, &str)> = file
+            .keys
+            .iter()
+            .map(|(chord, command)| (chord.as_str(), command.as_str()))
+            .collect();
+        match config.keymap.extend_from_pairs(&pairs) {
+            Ok(()) => {}
+            // The bindings before the bad one stay applied, so a typo on one line
+            // does not cost the user every key they rebound above it.
+            Err(err) => problem = Some(err.to_string()),
+        }
+    }
+    (config, problem)
 }
 
 /// Chrome styling for the frontend's non-text UI: the head/status bars and the
@@ -267,6 +430,155 @@ impl Default for Theme {
 mod tests {
     use super::*;
 
+    // --- The config file (SPEC §10.5) -----------------------------------------
+
+    #[test]
+    fn an_empty_or_missing_config_is_the_built_in_default() {
+        // A fresh install has no config file, which is not a problem to report.
+        let (config, problem) = parse("");
+        assert_eq!(config.tab_width, DEFAULT_TAB_WIDTH);
+        assert_eq!(config.theme_name, crate::theme::DEFAULT);
+        assert!(config.final_newline);
+        assert_eq!(problem, None);
+
+        let (config, problem) = load(std::path::Path::new("/nonexistent/vortex/config.toml"));
+        assert_eq!(config.theme_name, crate::theme::DEFAULT);
+        assert_eq!(problem, None);
+    }
+
+    #[test]
+    fn each_setting_can_be_given_on_its_own() {
+        // Every key is optional, so a config file can be one line and everything
+        // else keeps its default.
+        let (config, problem) = parse("tab_width = 8");
+        assert_eq!(problem, None);
+        assert_eq!(config.tab_width, 8);
+        assert!(config.final_newline, "untouched keys keep their default");
+
+        let (config, problem) = parse("final_newline = false");
+        assert_eq!(problem, None);
+        assert!(!config.final_newline);
+        assert_eq!(config.tab_width, DEFAULT_TAB_WIDTH);
+    }
+
+    #[test]
+    fn the_theme_is_the_setting_that_makes_a_pick_outlast_the_session() {
+        let (config, problem) = parse(r#"theme = "undertow""#);
+        assert_eq!(problem, None);
+        assert_eq!(config.theme_name, "undertow");
+        assert_eq!(config.theme, crate::theme::load_named("undertow").unwrap());
+    }
+
+    #[test]
+    fn an_unknown_key_is_reported_rather_than_ignored() {
+        // The theme-file rule, for the same reason: a typo must be reported, or
+        // the user stares at a setting that "did not apply" with nothing to go on.
+        let (config, problem) = parse("tab_wdith = 8");
+        assert_eq!(config.tab_width, DEFAULT_TAB_WIDTH);
+        let problem = problem.expect("a typo is reported");
+        assert!(problem.contains("tab_wdith"), "message: {problem}");
+    }
+
+    #[test]
+    fn a_broken_file_still_leaves_a_working_editor() {
+        // Every failure here degrades to the default for the part that failed and
+        // says why; none of them stops the editor coming up (SPEC §8).
+        let (config, problem) = parse("this is not toml at all");
+        assert_eq!(config.theme, Theme::default());
+        assert!(problem.is_some());
+
+        let (config, problem) = parse("tab_width = 0");
+        assert_eq!(config.tab_width, DEFAULT_TAB_WIDTH, "zero is not a width");
+        assert!(problem.unwrap().contains("tab_width"));
+
+        let (config, problem) = parse(r#"theme = "no-such-theme""#);
+        assert_eq!(config.theme, Theme::default(), "colors are not optional");
+        assert_eq!(config.theme_name, crate::theme::DEFAULT);
+        assert!(problem.unwrap().contains("no-such-theme"));
+    }
+
+    #[test]
+    fn a_keys_table_is_layered_over_the_built_in_bindings() {
+        use crate::command::Command;
+        use crate::keymap::command_for_key;
+        use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+        let (config, problem) = parse("[keys]\n\"ctrl+e\" = \"quit\"\n");
+        assert_eq!(problem, None);
+        let ctrl_e = KeyEvent::new(KeyCode::Char('e'), KeyModifiers::CONTROL);
+        assert_eq!(
+            command_for_key(&config.keymap, ctrl_e, 10),
+            Some(Command::Editor(vortex_core::Action::Quit))
+        );
+        // Rebinding one chord leaves the other fifty alone.
+        let ctrl_s = KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL);
+        assert_eq!(
+            command_for_key(&config.keymap, ctrl_s, 10),
+            Some(Command::Editor(vortex_core::Action::Save))
+        );
+    }
+
+    #[test]
+    fn rebinding_a_bound_chord_replaces_it() {
+        use crate::command::Command;
+        use crate::keymap::command_for_key;
+        use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+        let (config, problem) = parse("[keys]\n\"ctrl+s\" = \"quit\"\n");
+        assert_eq!(problem, None);
+        let ctrl_s = KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL);
+        assert_eq!(
+            command_for_key(&config.keymap, ctrl_s, 10),
+            Some(Command::Editor(vortex_core::Action::Quit))
+        );
+    }
+
+    #[test]
+    fn a_binding_that_names_nothing_is_reported() {
+        let (_, problem) = parse("[keys]\n\"ctrl+e\" = \"frobnicate\"\n");
+        assert!(problem.unwrap().contains("frobnicate"));
+        let (_, problem) = parse("[keys]\n\"ctrl+nonsense\" = \"quit\"\n");
+        assert!(problem.unwrap().contains("nonsense"));
+    }
+
+    #[test]
+    fn only_the_settings_the_core_acts_on_cross_the_seam() {
+        // Tab width and the keymap are the frontend's business; the final-newline
+        // policy is the core's, because the core is what writes the file.
+        let config = Config {
+            final_newline: false,
+            tab_width: 8,
+            ..Default::default()
+        };
+        assert!(!config.core_options().final_newline);
+        assert!(Config::default().core_options().final_newline);
+    }
+
+    #[test]
+    fn the_config_path_follows_xdg_before_home() {
+        // Same rule as the themes directory, so one dotfiles repo works everywhere.
+        use std::ffi::OsString;
+        assert_eq!(
+            config_path(
+                Some(OsString::from("/xdg")),
+                Some(OsString::from("/home/me"))
+            ),
+            Some(PathBuf::from("/xdg/vortex/config.toml")),
+            "XDG wins when it is set"
+        );
+        assert_eq!(
+            config_path(None, Some(OsString::from("/home/me"))),
+            Some(PathBuf::from("/home/me/.config/vortex/config.toml"))
+        );
+        assert_eq!(
+            config_path(None, None),
+            None,
+            "nowhere to look is not an error"
+        );
+        // And the live rule resolves without panicking, whatever this machine has.
+        let _ = user_path();
+    }
+
     #[test]
     fn default_config_carries_the_builtin_theme_and_its_name() {
         let config = Config::default();
@@ -366,5 +678,26 @@ mod tests {
         assert_eq!(t.highlight(K::Parameter), t.syntax_variable);
         assert_eq!(t.highlight(K::Punctuation), t.syntax_punctuation);
         assert_eq!(t.highlight(K::Attribute), t.syntax_punctuation);
+    }
+}
+
+#[cfg(test)]
+mod readme_tests {
+    /// The README documents the config format with a worked example. A format doc
+    /// that does not parse is worse than none, so it is held to the real parser -
+    /// the same guard the theme format carries.
+    #[test]
+    fn the_readme_example_config_parses() {
+        let readme = include_str!("../../../README.md");
+        let block = readme
+            .split("```toml")
+            .find(|b| b.contains("final_newline"))
+            .and_then(|rest| rest.split("```").next())
+            .expect("README documents the config format in a toml block");
+        let (config, problem) = super::parse(block);
+        assert_eq!(problem, None, "the README's example config must load");
+        // ...and it must actually be the example, not an empty parse that says yes.
+        assert_eq!(config.theme_name, "phosphor");
+        assert_eq!(config.tab_width, 4);
     }
 }

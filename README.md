@@ -51,10 +51,10 @@ milestones landed before earlier ones - that is a real gap, not a rounding error
 | M1 | Edit + render pipeline | done |
 | M2 | Async runtime + LSP | done - `rust-analyzer` diagnostics for Rust files, underlined by span |
 | M3 | Anchors, undo tree, multi-cursor | done |
-| M4 | Syntax highlighting (tree-sitter) | **not started** - the decoration channel it needs landed in M2 |
-| M5 | File handling (encoding, EOL, conflicts) | **not started** - non-UTF-8 files fail to open today |
+| M4 | Syntax highlighting (tree-sitter) | done - grammars are `dlopen`ed at runtime, never linked in |
+| M5 | File handling (encoding, EOL, conflicts) | done - encoding and line endings survive a round trip, external changes are noticed, config is a file |
 | M6 | UI shell: compositor, toasts | done |
-| M7 | Pickers, palette, themes | in progress - file picker, palette, and themes done; buffer + global-search pickers, preview pane, which-key, and multi-buffer outstanding |
+| M7 | Pickers, palette, themes | in progress - file/theme/buffer pickers, the palette, and multi-buffer done; global-search picker, preview pane, and which-key outstanding |
 | M8 | Chrome and polish | not started |
 
 What works today: open/save a file, edit with multiple cursors, undo/redo with coalescing,
@@ -111,8 +111,8 @@ Four ship with the editor, compiled into the binary:
 | **phosphor** | the amber CRT taken literally: one hue, five intensities, escalation by inverse video |
 
 Press `Ctrl+T` to switch. The picker **previews** - moving the highlight applies the theme
-immediately, `Enter` keeps it, `Esc` restores the one you started in. (The picked theme
-lasts the session; persisting it needs the config file, which arrives with M5.)
+immediately, `Enter` keeps it, `Esc` restores the one you started in. A pick lasts the
+session; `theme = "phosphor"` in the config file below makes it the one you start in.
 
 ### Writing your own
 
@@ -147,6 +147,28 @@ palette_selected = { fg = "#eef2f4", bg = "#2f383e", bold = true }
 
 The shipped themes live in [`crates/tui/themes/`](crates/tui/themes) and are the best
 worked examples.
+
+## Configuration
+
+`$XDG_CONFIG_HOME/vortex/config.toml`, else `~/.config/vortex/config.toml`. Every key is
+optional, so the file can be one line; `--config PATH` reads a different one.
+
+```toml
+theme         = "phosphor"   # any built-in or one of your own
+tab_width     = 4            # display width of a tab stop
+final_newline = true         # add a trailing newline on save if the file lacks one
+
+[keys]                       # layered over the built-in bindings, not replacing them
+"ctrl+w"      = "close_buffer"
+"ctrl+alt+up" = "add_cursor_above"
+```
+
+Chords are `mod+mod+key` with `ctrl`/`shift`/`alt` in any order; command names are the
+same identifiers the palette lists. Rebinding one chord leaves every other binding alone.
+
+Like a theme file, **an unknown key is an error rather than a shrug** - but a config that
+does not load never stops the editor coming up. It starts on the defaults and says what
+was wrong in a toast.
 
 ## Layout
 

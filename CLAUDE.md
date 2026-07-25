@@ -21,7 +21,7 @@ cargo clippy --all-targets --all-features -- -D warnings   # 2. lint (warnings a
 cargo build --workspace        # 3. compile
 cargo test --workspace         # 4. tests
 # 5. coverage gates - EVERY file must stay above its crate's floor (SPEC §13).
-#    Ratchet: no regress. Current: core 99.3% lines, tui 88.9%.
+#    Ratchet: no regress. Current: core 99.3% lines, tui 89.9%.
 cargo llvm-cov --package vortex-core --fail-under-file-lines 90 \
   --ignore-filename-regex 'lsp/client\.rs' --summary-only
 cargo llvm-cov --package vortex-tui  --fail-under-file-lines 60 --summary-only
@@ -49,7 +49,10 @@ shell - the grammar `dlopen`/attach glue (`load_grammar`, `GrammarManager::ensur
 frontend twin of `lsp/client.rs`'s exemption: the grammar cdylib is not built under the
 coverage harness, so the successful-load path cannot run there. The *resolution* logic
 (which library, which queries) is extracted into `grammar.rs` and tested, which is why the
-tui line total eased from 89.9% to 88.9% while every file still clears its floor.
+tui line total eased from 89.9% to 88.9% while every file still clears its floor. M5's
+watcher took the same shape - `watcher.rs`'s loop is generic over `notify::Watcher` so the
+routing is tested against a stand-in, leaving only the backend constructor untested - and
+brought the tui total back to 89.9%.
 Requires `cargo-llvm-cov` >=0.8.6 (the release that added `--fail-under-file-lines`) +
 `rustup component add llvm-tools-preview`. Install/upgrade with `cargo install cargo-llvm-cov`.
 

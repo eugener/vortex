@@ -16,6 +16,38 @@ use serde::{Deserialize, Serialize};
 use crate::selection::Motion;
 use crate::view::BufferId;
 
+/// The handful of settings that change what the *core* does, as opposed to how the
+/// frontend paints (SPEC §10.5).
+///
+/// Configuration is frontend-owned and file-loaded, which leaves the few settings
+/// that are genuinely about editing needing a way across. They come over the same
+/// message seam as everything else rather than through a constructor argument,
+/// because a remote frontend reads its user's config on *its* machine and has to be
+/// able to send it - and because that keeps one path for a setting whether it
+/// arrives at startup or changes mid-session.
+///
+/// Deliberately small. A setting belongs here only if the core is what acts on it:
+/// tab width, key bindings and colors are frontend concerns and stay there
+/// (SPEC §2.2, §5). The next candidate is §10.4's large-file degradation threshold.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
+pub struct CoreOptions {
+    /// Append a trailing newline when saving a buffer that lacks one - SPEC
+    /// §10.1's POSIX-style default, and the reason a file edited here does not
+    /// sprout a "\ No newline at end of file" in someone's diff. Only the bytes
+    /// written are affected; the buffer is never touched, so this can never show
+    /// up as an unsaved change.
+    pub final_newline: bool,
+}
+
+impl Default for CoreOptions {
+    fn default() -> Self {
+        Self {
+            final_newline: true,
+        }
+    }
+}
+
 /// A single intent from a frontend to the core.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[non_exhaustive]
@@ -140,6 +172,11 @@ pub enum Action {
     /// changed somewhere other than where the user was looking, and sending the
     /// caret home would be its own kind of lost work.
     Reload { id: BufferId, force: bool },
+    /// Replace the core's settings with `options` (SPEC §10.5). Sent once at
+    /// startup with whatever the frontend's config file resolved to, and again if
+    /// it is ever reloaded; nothing is merged, so the value sent is the value in
+    /// force. Changes no text, so no delta and no version bump.
+    Configure(CoreOptions),
     /// Shut the editor down cleanly. The core drains and stops its loop.
     Quit,
 }

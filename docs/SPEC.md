@@ -525,7 +525,7 @@ frontend-side, on `nucleo-matcher` (Helix's matcher; §3), which landed with the
 Each reads data the snapshot/decorations already carry; none needs a seam change beyond the
 decoration channel. All are theme-driven (§10.5) - theme *files* exist now, so a new piece
 of chrome adds a slot to that format rather than a constant - and default-off where they
-add noise, with the on/off switches still waiting on the M5 config loader:
+add noise, each on/off switch a key in the config file the M5 loader now reads:
 
 - **Indent guides** - vertical rules per indent level (display-column math already in
   `layout.rs`).
@@ -645,8 +645,9 @@ free random-access editing, and Tier 3 collides with the §5 render model (see �
 ### 10.5 Configuration (styles + keymap)
 User configuration is **frontend-owned and file-loaded** (`toml` + `serde`, Helix-style;
 §3). The core stays config-free: chrome styling and key bindings are pure frontend
-concerns (§2.2, §5) and never cross the seam. Two surfaces are configurable from the
-start of the design, even though file loading itself lands at **M5**:
+concerns (§2.2, §5) and never cross the seam - with the one exception the loader below
+names. Two surfaces were configurable from the start of the design, before the file
+existed to configure them from:
 
 - **Styles (theme).** Two frontend-owned tables. (a) Colors/attributes for the non-text
   chrome - editor ground, head bar, status bar, line-number gutter (active vs inactive),
@@ -718,21 +719,32 @@ format the rest of the config will use.
   frontend-owned - a preview is a local repaint, and the seam never hears about it. It
   is also why `Layer::restyle` exists: layers cache their `Style`s at construction, so a
   theme change has to hand the new ones to every open overlay and to the toast surface.
-- **Not persisted yet.** The picked theme lasts the session; remembering it needs the
-  config *file* (`theme = "…"`), which is the M5 loader below. Deliberate: the loader is
-  one change, and doing half of it early would mean two.
+- **Persisted by the config file, not by the picker.** A pick lasts the session;
+  `theme = "…"` in `config.toml` is what makes it the theme you start in. The picker never
+  writes to the user's disk - the same rule the themes directory follows.
 - **The built-in `Theme::default()` is written in Rust, not parsed at startup**, so the
   editor can never fail to have a theme. A test holds it equal to `themes/undertow.toml`,
   which is what keeps the hand-written copy and the file a user reads from drifting.
 
-**Seam, not yet a loader (current state).** The config lives behind a single resolved
-`Config` value built once at frontend startup (next to argv, before the first frame) and
-threaded into the render/input paths - **not** scattered constants. Today it is the
-built-in `Default`; M5 replaces that construction with `Config::load(path)` deserializing
-the user's file and falling back to the defaults for any unset field. Because every call
-site already reads from the `Config` value, adding file loading touches only that one
-construction point. A `--config <path>` flag rides the same argv parser. This mirrors the
-Tier-3 / CRDT move: build the swap-ready seam now, defer the feature.
+**The loader (built, M5).** The config lives behind a single resolved `Config` value built
+once at frontend startup (next to argv, before the first frame) and threaded into the
+render/input paths - **not** scattered constants. Because every call site already read from
+that value while it was still the built-in `Default`, adding the file touched only the one
+construction point, exactly as this section predicted. `config.toml` sits beside the themes
+directory (`$XDG_CONFIG_HOME/vortex`, else `~/.config/vortex`), `--config <path>` rides the
+same argv parser, every key is optional, and an unknown key is an error - the theme files'
+rule, for the same reason. A config that will not load never stops the editor starting: it
+comes up on defaults and reports the problem as a toast, since the config resolves before
+the terminal is even in raw mode.
+
+**The one thing that crosses the seam.** Most settings are frontend-owned by nature -
+colors, key bindings, tab width (a tab is one byte whatever it is painted as). The
+final-newline policy (§10.1) is not: the *core* writes the file. It travels as
+`Action::Configure(CoreOptions)` rather than a constructor argument, because a remote
+frontend reads its user's config on its own machine and has to be able to send it, and
+because that leaves one path whether a setting arrives at startup or changes mid-session.
+`CoreOptions` stays deliberately small - a setting belongs in it only if the core is what
+acts on it, and the next candidate is §10.4's degradation threshold.
 
 ---
 
@@ -771,10 +783,10 @@ early milestones is a deliberate scope choice, not an oversight:
 - **Search + regex.** `select-all-matches` / `split-on-regex` (§12.2) imply a `regex`
   dependency and a search subsystem in `vortex-core`. Add the `regex` crate to the stack
   when this lands; incremental/streaming search over the rope. Target: M3 band.
-- **Keymap configuration.** The data-driven keymap and its chord/command string format
-  exist now (§10.5); what remains is loading a user file into it (M5, rides the same
-  `toml` seam) and the richer *modal* design - chord sequences, per-mode maps, modal vs
-  modeless - drafted alongside §12.2's `Action` vocabulary. Target: M1+.
+- **Keymap configuration.** Built (M5): a `[keys]` table in `config.toml` is layered over
+  the built-in bindings through the same `Chord`/`Command` string format the defaults are
+  written in. What remains is the richer *modal* design - chord sequences, per-mode maps,
+  modal vs modeless - drafted alongside §12.2's `Action` vocabulary. Target: M1+.
 
 ### Known structural debt (identified 2026-07-21, with triggers)
 
@@ -993,8 +1005,40 @@ Incremental build order so the risky assumptions are validated early, not at the
   cannot desync); language injection (embedded languages / doc-comment code - the injection
   callback returns `None`); parse cancellation; an interval index for `highlights_in` /
   `transform_through` (linear now, the case the decoration channel's own comments flag).
-- **M5 - File handling hardening.** encoding/EOL preservation, external-change conflicts,
-  save-failure handling (§8, §10). *Verify:* fixture round-trips + fault-injection.
+- **M5 - File handling hardening. DONE.** The buffer now always holds UTF-8 with LF
+  terminators - one shape for every motion, column and edit rule - and a per-document
+  `FileFormat` remembers what the file on disk actually is, so a save reproduces it.
+  Detection is sampled as §10.4 requires: BOM, then whether a bounded prefix is valid
+  UTF-8, then windows-1252, which maps all 256 bytes and so keeps a file in an encoding
+  we cannot *name* byte-exact rather than refusing to open it (a proptest pins that round
+  trip over arbitrary input). Two refusals come with it, both because the alternative
+  loses data silently: a save whose text does not fit the file's encoding fails and leaves
+  the buffer dirty rather than letting `encoding_rs` write `&#128512;` into a source file,
+  and a file with NUL bytes is not opened at all, since the windows-1252 fallback would
+  otherwise present a PNG as mojibake that corrupts on the first edit.
+  **Read-only is enforced by the core** (§10.3), for two reasons decided at load: the file
+  cannot be written - probed by opening it for append, because permission *bits* are not
+  the question a mode-644 file owned by someone else answers - or it did not fully decode,
+  where saving would write U+FFFD over bytes the user never touched. The guard sits on
+  `Step`, which every text change funnels through, so a new step has to state which side it
+  is on rather than defaulting to "allowed". A FIFO or device is refused before the read,
+  because reading one blocks the actor thread forever.
+  **External changes** (§10.2) arrive from a frontend-owned `notify` watcher over the same
+  producer seam LSP and syntax use; the *policy* stays in the core, which reloads a clean
+  buffer and refuses to choose for a modified one (`ExternalChange` → the frontend asks →
+  a forced `Reload` comes back, the close guard's shape). Each document remembers the
+  mtime+length it last accounted for, which is what tells the editor's own save apart from
+  someone else's write - and one write raises one prompt however many events a platform
+  sends. **Configuration is a file** (§10.5): `config.toml` with `theme`, `tab_width`,
+  `final_newline` and a `[keys]` table layered over the built-in bindings, plus
+  `--config PATH`. The settings the *core* acts on cross as `Action::Configure`, which is
+  where §10.4's degradation threshold will go. *Verified:* fixture round-trips, a
+  byte-preservation proptest, fault injection (unwritable files, FIFOs, directories,
+  binaries, truncated UTF-16), and the whole arc driven in a real terminal.
+  **Deferred within M5:** a statistical encoding detector (`chardetng`) that would *name*
+  Shift-JIS and KOI8-R rather than preserving them as windows-1252 mojibake; a
+  `set encoding` escape hatch for a save the current encoding cannot represent; loading
+  large files off the actor thread (§2.3).
 - **M6 - Frontend UI shell.** The overlay compositor (§7.5, job 2 only) + a message/toast
   surface (consuming `Notification`) + a prompt line. Proves the layer stack and the
   commit-only seam rule (§7.5): surface navigation stays frontend-local, only the committed

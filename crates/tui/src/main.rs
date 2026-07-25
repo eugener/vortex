@@ -54,9 +54,6 @@ use vortex_tui::{
     themepicker, watcher,
 };
 
-/// Default tab stop width for display-column layout (SPEC §4). Config in M5.
-const TAB_WIDTH: usize = 4;
-
 /// The frontend's view state: which window of the buffer is on screen. Both axes
 /// are pure frontend concerns (SPEC §5) - scrolling reads a different window of the
 /// same snapshot with no core round-trip. Carried as one struct (not a growing
@@ -103,8 +100,12 @@ const SCROLL_STEP: usize = 3;
 fn main() -> io::Result<()> {
     // Parse argv before touching the terminal: `--help`/`--version` and bad flags
     // must print to normal stdout/stderr, not paint into the alternate screen.
-    let path = match parse_args(std::env::args_os().skip(1)) {
-        Args::Open(path) => path,
+    let (path, config_path) = match parse_args(std::env::args_os().skip(1)) {
+        Args::Open { file, config } => (file, config),
+        Args::MissingValue(flag) => {
+            eprintln!("vortex: '{flag}' needs a value\n{USAGE}");
+            std::process::exit(2);
+        }
         Args::Help => {
             print!("{HELP}{UNDO_REDO_HELP}");
             return Ok(());
@@ -177,11 +178,21 @@ fn main() -> io::Result<()> {
         grammars.ensure(p, &handle);
     }
 
-    // Resolve frontend configuration once, up front. Today this is the built-in
-    // default; M5 swaps it for `Config::load` reading the user's file (SPEC §10.5).
-    // Parsed here, next to argv, because that is where a `--config <path>` flag will
-    // live and because config must be settled before the first frame paints.
-    let config = config::Config::default();
+    // Resolve configuration once, up front - next to argv, because that is where
+    // `--config` arrives and because it must be settled before the first frame
+    // paints (SPEC §10.5). A file that will not parse degrades to the defaults and
+    // reports itself as a toast below, once there is a screen to show it on: the
+    // editor starting is not negotiable (SPEC §8).
+    let (config, config_problem) = match config_path.or_else(config::user_path) {
+        Some(path) => config::load(&path),
+        // No home directory to look in: built-in defaults, and nothing to report.
+        None => (config::Config::default(), None),
+    };
+    // Settings the core acts on rather than the frontend (SPEC §10.5). Sent before
+    // the first file is opened so the very first save already honors them.
+    let _ = handle
+        .actions
+        .send_blocking(vortex_core::Action::Configure(config.core_options()));
 
     // Terminal setup. On any error we still attempt teardown so we never leave the
     // user's terminal in raw mode (the Drop impl is the backstop).
@@ -191,6 +202,7 @@ fn main() -> io::Result<()> {
         &mut term.terminal,
         path,
         config,
+        config_problem,
         &mut lsp,
         &mut grammars,
     );
@@ -456,7 +468,14 @@ A terminal text editor. Opens FILE, or an empty buffer if omitted.
 Options:
   -h, --help       Print this help and exit
   -V, --version    Print the version and exit
+      --config P   Read settings from P instead of the default config file
       --           Treat every following argument as a file name
+
+Config:
+  $XDG_CONFIG_HOME/vortex/config.toml, else ~/.config/vortex/config.toml
+    theme = \"undertow\"   tab_width = 4   final_newline = true
+    [keys]                 # chord = command, layered over the defaults
+    \"ctrl+w\" = \"close_buffer\"
 
 Keys:
   Ctrl+S           Save        Ctrl+Q            Quit
@@ -485,10 +504,16 @@ const UNDO_REDO_HELP: &str = "  Ctrl+Z           Undo        Ctrl+Y            R
 /// The outcome of parsing the command line - what `main` should do next.
 #[derive(Debug, PartialEq, Eq)]
 enum Args {
-    /// Open this file, or start an empty unnamed buffer (`None`).
-    Open(Option<PathBuf>),
+    /// Open this file, or start an empty unnamed buffer (`None`), reading settings
+    /// from an explicit `--config` path when one was given.
+    Open {
+        file: Option<PathBuf>,
+        config: Option<PathBuf>,
+    },
     Help,
     Version,
+    /// A flag that takes a value, with none following it.
+    MissingValue(&'static str),
     /// An unrecognized `-`/`--` flag; report it rather than opening a file by
     /// that name (so `vortex --version` prints a version, not a "--version" buffer).
     Unknown(OsString),
@@ -501,8 +526,10 @@ enum Args {
 /// need not be UTF-8) so it is unit-testable without a process (SPEC §13).
 fn parse_args(args: impl IntoIterator<Item = OsString>) -> Args {
     let mut file: Option<PathBuf> = None;
+    let mut config: Option<PathBuf> = None;
     let mut flags_done = false;
-    for arg in args {
+    let mut args = args.into_iter();
+    while let Some(arg) = args.next() {
         if flags_done {
             file.get_or_insert_with(|| PathBuf::from(&arg));
             continue;
@@ -511,6 +538,16 @@ fn parse_args(args: impl IntoIterator<Item = OsString>) -> Args {
             Some("--") => flags_done = true,
             Some("-h" | "--help") => return Args::Help,
             Some("-V" | "--version") => return Args::Version,
+            // `--config PATH`: the config is read before the first frame, so the
+            // flag has to be here rather than being something the editor learns
+            // later (SPEC §10.5).
+            Some("--config") => match args.next() {
+                Some(path) => config = Some(PathBuf::from(path)),
+                None => return Args::MissingValue("--config"),
+            },
+            Some(s) if s.starts_with("--config=") => {
+                config = Some(PathBuf::from(&s["--config=".len()..]));
+            }
             // A dashed token we do not recognize (but not a lone "-", which is a
             // conventional stdin placeholder / valid-ish name, left as a path).
             Some(s) if s.starts_with('-') && s != "-" => return Args::Unknown(arg),
@@ -520,7 +557,7 @@ fn parse_args(args: impl IntoIterator<Item = OsString>) -> Args {
             }
         }
     }
-    Args::Open(file)
+    Args::Open { file, config }
 }
 
 /// The render + input loop, run synchronously on the main thread. Returns when the
@@ -533,6 +570,11 @@ fn event_loop(
     terminal: &mut Terminal<ratatui::backend::CrosstermBackend<Stdout>>,
     path: Option<PathBuf>,
     mut config: config::Config,
+    // What went wrong reading the config file, if anything. Carried in rather than
+    // reported where it was found, because the config resolves before the terminal
+    // exists and a message printed then would be scrolled away by the alternate
+    // screen. Surfaced as the first toast instead.
+    config_problem: Option<String>,
     lsp: &mut LspManager,
     grammars: &mut GrammarManager,
 ) -> io::Result<()> {
@@ -571,6 +613,15 @@ fn event_loop(
     // top-right toasts that auto-fade, rather than hijacking the status bar (SPEC
     // §7.5). A failed save must be visible, not silent (SPEC §8).
     let mut toasts = Toasts::new(config.theme.toast_info, config.theme.toast_error);
+    // The first thing on screen when the config file had something wrong with it:
+    // the editor came up on defaults, and this is what says why (SPEC §8).
+    if let Some(problem) = config_problem {
+        toasts.push(
+            format!("Config: {problem}"),
+            toast::Level::Error,
+            Instant::now(),
+        );
+    }
     // Repaint only when something changed - a new snapshot, a resize, or the
     // first frame. Redrawing every idle poll tick is wasted work (ratatui
     // cell-diffs, so it emits nothing, but it still rebuilds the frame ~60x/sec).
@@ -724,6 +775,7 @@ fn event_loop(
                     theme: config.theme,
                     follow,
                     selected,
+                    tab_width: config.tab_width,
                 },
                 &overlays,
                 &toasts,
@@ -848,7 +900,13 @@ fn event_loop(
                         }
                         let extend = matches!(mouse.kind, MouseEventKind::Drag(_))
                             || mouse.modifiers.contains(KeyModifiers::SHIFT);
-                        let offset = pointer_offset(snap, viewport, mouse.column, mouse.row);
+                        let offset = pointer_offset(
+                            snap,
+                            viewport,
+                            config.tab_width,
+                            mouse.column,
+                            mouse.row,
+                        );
                         // Alt+click adds a cursor without collapsing the set
                         // (SPEC §2.2 multi-cursor); a plain click/drag places or
                         // extends the single caret. Alt only adds on a fresh
@@ -1023,7 +1081,13 @@ fn dispatch_command(command: Command, handle: &vortex_core::CoreHandle, ui: &mut
 /// `row - 1`, clamped into the painted text rows: a click on the head bar maps to
 /// the top visible line and a drag below the body to the last one. Column and
 /// end-of-line clamping are handled by [`layout::offset_at_cell`].
-fn pointer_offset(snapshot: &ViewSnapshot, viewport: ViewState, column: u16, row: u16) -> usize {
+fn pointer_offset(
+    snapshot: &ViewSnapshot,
+    viewport: ViewState,
+    tab_width: usize,
+    column: u16,
+    row: u16,
+) -> usize {
     let gutter_width = layout::gutter_width(layout::display_line_count(&snapshot.text));
     let last_body_row = viewport.page_height.saturating_sub(1);
     let body_row = (row.saturating_sub(1) as usize).min(last_body_row);
@@ -1032,7 +1096,7 @@ fn pointer_offset(snapshot: &ViewSnapshot, viewport: ViewState, column: u16, row
         viewport.scroll,
         viewport.h_scroll,
         gutter_width,
-        TAB_WIDTH,
+        tab_width,
         body_row,
         column as usize,
     )
@@ -1087,6 +1151,9 @@ struct PaintInputs {
     /// Grapheme count of the active selection, computed once per snapshot by the
     /// event loop (O(selected bytes) - too costly to re-derive every repaint).
     selected: usize,
+    /// Display width of a tab stop (SPEC §4, §10.5). Carried per frame rather than
+    /// read from a constant so a config change takes effect without a restart.
+    tab_width: usize,
 }
 
 /// Compose the whole frame: head bar, gutter + text, status bar, and the cursor.
@@ -1100,6 +1167,7 @@ fn paint(frame: &mut Frame, snapshot: &ViewSnapshot, inputs: PaintInputs) -> Vie
         theme,
         follow,
         selected,
+        tab_width,
     } = inputs;
     let area = frame.area();
     // Head bar (1 row), text body (rest), status bar (1 row). `Min(0)` lets the
@@ -1119,7 +1187,7 @@ fn paint(frame: &mut Frame, snapshot: &ViewSnapshot, inputs: PaintInputs) -> Vie
         .map(|s| s.head)
         .unwrap_or(0);
     let (cursor_line, cursor_byte_col, line_text) = layout::cursor_line_col(&snapshot.text, head);
-    let cursor_display_col = layout::display_column(&line_text, cursor_byte_col, TAB_WIDTH);
+    let cursor_display_col = layout::display_column(&line_text, cursor_byte_col, tab_width);
 
     // Gutter width is fixed for the frame; the text column budget is what's left of
     // the body after it. Both scroll axes follow the cursor minimally (SPEC §5):
@@ -1134,7 +1202,7 @@ fn paint(frame: &mut Frame, snapshot: &ViewSnapshot, inputs: PaintInputs) -> Vie
     // clamp each axis to its max useful offset. The `+ 1` on the horizontal extent
     // leaves a cell for the caret sitting just past the line's last glyph.
     let max_scroll = display_lines.saturating_sub(text_height);
-    let line_width = layout::display_column(&line_text, line_text.len(), TAB_WIDTH);
+    let line_width = layout::display_column(&line_text, line_text.len(), tab_width);
     let max_h_scroll = (line_width + 1).saturating_sub(text_width);
     // When following the caret (keys, clicks, edits) each axis scrolls the minimum
     // to keep it visible; a wheel scroll turns follow off and paints the viewport's
@@ -1165,6 +1233,7 @@ fn paint(frame: &mut Frame, snapshot: &ViewSnapshot, inputs: PaintInputs) -> Vie
             text_width,
             cursor_line,
             theme,
+            tab_width,
         },
     );
     paint_status_bar(
@@ -1257,6 +1326,8 @@ struct Body {
     /// (gutter, selection, current line, secondary caret). `Theme` is `Copy`, so
     /// holding it beats copying each style field out by hand.
     theme: config::Theme,
+    /// Display width of a tab stop (SPEC §4, §10.5).
+    tab_width: usize,
 }
 
 /// Paint the text body with a line-number gutter. Each visible row is a gutter
@@ -1272,7 +1343,7 @@ struct Body {
 fn paint_body(frame: &mut Frame, area: Rect, snapshot: &ViewSnapshot, body: Body) {
     let text = &snapshot.text;
     let height = area.height as usize;
-    let lines = layout::visible_lines(text, body.scroll, height, TAB_WIDTH);
+    let lines = layout::visible_lines(text, body.scroll, height, body.tab_width);
 
     // Each secondary caret's line is invariant across the frame: resolve it once
     // here (O(selections) rope lookups) instead of per visible row, which would
@@ -1324,7 +1395,7 @@ fn paint_body(frame: &mut Frame, area: Rect, snapshot: &ViewSnapshot, body: Body
                         raw,
                         line_start,
                         line_end_excl,
-                        TAB_WIDTH,
+                        body.tab_width,
                         s.start(),
                         s.end(),
                     )
@@ -1338,7 +1409,7 @@ fn paint_body(frame: &mut Frame, area: Rect, snapshot: &ViewSnapshot, body: Body
                 // Highlights arrive sorted and non-overlapping, so one walker
                 // resolves every span on this line in a single left-to-right pass
                 // (O(line + spans)) instead of rescanning from byte 0 per span.
-                let mut walker = layout::ColumnWalker::new(raw, TAB_WIDTH);
+                let mut walker = layout::ColumnWalker::new(raw, body.tab_width);
                 for (span, kind) in snapshot
                     .decorations
                     .highlights_in(line_start..line_end_excl)
@@ -1368,7 +1439,7 @@ fn paint_body(frame: &mut Frame, area: Rect, snapshot: &ViewSnapshot, body: Body
                         raw,
                         line_start,
                         line_end_excl,
-                        TAB_WIDTH,
+                        body.tab_width,
                         span.start,
                         span.end,
                     ) {
@@ -1386,7 +1457,7 @@ fn paint_body(frame: &mut Frame, area: Rect, snapshot: &ViewSnapshot, body: Body
             // so a caret shows on top of any highlight sharing its cell.
             for &(line, head) in &secondary_carets {
                 if line == line_index {
-                    let col = layout::display_column(raw, head - line_start, TAB_WIDTH);
+                    let col = layout::display_column(raw, head - line_start, body.tab_width);
                     overlays.push((col..col + 1, body.theme.secondary_cursor));
                 }
             }
@@ -1694,6 +1765,7 @@ mod tests {
             theme: config::Theme::default(),
             follow: true,
             selected,
+            tab_width: config::DEFAULT_TAB_WIDTH,
         }
     }
 
@@ -1701,14 +1773,53 @@ mod tests {
     /// real [`paint`] path, and hand back the painted buffer for cell assertions.
     /// The selection count is derived from the snapshot, as the event loop does.
     fn render(snapshot: &ViewSnapshot, w: u16, h: u16) -> ratatui::buffer::Buffer {
+        render_with(snapshot, w, h, paint_inputs(0))
+    }
+
+    /// [`render`] with the per-frame inputs spelled out, for the settings that only
+    /// show up in what gets painted.
+    fn render_with(
+        snapshot: &ViewSnapshot,
+        w: u16,
+        h: u16,
+        inputs: PaintInputs,
+    ) -> ratatui::buffer::Buffer {
         let mut terminal = Terminal::new(TestBackend::new(w, h)).unwrap();
         let selected = layout::selected_grapheme_count(&snapshot.text, &snapshot.selections);
         terminal
             .draw(|frame| {
-                paint(frame, snapshot, paint_inputs(selected));
+                paint(frame, snapshot, PaintInputs { selected, ..inputs });
             })
             .unwrap();
         terminal.backend().buffer().clone()
+    }
+
+    #[test]
+    fn the_configured_tab_width_is_what_gets_painted() {
+        // The config value has to reach the paint path, not just parse: this is the
+        // only place a tab stop is visible at all (SPEC §4, §10.5).
+        let snap = snapshot_after(&[Action::Insert("a\tb".into())]);
+        let gap = |width: usize| {
+            let buf = render_with(
+                &snap,
+                40,
+                5,
+                PaintInputs {
+                    tab_width: width,
+                    ..paint_inputs(0)
+                },
+            );
+            let row = row_text(&buf, 1);
+            let a = row.find('a').expect("the line is painted");
+            let b = row[a..].find('b').expect("both glyphs are painted");
+            b - 1 // cells of tab between them
+        };
+        assert_eq!(
+            gap(2),
+            1,
+            "a tab stop at 2 puts 'b' in the next column pair"
+        );
+        assert_eq!(gap(8), 7);
     }
 
     /// Parse a slice of string args (skipping argv[0]) the way `main` does.
@@ -1718,14 +1829,23 @@ mod tests {
 
     #[test]
     fn parse_args_no_args_opens_empty_buffer() {
-        assert_eq!(args(&[]), Args::Open(None));
+        assert_eq!(
+            args(&[]),
+            Args::Open {
+                file: None,
+                config: None
+            }
+        );
     }
 
     #[test]
     fn parse_args_positional_is_the_file() {
         assert_eq!(
             args(&["notes.txt"]),
-            Args::Open(Some(PathBuf::from("notes.txt")))
+            Args::Open {
+                file: Some(PathBuf::from("notes.txt")),
+                config: None
+            }
         );
     }
 
@@ -1753,7 +1873,10 @@ mod tests {
         // `--` ends option parsing so a file literally named "--version" opens.
         assert_eq!(
             args(&["--", "--version"]),
-            Args::Open(Some(PathBuf::from("--version")))
+            Args::Open {
+                file: Some(PathBuf::from("--version")),
+                config: None
+            }
         );
     }
 
@@ -1761,14 +1884,58 @@ mod tests {
     fn parse_args_lone_dash_is_treated_as_a_path() {
         // A bare "-" is a conventional stdin placeholder, not an unknown flag;
         // keep it as a path rather than erroring.
-        assert_eq!(args(&["-"]), Args::Open(Some(PathBuf::from("-"))));
+        assert_eq!(
+            args(&["-"]),
+            Args::Open {
+                file: Some(PathBuf::from("-")),
+                config: None
+            }
+        );
     }
 
     #[test]
     fn parse_args_first_positional_wins() {
         assert_eq!(
             args(&["a.txt", "b.txt"]),
-            Args::Open(Some(PathBuf::from("a.txt")))
+            Args::Open {
+                file: Some(PathBuf::from("a.txt")),
+                config: None
+            }
+        );
+    }
+
+    #[test]
+    fn parse_args_takes_a_config_path_in_either_spelling() {
+        // The config has to be settled before the first frame, so it is a flag
+        // rather than something the editor learns later (SPEC §10.5).
+        let expected = Args::Open {
+            file: Some(PathBuf::from("notes.txt")),
+            config: Some(PathBuf::from("/etc/vortex.toml")),
+        };
+        assert_eq!(
+            args(&["--config", "/etc/vortex.toml", "notes.txt"]),
+            expected
+        );
+        assert_eq!(args(&["--config=/etc/vortex.toml", "notes.txt"]), expected);
+    }
+
+    #[test]
+    fn parse_args_reports_a_config_flag_with_nothing_after_it() {
+        // Silently starting on defaults would be the worst answer: the user asked
+        // for a specific config and would never learn it was ignored.
+        assert_eq!(args(&["--config"]), Args::MissingValue("--config"));
+    }
+
+    #[test]
+    fn parse_args_does_not_read_a_config_value_as_a_flag() {
+        // A config file named `--help` is absurd, but the value after the flag is a
+        // path and must not be re-parsed as one.
+        assert_eq!(
+            args(&["--config", "--help"]),
+            Args::Open {
+                file: None,
+                config: Some(PathBuf::from("--help"))
+            }
         );
     }
 
@@ -2543,8 +2710,14 @@ mod tests {
         };
         // Screen row 2 is body row 1 = line "cdef" (starts at byte 3); the gutter
         // edge (column 4) maps to its first character.
-        assert_eq!(pointer_offset(&snap, vp, 4, 2), 3);
+        assert_eq!(
+            pointer_offset(&snap, vp, config::DEFAULT_TAB_WIDTH, 4, 2),
+            3
+        );
         // A click on the head bar (screen row 0) clamps to the top line's start.
-        assert_eq!(pointer_offset(&snap, vp, 4, 0), 0);
+        assert_eq!(
+            pointer_offset(&snap, vp, config::DEFAULT_TAB_WIDTH, 4, 0),
+            0
+        );
     }
 }
