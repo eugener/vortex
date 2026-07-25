@@ -1967,3 +1967,44 @@ fn attaching_a_second_watcher_replaces_the_first() {
         await_note(&h, |n| matches!(n, Notification::FileReloaded { .. })).await;
     });
 }
+
+#[test]
+fn the_final_newline_policy_is_what_the_frontend_configured() {
+    // The one setting that has to cross the seam (SPEC §10.5): the frontend reads
+    // the config file, the core is what writes the bytes.
+    let dir = TempDir::new();
+    let path = dir.file("with-policy.txt");
+    let bare = dir.file("without-policy.txt");
+
+    // Default: a trailing newline is added, so a file edited here does not sprout
+    // a "\ No newline at end of file" in someone's diff.
+    drive(|h| {
+        let path = path.clone();
+        async move {
+            step(&h, Action::Open(path.clone())).await;
+            step(&h, Action::Insert("no trailing newline".into())).await;
+            step(&h, Action::Save).await;
+            await_note(&h, |n| matches!(n, Notification::FileSaved { .. })).await;
+            assert_eq!(
+                std::fs::read_to_string(&path).unwrap(),
+                "no trailing newline\n"
+            );
+        }
+    });
+
+    // Turned off, the buffer is written exactly as it stands.
+    drive(|h| async move {
+        let options = crate::action::CoreOptions {
+            final_newline: false,
+        };
+        step(&h, Action::Configure(options)).await;
+        step(&h, Action::Open(bare.clone())).await;
+        step(&h, Action::Insert("no trailing newline".into())).await;
+        step(&h, Action::Save).await;
+        await_note(&h, |n| matches!(n, Notification::FileSaved { .. })).await;
+        assert_eq!(
+            std::fs::read_to_string(&bare).unwrap(),
+            "no trailing newline"
+        );
+    });
+}

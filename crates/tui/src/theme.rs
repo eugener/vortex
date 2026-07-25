@@ -170,7 +170,7 @@ const MAX_ERROR: usize = 200;
 /// 10`, then `  |`, `2 | <the offending source>`, `  | ^`, then the explanation. The
 /// diagram rows are noise once the newlines are gone, and the source row would echo
 /// the file's own contents onto the screen, so only the prose rows are kept.
-fn one_line(error: &str) -> String {
+pub(crate) fn one_line(error: &str) -> String {
     let mut out = error
         .lines()
         .map(str::trim)

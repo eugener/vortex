@@ -476,6 +476,26 @@ impl Keymap {
         Ok(Self { bindings })
     }
 
+    /// Apply `pairs` over the existing bindings - a config file's `[keys]` table
+    /// layered on the built-in map (SPEC §10.5). Rebinding a chord that is already
+    /// bound replaces it, which is the point; every chord left alone keeps working,
+    /// so a user who rebinds one key does not lose the other fifty.
+    ///
+    /// # Errors
+    /// Returns a message naming the first unparseable chord or command. The
+    /// bindings applied before it stay applied: a typo on line 9 must not silently
+    /// undo lines 1 to 8, and the message says which line to fix.
+    pub fn extend_from_pairs(&mut self, pairs: &[(&str, &str)]) -> Result<(), KeymapError> {
+        for (chord, command) in pairs {
+            let chord_key =
+                Chord::parse(chord).ok_or_else(|| KeymapError::UnknownChord(chord.to_string()))?;
+            let command = Command::parse(command)
+                .ok_or_else(|| KeymapError::UnknownCommand(command.to_string()))?;
+            self.bindings.insert(chord_key, command);
+        }
+        Ok(())
+    }
+
     /// The shortcut bound to `command`, formatted for display (e.g. `"Ctrl+S"`), or
     /// `None` if it is unbound. Lets the palette show each command's key without a
     /// second source of truth - a rebind (M5 config) keeps the palette correct.
