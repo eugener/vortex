@@ -20,9 +20,11 @@
 #[path = "testutil.rs"]
 mod testutil;
 
+use std::collections::HashMap;
 use std::ffi::OsString;
 use std::io::{self, Stdout};
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use ratatui::crossterm::event::{
@@ -40,9 +42,9 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 use ratatui::{Frame, Terminal, TerminalOptions, Viewport};
 
-use vortex_core::{Action, Core, ViewSnapshot};
+use vortex_core::{Action, BufferId, BufferInfo, Core, ViewSnapshot};
 
-use vortex_tui::command::Command;
+use vortex_tui::command::{self, Command};
 use vortex_tui::compositor::{Compositor, EventResult};
 use vortex_tui::toast::{self, Toasts};
 use vortex_tui::{
@@ -247,11 +249,24 @@ struct GrammarManager {
     /// another file of the same language reuses the running highlighter, while a
     /// different language replaces it in the core.
     current: Option<&'static str>,
+    /// Languages whose grammar has already been loaded, and the `Language` handle
+    /// each one produced. Shared with the loader threads.
+    ///
+    /// Without this, switching between two buffers of different languages would
+    /// `dlopen` a grammar every time focus moved (M7 made that a per-keystroke-ish
+    /// event rather than a once-per-session one), paying ~200ms *and* leaking the
+    /// library image on each pass, since `load_grammar` deliberately never unmaps.
+    /// A `Language` is a pointer into an image that stays mapped for the process, so
+    /// caching it is sound by construction and re-attaching becomes near-free.
+    loaded: Arc<Mutex<HashMap<&'static str, tree_sitter::Language>>>,
 }
 
 impl GrammarManager {
     fn new() -> Self {
-        Self { current: None }
+        Self {
+            current: None,
+            loaded: Arc::new(Mutex::new(HashMap::new())),
+        }
     }
 
     /// Ensure the highlighter attached to the core matches `path`'s language,
@@ -266,6 +281,11 @@ impl GrammarManager {
     /// loop - the render thread never blocks. `current` is set *before* spawning, so
     /// a language is loaded at most once even though the launch file is both
     /// pre-warmed (see `main`) and re-announced via `FileOpened`.
+    ///
+    /// Called on a buffer *switch* as well as an open (M7): the highlighter holds one
+    /// grammar, so moving focus to a buffer of another language has to re-attach.
+    /// That is what makes the grammar cache load-bearing rather than an optimization -
+    /// alternating between two languages would otherwise reload on every switch.
     fn ensure(&mut self, path: &Path, handle: &vortex_core::CoreHandle) {
         let Some(lang) = grammar::grammar_target(path) else {
             return;
@@ -276,17 +296,31 @@ impl GrammarManager {
             return;
         }
         self.current = Some(lang);
-        // Only the syntax-attach sender crosses to the thread (it is a cheap channel
-        // handle clone); the render loop keeps the receivers.
+        // Only the syntax-attach sender and the shared cache cross to the thread (both
+        // cheap clones); the render loop keeps the receivers.
         let syntax_tx = handle.syntax.clone();
+        let loaded = Arc::clone(&self.loaded);
         let _ = std::thread::Builder::new()
             .name("vortex-syntax".into())
             .spawn(move || {
                 let Some(resolved) = grammar::resolve(lang) else {
                     return;
                 };
-                let Some(language) = load_grammar(&resolved.lib_path) else {
-                    return;
+                // Reuse an already-mapped grammar. A poisoned lock (a loader thread
+                // panicked) is not worth taking the editor down for: fall back to
+                // loading it again, which is correct, just slower.
+                let cached = loaded.lock().ok().and_then(|m| m.get(lang).cloned());
+                let language = match cached {
+                    Some(language) => language,
+                    None => {
+                        let Some(language) = load_grammar(&resolved.lib_path) else {
+                            return;
+                        };
+                        if let Ok(mut map) = loaded.lock() {
+                            map.insert(lang, language.clone());
+                        }
+                        language
+                    }
                 };
                 let (syntax_handle, syntax_loop) = vortex_core::highlighter(
                     language,
@@ -473,6 +507,14 @@ fn event_loop(
     // View state (scroll on both axes + last page height). Updated by `draw` each
     // frame and carried forward; `page()` sizes PageUp/PageDown (SPEC §5).
     let mut viewport = ViewState::default();
+    // Where each buffer was scrolled to, so switching away and back returns to the
+    // same place instead of snapping to the top. Frontend-owned: the viewport is not
+    // core state (SPEC §5), so the core neither knows nor needs to know about this.
+    // Keyed by `BufferId`, and entries for closed buffers are dropped as the buffer
+    // list shrinks, so this cannot grow without bound over a long session.
+    let mut viewports: HashMap<BufferId, ViewState> = HashMap::new();
+    // The buffer the last painted frame belonged to, so a switch can be noticed.
+    let mut painted: Option<BufferId> = None;
     // Transient file/edit notices (open/save results, failures) surface here as
     // top-right toasts that auto-fade, rather than hijacking the status bar (SPEC
     // §7.5). A failed save must be visible, not silent (SPEC §8).
@@ -515,14 +557,36 @@ fn event_loop(
             // one lazily for its type, whether the open came from argv or the
             // picker. Keyed off the core's own `FileOpened` so there is one path for
             // every open, and it fires with the path the core actually loaded.
-            if let vortex_core::Notification::FileOpened { path, .. } = &note {
-                lsp.ensure(path, handle);
-                grammars.ensure(path, handle);
+            // A buffer arriving on screen may want a language server and a grammar
+            // (SPEC §3, M2/M4). Both a fresh open and a *switch* qualify: the
+            // highlighter holds one grammar at a time, so moving focus to a buffer of
+            // another language has to re-attach exactly as an open does. Keyed off the
+            // core's own notifications so there is one path for every way a buffer can
+            // become current, carrying the path the core actually has.
+            let arriving = match &note {
+                vortex_core::Notification::FileOpened { path, .. } => Some(path.clone()),
+                vortex_core::Notification::BufferSwitched { path, .. } => path.clone(),
+                _ => None,
+            };
+            if let Some(path) = arriving {
+                lsp.ensure(&path, handle);
+                grammars.ensure(&path, handle);
                 // If this file type highlights, hold its first paint for the colors
                 // (below). No grammar -> nothing to wait for, paint as usual.
-                if grammar::grammar_target(path).is_some() {
+                if grammar::grammar_target(&path).is_some() {
                     awaiting_highlight = Some(Instant::now());
                 }
+            }
+            // The core refused to close a buffer with unsaved work (SPEC §8). Ask, and
+            // re-send the close forced if the user accepts - the confirmation is
+            // frontend-local right up to the committed answer (SPEC §7.5).
+            if let vortex_core::Notification::CloseRejected { buffer_id, path } = &note {
+                overlays.push(prompt::confirm_close(
+                    &config.theme,
+                    *buffer_id,
+                    path.as_deref(),
+                ));
+                needs_redraw = true;
             }
             // A copy/cut asks us to mirror the register to the OS clipboard. We push
             // it over OSC 52 (clipboard-over-terminal), which works locally and over
@@ -558,6 +622,17 @@ fn event_loop(
             && needs_redraw
             && !hold_for_highlight
         {
+            // A switch swaps the viewport: park the outgoing buffer's scroll and
+            // restore the incoming one's, so coming back lands where you left rather
+            // than snapping to the top. A buffer never painted before starts at the
+            // default, which is the top.
+            if painted != Some(snap.buffer_id) {
+                if let Some(previous) = painted {
+                    viewports.insert(previous, viewport);
+                }
+                viewport = viewports.get(&snap.buffer_id).copied().unwrap_or_default();
+                painted = Some(snap.buffer_id);
+            }
             viewport = draw(
                 terminal,
                 snap,
@@ -570,6 +645,12 @@ fn event_loop(
                 &overlays,
                 &toasts,
             )?;
+            viewports.insert(snap.buffer_id, viewport);
+            // Forget closed buffers so a long session cannot accumulate their scroll
+            // positions. Only worth walking when the map has outgrown the buffer list.
+            if viewports.len() > snap.buffers.len() {
+                viewports.retain(|id, _| snap.buffers.iter().any(|info| info.id == *id));
+            }
             needs_redraw = false;
             awaiting_highlight = None;
             // Default back to caret-follow; only a wheel scroll opts out, and only
@@ -604,6 +685,8 @@ fn event_loop(
                                 config: &mut config,
                                 toasts: &mut toasts,
                                 path: latest.as_ref().and_then(|s| s.path.as_deref()),
+                                buffers: latest.as_ref().map_or(&[], |s| &s.buffers),
+                                active: latest.as_ref().map(|s| s.buffer_id),
                             };
                             if !dispatch_command(command, handle, &mut ui) {
                                 return Ok(());
@@ -641,6 +724,8 @@ fn event_loop(
                             config: &mut config,
                             toasts: &mut toasts,
                             path: latest.as_ref().and_then(|s| s.path.as_deref()),
+                            buffers: latest.as_ref().map_or(&[], |s| &s.buffers),
+                            active: latest.as_ref().map(|s| s.buffer_id),
                         };
                         if !dispatch_command(command, handle, &mut ui) {
                             return Ok(());
@@ -725,6 +810,21 @@ struct Frontend<'a> {
     /// The current buffer's file path (from the latest snapshot), so the save-as
     /// prompt can pre-fill it. `None` before any file is bound.
     path: Option<&'a std::path::Path>,
+    /// Every open buffer in bufferline order, and which one is active, from the
+    /// latest snapshot. This is what lets "next buffer" be resolved here rather than
+    /// in the core: the frontend already holds the order, so it names the neighbor
+    /// and only the committed `SwitchBuffer { id }` crosses the seam (SPEC §7.5).
+    buffers: &'a [BufferInfo],
+    active: Option<BufferId>,
+}
+
+impl Frontend<'_> {
+    /// The buffer `offset` positions from the active one, or `None` when there is
+    /// nothing to switch to (no snapshot yet, or a single buffer). The wrapping lives
+    /// in [`command::neighbor_buffer`], which is pure and unit-tested.
+    fn neighbor(&self, offset: isize) -> Option<BufferId> {
+        command::neighbor_buffer(self.buffers, self.active?, offset)
+    }
 }
 
 /// Dispatch one resolved frontend command (SPEC §7.5), from either a bound key or a
@@ -755,6 +855,36 @@ fn dispatch_command(command: Command, handle: &vortex_core::CoreHandle, ui: &mut
         // The save-as prompt pre-fills the current path (if any) so a save-as is a
         // quick edit of the existing name; its committed path returns as SaveAs.
         Command::OpenSavePrompt => ui.overlays.push(prompt::save_as(&ui.config.theme, ui.path)),
+        // Buffer motion is resolved here, against the list the snapshot carries, and
+        // only the chosen buffer crosses the seam. With one buffer open there is no
+        // neighbor, so the key does nothing rather than round-tripping a no-op.
+        Command::NextBuffer | Command::PrevBuffer => {
+            let offset = if command == Command::NextBuffer {
+                1
+            } else {
+                -1
+            };
+            if let Some(id) = ui.neighbor(offset)
+                && handle
+                    .actions
+                    .send_blocking(Action::SwitchBuffer { id })
+                    .is_err()
+            {
+                return false;
+            }
+        }
+        // Unforced: the core refuses if there is unsaved work, and its `CloseRejected`
+        // is what raises the confirmation (SPEC §8).
+        Command::CloseBuffer => {
+            if let Some(id) = ui.active
+                && handle
+                    .actions
+                    .send_blocking(Action::CloseBuffer { id, force: false })
+                    .is_err()
+            {
+                return false;
+            }
+        }
         // Chrome is frontend-owned, so a theme change never crosses the seam: swap
         // the live config and hand the new styles to the surfaces that cached them.
         // A theme file that will not load must say so (SPEC §8: never silent) - and
@@ -1294,6 +1424,129 @@ mod tests {
             }
             snap.expect("script must contain at least one action")
         }))
+    }
+
+    /// Drive `dispatch_command` against a live core, the way the event loop does.
+    ///
+    /// `setup` runs first (opening buffers, typing), then each command in `commands`
+    /// is dispatched with a `Frontend` built from the latest snapshot - which is what
+    /// makes buffer switching resolvable at all, since it reads that snapshot's list.
+    /// Returns the final snapshot and the notifications the core emitted.
+    fn dispatch_against_core(
+        setup: &[Action],
+        commands: &[Command],
+    ) -> (ViewSnapshot, Vec<vortex_core::Notification>) {
+        let ex = smol::Executor::new();
+        let Core { handle, run } = vortex_core::new(64);
+        ex.spawn(run).detach();
+        smol::block_on(ex.run(async move {
+            let mut latest = None;
+            for action in setup {
+                handle.actions.send(action.clone()).await.unwrap();
+                while handle.deltas.try_recv().is_ok() {}
+                latest = Some(handle.snapshots.recv().await.unwrap());
+            }
+            while handle.notifications.try_recv().is_ok() {}
+
+            let mut config = config::Config::default();
+            let mut overlays = Compositor::new();
+            let mut toasts = Toasts::new(config.theme.toast_info, config.theme.toast_error);
+            for command in commands {
+                {
+                    let mut ui = Frontend {
+                        overlays: &mut overlays,
+                        config: &mut config,
+                        toasts: &mut toasts,
+                        path: latest.as_ref().and_then(|s| s.path.as_deref()),
+                        buffers: latest.as_ref().map_or(&[], |s| &s.buffers),
+                        active: latest.as_ref().map(|s| s.buffer_id),
+                    };
+                    assert!(dispatch_command(command.clone(), &handle, &mut ui));
+                }
+                // A dispatched core intent answers with a snapshot; a purely local
+                // no-op (no neighbor to switch to) sends nothing, so poll for one
+                // rather than awaiting - a bare `recv` would hang on that case.
+                for _ in 0..64 {
+                    smol::future::yield_now().await;
+                    while handle.deltas.try_recv().is_ok() {}
+                    if let Some(snap) = handle.snapshots.try_recv() {
+                        latest = Some(snap);
+                        break;
+                    }
+                }
+            }
+            let notes = std::iter::from_fn(|| handle.notifications.try_recv().ok()).collect();
+            (latest.expect("a snapshot was produced"), notes)
+        }))
+    }
+
+    /// Two temp files, opened as two buffers. Returns the dir (kept alive by the
+    /// caller: dropping it deletes the files) and the open actions.
+    fn two_open_files() -> (std::path::PathBuf, Vec<Action>) {
+        let dir = std::env::temp_dir().join(format!(
+            "vortex-tui-mb-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut actions = Vec::new();
+        for name in ["one.txt", "two.txt"] {
+            let path = dir.join(name);
+            std::fs::write(&path, format!("body of {name}")).unwrap();
+            actions.push(Action::Open(path));
+        }
+        (dir, actions)
+    }
+
+    #[test]
+    fn next_buffer_resolves_the_neighbor_from_the_snapshot_list() {
+        // The core has no "next": the frontend reads the ordered list off the
+        // snapshot, names the neighbor, and sends `SwitchBuffer { id }` (SPEC §7.5).
+        let (dir, opens) = two_open_files();
+        let (snap, _) = dispatch_against_core(&opens, &[Command::NextBuffer]);
+        // Two buffers, the second active after opening: next wraps to the first.
+        assert_eq!(snap.buffers.len(), 2);
+        assert_eq!(snap.buffer_id, snap.buffers[0].id);
+        assert_eq!(snap.text.to_string(), "body of one.txt");
+
+        // And back the other way.
+        let (snap, _) = dispatch_against_core(&opens, &[Command::NextBuffer, Command::PrevBuffer]);
+        assert_eq!(snap.buffer_id, snap.buffers[1].id);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn buffer_switching_with_one_buffer_open_does_nothing() {
+        // No neighbor: the key is a no-op rather than a round trip that re-selects
+        // what is already on screen.
+        let (snap, _) = dispatch_against_core(
+            &[Action::Insert("only".into())],
+            &[Command::NextBuffer, Command::PrevBuffer],
+        );
+        assert_eq!(snap.buffers.len(), 1);
+        assert_eq!(snap.text.to_string(), "only");
+    }
+
+    #[test]
+    fn close_buffer_sends_an_unforced_close_so_the_core_can_refuse() {
+        // Clean buffer: it just closes.
+        let (dir, opens) = two_open_files();
+        let (snap, _) = dispatch_against_core(&opens, &[Command::CloseBuffer]);
+        assert_eq!(snap.buffers.len(), 1);
+
+        // Dirty buffer: the core refuses, and that refusal is what raises the
+        // confirmation in the event loop (SPEC §8).
+        let mut dirty = opens.clone();
+        dirty.push(Action::Insert("unsaved".into()));
+        let (snap, notes) = dispatch_against_core(&dirty, &[Command::CloseBuffer]);
+        assert_eq!(snap.buffers.len(), 2, "nothing was closed");
+        assert!(
+            notes
+                .iter()
+                .any(|n| matches!(n, vortex_core::Notification::CloseRejected { .. })),
+            "expected the core to refuse, got {notes:?}"
+        );
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     /// Default per-frame paint inputs for tests: fresh view state, default theme,
