@@ -14,7 +14,7 @@ use vortex_core::{Action, BufferId, BufferInfo};
 use crate::command::Command;
 use crate::compositor::Layer;
 use crate::config::Theme;
-use crate::layout::buffer_display_name;
+use crate::layout::{buffer_display_name, with_modified_marker};
 use crate::picker::{Item, Picker};
 
 /// One row per open buffer. The label is the file's *full* path where it has one
@@ -38,10 +38,10 @@ fn items(buffers: &[BufferInfo], active: BufferId) -> Vec<Item> {
 /// A buffer's picker label: its path when it has one, otherwise the unnamed-buffer
 /// placeholder, with any modified marker.
 fn label_for(info: &BufferInfo) -> String {
-    match info.path.as_deref() {
-        Some(path) => decorate(&display_path(path), info.modified),
-        None => buffer_display_name(None, info.modified),
-    }
+    let Some(path) = info.path.as_deref() else {
+        return buffer_display_name(None, info.modified);
+    };
+    with_modified_marker(&display_path(path), info.modified)
 }
 
 /// The path as shown: relative to the working directory when it is under it, so the
@@ -54,15 +54,6 @@ fn display_path(path: &Path) -> String {
         .unwrap_or(path)
         .to_string_lossy()
         .into_owned()
-}
-
-/// Prefix the modified marker, matching [`buffer_display_name`]'s convention.
-fn decorate(name: &str, modified: bool) -> String {
-    if modified {
-        format!("● {name}")
-    } else {
-        name.to_string()
-    }
 }
 
 /// Open the buffer picker over the snapshot's buffer list.

@@ -141,14 +141,45 @@ struct Document {
     /// It also means the actor never awaits the sync channel, which would deadlock
     /// against the server task awaiting the event channel.
     lsp_dirty: bool,
-    /// Whether the server has been told this file exists (`didOpen`). A change
-    /// notification for an unopened document is a protocol error.
-    lsp_opened: bool,
     /// The buffer changed but the highlighter has not been told yet. Same role and
     /// same full-document-sync payoff as [`Self::lsp_dirty`]: re-sending the
     /// current buffer subsumes every missed state, so a dropped sync can never
     /// mis-color, and the actor never awaits the sync channel.
     syntax_dirty: bool,
+}
+
+/// A live connection to a language server, and which documents *this* connection
+/// has been told about.
+///
+/// The set lives here rather than as a flag on each [`Document`] because "has been
+/// announced" is a fact about the **connection**, not about the buffer: replacing the
+/// server invalidates every one of them at once. Holding it here makes that true by
+/// construction - a new connection starts with an empty set, so nothing has to
+/// remember to walk the documents and clear a flag. Getting that walk wrong is
+/// exactly how a buffer ended up silently unanalyzed once multi-buffer landed.
+struct LspConnection {
+    /// editor -> server (SPEC §5 full-text sync).
+    sync: Sender<DocumentSync>,
+    /// Documents this connection has had a `didOpen` for. A change notification for
+    /// a document a server has not opened is a protocol error, and the client drops
+    /// it, so this decides which of the two a sync sends.
+    opened: std::collections::HashSet<BufferId>,
+}
+
+impl LspConnection {
+    fn new(sync: Sender<DocumentSync>) -> Self {
+        Self {
+            sync,
+            opened: std::collections::HashSet::new(),
+        }
+    }
+
+    /// Forget that `id` was announced, so its next sync opens it afresh. Used when a
+    /// document's *identity* changes under a stable id (a scratch buffer adopting a
+    /// path, a save-as onto a new name) and when it closes.
+    fn forget(&mut self, id: BufferId) {
+        self.opened.remove(&id);
+    }
 }
 
 /// Owns all editor state: every open [`Document`] plus the state that spans them.
@@ -169,12 +200,10 @@ struct Session {
     /// documents are live) copying in one and pasting in another. Empty until the
     /// first copy/cut.
     register: Vec<String>,
-    /// editor -> language server, or `None` when no server is attached (the
-    /// common case). Everything LSP-related is an `Option` rather than a separate
-    /// code path so a session with no server pays nothing and behaves identically.
-    /// One server serves every document; which one it is told about is the
-    /// per-document `lsp_opened`/`lsp_dirty` pair's job.
-    lsp_sync: Option<Sender<DocumentSync>>,
+    /// The attached language server, or `None` when none is (the common case).
+    /// Everything LSP-related is an `Option` rather than a separate code path so a
+    /// session with no server pays nothing and behaves identically.
+    lsp: Option<LspConnection>,
     /// editor -> syntax highlighter, or `None` when none is attached (M4). The
     /// twin of [`Self::lsp_sync`] and, like it, an `Option` so a session with no
     /// highlighter pays nothing. The highlighter has no `didOpen`/`didChange`
@@ -201,7 +230,7 @@ impl Session {
             docs: vec![Document::new(BufferId(0))],
             active: 0,
             register: Vec::new(),
-            lsp_sync: None,
+            lsp: None,
             syntax_sync: None,
             next_id: 1,
             buffers: Arc::from(Vec::new()),
@@ -241,9 +270,11 @@ impl Session {
     /// the moment a file is moved or a symlink is repointed underneath us.
     fn index_of_path(&self, path: &Path) -> Option<usize> {
         let identity = file_identity(path);
-        self.docs
-            .iter()
-            .position(|d| d.path.as_deref().map(file_identity) == Some(identity.clone()))
+        self.docs.iter().position(|d| {
+            d.path
+                .as_deref()
+                .is_some_and(|p| file_identity(p) == identity)
+        })
     }
 
     /// The cached buffer list, rebuilt only when it would differ.
@@ -293,7 +324,6 @@ impl Document {
             history: History::new(),
             decorations: Arc::new(DecorationSet::new()),
             lsp_dirty: false,
-            lsp_opened: false,
             syntax_dirty: false,
         }
     }
@@ -537,17 +567,22 @@ impl Session {
     /// Never awaits: a full sync channel leaves `lsp_dirty` set and the next call
     /// re-sends the newest text, which is why dropping the attempt is safe.
     fn sync_lsp(&mut self) {
-        let Some(sync) = &self.lsp_sync else {
+        let Some(lsp) = &mut self.lsp else {
             return;
         };
         let doc = &mut self.docs[self.active];
         let Some(path) = &doc.path else {
             return;
         };
-        if !doc.lsp_dirty {
+        // A document this connection has never opened is outstanding even when its
+        // text has not changed since: the *server* has not seen it. That is what
+        // makes a replacement connection announce every buffer without anyone
+        // walking the list to re-flag them.
+        let announced = lsp.opened.contains(&doc.id);
+        if announced && !doc.lsp_dirty {
             return;
         }
-        let message = if doc.lsp_opened {
+        let message = if announced {
             DocumentSync::Changed {
                 path: path.clone(),
                 version: doc.version,
@@ -561,9 +596,9 @@ impl Session {
                 version: doc.version,
             }
         };
-        if sync.try_send(message).is_ok() {
+        if lsp.sync.try_send(message).is_ok() {
             doc.lsp_dirty = false;
-            doc.lsp_opened = true;
+            lsp.opened.insert(doc.id);
         }
     }
 
@@ -951,7 +986,7 @@ async fn run(
 ) {
     let mut session = Session::new();
     // The event side of the attached server, or `None` until one attaches. The
-    // send side lives on `session.lsp_sync`, so both are swapped together on attach.
+    // send side lives on `session.lsp`, so both are swapped together on attach.
     let mut lsp_events: Option<Receiver<LspEvent>> = None;
     // The syntax producer's event side, swapped in the same way (M4).
     let mut syntax_events: Option<Receiver<SyntaxEvent>> = None;
@@ -985,33 +1020,22 @@ async fn run(
             // server arrives is analyzed too. Replacing an earlier server drops its
             // channels, which stops its client loop (SPEC §8).
             //
-            // **Every** document, not just the active one: `lsp_sync` is session-wide
-            // while `lsp_opened` is per-document, so a document still flagged as
-            // opened would send the new server a `didChange` for a file it has never
-            // seen - which the client drops, leaving that buffer silently unanalyzed
-            // for as long as it stays open. Marking them all dirty means each
-            // announces itself when it next becomes active.
+            // A fresh connection has been told about nothing, which its empty
+            // `opened` set says on its own - no document has to be walked and
+            // re-flagged, and none can be missed.
             Incoming::Attach(handle) => {
-                session.lsp_sync = Some(handle.sync);
+                session.lsp = Some(LspConnection::new(handle.sync));
                 lsp_events = Some(handle.events);
-                for doc in &mut session.docs {
-                    doc.lsp_opened = false;
-                    doc.lsp_dirty = true;
-                }
                 continue;
             }
             // The server died, or its task ended. That must never take the editor
             // with it (SPEC §8): fall back to the no-LSP path, which is also what
             // keeps `select` from spinning on a permanently-ready closed channel.
-            // Drop the send side too, so a stale sync never targets a dead server.
-            // Clearing `lsp_opened` session-wide for the same reason as the attach
-            // arm: whatever attaches next has seen none of these documents.
+            // Dropping the connection drops what it had been told with it, so
+            // whatever attaches next starts from nothing.
             Incoming::LspClosed => {
                 lsp_events = None;
-                session.lsp_sync = None;
-                for doc in &mut session.docs {
-                    doc.lsp_opened = false;
-                }
+                session.lsp = None;
                 continue;
             }
             Incoming::Lsp(LspEvent::Diagnostics { path, diagnostics }) => {
@@ -1077,18 +1101,20 @@ async fn run(
                 // another's text the moment the user switches mid-parse. The batch is
                 // applied to whichever document it belongs to, background or not - its
                 // highlights are correct for that buffer, and it repaints when focused.
-                let target = session.index_of(buffer_id);
-                let repaint = match target {
-                    Some(index) => {
-                        let active = session.active;
-                        let doc = &mut session.docs[index];
-                        version == doc.version && doc.apply_highlights(spans) && index == active
-                    }
-                    None => false, // parsed for a buffer that has since been closed
+                // Parsed for a buffer that has since been closed: nothing to apply.
+                let Some(index) = session.index_of(buffer_id) else {
+                    continue;
                 };
-                // Republish only when the set actually changed, so an identical
-                // reparse (an edit that left tokens intact) costs no frame.
-                if repaint && !snapshots.publish(session.snapshot(None)) {
+                let active = session.active;
+                let doc = &mut session.docs[index];
+                // Republish only when the set actually changed *and* it is on screen,
+                // so an identical reparse (an edit that left tokens intact) or one for
+                // a background buffer costs no frame.
+                if version == doc.version
+                    && doc.apply_highlights(spans)
+                    && index == active
+                    && !snapshots.publish(session.snapshot(None))
+                {
                     break;
                 }
                 continue;
@@ -1477,18 +1503,23 @@ async fn open_file(
     // rather than sending a change against the old one's identity. The highlighter
     // has no per-document identity, so a plain dirty flag re-parses the new text.
     doc.lsp_dirty = true;
-    doc.lsp_opened = false;
     doc.syntax_dirty = true;
-
-    let _ = notifications.try_send(Notification::FileOpened {
-        buffer_id: doc.id,
-        path,
-        existed,
-    });
+    let id = doc.id;
     // `dirty` is a "what changed" repaint hint, so it is `None` when no delta was
     // emitted (a missing/empty file); reporting a spurious `Some(0..0)` would tell
     // a frontend an edit happened where none did (view.rs contract).
     let dirty = changed.then(|| 0..doc.buffer.byte_len());
+
+    let _ = notifications.try_send(Notification::FileOpened {
+        buffer_id: id,
+        path,
+        existed,
+    });
+    // Reusing a scratch buffer keeps its id while changing what it *is*, so the
+    // server has to be told about it again under the new name.
+    if let Some(lsp) = &mut session.lsp {
+        lsp.forget(id);
+    }
     // The path changed, so the cached entry for this buffer is stale.
     session.buffers_stale = true;
     snapshots.publish(session.snapshot(dirty))
@@ -1554,28 +1585,32 @@ fn close_buffer(
 
     session.docs.remove(index);
     session.buffers_stale = true;
+    // Ids are never reused, so a leftover entry could not mis-target a later buffer -
+    // but it would accumulate for the session's life, so drop it with the document.
+    if let Some(lsp) = &mut session.lsp {
+        lsp.forget(id);
+    }
     let _ = notifications.try_send(Notification::BufferClosed { buffer_id: id });
 
     if session.docs.is_empty() {
-        // Never leave the session with nowhere to type.
+        // Never leave the session with nowhere to type. This lands on the
+        // "active buffer is gone" case below, with `active` already 0.
         let fresh = session.next_buffer_id();
         session.docs.push(Document::new(fresh));
-        session.active = 0;
-        return switch_to(session, 0, snapshots, notifications);
     }
     if index < session.active {
         // Focus is unchanged, but every index after the hole shifted down.
         session.active -= 1;
         return snapshots.publish(session.snapshot(None));
     }
-    if index == session.active {
-        // The active buffer is gone: focus whatever slid into its place.
-        let next = session.active.min(session.docs.len() - 1);
-        session.active = next;
-        return switch_to(session, next, snapshots, notifications);
+    if index > session.active {
+        // Closed a buffer after the active one: focus and indices are untouched.
+        return snapshots.publish(session.snapshot(None));
     }
-    // Closed a buffer after the active one: focus and indices are untouched.
-    snapshots.publish(session.snapshot(None))
+    // The active buffer is gone: focus whatever slid into its place. `switch_to`
+    // sets `active` itself, so there is nothing to assign here.
+    let next = session.active.min(session.docs.len() - 1);
+    switch_to(session, next, snapshots, notifications)
 }
 
 /// Write the buffer to its bound file atomically (SPEC §8). Fails with a
@@ -1620,9 +1655,9 @@ async fn save_file(
 /// frontend has hung up.
 ///
 /// Adopting a path that differs from the current one changes the document's
-/// *identity*, so the language server is re-announced: `lsp_opened` is cleared and
-/// `lsp_dirty` set, and the next [`Session::sync_lsp`] sends a fresh `didOpen` under
-/// the new path (whose extension may map to a different `languageId`). The old
+/// *identity*, so the language server is re-announced: the connection forgets it and
+/// `lsp_dirty` is set, and the next [`Session::sync_lsp`] sends a fresh `didOpen`
+/// under the new path (whose extension may map to a different `languageId`). The old
 /// document is not formally closed - the same re-announce shape [`open_file`] uses.
 /// The highlighter is path-agnostic and the text is unchanged, so no reparse is
 /// forced; a save-as that changes the *language* still needs the frontend to attach
@@ -1658,8 +1693,9 @@ async fn save_as_file(
     let doc = session.active_mut();
     // A different target is a different document to the server; re-announce it so
     // diagnostics track the new name rather than the old one.
-    if doc.path.as_deref() != Some(path.as_path()) {
-        doc.lsp_opened = false;
+    let renamed = doc.path.as_deref() != Some(path.as_path());
+    let id = doc.id;
+    if renamed {
         doc.lsp_dirty = true;
     }
     doc.path = Some(path.clone());
@@ -1667,9 +1703,12 @@ async fn save_as_file(
     // later clears the modified marker, exactly as a plain save.
     doc.history.mark_saved();
     let _ = notifications.try_send(Notification::FileSaved {
-        buffer_id: doc.id,
+        buffer_id: id,
         path,
     });
+    if renamed && let Some(lsp) = &mut session.lsp {
+        lsp.forget(id);
+    }
     snapshots.publish(session.snapshot(None))
 }
 
