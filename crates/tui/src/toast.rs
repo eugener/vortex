@@ -60,6 +60,31 @@ pub fn toast_for(note: &Notification) -> Option<(String, Level)> {
         Notification::EditRejected { message, .. } => {
             Some((format!("Edit rejected: {message}"), Level::Error))
         }
+        Notification::FileReloaded { path, .. } => Some((
+            format!("Reloaded {}", buffer_display_name(Some(path), false)),
+            Level::Info,
+        )),
+        // The conflict prompt is the *answer* to an external change (see
+        // `main.rs`); this toast is what remains once it has been dealt with, and
+        // the removed case, which has no prompt because there is nothing to
+        // reload from. An error either way: both mean the buffer and its file no
+        // longer agree, which is not a calm state to leave a user in (SPEC §8).
+        Notification::ExternalChange { path, removed, .. } => {
+            let name = buffer_display_name(Some(path), false);
+            let text = if *removed {
+                format!("{name} was removed on disk")
+            } else {
+                format!("{name} changed on disk")
+            };
+            Some((text, Level::Error))
+        }
+        Notification::ReloadRejected { path, .. } => Some((
+            format!(
+                "{} has unsaved changes",
+                buffer_display_name(Some(path), false)
+            ),
+            Level::Error,
+        )),
         // Non-exhaustive: unknown/silent notifications surface no toast.
         _ => None,
     }
@@ -204,6 +229,46 @@ mod tests {
                 message: "nope".into(),
             }),
             Some(("Edit rejected: nope".into(), Level::Error))
+        );
+    }
+
+    #[test]
+    fn toast_for_renders_external_changes_as_something_to_notice() {
+        use std::path::PathBuf;
+        let id = BufferId(0);
+        // A clean buffer following its file is routine - the editor did the right
+        // thing on its own, so this is status, not alarm.
+        assert_eq!(
+            toast_for(&Notification::FileReloaded {
+                buffer_id: id,
+                path: PathBuf::from("dir/a.rs"),
+            }),
+            Some(("Reloaded a.rs".into(), Level::Info))
+        );
+        // The rest all mean the buffer and its file disagree, which is not a calm
+        // state to leave someone in (SPEC §8).
+        assert_eq!(
+            toast_for(&Notification::ExternalChange {
+                buffer_id: id,
+                path: PathBuf::from("dir/a.rs"),
+                removed: false,
+            }),
+            Some(("a.rs changed on disk".into(), Level::Error))
+        );
+        assert_eq!(
+            toast_for(&Notification::ExternalChange {
+                buffer_id: id,
+                path: PathBuf::from("dir/a.rs"),
+                removed: true,
+            }),
+            Some(("a.rs was removed on disk".into(), Level::Error))
+        );
+        assert_eq!(
+            toast_for(&Notification::ReloadRejected {
+                buffer_id: id,
+                path: PathBuf::from("dir/a.rs"),
+            }),
+            Some(("a.rs has unsaved changes".into(), Level::Error))
         );
     }
 

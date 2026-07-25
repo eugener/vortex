@@ -11,11 +11,22 @@ name = "vortex"
 path = "src/main.rs"
 
 [dependencies]
+# Channels for the file-watcher seam: the frontend constructs the `WatchHandle`
+# it hands the core, so it needs the same channel types `vortex-core` uses.
+# Cargo unifies these to one version, which is what makes the handle's `Sender`
+# and `Receiver` the same types on both sides.
+async-channel = "2.5.0"
 # Load grammar libraries at runtime (M4): the frontend `dlopen`s a `grammar-*`
 # cdylib and resolves its `vortex_grammar` entry point. This is the "genuinely
 # dynamic" half of syntax highlighting - grammars are config-driven runtime data,
 # never compiled into the editor (SPEC §3, §14).
 libloading = "0.9.0"
+# External-change detection (SPEC §3 "File watch" row, §10.2). Frontend-side by
+# design: it owns the OS watch threads and the platform backends, which keeps
+# vortex-core headless and lets a remote frontend watch the machine the files are
+# actually on. 8.x rather than the 9.0 release candidates - a watcher is not the
+# place to run a pre-release.
+notify = "8.2.0"
 nucleo-matcher = "0.3.1"
 # crossterm is used via ratatui's re-export (ratatui::crossterm) so the KeyEvent
 # types the render loop and event reader share are guaranteed identical - a
@@ -36,10 +47,6 @@ unicode-width = "0.2.2"
 vortex-core = { path = "../core" }
 
 [dev-dependencies]
-# Only for tests that drive the core with a fake language server on its channels
-# (the diagnostic-rendering paint tests). Not a runtime dependency: the frontend
-# talks to the core over the handle `vortex-core` hands back, never a raw channel.
-async-channel = "2.5.0"
 # Microbenchmarks for the display-column paint hot paths (`benches/layout.rs`).
 # Slim, matching vortex-core: no plotters/html/rayon, `cargo_bench_support` kept
 # for `--save-baseline` and the loop's `--test` smoke mode. Reachable only because

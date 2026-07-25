@@ -51,7 +51,7 @@ use vortex_tui::compositor::{Compositor, EventResult};
 use vortex_tui::toast::{self, Toasts};
 use vortex_tui::{
     bufferpicker, config, filepicker, grammar, keymap, layout, osc52, palette, prompt, theme,
-    themepicker,
+    themepicker, watcher,
 };
 
 /// Default tab stop width for display-column layout (SPEC §4). Config in M5.
@@ -136,6 +136,26 @@ fn main() -> io::Result<()> {
     let core_thread = std::thread::Builder::new()
         .name("vortex-core".into())
         .spawn(move || smol::block_on(run))?;
+
+    // Watch the open files for changes made outside the editor (SPEC §10.2). One
+    // watcher for the session, attached up front rather than lazily: it has no
+    // per-language cost to defer, and the core announces every already-open file to
+    // whatever attaches, so there is nothing to be early for. Its loop runs on its
+    // own thread, off the render thread, like the other producers. A backend that
+    // will not start is not fatal - the session simply does not notice external
+    // changes, which is where every session was before this existed (SPEC §8).
+    match watcher::watcher() {
+        Ok((watch_handle, watch_loop)) => {
+            std::thread::Builder::new()
+                .name("vortex-watch".into())
+                .spawn(move || smol::block_on(watch_loop))?;
+            let _ = handle.watch.send_blocking(watch_handle);
+        }
+        Err(_) => {
+            // Nothing to report to yet - the terminal is not even in raw mode, and
+            // a message here would be scrolled away by the alternate screen.
+        }
+    }
 
     // Language servers are attached lazily, driven by the core's `FileOpened`
     // notification (SPEC §3, M2): whenever a file is opened - at launch, or via the
@@ -626,6 +646,23 @@ fn event_loop(
                     &config.theme,
                     *buffer_id,
                     path.as_deref(),
+                ));
+                needs_redraw = true;
+            }
+            // The file changed under a buffer that has unsaved work (SPEC §10.2).
+            // Only the conflict gets a question - a clean buffer was already
+            // reloaded by the core, and a *removed* file has nothing to reload
+            // from, so both of those surface as a toast instead.
+            if let vortex_core::Notification::ExternalChange {
+                buffer_id,
+                path,
+                removed: false,
+            } = &note
+            {
+                overlays.push(prompt::confirm_reload(
+                    &config.theme,
+                    *buffer_id,
+                    Some(path.as_path()),
                 ));
                 needs_redraw = true;
             }

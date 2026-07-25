@@ -772,6 +772,11 @@ impl TempDir {
         std::fs::create_dir_all(&path).unwrap();
         Self(path)
     }
+
+    /// A path to `name` inside this dir (the file need not exist).
+    fn file(&self, name: &str) -> std::path::PathBuf {
+        self.0.join(name)
+    }
 }
 
 impl Drop for TempDir {
@@ -1765,6 +1770,7 @@ fn a_highlight_batch_that_cannot_be_published_stops_the_actor() {
             deltas: _deltas,
             lsp: _lsp,
             syntax: _syntax,
+            watch: _watch,
         } = h;
         drop(snapshots);
         // A non-empty batch for the current version (0, a fresh buffer) changes the
@@ -1801,5 +1807,163 @@ fn the_highlighter_closing_does_not_take_the_editor_with_it() {
         drop(fake);
         let snap = step(&h, Action::Insert("!".into())).await;
         assert_eq!(snap.text.to_string(), "fn f() {}!");
+    });
+}
+
+// --- External changes through the seam (SPEC §10.2) ---------------------------
+
+/// The watcher side of the seam: what the core asked us to watch, and a way to
+/// report that a file changed.
+struct FakeWatcher {
+    /// editor -> us: which files to follow.
+    requests: Receiver<crate::watch::WatchRequest>,
+    /// us -> editor: a file changed.
+    events: Sender<crate::watch::FileEvent>,
+}
+
+/// Attach a fake watcher over `CoreHandle::watch`, as the frontend does at startup.
+async fn attach_watcher(h: &CoreHandle) -> FakeWatcher {
+    let (request_tx, request_rx) = async_channel::bounded(16);
+    let (event_tx, event_rx) = async_channel::bounded(16);
+    h.watch
+        .send(crate::watch::WatchHandle {
+            requests: request_tx,
+            events: event_rx,
+        })
+        .await
+        .unwrap();
+    FakeWatcher {
+        requests: request_rx,
+        events: event_tx,
+    }
+}
+
+/// Await the next notification matching `f`, ignoring the ones that precede it.
+/// The producer channels interleave, so a seam test cannot assume position.
+async fn await_note<F>(h: &CoreHandle, f: F) -> Notification
+where
+    F: Fn(&Notification) -> bool,
+{
+    loop {
+        let note = h.notifications.recv().await.unwrap();
+        if f(&note) {
+            return note;
+        }
+    }
+}
+
+#[test]
+fn a_file_changing_under_a_clean_buffer_reloads_it_through_the_loop() {
+    // The whole path in one test: open a file, tell the core it changed, and watch
+    // the reload come back out as a snapshot - no direct calls into the internals.
+    let dir = TempDir::new();
+    let path = dir.file("watched.txt");
+    std::fs::write(&path, "first\n").unwrap();
+
+    drive(|h| async move {
+        let watcher = attach_watcher(&h).await;
+        step(&h, Action::Open(path.clone())).await;
+        assert_eq!(
+            watcher.requests.recv().await.unwrap(),
+            crate::watch::WatchRequest::Watch(path.clone()),
+            "opening announces the file to the watcher"
+        );
+
+        std::fs::write(&path, "rewritten by someone else\n").unwrap();
+        watcher
+            .events
+            .send(crate::watch::FileEvent::Changed(path.clone()))
+            .await
+            .unwrap();
+
+        await_note(&h, |n| matches!(n, Notification::FileReloaded { .. })).await;
+        let snap = step(&h, Action::RequestSnapshot).await;
+        assert_eq!(snap.text.to_string(), "rewritten by someone else\n");
+        assert!(!snap.modified);
+    });
+}
+
+#[test]
+fn a_conflict_is_resolved_by_the_reload_the_frontend_sends_back() {
+    // The modified case end to end: the core refuses to choose, the frontend asks,
+    // and the answer comes back as a forced Reload (SPEC §8).
+    let dir = TempDir::new();
+    let path = dir.file("watched.txt");
+    std::fs::write(&path, "first\n").unwrap();
+
+    drive(|h| async move {
+        let watcher = attach_watcher(&h).await;
+        step(&h, Action::Open(path.clone())).await;
+        let snap = step(&h, Action::Insert("mine ".into())).await;
+        let id = snap.buffer_id;
+
+        std::fs::write(&path, "theirs\n").unwrap();
+        watcher
+            .events
+            .send(crate::watch::FileEvent::Changed(path.clone()))
+            .await
+            .unwrap();
+        await_note(&h, |n| matches!(n, Notification::ExternalChange { .. })).await;
+
+        // Unforced first: still refused, because the buffer still has the work.
+        step(&h, Action::Reload { id, force: false }).await;
+        await_note(&h, |n| matches!(n, Notification::ReloadRejected { .. })).await;
+        let snap = step(&h, Action::RequestSnapshot).await;
+        assert_eq!(snap.text.to_string(), "mine first\n");
+
+        // Then forced, which is what the confirmation prompt commits.
+        step(&h, Action::Reload { id, force: true }).await;
+        await_note(&h, |n| matches!(n, Notification::FileReloaded { .. })).await;
+        let snap = step(&h, Action::RequestSnapshot).await;
+        assert_eq!(snap.text.to_string(), "theirs\n");
+        assert!(!snap.modified);
+    });
+}
+
+#[test]
+fn the_watcher_closing_does_not_take_the_editor_with_it() {
+    // The watcher dying degrades to "no external-change detection", never to "no
+    // editor" (SPEC §8) - the same guarantee the LSP and syntax producers carry.
+    drive(|h| async move {
+        let watcher = attach_watcher(&h).await;
+        step(&h, Action::Insert("still here".into())).await;
+        drop(watcher);
+        let snap = step(&h, Action::Insert("!".into())).await;
+        assert_eq!(snap.text.to_string(), "still here!");
+    });
+}
+
+#[test]
+fn attaching_a_second_watcher_replaces_the_first() {
+    // A watcher can be replaced mid-session, and the replacement has to be told
+    // about the files already open - the same re-announce a new language server
+    // gets. Dropping the first one's channels is what stops its loop (SPEC §8).
+    let dir = TempDir::new();
+    let path = dir.file("watched.txt");
+    std::fs::write(&path, "body\n").unwrap();
+
+    drive(|h| async move {
+        let first = attach_watcher(&h).await;
+        step(&h, Action::Open(path.clone())).await;
+        assert_eq!(
+            first.requests.recv().await.unwrap(),
+            crate::watch::WatchRequest::Watch(path.clone())
+        );
+
+        let second = attach_watcher(&h).await;
+        assert_eq!(
+            second.requests.recv().await.unwrap(),
+            crate::watch::WatchRequest::Watch(path.clone()),
+            "the replacement hears about the file that was already open"
+        );
+
+        // And it is the one now driving: a change reported through it lands.
+        std::fs::write(&path, "changed by someone else\n").unwrap();
+        second
+            .events
+            .send(crate::watch::FileEvent::Changed(path))
+            .await
+            .unwrap();
+        await_note(&h, |n| matches!(n, Notification::FileReloaded { .. })).await;
     });
 }

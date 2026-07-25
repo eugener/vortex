@@ -236,6 +236,29 @@ pub fn confirm_close(
     ))
 }
 
+/// Ask whether to discard unsaved edits in favour of the file's own contents,
+/// after the core reported that it changed underneath (SPEC §10.2).
+///
+/// The mirror image of [`confirm_close`], and refused by the core for the same
+/// reason: a reload throws away work, so the question has to be asked. Declining
+/// keeps the buffer - the file's version is still on disk, so nothing is lost by
+/// saying no, which is why "no" is the default here too.
+pub fn confirm_reload(
+    theme: &Theme,
+    id: vortex_core::BufferId,
+    path: Option<&std::path::Path>,
+) -> Box<dyn Layer> {
+    let name = path.map_or_else(
+        || "this buffer".to_string(),
+        |p| crate::layout::buffer_display_name(Some(p), false),
+    );
+    Box::new(Confirm::new(
+        format!("{name} changed on disk. Discard your changes and reload? (y/N) "),
+        vec![Command::Editor(Action::Reload { id, force: true })],
+        theme.palette,
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -444,6 +467,36 @@ mod tests {
         let mut layer = close_confirm();
         layer.handle_key(key('Y'));
         assert_eq!(layer.take_commands().len(), 1);
+    }
+
+    #[test]
+    fn confirming_a_reload_commits_a_forced_reload_for_that_buffer() {
+        // The other half of the external-change conflict (SPEC §10.2): the core
+        // refused the unforced reload precisely so this question gets asked.
+        let mut layer = confirm_reload(
+            &Theme::default(),
+            vortex_core::BufferId(3),
+            Some(std::path::Path::new("dir/notes.md")),
+        );
+        assert_eq!(layer.handle_key(key('y')), EventResult::Consumed);
+        assert!(layer.is_finished());
+        assert_eq!(
+            layer.take_commands(),
+            vec![Command::Editor(Action::Reload {
+                id: vortex_core::BufferId(3),
+                force: true,
+            })]
+        );
+    }
+
+    #[test]
+    fn declining_a_reload_keeps_the_buffer() {
+        // Saying no must commit nothing at all - the file's version is still on
+        // disk, so declining loses nothing, which is why it is the default.
+        let mut layer = confirm_reload(&Theme::default(), vortex_core::BufferId(3), None);
+        layer.handle_key(press(KeyCode::Esc));
+        assert!(layer.is_finished());
+        assert!(layer.take_commands().is_empty());
     }
 
     #[test]
