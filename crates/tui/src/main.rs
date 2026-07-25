@@ -1139,10 +1139,12 @@ fn paint_head_bar(frame: &mut Frame, area: Rect, snapshot: &ViewSnapshot, theme:
     let mut used = 0;
     for tab in tabs {
         used += tab.label.width();
-        let style = if tab.active {
-            theme.head_bar
-        } else {
-            theme.head_bar_inactive
+        // Three kinds of segment: the filled current tab, the tabs behind it, and
+        // the chrome (separators and overflow markers) that divides them.
+        let style = match (tab.is_tab(), tab.active) {
+            (true, true) => theme.head_bar_active,
+            (true, false) => theme.head_bar_inactive,
+            _ => theme.head_bar_separator,
         };
         spans.push(Span::styled(tab.label, style));
     }
@@ -1708,11 +1710,21 @@ mod tests {
         let head = row_text(&buf, 0);
         assert!(head.contains(layout::NO_NAME), "head bar: {head:?}");
         assert!(head.contains("3 lines"), "head bar: {head:?}");
-        // The whole row is painted with the head background (color, not a border).
-        // Asserted against the theme, not a literal, so a retheme is not a test edit.
-        let head_bg = config::Theme::default().head_bar.bg;
-        assert_eq!(buf.cell((0, 0)).unwrap().bg, head_bg.unwrap());
-        assert_eq!(buf.cell((39, 0)).unwrap().bg, head_bg.unwrap());
+        // The row is painted with colour, not borders. The sole buffer's tab is the
+        // active one, so it carries the accent fill; the bar's own ground shows
+        // through beneath the line count. Asserted against the theme, not literals,
+        // so a retheme is not a test edit.
+        let theme = config::Theme::default();
+        assert_eq!(
+            buf.cell((0, 0)).unwrap().bg,
+            theme.head_bar_active.bg.unwrap(),
+            "the active tab is filled from the first cell"
+        );
+        assert_eq!(
+            buf.cell((39, 0)).unwrap().bg,
+            theme.head_bar.bg.unwrap(),
+            "the bar's own ground runs to the right edge"
+        );
     }
 
     #[test]
@@ -1728,16 +1740,27 @@ mod tests {
         // The line count keeps the right end of the bar.
         assert!(head.contains("line"), "bufferline: {head:?}");
 
-        // The inactive tab is dimmed and the active one is not, so the buffer being
-        // edited reads as current. Asserted against the theme rather than literals,
-        // so a retheme is not a test edit.
+        // Tabs are divided, not just spaced: two names must not read as one string.
+        assert!(head.contains('│'), "bufferline: {head:?}");
+
+        // The active tab is *filled* with the accent and the others recede, so the
+        // current buffer survives a terminal where foreground brightness washes out.
+        // Asserted against the theme rather than literals, so a retheme is not a test
+        // edit.
         let theme = config::Theme::default();
         let column_of = |needle: &str| head.find(needle).expect("tab is present") as u16;
-        let inactive_fg = buf.cell((column_of("one.txt"), 0)).unwrap().fg;
-        let active_fg = buf.cell((column_of("two.txt"), 0)).unwrap().fg;
-        assert_eq!(inactive_fg, theme.head_bar_inactive.fg.unwrap());
-        assert_eq!(active_fg, theme.head_bar.fg.unwrap());
-        assert_ne!(inactive_fg, active_fg);
+        let inactive = buf.cell((column_of("one.txt"), 0)).unwrap().clone();
+        let active = buf.cell((column_of("two.txt"), 0)).unwrap().clone();
+        assert_eq!(active.bg, theme.head_bar_active.bg.unwrap());
+        assert_eq!(active.fg, theme.head_bar_active.fg.unwrap());
+        assert_eq!(inactive.bg, theme.head_bar_inactive.bg.unwrap());
+        assert_eq!(inactive.fg, theme.head_bar_inactive.fg.unwrap());
+        // The distinction is carried by the background, not brightness alone.
+        assert_ne!(active.bg, inactive.bg);
+
+        // The divider is chrome: dimmer than either tab's text.
+        let separator = buf.cell((head.find('│').unwrap() as u16, 0)).unwrap();
+        assert_eq!(separator.fg, theme.head_bar_separator.fg.unwrap());
         let _ = std::fs::remove_dir_all(dir);
     }
 

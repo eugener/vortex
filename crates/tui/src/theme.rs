@@ -219,7 +219,9 @@ struct StyleSpec {
 struct ThemeFile {
     text: Option<StyleSpec>,
     head_bar: Option<StyleSpec>,
+    head_bar_active: Option<StyleSpec>,
     head_bar_inactive: Option<StyleSpec>,
+    head_bar_separator: Option<StyleSpec>,
     status_bar: Option<StyleSpec>,
     gutter: Option<StyleSpec>,
     gutter_current: Option<StyleSpec>,
@@ -252,10 +254,20 @@ impl ThemeFile {
         Ok(Theme {
             text: slot("text", self.text, base.text)?,
             head_bar: slot("head_bar", self.head_bar, base.head_bar)?,
+            head_bar_active: slot(
+                "head_bar_active",
+                self.head_bar_active,
+                base.head_bar_active,
+            )?,
             head_bar_inactive: slot(
                 "head_bar_inactive",
                 self.head_bar_inactive,
                 base.head_bar_inactive,
+            )?,
+            head_bar_separator: slot(
+                "head_bar_separator",
+                self.head_bar_separator,
+                base.head_bar_separator,
             )?,
             status_bar: slot("status_bar", self.status_bar, base.status_bar)?,
             gutter: slot("gutter", self.gutter, base.gutter)?,

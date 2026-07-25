@@ -58,11 +58,21 @@ pub struct Theme {
     /// Top bar: the bufferline's tab strip (left) and line count (right). This is
     /// the style of the *active* tab and of the bar itself.
     pub head_bar: Style,
-    /// Tabs in the bufferline other than the active one - dimmed so the buffer you
-    /// are actually editing reads as the current one at a glance. Its own slot
-    /// rather than a modifier applied to [`Self::head_bar`], because which pair of
-    /// colors separates "current" from "background" is a theme's call (§10.5).
+    /// The active buffer's tab: **filled** with the theme's "you are here" accent as
+    /// a background, so the current buffer is legible as a block rather than as a
+    /// slightly brighter word. Carrying it in the background is what keeps it
+    /// readable on a washed-out terminal, where foreground brightness is the first
+    /// distinction to disappear.
+    pub head_bar_active: Style,
+    /// Tabs in the bufferline other than the active one - dimmed so they recede
+    /// behind the filled one. Its own slot rather than a modifier applied to
+    /// [`Self::head_bar`], because which pair of colors separates "current" from
+    /// "background" is a theme's call (§10.5).
     pub head_bar_inactive: Style,
+    /// The divider between adjacent tabs, and the `‹`/`›` overflow markers - the
+    /// bufferline's chrome. Dim: it is there to stop two names reading as one, not
+    /// to be looked at.
+    pub head_bar_separator: Style,
     /// Bottom bar: cursor position (left) and buffer metrics (right).
     pub status_bar: Style,
     /// Gutter line numbers away from the cursor - dimmed so they recede.
@@ -175,8 +185,17 @@ impl Default for Theme {
                 .fg(Color::Rgb(0xcc, 0xd2, 0xe4))
                 .bg(Color::Rgb(0x11, 0x14, 0x1d))
                 .add_modifier(Modifier::BOLD),
+            // The accent undertow reserves for "you are here" (§10.5), spent here on
+            // the one tab that is.
+            head_bar_active: Style::new()
+                .fg(Color::Rgb(0x15, 0x18, 0x23))
+                .bg(Color::Rgb(0x63, 0xd2, 0xc3))
+                .add_modifier(Modifier::BOLD),
             head_bar_inactive: Style::new()
                 .fg(Color::Rgb(0x6b, 0x74, 0x96))
+                .bg(Color::Rgb(0x11, 0x14, 0x1d)),
+            head_bar_separator: Style::new()
+                .fg(Color::Rgb(0x39, 0x40, 0x5e))
                 .bg(Color::Rgb(0x11, 0x14, 0x1d)),
             status_bar: Style::new()
                 .fg(Color::Rgb(0x8a, 0x93, 0xb5))
@@ -286,7 +305,9 @@ mod tests {
         let slots = [
             ("text", t.text),
             ("head_bar", t.head_bar),
+            ("head_bar_active", t.head_bar_active),
             ("head_bar_inactive", t.head_bar_inactive),
+            ("head_bar_separator", t.head_bar_separator),
             ("status_bar", t.status_bar),
             ("gutter", t.gutter),
             ("gutter_current", t.gutter_current),
