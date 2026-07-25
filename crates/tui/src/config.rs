@@ -151,6 +151,12 @@ pub fn load(path: &Path) -> (Config, Option<String>) {
 }
 
 /// [`load`]'s pure half: config text in, resolved config plus any complaint out.
+///
+/// Every message out of here is [`one_line`](crate::theme::one_line)d, because the
+/// only place they are shown is a toast - one row, of one screen width. It also
+/// bounds them: a `toml` error quotes the offending line back, and a bad binding
+/// echoes the key the user wrote, so a config file that is not really a config file
+/// (a binary, a minified blob) would otherwise carry a megabyte-long line into it.
 fn parse(text: &str) -> (Config, Option<String>) {
     let file: ConfigFile = match toml::from_str(text) {
         Ok(file) => file,
@@ -184,7 +190,7 @@ fn parse(text: &str) -> (Config, Option<String>) {
                 config.theme = theme;
                 config.theme_name = name;
             }
-            Err(err) => problem = Some(err),
+            Err(err) => problem = Some(crate::theme::one_line(&err)),
         }
     }
     if !file.keys.is_empty() {
@@ -197,7 +203,7 @@ fn parse(text: &str) -> (Config, Option<String>) {
             Ok(()) => {}
             // The bindings before the bad one stay applied, so a typo on one line
             // does not cost the user every key they rebound above it.
-            Err(err) => problem = Some(err.to_string()),
+            Err(err) => problem = Some(crate::theme::one_line(&err.to_string())),
         }
     }
     (config, problem)
@@ -531,6 +537,25 @@ mod tests {
             command_for_key(&config.keymap, ctrl_s, 10),
             Some(Command::Editor(vortex_core::Action::Quit))
         );
+    }
+
+    #[test]
+    fn a_config_that_is_not_a_config_cannot_flood_the_toast() {
+        // The toast is one row of one screen width. Every message here quotes the
+        // file back in some form, so a binary pointed at with --config must not
+        // carry a megabyte-long line into it.
+        let huge = "x".repeat(50_000);
+        for text in [
+            format!("[keys]\n\"ctrl+e\" = \"{huge}\"\n"),
+            format!("[keys]\n\"{huge}\" = \"quit\"\n"),
+            format!("theme = \"{huge}\"\n"),
+            format!("{huge} = 1\n"),
+        ] {
+            let (_, problem) = parse(&text);
+            let problem = problem.expect("each of these is a complaint");
+            assert!(problem.len() <= 220, "message was {} bytes", problem.len());
+            assert!(!problem.contains('\n'), "message must be one line");
+        }
     }
 
     #[test]
