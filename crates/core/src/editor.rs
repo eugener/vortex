@@ -108,8 +108,12 @@ impl SnapshotSink {
     }
 }
 
-/// Owns all editor state. Never shared; lives inside the actor loop.
-struct Editor {
+/// One open document - everything that is *per-buffer* state. Versions, anchors
+/// and history are per-buffer (SPEC §5), so an edit in one document never
+/// invalidates another's. What deliberately does not live here is the state that
+/// spans documents - the clipboard register and the producer channels - which
+/// belongs to the owning [`Session`].
+struct Document {
     id: BufferId,
     buffer: RopeBuffer,
     selections: SelectionSet,
@@ -122,22 +126,12 @@ struct Editor {
     /// The undo tree (SPEC §2.4). Owns the reversible change history and the
     /// coalescing state; reset on a file open (undo does not cross a load).
     history: History,
-    /// The clipboard register: one entry per selection copied/cut, in selection
-    /// order (SPEC §11). The core owns this state so a multi-cursor copy round-trips
-    /// per-cursor on paste; the frontend mirrors a flattened form to the OS clipboard
-    /// via `Notification::SetClipboard`. Survives file opens (a yank is not tied to a
-    /// buffer). Empty until the first copy/cut.
-    register: Vec<String>,
     /// Everything the frontend paints at a position (SPEC §5): LSP diagnostics
     /// now, syntax highlights and git signs later. Held behind an `Arc` so
     /// publishing a snapshot is a ref-count bump rather than a deep clone of
     /// every span, and transformed through each edit so overlays keep pointing at
     /// the right text between a producer's refreshes.
     decorations: Arc<DecorationSet>,
-    /// editor -> language server, or `None` when no server is attached (the
-    /// common case). Everything LSP-related is an `Option` rather than a separate
-    /// code path so a buffer with no server pays nothing and behaves identically.
-    lsp_sync: Option<Sender<DocumentSync>>,
     /// The buffer changed but the server has not been told yet - either because
     /// the sync channel was momentarily full, or because an edit just landed.
     ///
@@ -150,12 +144,6 @@ struct Editor {
     /// Whether the server has been told this file exists (`didOpen`). A change
     /// notification for an unopened document is a protocol error.
     lsp_opened: bool,
-    /// editor -> syntax highlighter, or `None` when none is attached (M4). The
-    /// twin of [`Self::lsp_sync`] and, like it, an `Option` so a buffer with no
-    /// highlighter pays nothing. The highlighter has no `didOpen`/`didChange`
-    /// distinction - every message is the full text - so it needs no `opened`
-    /// flag, only the dirty flag below.
-    syntax_sync: Option<Sender<SyntaxSync>>,
     /// The buffer changed but the highlighter has not been told yet. Same role and
     /// same full-document-sync payoff as [`Self::lsp_dirty`]: re-sending the
     /// current buffer subsumes every missed state, so a dropped sync can never
@@ -163,21 +151,72 @@ struct Editor {
     syntax_dirty: bool,
 }
 
-impl Editor {
+/// Owns all editor state: every open [`Document`] plus the state that spans them.
+/// Never shared; lives inside the actor loop (SPEC §2.3 single owner).
+struct Session {
+    /// Every open document, in the order a frontend lists them. A `Vec` rather
+    /// than a map because the order *is* the bufferline order and lookups are over
+    /// a handful of entries. Never empty: the session always holds at least one
+    /// document, so [`Self::active`] is always a valid index.
+    docs: Vec<Document>,
+    /// Index into [`Self::docs`] of the document actions apply to.
+    active: usize,
+    /// The clipboard register: one entry per selection copied/cut, in selection
+    /// order (SPEC §11). The core owns this state so a multi-cursor copy round-trips
+    /// per-cursor on paste; the frontend mirrors a flattened form to the OS clipboard
+    /// via `Notification::SetClipboard`. Session-wide rather than per-document - a
+    /// yank is not tied to a buffer, so it survives file opens and (once several
+    /// documents are live) copying in one and pasting in another. Empty until the
+    /// first copy/cut.
+    register: Vec<String>,
+    /// editor -> language server, or `None` when no server is attached (the
+    /// common case). Everything LSP-related is an `Option` rather than a separate
+    /// code path so a session with no server pays nothing and behaves identically.
+    /// One server serves every document; which one it is told about is the
+    /// per-document `lsp_opened`/`lsp_dirty` pair's job.
+    lsp_sync: Option<Sender<DocumentSync>>,
+    /// editor -> syntax highlighter, or `None` when none is attached (M4). The
+    /// twin of [`Self::lsp_sync`] and, like it, an `Option` so a session with no
+    /// highlighter pays nothing. The highlighter has no `didOpen`/`didChange`
+    /// distinction - every message is the full text - so it needs no `opened`
+    /// flag, only the per-document dirty flag.
+    syntax_sync: Option<Sender<SyntaxSync>>,
+}
+
+impl Session {
     fn new() -> Self {
         Self {
-            id: BufferId(0),
+            docs: vec![Document::new(BufferId(0))],
+            active: 0,
+            register: Vec::new(),
+            lsp_sync: None,
+            syntax_sync: None,
+        }
+    }
+
+    /// The document actions apply to. Infallible: `docs` is never empty and
+    /// `active` is only ever set to a valid index.
+    fn active(&self) -> &Document {
+        &self.docs[self.active]
+    }
+
+    fn active_mut(&mut self) -> &mut Document {
+        &mut self.docs[self.active]
+    }
+}
+
+impl Document {
+    fn new(id: BufferId) -> Self {
+        Self {
+            id,
             buffer: RopeBuffer::new(),
             selections: SelectionSet::at_origin(),
             version: 0,
             path: None,
             history: History::new(),
-            register: Vec::new(),
             decorations: Arc::new(DecorationSet::new()),
-            lsp_sync: None,
             lsp_dirty: false,
             lsp_opened: false,
-            syntax_sync: None,
             syntax_dirty: false,
         }
     }
@@ -269,28 +308,6 @@ impl Editor {
         edits
     }
 
-    /// Copy every non-empty selection's text into the register (SPEC §11), one
-    /// entry per selection in selection order (the set is sorted, so this is the
-    /// on-screen top-to-bottom order). Returns `true` if anything was copied - a set
-    /// of bare cursors selects nothing, leaves the register untouched, and returns
-    /// `false` so the caller emits no clipboard notification. Reads text via
-    /// [`Text::slice`], which is bounded to the selected bytes, never the whole file.
-    fn fill_register(&mut self) -> bool {
-        let text = self.buffer.text();
-        let slices: Vec<String> = self
-            .selections
-            .all()
-            .iter()
-            .filter(|sel| !sel.is_cursor())
-            .map(|sel| text.slice(sel.start()..sel.end()))
-            .collect();
-        if slices.is_empty() {
-            return false;
-        }
-        self.register = slices;
-        true
-    }
-
     /// Move every decoration across the applied `changes` (SPEC §5). Skips the
     /// `Arc` clone entirely when nothing is decorated - the overwhelmingly common
     /// case of a buffer with no LSP attached, which must not pay for this at all.
@@ -301,62 +318,6 @@ impl Editor {
         // `make_mut` clones only while a published snapshot still shares the set;
         // once the frontend drops that snapshot this mutates in place.
         Arc::make_mut(&mut self.decorations).transform_through(edits);
-    }
-
-    /// Tell the language server about the buffer's current contents, if one is
-    /// attached and anything is outstanding (SPEC §5 full-text sync).
-    ///
-    /// Never awaits: a full sync channel leaves `lsp_dirty` set and the next call
-    /// re-sends the newest text, which is why dropping the attempt is safe.
-    fn sync_lsp(&mut self) {
-        let (Some(sync), Some(path)) = (&self.lsp_sync, &self.path) else {
-            return;
-        };
-        if !self.lsp_dirty {
-            return;
-        }
-        let message = if self.lsp_opened {
-            DocumentSync::Changed {
-                path: path.clone(),
-                version: self.version,
-                text: self.buffer.text(),
-            }
-        } else {
-            DocumentSync::Opened {
-                path: path.clone(),
-                language_id: language_id(path),
-                text: self.buffer.text(),
-                version: self.version,
-            }
-        };
-        if sync.try_send(message).is_ok() {
-            self.lsp_dirty = false;
-            self.lsp_opened = true;
-        }
-    }
-
-    /// Send the current buffer to the highlighter if it has changed since the last
-    /// send (M4). The twin of [`Self::sync_lsp`], minus the `didOpen`/`didChange`
-    /// split the highlighter does not have: every message is the full text.
-    ///
-    /// Never awaits: a full sync channel leaves `syntax_dirty` set and the next
-    /// call re-sends the newest text (the highlighter also coalesces to the newest
-    /// on its side), so a dropped attempt is safe and the actor cannot deadlock
-    /// against the highlighter awaiting the event channel.
-    fn sync_syntax(&mut self) {
-        let Some(sync) = &self.syntax_sync else {
-            return;
-        };
-        if !self.syntax_dirty {
-            return;
-        }
-        let message = SyntaxSync {
-            version: self.version,
-            text: self.buffer.text(),
-        };
-        if sync.try_send(message).is_ok() {
-            self.syntax_dirty = false;
-        }
     }
 
     /// Replace the syntax highlights with `spans` (M4). Mirrors
@@ -422,6 +383,31 @@ impl Editor {
         Arc::make_mut(&mut self.decorations).set_bucket(DecorationSource::Lsp, candidate);
         true
     }
+}
+
+impl Session {
+    /// Copy every non-empty selection's text into the register (SPEC §11), one
+    /// entry per selection in selection order (the set is sorted, so this is the
+    /// on-screen top-to-bottom order). Returns `true` if anything was copied - a set
+    /// of bare cursors selects nothing, leaves the register untouched, and returns
+    /// `false` so the caller emits no clipboard notification. Reads text via
+    /// [`Text::slice`], which is bounded to the selected bytes, never the whole file.
+    fn fill_register(&mut self) -> bool {
+        let doc = self.active();
+        let text = doc.buffer.text();
+        let slices: Vec<String> = doc
+            .selections
+            .all()
+            .iter()
+            .filter(|sel| !sel.is_cursor())
+            .map(|sel| text.slice(sel.start()..sel.end()))
+            .collect();
+        if slices.is_empty() {
+            return false;
+        }
+        self.register = slices;
+        true
+    }
 
     /// The register flattened for the OS clipboard: entries joined with `\n` (SPEC
     /// §11). The OS clipboard is a single string, so the per-selection structure is
@@ -430,18 +416,19 @@ impl Editor {
         self.register.join("\n")
     }
 
-    /// Plan the per-cursor edits a `Paste` produces: each selection's span is
-    /// replaced by the register text assigned to it (SPEC §11 distribution rule).
-    /// With one register entry it goes to every cursor; with exactly as many entries
-    /// as selections the i-th entry goes to the i-th selection (the multi-cursor
-    /// round-trip); otherwise every cursor gets the whole register joined with `\n`.
-    /// Returns edits sorted DESCENDING by start (as [`Self::plan_edit`]) so
-    /// back-to-front application is offset-stable, or empty for an empty register.
+    /// Plan the per-cursor edits a `Paste` produces over the active document: each
+    /// selection's span is replaced by the register text assigned to it (SPEC §11
+    /// distribution rule). With one register entry it goes to every cursor; with
+    /// exactly as many entries as selections the i-th entry goes to the i-th
+    /// selection (the multi-cursor round-trip); otherwise every cursor gets the whole
+    /// register joined with `\n`. Returns edits sorted DESCENDING by start (as
+    /// [`Document::plan_edit`]) so back-to-front application is offset-stable, or
+    /// empty for an empty register.
     fn plan_paste(&self) -> Vec<(std::ops::Range<usize>, String)> {
         if self.register.is_empty() {
             return Vec::new();
         }
-        let selections = self.selections.all();
+        let selections = self.active().selections.all();
         // The joined fallback applies only when counts are neither 1 nor equal;
         // build it once then, and not at all on the common paths.
         let joined = (self.register.len() != 1 && self.register.len() != selections.len())
@@ -460,6 +447,67 @@ impl Editor {
             .collect();
         edits.sort_by_key(|e| std::cmp::Reverse(e.0.start));
         edits
+    }
+
+    /// Tell the language server about the active document's current contents, if a
+    /// server is attached and anything is outstanding (SPEC §5 full-text sync).
+    ///
+    /// Never awaits: a full sync channel leaves `lsp_dirty` set and the next call
+    /// re-sends the newest text, which is why dropping the attempt is safe.
+    fn sync_lsp(&mut self) {
+        let Some(sync) = &self.lsp_sync else {
+            return;
+        };
+        let doc = &mut self.docs[self.active];
+        let Some(path) = &doc.path else {
+            return;
+        };
+        if !doc.lsp_dirty {
+            return;
+        }
+        let message = if doc.lsp_opened {
+            DocumentSync::Changed {
+                path: path.clone(),
+                version: doc.version,
+                text: doc.buffer.text(),
+            }
+        } else {
+            DocumentSync::Opened {
+                path: path.clone(),
+                language_id: language_id(path),
+                text: doc.buffer.text(),
+                version: doc.version,
+            }
+        };
+        if sync.try_send(message).is_ok() {
+            doc.lsp_dirty = false;
+            doc.lsp_opened = true;
+        }
+    }
+
+    /// Send the active document to the highlighter if it has changed since the last
+    /// send (M4). The twin of [`Self::sync_lsp`], minus the `didOpen`/`didChange`
+    /// split the highlighter does not have: every message is the full text.
+    ///
+    /// Never awaits: a full sync channel leaves `syntax_dirty` set and the next
+    /// call re-sends the newest text (the highlighter also coalesces to the newest
+    /// on its side), so a dropped attempt is safe and the actor cannot deadlock
+    /// against the highlighter awaiting the event channel.
+    fn sync_syntax(&mut self) {
+        let Some(sync) = &self.syntax_sync else {
+            return;
+        };
+        let doc = &mut self.docs[self.active];
+        if !doc.syntax_dirty {
+            return;
+        }
+        let message = SyntaxSync {
+            version: doc.version,
+            text: doc.buffer.text(),
+        };
+        if sync.try_send(message).is_ok() {
+            doc.syntax_dirty = false;
+        }
     }
 }
 
@@ -774,12 +822,12 @@ fn build(action_capacity: usize, lsp: Option<LspHandle>) -> Core {
 
 /// Mirror the register to the OS clipboard: fill it from the selections and, if
 /// anything was copied, emit `SetClipboard`. Shared by Copy and Cut, which differ
-/// only in their follow-up step. Lives in the actor (not on `Editor`) so the
+/// only in their follow-up step. Lives in the actor (not on `Session`) so the
 /// notifications channel stays a transport concern, not core state.
-fn mirror_register(editor: &mut Editor, notifications: &Sender<Notification>) {
-    if editor.fill_register() {
+fn mirror_register(session: &mut Session, notifications: &Sender<Notification>) {
+    if session.fill_register() {
         let _ = notifications.try_send(Notification::SetClipboard {
-            text: editor.register_flattened(),
+            text: session.register_flattened(),
         });
     }
 }
@@ -794,9 +842,9 @@ async fn run(
     lsp_attach: Receiver<LspHandle>,
     syntax_attach: Receiver<SyntaxHandle>,
 ) {
-    let mut editor = Editor::new();
+    let mut session = Session::new();
     // The event side of the attached server, or `None` until one attaches. The
-    // send side lives on `editor.lsp_sync`, so both are swapped together on attach.
+    // send side lives on `session.lsp_sync`, so both are swapped together on attach.
     let mut lsp_events: Option<Receiver<LspEvent>> = None;
     // The syntax producer's event side, swapped in the same way (M4).
     let mut syntax_events: Option<Receiver<SyntaxEvent>> = None;
@@ -809,8 +857,8 @@ async fn run(
         // Flush any outstanding document sync before parking on input, so the
         // server and highlighter see the newest text while the user is idle rather
         // than only once they press another key.
-        editor.sync_lsp();
-        editor.sync_syntax();
+        session.sync_lsp();
+        session.sync_syntax();
 
         // Bound the borrow of `*_events` to this statement so the arms below can
         // clear them.
@@ -830,10 +878,11 @@ async fn run(
             // when the server arrives is analyzed too. Replacing an earlier server
             // drops its channels, which stops its client loop (SPEC §8).
             Incoming::Attach(handle) => {
-                editor.lsp_sync = Some(handle.sync);
+                session.lsp_sync = Some(handle.sync);
                 lsp_events = Some(handle.events);
-                editor.lsp_opened = false;
-                editor.lsp_dirty = true;
+                let doc = session.active_mut();
+                doc.lsp_opened = false;
+                doc.lsp_dirty = true;
                 continue;
             }
             // The server died, or its task ended. That must never take the editor
@@ -842,16 +891,17 @@ async fn run(
             // Drop the send side too, so a stale sync never targets a dead server.
             Incoming::LspClosed => {
                 lsp_events = None;
-                editor.lsp_sync = None;
-                editor.lsp_opened = false;
+                session.lsp_sync = None;
+                session.active_mut().lsp_opened = false;
                 continue;
             }
             Incoming::Lsp(LspEvent::Diagnostics { path, diagnostics }) => {
                 // Republish only when the screen would actually differ: a server
                 // re-sending an identical batch (common while indexing) must not
                 // cost a frame.
-                if editor.apply_diagnostics(&path, &diagnostics)
-                    && !snapshots.publish(editor.snapshot(None))
+                let doc = session.active_mut();
+                if doc.apply_diagnostics(&path, &diagnostics)
+                    && !snapshots.publish(doc.snapshot(None))
                 {
                     break;
                 }
@@ -861,9 +911,9 @@ async fn run(
             // dirty so the next loop turn sends it for a first parse (M4). Replacing
             // an earlier highlighter drops its channels, stopping its loop (SPEC §8).
             Incoming::SyntaxAttach(handle) => {
-                editor.syntax_sync = Some(handle.sync);
+                session.syntax_sync = Some(handle.sync);
                 syntax_events = Some(handle.events);
-                editor.syntax_dirty = true;
+                session.active_mut().syntax_dirty = true;
                 continue;
             }
             // The highlighter died or its task ended. As with LSP, that must never
@@ -872,7 +922,7 @@ async fn run(
             // permanently-ready closed channel.
             Incoming::SyntaxClosed => {
                 syntax_events = None;
-                editor.syntax_sync = None;
+                session.syntax_sync = None;
                 continue;
             }
             Incoming::Syntax(SyntaxEvent::Highlights { version, spans }) => {
@@ -888,9 +938,10 @@ async fn run(
                 // misplace it" contract (SPEC §5); the `version` on the event exists
                 // for exactly this guard. Republish only when the set actually
                 // changed, so an identical reparse costs no frame.
-                if version == editor.version
-                    && editor.apply_highlights(spans)
-                    && !snapshots.publish(editor.snapshot(None))
+                let doc = session.active_mut();
+                if version == doc.version
+                    && doc.apply_highlights(spans)
+                    && !snapshots.publish(doc.snapshot(None))
                 {
                     break;
                 }
@@ -904,13 +955,17 @@ async fn run(
         // actions then share one apply_edit call instead of repeating the
         // apply/break plumbing per variant.
         let step = match action {
-            Action::Insert(text) => Step::Edit(editor.plan_edit(EditKind::Insert(text))),
-            Action::DeleteBackward => Step::Edit(editor.plan_edit(EditKind::DeleteBackward)),
-            Action::DeleteForward => Step::Edit(editor.plan_edit(EditKind::DeleteForward)),
+            Action::Insert(text) => Step::Edit(session.active().plan_edit(EditKind::Insert(text))),
+            Action::DeleteBackward => {
+                Step::Edit(session.active().plan_edit(EditKind::DeleteBackward))
+            }
+            Action::DeleteForward => {
+                Step::Edit(session.active().plan_edit(EditKind::DeleteForward))
+            }
             // Copy fills the register but touches no text: emit the clipboard mirror
             // (if anything was selected) and republish, no delta or version bump.
             Action::Copy => {
-                mirror_register(&mut editor, &notifications);
+                mirror_register(&mut session, &notifications);
                 Step::Republish
             }
             // Cut = copy + delete the selections, as one edit / one undo unit. Fill
@@ -918,8 +973,8 @@ async fn run(
             // of bare cursors selects nothing, so `plan_edit` returns no edits and
             // the apply path treats it as a no-op.
             Action::Cut => {
-                mirror_register(&mut editor, &notifications);
-                Step::Edit(editor.plan_edit(EditKind::DeleteSelection))
+                mirror_register(&mut session, &notifications);
+                Step::Edit(session.active().plan_edit(EditKind::DeleteSelection))
             }
             // Paste distributes the register over the cursors (SPEC §11); an empty
             // register plans no edits and is a clean no-op. A paste is a distinct
@@ -928,35 +983,35 @@ async fn run(
             // where typing would and a single-character payload is indistinguishable
             // from a keystroke at the `Change` level (SPEC §2.4).
             Action::Paste => {
-                editor.history.break_coalescing();
-                Step::Edit(editor.plan_paste())
+                session.active_mut().history.break_coalescing();
+                Step::Edit(session.plan_paste())
             }
             // The selection-changing actions need no coalescing bookkeeping: every
             // edit carries the selection set it started from, so `History` sees the
             // caret moved and ends the typing run itself (SPEC §2.4 break rule (d)).
             // A new selection action added here inherits that for free.
             Action::MoveCursor { motion, extend } => {
-                editor.move_cursor(motion, extend);
+                session.active_mut().move_cursor(motion, extend);
                 Step::Republish
             }
             Action::PlaceCursor { offset, extend } => {
-                editor.place_cursor(offset, extend);
+                session.active_mut().place_cursor(offset, extend);
                 Step::Republish
             }
             Action::AddCursorAbove => {
-                editor.add_cursor_vertical(true);
+                session.active_mut().add_cursor_vertical(true);
                 Step::Republish
             }
             Action::AddCursorBelow => {
-                editor.add_cursor_vertical(false);
+                session.active_mut().add_cursor_vertical(false);
                 Step::Republish
             }
             Action::AddCursorAt { offset } => {
-                editor.add_cursor_at(offset);
+                session.active_mut().add_cursor_at(offset);
                 Step::Republish
             }
             Action::CollapseSelections => {
-                editor.collapse_selections();
+                session.active_mut().collapse_selections();
                 Step::Republish
             }
             Action::Undo => Step::Undo,
@@ -970,22 +1025,40 @@ async fn run(
 
         let alive = match step {
             Step::Edit(edits) => {
-                apply_edit(&mut editor, edits, &deltas, &snapshots, &notifications).await
+                apply_edit(
+                    session.active_mut(),
+                    edits,
+                    &deltas,
+                    &snapshots,
+                    &notifications,
+                )
+                .await
             }
             Step::Undo => {
-                let reverted = editor.history.undo();
-                reapply(&mut editor, reverted, &deltas, &snapshots, &notifications).await
+                let doc = session.active_mut();
+                let reverted = doc.history.undo();
+                reapply(doc, reverted, &deltas, &snapshots, &notifications).await
             }
             Step::Redo => {
-                let reverted = editor.history.redo();
-                reapply(&mut editor, reverted, &deltas, &snapshots, &notifications).await
+                let doc = session.active_mut();
+                let reverted = doc.history.redo();
+                reapply(doc, reverted, &deltas, &snapshots, &notifications).await
             }
-            Step::Republish => snapshots.publish(editor.snapshot(None)),
+            Step::Republish => snapshots.publish(session.active().snapshot(None)),
             Step::Open(path) => {
-                open_file(&mut editor, path, &deltas, &snapshots, &notifications).await
+                open_file(
+                    session.active_mut(),
+                    path,
+                    &deltas,
+                    &snapshots,
+                    &notifications,
+                )
+                .await
             }
-            Step::Save => save_file(&mut editor, &snapshots, &notifications).await,
-            Step::SaveAs(path) => save_as_file(&mut editor, path, &snapshots, &notifications).await,
+            Step::Save => save_file(session.active_mut(), &snapshots, &notifications).await,
+            Step::SaveAs(path) => {
+                save_as_file(session.active_mut(), path, &snapshots, &notifications).await
+            }
         };
         if !alive {
             break;
@@ -1010,7 +1083,7 @@ async fn run(
 /// ranges come from the current selection set and the buffer they are validated
 /// against, rejection is not expected in M1, but the path is handled not panicked.
 async fn apply_edit(
-    editor: &mut Editor,
+    doc: &mut Document,
     edits: Vec<(std::ops::Range<usize>, String)>,
     deltas: &Sender<Delta>,
     snapshots: &SnapshotSink,
@@ -1019,13 +1092,12 @@ async fn apply_edit(
     if edits.is_empty() {
         // No-op (e.g. backspace at buffer start): republish so the frontend's
         // view stays current, but do not bump the version or emit a delta.
-        return snapshots.publish(editor.snapshot(None));
+        return snapshots.publish(doc.snapshot(None));
     }
 
     // Snapshot the selections *before* the edit so undo can restore them.
-    let before = editor.selections.clone();
-    let Some((changes, dirty)) = apply_change_list(editor, &edits, deltas, notifications).await
-    else {
+    let before = doc.selections.clone();
+    let Some((changes, dirty)) = apply_change_list(doc, &edits, deltas, notifications).await else {
         return false; // frontend gone mid-stream
     };
 
@@ -1033,7 +1105,7 @@ async fn apply_edit(
     // do not bump the version or record history (a version bump with no delta
     // would diverge a remote frontend replaying the delta stream, SPEC §5).
     if changes.is_empty() {
-        return snapshots.publish(editor.snapshot(None));
+        return snapshots.publish(doc.snapshot(None));
     }
 
     // Build the anchor-transform edit list once and share it: both the selection
@@ -1043,21 +1115,19 @@ async fn apply_edit(
     // Remap selections by transforming each pre-edit caret through the applied
     // edits (SPEC §2.1 anchors): a cursor lands after its own inserted text / at its
     // deletion point, and every other cursor shifts by the edits around it.
-    editor.selections = selections_after_edits(&before, &edits);
+    doc.selections = selections_after_edits(&before, &edits);
     // Decorations ride the same batch, so a squiggle stays under the token it
     // flagged while the producer catches up (SPEC §5).
-    editor.transform_decorations(&edits);
-    editor.version += 1;
+    doc.transform_decorations(&edits);
+    doc.version += 1;
     // One user action is one undo unit, even when it fanned across N cursors
     // (SPEC §2.4). Coalescing (single-caret typing) is decided inside `record`.
-    editor
-        .history
-        .record(changes, before, editor.selections.clone());
+    doc.history.record(changes, before, doc.selections.clone());
     // The server's and highlighter's copies are now stale; `sync_lsp` /
     // `sync_syntax` re-send before the next park.
-    editor.lsp_dirty = true;
-    editor.syntax_dirty = true;
-    snapshots.publish(editor.snapshot(dirty))
+    doc.lsp_dirty = true;
+    doc.syntax_dirty = true;
+    snapshots.publish(doc.snapshot(dirty))
 }
 
 /// Apply an undo or redo, sharing the "apply edits + restore selections + publish"
@@ -1068,7 +1138,7 @@ async fn apply_edit(
 /// like any change, so a remote frontend replaying the log converges (SPEC §5) - it
 /// has no notion of "undo", only more buffer edits moving forward in version time.
 async fn reapply(
-    editor: &mut Editor,
+    doc: &mut Document,
     reverted: Option<Reverted>,
     deltas: &Sender<Delta>,
     snapshots: &SnapshotSink,
@@ -1076,11 +1146,11 @@ async fn reapply(
 ) -> bool {
     let Some(reverted) = reverted else {
         // Nothing to undo/redo: republish so the view stays current, no version bump.
-        return snapshots.publish(editor.snapshot(None));
+        return snapshots.publish(doc.snapshot(None));
     };
 
     let Some((changes, dirty)) =
-        apply_change_list(editor, &reverted.edits, deltas, notifications).await
+        apply_change_list(doc, &reverted.edits, deltas, notifications).await
     else {
         return false; // frontend gone
     };
@@ -1088,13 +1158,13 @@ async fn reapply(
     // always apply cleanly, so `changes` is non-empty here; guard the version bump
     // anyway so a would-be no-op never advances the version without a delta.
     if !changes.is_empty() {
-        editor.version += 1;
+        doc.version += 1;
     }
-    editor.transform_decorations(&edits_from_changes(&changes));
-    editor.lsp_dirty = true;
-    editor.syntax_dirty = true;
-    editor.selections = reverted.selections;
-    snapshots.publish(editor.snapshot(dirty))
+    doc.transform_decorations(&edits_from_changes(&changes));
+    doc.lsp_dirty = true;
+    doc.syntax_dirty = true;
+    doc.selections = reverted.selections;
+    snapshots.publish(doc.snapshot(dirty))
 }
 
 /// Apply `edits` (each `(range, replacement)`, pre-sorted DESCENDING by start so
@@ -1106,14 +1176,14 @@ async fn reapply(
 /// degenerate delta or revision. Version and selection updates are the caller's job
 /// - `apply_edit` remaps to the edit ends, undo/redo restore saved selections.
 async fn apply_change_list(
-    editor: &mut Editor,
+    doc: &mut Document,
     edits: &[(std::ops::Range<usize>, String)],
     deltas: &Sender<Delta>,
     notifications: &Sender<Notification>,
 ) -> Option<(Vec<Change>, Option<std::ops::Range<usize>>)> {
     // Deltas are expressed against the pre-edit version; no edit here bumps it
     // (the caller does, once, after this returns), so read it once up front.
-    let base_version = editor.version;
+    let base_version = doc.version;
     let mut changes: Vec<Change> = Vec::with_capacity(edits.len());
     let mut dirty: Option<std::ops::Range<usize>> = None;
 
@@ -1123,13 +1193,13 @@ async fn apply_change_list(
         if range.is_empty() && new_text.is_empty() {
             continue;
         }
-        let removed = match editor.buffer.replace(range.clone(), new_text) {
+        let removed = match doc.buffer.replace(range.clone(), new_text) {
             Ok(removed) => removed,
             Err(err) => {
                 // Surface and skip this one edit; keep the buffer intact (SPEC §8).
                 let _ = notifications.try_send(Notification::EditRejected {
-                    buffer_id: editor.id,
-                    version: editor.version,
+                    buffer_id: doc.id,
+                    version: doc.version,
                     message: err.to_string(),
                 });
                 continue;
@@ -1138,7 +1208,7 @@ async fn apply_change_list(
         // A Delta is expressed against the base (pre-edit) version. Emitting one
         // per sub-edit keeps the lossless log exact for a remote frontend.
         let delta = Delta {
-            buffer_id: editor.id,
+            buffer_id: doc.id,
             base_version,
             range: range.clone(),
             new_text: new_text.clone(),
@@ -1172,7 +1242,7 @@ async fn apply_change_list(
 /// user action (not the per-keystroke hot path). Moving large loads off the
 /// critical path via a background read (SPEC §2.3) is an M5 refinement.
 async fn open_file(
-    editor: &mut Editor,
+    doc: &mut Document,
     path: PathBuf,
     deltas: &Sender<Delta>,
     snapshots: &SnapshotSink,
@@ -1186,13 +1256,7 @@ async fn open_file(
         // Missing file: open an empty buffer bound to the path (created on save).
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => (String::new(), false),
         Err(err) => {
-            return report_file_error(
-                editor,
-                Some(path),
-                &err.to_string(),
-                snapshots,
-                notifications,
-            );
+            return report_file_error(doc, Some(path), &err.to_string(), snapshots, notifications);
         }
     };
 
@@ -1202,13 +1266,13 @@ async fn open_file(
     // The load builds a fresh buffer rather than calling the fallible `replace`:
     // a whole-buffer swap has no range to reject, so there is no error path to
     // handle here (the delta still records the change for SPEC §5 replay).
-    let old_len = editor.buffer.byte_len();
+    let old_len = doc.buffer.byte_len();
     let changed = old_len != 0 || !contents.is_empty();
     if changed {
-        let base_version = editor.version;
-        editor.buffer = RopeBuffer::from(contents.as_str());
+        let base_version = doc.version;
+        doc.buffer = RopeBuffer::from(contents.as_str());
         let delta = Delta {
-            buffer_id: editor.id,
+            buffer_id: doc.id,
             base_version,
             range: 0..old_len,
             new_text: contents,
@@ -1216,35 +1280,35 @@ async fn open_file(
         if deltas.send(delta).await.is_err() {
             return false; // frontend gone
         }
-        editor.version += 1;
+        doc.version += 1;
     }
 
     // A freshly opened buffer starts at the origin and matches disk. Undo does not
     // cross a load, so the history is reset to a fresh tree rooted at the loaded
     // content, which is the saved state (SPEC §2.4).
-    editor.selections = SelectionSet::at_origin();
-    editor.path = Some(path.clone());
-    editor.history = History::new();
+    doc.selections = SelectionSet::at_origin();
+    doc.path = Some(path.clone());
+    doc.history = History::new();
     // Decorations describe the *previous* file's text; keeping them would paint
     // squiggles at meaningless offsets until a producer refreshes.
-    editor.decorations = Arc::new(DecorationSet::new());
+    doc.decorations = Arc::new(DecorationSet::new());
     // A different file is a different document to the server: announce it fresh
     // rather than sending a change against the old one's identity. The highlighter
     // has no per-document identity, so a plain dirty flag re-parses the new text.
-    editor.lsp_dirty = true;
-    editor.lsp_opened = false;
-    editor.syntax_dirty = true;
+    doc.lsp_dirty = true;
+    doc.lsp_opened = false;
+    doc.syntax_dirty = true;
 
     let _ = notifications.try_send(Notification::FileOpened {
-        buffer_id: editor.id,
+        buffer_id: doc.id,
         path,
         existed,
     });
     // `dirty` is a "what changed" repaint hint, so it is `None` when no delta was
     // emitted (a missing/empty file); reporting a spurious `Some(0..0)` would tell
     // a frontend an edit happened where none did (view.rs contract).
-    let dirty = changed.then(|| 0..editor.buffer.byte_len());
-    snapshots.publish(editor.snapshot(dirty))
+    let dirty = changed.then(|| 0..doc.buffer.byte_len());
+    snapshots.publish(doc.snapshot(dirty))
 }
 
 /// Write the buffer to its bound file atomically (SPEC §8). Fails with a
@@ -1252,13 +1316,13 @@ async fn open_file(
 /// write fails; on failure the buffer stays dirty so no work is lost. Returns
 /// `false` if the frontend has hung up.
 async fn save_file(
-    editor: &mut Editor,
+    doc: &mut Document,
     snapshots: &SnapshotSink,
     notifications: &Sender<Notification>,
 ) -> bool {
-    let Some(path) = editor.path.clone() else {
+    let Some(path) = doc.path.clone() else {
         return report_file_error(
-            editor,
+            doc,
             None,
             "no file name (save-as not available yet)",
             snapshots,
@@ -1266,19 +1330,19 @@ async fn save_file(
         );
     };
 
-    let contents = editor.buffer.text().to_string();
+    let contents = doc.buffer.text().to_string();
     if let Err(message) = write_atomic(&path, contents.as_bytes()) {
-        return report_file_error(editor, Some(path), &message, snapshots, notifications);
+        return report_file_error(doc, Some(path), &message, snapshots, notifications);
     }
 
     // Mark the current history node as the on-disk state, so undoing back to it
     // later clears the modified marker (SPEC §2.4, §8).
-    editor.history.mark_saved();
+    doc.history.mark_saved();
     let _ = notifications.try_send(Notification::FileSaved {
-        buffer_id: editor.id,
+        buffer_id: doc.id,
         path,
     });
-    snapshots.publish(editor.snapshot(None))
+    snapshots.publish(doc.snapshot(None))
 }
 
 /// Write the buffer to `path` and adopt it as the buffer's file (the save-as the
@@ -1289,56 +1353,56 @@ async fn save_file(
 ///
 /// Adopting a path that differs from the current one changes the document's
 /// *identity*, so the language server is re-announced: `lsp_opened` is cleared and
-/// `lsp_dirty` set, and the next [`Editor::sync_lsp`] sends a fresh `didOpen` under
+/// `lsp_dirty` set, and the next [`Session::sync_lsp`] sends a fresh `didOpen` under
 /// the new path (whose extension may map to a different `languageId`). The old
 /// document is not formally closed - the same re-announce shape [`open_file`] uses.
 /// The highlighter is path-agnostic and the text is unchanged, so no reparse is
 /// forced; a save-as that changes the *language* still needs the frontend to attach
 /// the new grammar, deferred with per-buffer grammar (M7).
 async fn save_as_file(
-    editor: &mut Editor,
+    doc: &mut Document,
     path: PathBuf,
     snapshots: &SnapshotSink,
     notifications: &Sender<Notification>,
 ) -> bool {
-    let contents = editor.buffer.text().to_string();
+    let contents = doc.buffer.text().to_string();
     if let Err(message) = write_atomic(&path, contents.as_bytes()) {
-        return report_file_error(editor, Some(path), &message, snapshots, notifications);
+        return report_file_error(doc, Some(path), &message, snapshots, notifications);
     }
 
     // A different target is a different document to the server; re-announce it so
     // diagnostics track the new name rather than the old one.
-    if editor.path.as_deref() != Some(path.as_path()) {
-        editor.lsp_opened = false;
-        editor.lsp_dirty = true;
+    if doc.path.as_deref() != Some(path.as_path()) {
+        doc.lsp_opened = false;
+        doc.lsp_dirty = true;
     }
-    editor.path = Some(path.clone());
+    doc.path = Some(path.clone());
     // The write is now the on-disk state (SPEC §2.4, §8): undoing back to this node
     // later clears the modified marker, exactly as a plain save.
-    editor.history.mark_saved();
+    doc.history.mark_saved();
     let _ = notifications.try_send(Notification::FileSaved {
-        buffer_id: editor.id,
+        buffer_id: doc.id,
         path,
     });
-    snapshots.publish(editor.snapshot(None))
+    snapshots.publish(doc.snapshot(None))
 }
 
 /// Emit a `FileError` and republish current state, leaving the buffer untouched
 /// (SPEC §8: a failed file op never loses work). Returns the publish's liveness so
 /// callers can `return report_file_error(...)` directly.
 fn report_file_error(
-    editor: &Editor,
+    doc: &Document,
     path: Option<PathBuf>,
     message: &str,
     snapshots: &SnapshotSink,
     notifications: &Sender<Notification>,
 ) -> bool {
     let _ = notifications.try_send(Notification::FileError {
-        buffer_id: editor.id,
+        buffer_id: doc.id,
         path,
         message: message.to_string(),
     });
-    snapshots.publish(editor.snapshot(None))
+    snapshots.publish(doc.snapshot(None))
 }
 
 /// Write `bytes` to `path` atomically: write a sibling temp file, flush it, then

@@ -73,17 +73,26 @@ impl Harness {
 // from a message script - the machinery is built now (SPEC §2.2) so M3's
 // multi-cursor rides on tested code.
 
-fn editor_with(text: &str, selections: SelectionSet) -> Editor {
-    let mut e = Editor::new();
+fn editor_with(text: &str, selections: SelectionSet) -> Document {
+    let mut e = Document::new(BufferId(0));
     e.buffer = RopeBuffer::from(text);
     e.selections = selections;
     e
 }
 
+/// A session whose single active document holds `text`/`selections` - for the
+/// clipboard paths, which read the active document but own the register at the
+/// session level (a yank is not tied to a buffer, SPEC §11).
+fn session_with(text: &str, selections: SelectionSet) -> Session {
+    let mut s = Session::new();
+    *s.active_mut() = editor_with(text, selections);
+    s
+}
+
 /// Put the editor in the "modified" state by recording a dummy revision, moving
 /// history off its saved node - the same state a real edit leaves behind
 /// (`modified` is derived from the history, not stored).
-fn mark_dirty(e: &mut Editor) {
+fn mark_dirty(e: &mut Document) {
     e.history.record(
         vec![Change {
             start: 0,
@@ -273,7 +282,7 @@ fn open_existing_file_loads_contents_and_binds_path() {
     let path = dir.file("hello.txt");
     std::fs::write(&path, "line one\nline two").unwrap();
 
-    let mut e = Editor::new();
+    let mut e = Document::new(BufferId(0));
     let h = Harness::new();
     let alive = smol::block_on(open_file(
         &mut e,
@@ -338,7 +347,7 @@ fn open_missing_file_opens_empty_buffer_bound_to_path() {
     let dir = TempDir::new();
     let path = dir.file("does-not-exist.txt");
 
-    let mut e = Editor::new();
+    let mut e = Document::new(BufferId(0));
     let h = Harness::new();
     let alive = smol::block_on(open_file(
         &mut e,
@@ -370,7 +379,7 @@ fn open_nonempty_file_reports_dirty_hint() {
     let path = dir.file("has-text.txt");
     std::fs::write(&path, "abcde").unwrap();
 
-    let mut e = Editor::new();
+    let mut e = Document::new(BufferId(0));
     let h = Harness::new();
     smol::block_on(open_file(
         &mut e,
@@ -503,7 +512,7 @@ fn open_then_edit_then_save_round_trips_through_disk() {
     let path = dir.file("round.txt");
     std::fs::write(&path, "abc").unwrap();
 
-    let mut e = Editor::new();
+    let mut e = Document::new(BufferId(0));
     let h = Harness::new();
 
     smol::block_on(open_file(
@@ -654,7 +663,7 @@ fn save_writes_to_a_new_file_that_did_not_exist() {
     let dir = TempDir::new();
     let path = dir.file("created-on-save.txt");
 
-    let mut e = Editor::new();
+    let mut e = Document::new(BufferId(0));
     let h = Harness::new();
     smol::block_on(open_file(
         &mut e,
@@ -760,6 +769,82 @@ fn run_seam(script: &[Action]) -> (ViewSnapshot, Vec<Notification>) {
 }
 
 #[test]
+fn clipboard_round_trips_through_the_actor_loop() {
+    // The copy/cut/paste dispatch arms end to end, over the real loop: these read
+    // the active document but write the session-wide register, so a script is the
+    // only thing that proves the two are wired to each other correctly.
+    let (snap, notes) = run_seam(&[
+        Action::Insert("hello world".into()),
+        // Select "hello": place at 0, then extend the head to 5.
+        Action::PlaceCursor {
+            offset: 0,
+            extend: false,
+        },
+        Action::PlaceCursor {
+            offset: 5,
+            extend: true,
+        },
+        Action::Copy,
+        // Caret to the end, then paste the register there.
+        Action::PlaceCursor {
+            offset: 11,
+            extend: false,
+        },
+        Action::Paste,
+    ]);
+    assert_eq!(snap.text.to_string(), "hello worldhello");
+
+    // A copy mirrors the register to the frontend for the OS clipboard (SPEC §11).
+    assert!(
+        notes
+            .iter()
+            .any(|n| matches!(n, Notification::SetClipboard { text } if text == "hello")),
+        "expected a SetClipboard mirror, got {notes:?}"
+    );
+
+    // Cut removes the selection and refills the register, still as one undo unit.
+    let (snap, _) = run_seam(&[
+        Action::Insert("abcdef".into()),
+        Action::PlaceCursor {
+            offset: 2,
+            extend: false,
+        },
+        Action::PlaceCursor {
+            offset: 4,
+            extend: true,
+        },
+        Action::Cut,
+        Action::Paste,
+    ]);
+    // "cd" cut out then pasted straight back at the caret it left behind.
+    assert_eq!(snap.text.to_string(), "abcdef");
+}
+
+#[test]
+fn delete_and_redo_dispatch_through_the_actor_loop() {
+    // The remaining edit arms over the real loop: backspace, delete-forward, and
+    // redo (undo already has seam coverage above).
+    let (snap, _) = run_seam(&[
+        Action::Insert("abcd".into()),
+        Action::DeleteBackward, // "abc", caret at 3
+        Action::PlaceCursor {
+            offset: 0,
+            extend: false,
+        },
+        Action::DeleteForward, // "bc"
+    ]);
+    assert_eq!(snap.text.to_string(), "bc");
+
+    let (snap, _) = run_seam(&[
+        Action::Insert("xy".into()),
+        Action::Undo,
+        Action::Redo,
+        Action::RequestSnapshot,
+    ]);
+    assert_eq!(snap.text.to_string(), "xy");
+}
+
+#[test]
 fn open_with_delta_receiver_dropped_reports_frontend_gone() {
     // Opening a non-empty file emits a whole-buffer delta; if the frontend has
     // dropped the delta receiver, the send fails and open_file returns false
@@ -768,7 +853,7 @@ fn open_with_delta_receiver_dropped_reports_frontend_gone() {
     let path = dir.file("has-content.txt");
     std::fs::write(&path, "content").unwrap();
 
-    let mut e = Editor::new();
+    let mut e = Document::new(BufferId(0));
     let h = Harness::new();
     drop(h.delta_rx); // frontend hung up the lossless delta channel
     let alive = smol::block_on(open_file(
@@ -1395,7 +1480,7 @@ mod atomic_write {
         // normalization as two separate selections.
         let set =
             SelectionSet::from_sorted_cursors(vec![Selection::new(0, 2), Selection::new(4, 6)]);
-        let mut e = editor_with("abcdef", set);
+        let mut e = session_with("abcdef", set);
         assert!(e.fill_register());
         assert_eq!(e.register, vec!["ab".to_string(), "ef".to_string()]);
     }
@@ -1404,7 +1489,7 @@ mod atomic_write {
     fn fill_register_is_noop_for_bare_cursors() {
         // Nothing selected: the register is left untouched and the caller is told
         // not to emit a clipboard notification.
-        let mut e = editor_with("abc", SelectionSet::single(Selection::cursor(1)));
+        let mut e = session_with("abc", SelectionSet::single(Selection::cursor(1)));
         e.register = vec!["previous".into()];
         assert!(!e.fill_register());
         assert_eq!(e.register, vec!["previous".to_string()]); // unchanged
@@ -1412,7 +1497,7 @@ mod atomic_write {
 
     #[test]
     fn register_flattened_joins_entries_with_newline() {
-        let mut e = editor_with("", SelectionSet::at_origin());
+        let mut e = session_with("", SelectionSet::at_origin());
         e.register = vec!["one".into(), "two".into(), "three".into()];
         assert_eq!(e.register_flattened(), "one\ntwo\nthree");
     }
@@ -1422,7 +1507,7 @@ mod atomic_write {
         // One register entry goes to all cursors (the common single-copy paste).
         let set =
             SelectionSet::from_sorted_cursors(vec![Selection::cursor(0), Selection::cursor(2)]);
-        let mut e = editor_with("ab", set);
+        let mut e = session_with("ab", set);
         e.register = vec!["X".into()];
         let edits = e.plan_paste();
         // Descending by start; both cursors get "X".
@@ -1435,7 +1520,7 @@ mod atomic_write {
         // (the multi-cursor copy/paste round-trip).
         let set =
             SelectionSet::from_sorted_cursors(vec![Selection::cursor(0), Selection::cursor(2)]);
-        let mut e = editor_with("ab", set);
+        let mut e = session_with("ab", set);
         e.register = vec!["P".into(), "Q".into()];
         let edits = e.plan_paste();
         // Descending by start: cursor 1 (start 2) -> "Q", cursor 0 (start 0) -> "P".
@@ -1448,7 +1533,7 @@ mod atomic_write {
         // whole register joined with newlines (the leftover policy).
         let set =
             SelectionSet::from_sorted_cursors(vec![Selection::cursor(0), Selection::cursor(2)]);
-        let mut e = editor_with("ab", set);
+        let mut e = session_with("ab", set);
         e.register = vec!["a".into(), "b".into(), "c".into()];
         let edits = e.plan_paste();
         assert_eq!(
@@ -1459,7 +1544,7 @@ mod atomic_write {
 
     #[test]
     fn plan_paste_empty_register_is_noop() {
-        let e = editor_with("ab", SelectionSet::single(Selection::cursor(1)));
+        let e = session_with("ab", SelectionSet::single(Selection::cursor(1)));
         assert!(e.plan_paste().is_empty());
     }
 
@@ -1468,7 +1553,7 @@ mod atomic_write {
         // Paste over a selection replaces it (the range is the selection span, not a
         // zero-width insert), mirroring Insert's replace-then-insert.
         let set = SelectionSet::single(Selection::new(0, 3)); // "abc" selected
-        let mut e = editor_with("abcdef", set);
+        let mut e = session_with("abcdef", set);
         e.register = vec!["Z".into()];
         assert_eq!(e.plan_paste(), vec![(0..3, "Z".into())]);
     }
@@ -1491,44 +1576,44 @@ mod atomic_write {
     fn copy_then_paste_round_trips_through_the_register() {
         // End-to-end register path: select "ab", copy (fills register + flattens for
         // the clipboard mirror), collapse to a caret at end, then paste it back.
-        let mut e = editor_with("abcdef", SelectionSet::single(Selection::new(0, 2)));
+        let mut e = session_with("abcdef", SelectionSet::single(Selection::new(0, 2)));
         assert!(e.fill_register());
         assert_eq!(e.register_flattened(), "ab");
 
         // Caret at end of buffer, paste the register there.
-        e.selections = SelectionSet::single(Selection::cursor(6));
+        e.active_mut().selections = SelectionSet::single(Selection::cursor(6));
         let edits = e.plan_paste();
         let h = Harness::new();
         smol::block_on(apply_edit(
-            &mut e,
+            e.active_mut(),
             edits,
             &h.delta_tx,
             &h.snapshots,
             &h.note_tx,
         ));
-        assert_eq!(e.buffer.text().to_string(), "abcdefab");
-        assert_eq!(e.version, 1);
+        assert_eq!(e.active().buffer.text().to_string(), "abcdefab");
+        assert_eq!(e.active().version, 1);
     }
 
     #[test]
     fn cut_is_one_edit_that_deletes_the_selection() {
         // Cut fills the register then applies DeleteSelection as one edit: the
         // selected text is removed and one undo unit recorded (version bumps once).
-        let mut e = editor_with("abcdef", SelectionSet::single(Selection::new(2, 4)));
+        let mut e = session_with("abcdef", SelectionSet::single(Selection::new(2, 4)));
         assert!(e.fill_register());
         assert_eq!(e.register, vec!["cd".to_string()]);
 
-        let edits = e.plan_edit(EditKind::DeleteSelection);
+        let edits = e.active().plan_edit(EditKind::DeleteSelection);
         let h = Harness::new();
         smol::block_on(apply_edit(
-            &mut e,
+            e.active_mut(),
             edits,
             &h.delta_tx,
             &h.snapshots,
             &h.note_tx,
         ));
-        assert_eq!(e.buffer.text().to_string(), "abef");
-        assert_eq!(e.version, 1);
+        assert_eq!(e.active().buffer.text().to_string(), "abef");
+        assert_eq!(e.active().version, 1);
         assert_eq!(h.delta_rx.len(), 1); // one delta for the single deletion
     }
 }
@@ -1569,4 +1654,108 @@ fn an_unknown_extension_falls_back_to_the_extension_itself() {
     assert_eq!(language_id(Path::new("a.zig")), "zig");
     // A file with no extension has no identifier to offer.
     assert_eq!(language_id(Path::new("Makefile")), "");
+}
+
+// --- Producer sync (SPEC §5) -------------------------------------------------
+//
+// The sync methods live on `Session` (they hold the one attached producer) but
+// read and clear per-`Document` flags. These drive them directly: the actor loop
+// only ever runs them with no producer attached, so the send paths would
+// otherwise go untested.
+
+#[test]
+fn sync_lsp_says_nothing_about_an_unnamed_buffer() {
+    // A server is attached but the active document has no path. There is no URI to
+    // announce, so nothing is sent - a `didOpen` needs a document identity. The
+    // dirty flag stays set, so the first `Save`/`Open` that binds a path announces
+    // the buffer then.
+    let (tx, rx) = async_channel::bounded::<DocumentSync>(4);
+    let mut s = session_with("typed but never saved", SelectionSet::at_origin());
+    s.lsp_sync = Some(tx);
+    s.active_mut().lsp_dirty = true;
+
+    s.sync_lsp();
+
+    assert!(rx.is_empty());
+    assert!(s.active().lsp_dirty);
+}
+
+#[test]
+fn sync_lsp_opens_then_changes_the_same_document() {
+    // The `didOpen`/`didChange` split: the first sync announces the document (with
+    // the languageId its extension maps to), every later one is a change against
+    // that same identity. Sending clears the dirty flag so an idle loop turn does
+    // not re-send unchanged text.
+    let (tx, rx) = async_channel::bounded::<DocumentSync>(4);
+    let mut s = session_with("fn main() {}", SelectionSet::at_origin());
+    s.lsp_sync = Some(tx);
+    s.active_mut().path = Some(PathBuf::from("/tmp/x.rs"));
+    s.active_mut().lsp_dirty = true;
+
+    s.sync_lsp();
+
+    match rx.try_recv().expect("a didOpen was sent") {
+        DocumentSync::Opened {
+            path,
+            language_id,
+            version,
+            ..
+        } => {
+            assert_eq!(path, PathBuf::from("/tmp/x.rs"));
+            assert_eq!(language_id, "rust");
+            assert_eq!(version, 0);
+        }
+        other => panic!("expected Opened, got {other:?}"),
+    }
+    assert!(!s.active().lsp_dirty);
+    assert!(s.active().lsp_opened);
+
+    // Nothing outstanding: a second call is a no-op rather than a redundant resend.
+    s.sync_lsp();
+    assert!(rx.is_empty());
+
+    // Once the buffer changes again the server gets a change, not another open.
+    s.active_mut().lsp_dirty = true;
+    s.sync_lsp();
+    assert!(matches!(
+        rx.try_recv().expect("a didChange was sent"),
+        DocumentSync::Changed { .. }
+    ));
+}
+
+#[test]
+fn sync_syntax_sends_the_active_text_once_per_change() {
+    // The highlighter has no open/change split - every message is the full text,
+    // tagged with the version it belongs to so a stale batch can be recognized on
+    // the way back (SPEC §5).
+    let (tx, rx) = async_channel::bounded::<SyntaxSync>(4);
+    let mut s = session_with("let x = 1;", SelectionSet::at_origin());
+    s.syntax_sync = Some(tx);
+    s.active_mut().syntax_dirty = true;
+
+    s.sync_syntax();
+
+    let sent = rx.try_recv().expect("the buffer was sent for a parse");
+    assert_eq!(sent.text.to_string(), "let x = 1;");
+    assert_eq!(sent.version, 0);
+    assert!(!s.active().syntax_dirty);
+
+    // Clean again: no resend until something marks the buffer dirty.
+    s.sync_syntax();
+    assert!(rx.is_empty());
+}
+
+#[test]
+fn producer_sync_is_a_noop_with_nothing_attached() {
+    // The common case - no server, no highlighter. A dirty buffer must not panic or
+    // spin; the flags simply stay set until a producer attaches.
+    let mut s = session_with("text", SelectionSet::at_origin());
+    s.active_mut().lsp_dirty = true;
+    s.active_mut().syntax_dirty = true;
+
+    s.sync_lsp();
+    s.sync_syntax();
+
+    assert!(s.active().lsp_dirty);
+    assert!(s.active().syntax_dirty);
 }
