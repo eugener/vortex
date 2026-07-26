@@ -3157,7 +3157,7 @@ fn place_cursor_at_matches_the_file_by_identity_not_by_spelling() {
 
 #[test]
 fn place_cursor_at_the_start_of_an_empty_buffer_is_harmless() {
-    // The degenerate case the clamp's `saturating_sub` exists for.
+    // The degenerate case: no line to clamp against, and nothing to round down to.
     let (snap, _) = run_seam(&[Action::PlaceCursorAt {
         position: Position::new(0, 0),
         in_file: None,
