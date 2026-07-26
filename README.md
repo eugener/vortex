@@ -54,7 +54,7 @@ milestones landed before earlier ones - that is a real gap, not a rounding error
 | M4 | Syntax highlighting (tree-sitter) | done - grammars are `dlopen`ed at runtime, never linked in |
 | M5 | File handling (encoding, EOL, conflicts) | done - encoding and line endings survive a round trip, external changes are noticed, config is a file |
 | M6 | UI shell: compositor, toasts | done |
-| M7 | Pickers, palette, themes | in progress - file/theme/buffer pickers, the palette, and multi-buffer done; global-search picker, preview pane, and which-key outstanding |
+| M7 | Pickers, palette, themes | in progress - file/theme/buffer pickers with a preview pane, the palette, and multi-buffer done; global-search picker and which-key outstanding |
 | M8 | Chrome and polish | not started |
 
 What works today: open/save a file, edit with multiple cursors, undo/redo with coalescing,
@@ -83,7 +83,7 @@ cargo build --release
 | | |
 |---|---|
 | `Ctrl+S` / `Ctrl+Q` | Save / quit |
-| `Ctrl+O` | Open a file (fuzzy picker over the working directory) |
+| `Ctrl+O` | Open a file (fuzzy picker over the working directory, previewing the highlighted one) |
 | `Ctrl+P` | Command palette |
 | `Ctrl+T` | Theme picker (previews as you move, `Esc` restores) |
 | `Ctrl+Alt+Up/Down` | Add a cursor above/below |

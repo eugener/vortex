@@ -508,7 +508,7 @@ adopt a component framework.**
 | **Message / toast area** | transient layer | consumes `Notification` | **built (M6).** errors, save/LSP status, external-change notices - a real surface, not a status-bar hijack |
 | **Prompt line** | overlay | emits `Action` on submit | single-line input: save-as path, search query, `:command`. Submit/cancel are the only seam traffic |
 | **Command palette** | overlay | emits `Action` on pick | **built (M7).** fuzzy list of commands; nav/filter pure frontend, only the chosen intent hits the core |
-| **Pickers** (file / theme / buffer / encoding / line-ending / global-search / symbol) | overlay | emits `Action` on pick | **file + theme + buffer + the two format pickers built (M7).** fuzzy list + optional preview pane; large lists stream in without blocking. Mouse-driven: a click on a row picks it, the wheel moves the highlight, a click outside dismisses |
+| **Pickers** (file / theme / buffer / encoding / line-ending / global-search / symbol) | overlay | emits `Action` on pick | **file + theme + buffer + the two format pickers built (M7).** fuzzy list + optional preview pane (**built (M7)**, opt-in per picker, filled when the highlight *moves*; the file picker uses it, and it is dropped below 80 columns rather than halving a narrow screen into two unreadable ones); large lists stream in without blocking. Mouse-driven: a click on a row picks it, the wheel moves the highlight, a click outside dismisses |
 | **Theme picker** | overlay | **none** | **built (M7).** the one surface whose commit never crosses the seam at all - chrome is frontend-owned, so it also *previews* as the highlight moves (§10.5) |
 | **Which-key popup** | overlay | none | after a prefix key, show the available continuations from the keymap (§10.5) - pure frontend introspection of the binding table |
 | **Completion popup** | overlay | emits `Action`, reads decorations | LSP completion menu; ghost-preview of the selected item as a `VirtualText` decoration |
@@ -839,13 +839,16 @@ None is a correctness bug today.
   putting `crop` in the public API. **Deferred because** it is an additive `Text` method,
   equally cheap to add later, and it deserves a benchmark rather than being folded into a
   cleanup pass. **Trigger:** a benchmark harness, or the first large-file report.
-- **The file picker walks the working directory on the UI thread.** Ctrl+O runs a
+- **The file picker reads the filesystem on the UI thread.** Ctrl+O runs a
   synchronous recursive `read_dir` of up to `MAX_FILES` entries before the overlay paints,
   so a cold or network filesystem freezes the editor until it finishes. The cap bounds the
-  match cost, not the walk latency. Walking on a background thread and feeding results in
-  incrementally suits the compositor's per-tick repaint already. **Trigger:** the picker
-  being used on a large or remote tree, or the same background-work machinery arriving for
-  §2.3's off-thread file loads.
+  match cost, not the walk latency. The preview pane then adds a second synchronous read -
+  bounded at `PREVIEW_BYTES` and only when the highlight *moves*, so it is a fixed cost per
+  keystroke rather than an unbounded one, but on a remote tree it is a stall per arrow key.
+  Walking (and previewing) on a background thread and feeding results in incrementally suits
+  the compositor's per-tick repaint already. **Trigger:** the picker being used on a large or
+  remote tree, or the same background-work machinery arriving for §2.3's off-thread file
+  loads.
 
 ---
 
@@ -1059,7 +1062,15 @@ Incremental build order so the risky assumptions are validated early, not at the
   batches now carry the buffer they were parsed against (versions are per-buffer, so a
   version-only guard painted the wrong buffer), and diagnostics route by path to whichever
   document owns them rather than only the active one.
-  **Still open in M7:** global-search picker, picker preview pane, which-key popup.
+  The **preview pane** followed, on the shared picker rather than the file picker: a picker
+  arms it with a source that turns the highlighted item into lines, so a second picker that
+  wants one supplies a closure instead of a layout. It fills only when the highlight *moves*
+  (a repaint must not re-read a file) and is dropped below 80 columns, where two half-columns
+  would be less readable than the list alone. The file picker's source is the one that
+  exists, and it decodes through the core's own loader - a preview that guessed the encoding
+  differently would misrepresent the thing it is there to identify, and it names a binary
+  file rather than showing it, the same refusal `Open` makes (§10.3).
+  **Still open in M7:** global-search picker, which-key popup.
   *Verify:* open a file via the picker, switch buffers, run a command via the palette -
   in-terminal.
 - **M8 - Chrome + polish.** Git diff signs (a git-diff task feeding `GutterMark`s; its git
