@@ -33,6 +33,11 @@ const IGNORE_DIRS: &[&str] = &["target", "node_modules"];
 /// the keystroke that moved the highlight - and holding Down through a directory of
 /// them would stall the picker entirely.
 const PREVIEW_BYTES: u64 = 16 * 1024;
+/// Bytes read when the preview starts partway down the file - a search hit, which
+/// can be anywhere in it. Matched to [`crate::search`]'s own file cap: the searcher
+/// will not report a hit in a file bigger than this, so a read this long always
+/// reaches the line it is being asked about.
+const DEEP_PREVIEW_BYTES: u64 = 1024 * 1024;
 
 /// Collect files under `root`, as paths **relative to `root`**, sorted. Skips
 /// dot-entries and [`IGNORE_DIRS`], does not follow symlinks (avoids cycles), and
@@ -107,17 +112,38 @@ fn preview_source() -> PreviewSource {
 /// thing it exists to let you identify. A binary file is named rather than shown, the
 /// same refusal `Action::Open` makes on it (SPEC §10.3).
 fn preview(path: &Path, lines: usize) -> Vec<String> {
+    preview_around(path, 0, lines)
+}
+
+/// The `lines` lines of `path` starting at 0-based `first_line`, or the one line
+/// that says why there are none.
+///
+/// The window exists for the global-search picker, whose rows name a place in a file
+/// rather than a file ([`crate::globalsearch`]) - a preview of the top of the file
+/// would answer a question nobody asked. Starting anywhere but the top costs a
+/// longer read ([`DEEP_PREVIEW_BYTES`]), since the line has to be reached before it
+/// can be shown.
+pub fn preview_around(path: &Path, first_line: usize, lines: usize) -> Vec<String> {
+    let cap = if first_line == 0 {
+        PREVIEW_BYTES
+    } else {
+        DEEP_PREVIEW_BYTES
+    };
     let mut bytes = Vec::new();
-    let read = File::open(path).and_then(|file| file.take(PREVIEW_BYTES).read_to_end(&mut bytes));
+    let read = File::open(path).and_then(|file| file.take(cap).read_to_end(&mut bytes));
     if let Err(err) = read {
         return vec![format!("cannot read: {err}")];
     }
     if vortex_core::file::is_binary(&bytes) {
         return vec!["binary file".to_string()];
     }
-    trim_cut_tail(&mut bytes);
+    trim_cut_tail(&mut bytes, cap);
     let text = vortex_core::file::load(&bytes).text;
-    text.lines().take(lines).map(clean).collect()
+    text.lines()
+        .skip(first_line)
+        .take(lines)
+        .map(clean)
+        .collect()
 }
 
 /// Undo what stopping at [`PREVIEW_BYTES`] did to the end of the read.
@@ -128,8 +154,8 @@ fn preview(path: &Path, lines: usize) -> Vec<String> {
 /// as mojibake over one truncated character. Cutting back to the last line break
 /// removes both the half character and the half line; a file with no line break in
 /// 16 KiB (a minified one) has only the character to fix.
-fn trim_cut_tail(bytes: &mut Vec<u8>) {
-    if bytes.len() as u64 != PREVIEW_BYTES {
+fn trim_cut_tail(bytes: &mut Vec<u8>, cap: u64) {
+    if bytes.len() as u64 != cap {
         return;
     }
     if let Some(newline) = bytes.iter().rposition(|&b| b == b'\n') {
@@ -341,6 +367,37 @@ mod tests {
         assert_eq!(lines.len(), 1);
         assert!(lines[0].starts_with("café café"), "{:?}", &lines[0][..12]);
         assert!(lines[0].chars().count() > 1_000, "cut back to the first é");
+    }
+
+    #[test]
+    fn preview_around_windows_the_file_at_a_line() {
+        // The global-search picker's rows name a place in a file, not a file: a
+        // preview of the top would answer a question nobody asked.
+        let t = TempDir::new();
+        t.file("a.rs", "l0\nl1\nl2\nl3\nl4\nl5\n");
+        assert_eq!(
+            preview_around(&t.path.join("a.rs"), 2, 3),
+            vec!["l2", "l3", "l4"]
+        );
+        // Past the end yields nothing rather than erroring or wrapping.
+        assert!(preview_around(&t.path.join("a.rs"), 99, 3).is_empty());
+    }
+
+    #[test]
+    fn preview_around_reaches_a_line_past_the_shallow_read_cap() {
+        // A hit can be anywhere in a file the searcher would read, which is far past
+        // the 16 KiB a preview-from-the-top needs. The deeper cap is what makes the
+        // window reachable at all - with the shallow one this line is never read.
+        let t = TempDir::new();
+        let filler = "填".repeat(20); // 60 bytes a line, so line 1000 is past 16 KiB
+        let mut body: String = (0..1000).map(|_| format!("{filler}\n")).collect();
+        body.push_str("the deep line\n");
+        t.file("deep.rs", &body);
+        assert!(body.len() > PREVIEW_BYTES as usize);
+        assert_eq!(
+            preview_around(&t.path.join("deep.rs"), 1000, 1),
+            vec!["the deep line"]
+        );
     }
 
     #[test]

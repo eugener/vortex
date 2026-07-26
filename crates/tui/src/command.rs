@@ -44,6 +44,21 @@ pub enum Command {
     /// Open the line-ending picker overlay (frontend-local), the twin of
     /// [`Command::OpenEncodingPicker`].
     OpenLineEndingPicker,
+    /// Open the global-search picker overlay (frontend-local). Its rows come from a
+    /// worker thread rather than a list, so unlike the other openers the surface it
+    /// opens keeps working after it is on screen (`Layer::tick`).
+    OpenSearchPicker,
+    /// Open `path` and put the caret at `position` - a global-search hit.
+    ///
+    /// One command rather than two so a picker row can commit a whole arrival: it
+    /// dispatches to [`Action::Open`] followed by [`Action::PlaceCursorAt`], both
+    /// down the same channel in order, so the jump resolves against the buffer the
+    /// open just produced. Carries data, so like [`Command::SetTheme`] it is emitted
+    /// by its picker rather than bound to a key.
+    OpenAt {
+        path: std::path::PathBuf,
+        position: vortex_core::Position,
+    },
     /// Switch to the named theme (frontend-local: chrome never crosses the seam).
     ///
     /// Carries data, so unlike the openers above it is not a bindable

@@ -50,8 +50,8 @@ use vortex_tui::command::{self, Command};
 use vortex_tui::compositor::{Compositor, EventResult};
 use vortex_tui::toast::{self, Toasts};
 use vortex_tui::{
-    bufferpicker, click, config, filepicker, formatpicker, grammar, keymap, layout, osc52, palette,
-    prompt, theme, themepicker, watcher,
+    bufferpicker, click, config, filepicker, formatpicker, globalsearch, grammar, keymap, layout,
+    osc52, palette, prompt, theme, themepicker, watcher,
 };
 
 /// The frontend's view state: which window of the buffer is on screen. Both axes
@@ -481,6 +481,7 @@ Keys:
   Ctrl+S           Save        Ctrl+Q            Quit
   Ctrl+Shift+S     Save as (prompt for a path; needs a Kitty-protocol terminal)
   Ctrl+O           Open file (fuzzy picker, previewing the highlighted file)
+  Ctrl+F           Search the project (regex; Enter opens the file at the match)
   Ctrl+P           Command palette (type to filter, Enter runs, Esc cancels)
   Ctrl+T           Theme picker (previews as you move, Esc restores)
   Ctrl+Alt+Up/Down Add cursor above/below        Alt+Click  Add cursor
@@ -740,6 +741,12 @@ fn event_loop(
         // Fade toasts past their TTL. The 16ms poll tick below drives this even while
         // the user is idle, so a notice disappears on its own (SPEC §7.5).
         if toasts.expire(Instant::now()) {
+            needs_redraw = true;
+        }
+        // Let the overlays take in whatever their own work has produced - the
+        // global-search picker's results arrive on a channel, and the same idle tick
+        // is what makes them appear while you wait rather than on the next keystroke.
+        if overlays.tick() {
             needs_redraw = true;
         }
 
@@ -1094,6 +1101,26 @@ fn dispatch_command(command: Command, handle: &vortex_core::CoreHandle, ui: &mut
             // Walk the working directory. If it cannot be read, fall back to ".".
             let root = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
             ui.overlays.push(filepicker::open(&ui.config.theme, &root));
+        }
+        Command::OpenSearchPicker => {
+            let root = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+            ui.overlays
+                .push(globalsearch::open(&ui.config.theme, &root));
+        }
+        // A hit is an arrival, not just an open: the two actions go down the same
+        // channel in order, so the jump resolves against the buffer the open just
+        // produced (SPEC §7.5 - the frontend owns "where", the core owns the text).
+        Command::OpenAt { path, position } => {
+            if handle.actions.send_blocking(Action::Open(path)).is_err() {
+                return false;
+            }
+            if handle
+                .actions
+                .send_blocking(Action::PlaceCursorAt { position })
+                .is_err()
+            {
+                return false;
+            }
         }
         Command::OpenThemePicker => ui
             .overlays
@@ -1890,6 +1917,36 @@ mod tests {
             })
             .collect();
         (dir, actions)
+    }
+
+    #[test]
+    fn a_search_hit_opens_its_file_and_lands_on_the_match() {
+        // The pick is an arrival, not an open: both actions go down the same channel
+        // in order, so the jump resolves against the buffer the open just produced.
+        // Nothing here waits for a snapshot in between, which is the point.
+        let dir = TempDir::new();
+        dir.file("hit.rs", "alpha\nbeta\nlet needle = 1;\n");
+        let path = dir.path.join("hit.rs");
+        let (snap, _) = dispatch_against_core(
+            &[],
+            &[
+                Command::OpenAt {
+                    path: path.clone(),
+                    position: vortex_core::Position::new(2, 4),
+                },
+                // A second dispatch, so the poll takes the *jump's* snapshot rather
+                // than the open's - two actions produce two of them.
+                Command::Editor(Action::RequestSnapshot),
+            ],
+        );
+        assert_eq!(snap.path.as_deref(), Some(path.as_path()));
+        let caret = snap.selections[0].head;
+        let text = snap.text.to_string();
+        assert_eq!(
+            &text[caret..caret + 6],
+            "needle",
+            "landed at {caret} in {text:?}"
+        );
     }
 
     #[test]

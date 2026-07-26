@@ -13,6 +13,7 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
+use crate::buffer::Position;
 use crate::file::LineEnding;
 use crate::selection::Motion;
 use crate::view::BufferId;
@@ -81,6 +82,21 @@ pub enum Action {
     /// drag grows a selection; otherwise the set becomes a plain cursor at `offset`.
     /// `offset` is clamped to the buffer defensively (SPEC §8).
     PlaceCursor { offset: usize, extend: bool },
+    /// Place the caret at a line and column, collapsing to a single selection - the
+    /// destination of a jump whose *source* named a place in the file rather than a
+    /// place on the screen (a global-search hit, an LSP goto, a `:42`).
+    ///
+    /// Line/column rather than a byte offset because the sender does not have the
+    /// buffer: a search hit names a file the editor may not have opened yet, so the
+    /// pick sends `Open` and this back to back and the core resolves the position
+    /// against the document it has just loaded. Resolving frontend-side would mean
+    /// waiting for the snapshot of that open before the jump could be computed -
+    /// two round trips and a race, for a conversion the core is holding the line
+    /// index for anyway.
+    ///
+    /// Both coordinates are clamped to the buffer (SPEC §8): a stale hit against a
+    /// file that has since shrunk lands at its end rather than being refused.
+    PlaceCursorAt { position: Position },
     /// Add a cursor one line above the topmost caret at its column, keeping the
     /// existing cursors (the column-select gesture, SPEC §2.2). A no-op at the first
     /// line. Changes only the selection set: no text, so no delta or version bump.

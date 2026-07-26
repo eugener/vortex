@@ -26,7 +26,12 @@ use crop::Rope;
 /// 0-based **byte** offset within that line's text (its line terminator
 /// excluded). Byte columns keep this conversion cheap and lossless; grapheme
 /// columns for cursor motion are derived in `selection` against the line's text.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+///
+/// `serde` because [`crate::Action::PlaceCursorAt`] carries one, and every action
+/// serializes for the journal and the future remote seam (SPEC §8.1).
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
+)]
 pub struct Position {
     pub line: usize,
     pub col: usize,

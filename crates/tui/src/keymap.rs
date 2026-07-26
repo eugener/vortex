@@ -208,6 +208,9 @@ pub enum Command {
     OpenThemePicker,
     /// Open the buffer-picker overlay (frontend-local).
     OpenBufferPicker,
+    /// Open the global-search picker (frontend-local: the walk, the matching and the
+    /// results are all this side; only a picked hit becomes an `Action`).
+    OpenSearchPicker,
     /// Open the encoding picker (frontend-local until a pick, which commits an
     /// `Action::SetEncoding`).
     OpenEncodingPicker,
@@ -297,6 +300,7 @@ impl Command {
             "open_file_picker" => Command::OpenFilePicker,
             "open_theme_picker" => Command::OpenThemePicker,
             "open_buffer_picker" => Command::OpenBufferPicker,
+            "open_search_picker" => Command::OpenSearchPicker,
             "open_encoding_picker" => Command::OpenEncodingPicker,
             "open_line_ending_picker" => Command::OpenLineEndingPicker,
             "next_buffer" => Command::NextBuffer,
@@ -315,6 +319,7 @@ impl Command {
             Command::OpenFilePicker => return FrontendCommand::OpenFilePicker,
             Command::OpenThemePicker => return FrontendCommand::OpenThemePicker,
             Command::OpenBufferPicker => return FrontendCommand::OpenBufferPicker,
+            Command::OpenSearchPicker => return FrontendCommand::OpenSearchPicker,
             Command::OpenEncodingPicker => return FrontendCommand::OpenEncodingPicker,
             Command::OpenLineEndingPicker => return FrontendCommand::OpenLineEndingPicker,
             Command::SaveAs => return FrontendCommand::OpenSavePrompt,
@@ -412,6 +417,12 @@ const DEFAULT_BINDINGS: &[(&str, &str)] = &[
     ("ctrl+pageup", "prev_buffer"),
     ("ctrl+w", "close_buffer"),
     ("ctrl+b", "open_buffer_picker"),
+    // Global search (M7). Ctrl+F rather than the Ctrl+Shift+F "find in files" chord,
+    // because that one needs the Kitty protocol and would leave the feature
+    // unreachable by key on a classic terminal. There is no in-buffer search to
+    // shadow yet; when one lands, that is the moment to split the two - plain
+    // Ctrl+F for this buffer, and this moves to the shift chord.
+    ("ctrl+f", "open_search_picker"),
 ];
 
 /// Bindings on the platform's native command modifier: Cmd on macOS (crossterm
@@ -897,6 +908,34 @@ mod tests {
         assert_eq!(
             command_for_key(&km, press(KeyCode::Char('a')), PAGE),
             Some(FrontendCommand::Editor(Action::Insert("a".into())))
+        );
+    }
+
+    #[test]
+    fn command_for_key_routes_ctrl_f_to_the_global_search_picker() {
+        // Ctrl+F rather than the Ctrl+Shift+F "find in files" chord: that one needs
+        // the Kitty protocol, which would leave the feature unreachable by key on a
+        // classic terminal.
+        let km = Keymap::default();
+        assert_eq!(
+            command_for_key(
+                &km,
+                with_mods(KeyCode::Char('f'), KeyModifiers::CONTROL),
+                PAGE
+            ),
+            Some(FrontendCommand::OpenSearchPicker)
+        );
+        assert_eq!(
+            km.shortcut_for(Command::OpenSearchPicker).as_deref(),
+            Some("Ctrl+F")
+        );
+    }
+
+    #[test]
+    fn the_search_picker_command_name_parses() {
+        assert_eq!(
+            Command::parse("open_search_picker"),
+            Some(Command::OpenSearchPicker)
         );
     }
 

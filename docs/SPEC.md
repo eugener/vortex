@@ -195,6 +195,8 @@ held-lock-across-`.await` deadlocks. Instead:
 | Terminal render | **`ratatui` + `crossterm`** | immediate-mode cell-diffing; we own the loop |
 | Frame atomicity | crossterm `BeginSynchronizedUpdate` / `EndSynchronizedUpdate` | anti-tearing (§7) |
 | Fuzzy match | **`nucleo-matcher`** | palette/picker ranking (Helix's matcher); on-thread for small lists (§7.5) |
+| Search patterns | **`regex`** | global search (M7). In `vortex-tui` first, since cross-file search is filesystem work and so frontend-owned; joins `vortex-core` when its own search subsystem lands (§11) - one engine, so the match semantics cannot diverge |
+| Project walk | **`ignore`** | gitignore-aware walker (ripgrep's). Global search respects a project's own `.gitignore` rather than a hardcoded skip list |
 | Config | **`toml` + `serde`** | Helix-style; in `vortex-tui` now, carrying theme files (§10.5) |
 | Encoding | `encoding_rs` | detect on load; edit as UTF-8 internally (§10.1) |
 | File watch | `notify` | external-change detection (§10.2) |
@@ -508,8 +510,9 @@ adopt a component framework.**
 | **Message / toast area** | transient layer | consumes `Notification` | **built (M6).** errors, save/LSP status, external-change notices - a real surface, not a status-bar hijack |
 | **Prompt line** | overlay | emits `Action` on submit | single-line input: save-as path, search query, `:command`. Submit/cancel are the only seam traffic |
 | **Command palette** | overlay | emits `Action` on pick | **built (M7).** fuzzy list of commands; nav/filter pure frontend, only the chosen intent hits the core |
-| **Pickers** (file / theme / buffer / encoding / line-ending / global-search / symbol) | overlay | emits `Action` on pick | **file + theme + buffer + the two format pickers built (M7).** fuzzy list + optional preview pane (**built (M7)**, opt-in per picker, filled when the highlight *moves*; the file picker uses it, and it is dropped below 80 columns rather than halving a narrow screen into two unreadable ones); large lists stream in without blocking. Mouse-driven: a click on a row picks it, the wheel moves the highlight, a click outside dismisses |
+| **Pickers** (file / theme / buffer / encoding / line-ending / global-search / symbol) | overlay | emits `Action` on pick | **file + theme + buffer + global-search + the two format pickers built (M7).** fuzzy list + optional preview pane (**built (M7)**, opt-in per picker, filled when the highlight *moves*; the file picker uses it, and it is dropped below 80 columns rather than halving a narrow screen into two unreadable ones); large lists stream in without blocking. Mouse-driven: a click on a row picks it, the wheel moves the highlight, a click outside dismisses |
 | **Theme picker** | overlay | **none** | **built (M7).** the one surface whose commit never crosses the seam at all - chrome is frontend-owned, so it also *previews* as the highlight moves (§10.5) |
+| **Global-search picker** | overlay | emits `Action` on pick | **built (M7).** the one picker whose rows are not a list it was handed: the query *is* the search, a worker thread walks the project, and results stream in through `Layer::tick`. A pick is two actions - `Open` then `PlaceCursorAt` - so it lands on the match, not the top of the file |
 | **Which-key popup** | overlay | none | after a prefix key, show the available continuations from the keymap (§10.5) - pure frontend introspection of the binding table |
 | **Completion popup** | overlay | emits `Action`, reads decorations | LSP completion menu; ghost-preview of the selected item as a `VirtualText` decoration |
 | **Hover / diagnostic popup** | overlay | reads decorations | LSP hover + full diagnostic text on demand |
@@ -780,9 +783,13 @@ early milestones is a deliberate scope choice, not an oversight:
   the OS clipboard. Must include **OSC 52** (clipboard over the terminal) so copy/paste
   works over SSH - directly relevant to the remote-frontend future (§0). Target: M1-M3
   band.
-- **Search + regex.** `select-all-matches` / `split-on-regex` (§12.2) imply a `regex`
-  dependency and a search subsystem in `vortex-core`. Add the `regex` crate to the stack
-  when this lands; incremental/streaming search over the rope. Target: M3 band.
+- **Search + regex.** *Half built (M7).* **Cross-file** search landed as a frontend
+  subsystem (`vortex-tui::search`) behind the global-search picker: `regex` + `ignore` on a
+  worker thread, searching the files on disk. What is still absent is search **in the
+  buffer** - `select-all-matches` / `split-on-regex` (§12.2), which are selection
+  operations over the rope the core owns and so belong in `vortex-core`, with `regex`
+  joining that crate's dependencies when they land. The two are deliberately different
+  jobs: one finds a place to go, the other builds a selection set. Target: M3 band.
 - **Keymap configuration.** Built (M5): a `[keys]` table in `config.toml` is layered over
   the built-in bindings through the same `Chord`/`Command` string format the defaults are
   written in. What remains is the richer *modal* design - chord sequences, per-mode maps,
@@ -848,7 +855,16 @@ None is a correctness bug today.
   Walking (and previewing) on a background thread and feeding results in incrementally suits
   the compositor's per-tick repaint already. **Trigger:** the picker being used on a large or
   remote tree, or the same background-work machinery arriving for §2.3's off-thread file
-  loads.
+  loads. (The global-search picker went the other way and put its walk on a worker thread
+  from the start, feeding the list through `Layer::tick` - the machinery this entry wants
+  now exists next door.)
+- **Global search restarts on every keystroke, with no debounce.** Typing `needle` spawns
+  six walks; each cancels the one before it, but cancellation is only checked between
+  files, so a slow tree does redundant work for the length of one file per keystroke. A
+  ~150ms debounce - the `HIGHLIGHT_WAIT` shape `main.rs` already uses - would collapse them
+  into one search. Left out because it needs a clock inside the picker, which nothing else
+  there has, and because the cost is invisible on a project that fits in the page cache.
+  **Trigger:** global search being used on a tree big enough for the restarts to show.
 
 ---
 
@@ -1070,7 +1086,19 @@ Incremental build order so the risky assumptions are validated early, not at the
   exists, and it decodes through the core's own loader - a preview that guessed the encoding
   differently would misrepresent the thing it is there to identify, and it names a binary
   file rather than showing it, the same refusal `Open` makes (§10.3).
-  **Still open in M7:** global-search picker, which-key popup.
+  The **global-search picker** closed the arc, and needed three things nothing before it
+  had. A picker whose rows are not a list it was handed (`ItemSource`: the query starts a
+  search rather than filtering, and results are appended in arrival order, never re-ranked,
+  so a row cannot move out from under a click). A `Layer::tick` so those results appear
+  while you wait rather than on the next keystroke - the first surface fed by something
+  other than input. And `Action::PlaceCursorAt`, the one core change: a pick sends `Open`
+  and then the position, both down the same channel, so the jump resolves against the
+  buffer the open just produced instead of waiting for a snapshot to compute an offset
+  from. The search itself is frontend-owned on a worker thread, the shape the LSP client
+  and the highlighter already have - a grep is filesystem work, and the actor thread every
+  keystroke goes through is the one place it must not run.
+  **Still open in M7:** which-key popup (and see §10.5's note on chord sequences, which it
+  needs first).
   *Verify:* open a file via the picker, switch buffers, run a command via the palette -
   in-terminal.
 - **M8 - Chrome + polish.** Git diff signs (a git-diff task feeding `GutterMark`s; its git

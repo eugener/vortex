@@ -514,6 +514,22 @@ impl Document {
         self.selections.place(&text, offset, extend);
     }
 
+    /// Place the caret at a line/column position (a search hit, a goto). Resolves
+    /// against the buffer *this* document holds, which is the whole reason the
+    /// action carries a position rather than an offset: the sender named a place in
+    /// a file, possibly before the file was open.
+    ///
+    /// A position past the end clamps rather than being refused (SPEC §8) - a hit
+    /// found against the file on disk can name a line the buffer no longer has, and
+    /// landing at the end beats refusing to jump at all.
+    fn place_cursor_at(&mut self, position: crate::buffer::Position) {
+        let text = self.buffer.text();
+        let line = position.line.min(text.line_count().saturating_sub(1));
+        let line_start = text.byte_of_line(line).unwrap_or(0);
+        let col = position.col.min(text.line_len(line).unwrap_or(0));
+        self.selections.place(&text, line_start + col, false);
+    }
+
     /// Add a cursor above (or below) the current set (SPEC §2.2). Pure selection
     /// change, like [`Self::move_cursor`]: no delta, no version bump.
     fn add_cursor_vertical(&mut self, above: bool) {
@@ -1423,6 +1439,10 @@ async fn run(
             }
             Action::AddCursorBelow => {
                 session.active_mut().add_cursor_vertical(false);
+                Step::Republish
+            }
+            Action::PlaceCursorAt { position } => {
+                session.active_mut().place_cursor_at(position);
                 Step::Republish
             }
             Action::AddCursorAt { offset } => {
