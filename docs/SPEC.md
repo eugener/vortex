@@ -858,13 +858,18 @@ None is a correctness bug today.
   loads. (The global-search picker went the other way and put its walk on a worker thread
   from the start, feeding the list through `Layer::tick` - the machinery this entry wants
   now exists next door.)
-- **Global search restarts on every keystroke, with no debounce.** Typing `needle` spawns
-  six walks; each cancels the one before it, but cancellation is only checked between
-  files, so a slow tree does redundant work for the length of one file per keystroke. A
-  ~150ms debounce - the `HIGHLIGHT_WAIT` shape `main.rs` already uses - would collapse them
-  into one search. Left out because it needs a clock inside the picker, which nothing else
-  there has, and because the cost is invisible on a project that fits in the page cache.
-  **Trigger:** global search being used on a tree big enough for the restarts to show.
+- ~~**Global search restarts on every keystroke, with no debounce.**~~ *Taken.* A query
+  now waits 150ms (the `HIGHLIGHT_WAIT` shape `main.rs` already uses) before it is walked,
+  so typing `needle` starts one search rather than six, and the intermediate prefixes are
+  never walked at all. The clock this entry said the picker lacked is the render tick it
+  already had: `ItemSource::take` is called once per tick, so the source starts the walk
+  there rather than on the keystroke. Two consequences worth naming. A bad pattern is now
+  reported at the deadline rather than at the keystroke, which is the better behavior and
+  not just a side effect - typing `(foo)` passes through `(`, and flashing that error on
+  the way is noise about a pattern nobody had finished writing. And `Layer::tick` had to
+  learn that a source can change what it *says* without producing a row: it now repaints
+  on a changed `ItemSource::status` too, or the line under the query would keep saying
+  `searching…` after the search had already failed to compile.
 
 ---
 
