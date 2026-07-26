@@ -2008,3 +2008,42 @@ fn the_final_newline_policy_is_what_the_frontend_configured() {
         );
     });
 }
+
+#[test]
+fn select_around_resolves_a_pointer_offset_to_a_word_or_a_line() {
+    // The double- and triple-click gestures through the seam: the frontend sends an
+    // offset, the core decides where the word ends (SPEC §2.2).
+    drive(|h| async move {
+        step(&h, Action::Insert("hello world\nsecond line\n".into())).await;
+
+        let snap = step(
+            &h,
+            Action::SelectAround {
+                offset: 7,
+                granularity: crate::action::Granularity::Word,
+            },
+        )
+        .await;
+        assert_eq!(snap.selections.len(), 1);
+        let sel = snap.selections[0];
+        assert_eq!(&snap.text.to_string()[sel.start()..sel.end()], "world");
+        // A selection is not an edit: no version bump, and no delta to replay.
+        let version = snap.version;
+
+        let snap = step(
+            &h,
+            Action::SelectAround {
+                offset: 7,
+                granularity: crate::action::Granularity::Line,
+            },
+        )
+        .await;
+        let sel = snap.selections[0];
+        assert_eq!(
+            &snap.text.to_string()[sel.start()..sel.end()],
+            "hello world\n",
+            "a line takes its terminator"
+        );
+        assert_eq!(snap.version, version, "selecting changes no text");
+    });
+}

@@ -30,8 +30,8 @@ use std::time::{Duration, Instant};
 
 use ratatui::crossterm::event::{
     self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
-    Event, KeyEventKind, KeyModifiers, KeyboardEnhancementFlags, MouseButton, MouseEventKind,
-    PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
+    Event, KeyEventKind, KeyModifiers, KeyboardEnhancementFlags, MouseButton, MouseEvent,
+    MouseEventKind, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
 };
 use ratatui::crossterm::terminal::{
     BeginSynchronizedUpdate, EndSynchronizedUpdate, supports_keyboard_enhancement,
@@ -44,14 +44,14 @@ use ratatui::widgets::Paragraph;
 use ratatui::{Frame, Terminal, TerminalOptions, Viewport};
 use unicode_width::UnicodeWidthStr;
 
-use vortex_core::{Action, BufferId, BufferInfo, Core, ViewSnapshot};
+use vortex_core::{Action, BufferId, BufferInfo, Core, Granularity, ViewSnapshot};
 
 use vortex_tui::command::{self, Command};
 use vortex_tui::compositor::{Compositor, EventResult};
 use vortex_tui::toast::{self, Toasts};
 use vortex_tui::{
-    bufferpicker, config, filepicker, grammar, keymap, layout, osc52, palette, prompt, theme,
-    themepicker, watcher,
+    bufferpicker, click, config, filepicker, grammar, keymap, layout, osc52, palette, prompt,
+    theme, themepicker, watcher,
 };
 
 /// The frontend's view state: which window of the buffer is on screen. Both axes
@@ -609,6 +609,9 @@ fn event_loop(
     let mut viewports: HashMap<BufferId, ViewState> = HashMap::new();
     // The buffer the last painted frame belonged to, so a switch can be noticed.
     let mut painted: Option<BufferId> = None;
+    // Consecutive presses, so a double- or triple-click can be told from two
+    // separate ones - the terminal reports presses and leaves the gesture to us.
+    let mut clicks = click::Clicks::new();
     // Transient file/edit notices (open/save results, failures) surface here as
     // top-right toasts that auto-fade, rather than hijacking the status bar (SPEC
     // §7.5). A failed save must be visible, not silent (SPEC §8).
@@ -940,24 +943,22 @@ fn event_loop(
                             }
                             continue;
                         }
-                        let extend = matches!(mouse.kind, MouseEventKind::Drag(_))
-                            || mouse.modifiers.contains(KeyModifiers::SHIFT);
-                        let offset = pointer_offset(
-                            snap,
-                            viewport,
-                            config.tab_width,
-                            mouse.column,
-                            mouse.row,
-                        );
-                        // Alt+click adds a cursor without collapsing the set
-                        // (SPEC §2.2 multi-cursor); a plain click/drag places or
-                        // extends the single caret. Alt only adds on a fresh
-                        // press, never mid-drag.
-                        let action = if is_press && mouse.modifiers.contains(KeyModifiers::ALT) {
-                            Action::AddCursorAt { offset }
+                        // Only a plain press advances the click run (SPEC §2.2): a
+                        // drag is one continuous gesture, and a modified click means
+                        // something else entirely, so both end the run rather than
+                        // extending it. Counted here because it is the one part of
+                        // the decision that needs a clock.
+                        let count = if is_press
+                            && !mouse
+                                .modifiers
+                                .intersects(KeyModifiers::ALT | KeyModifiers::SHIFT)
+                        {
+                            clicks.press(mouse.column, mouse.row, Instant::now())
                         } else {
-                            Action::PlaceCursor { offset, extend }
+                            clicks.reset();
+                            1
                         };
+                        let action = press_action(snap, viewport, config.tab_width, mouse, count);
                         if handle.actions.send_blocking(action).is_err() {
                             return Ok(());
                         }
@@ -1572,6 +1573,60 @@ fn paint_status_bar(frame: &mut Frame, area: Rect, snapshot: &ViewSnapshot, stat
     frame.render_widget(Paragraph::new(bar).style(status.style), area);
 }
 
+/// What a press or drag in the editor body means, given how many clicks the run has
+/// reached (SPEC §2.2's pointer gestures).
+///
+/// Every branch resolves the pointer to a buffer offset and hands the *core* the
+/// intent, never the coordinates - which is why this returns an `Action` rather than
+/// doing anything: it is the whole screen→intent mapping for the body, and pure, so
+/// the gesture table is testable without a terminal (SPEC §13). The event loop keeps
+/// only the parts that need the outside world: the clock, and the send.
+///
+/// Precedence, highest first:
+/// - **Alt** adds a cursor, whatever else is held - the multi-cursor gesture is not
+///   something a click count should be able to turn into a word selection.
+/// - **The gutter** selects the whole line. A line number is a line selector, not a
+///   place to put a caret, and the click count is irrelevant there: clicking one
+///   twice means what clicking it once means.
+/// - **The click count** selects a word (2) or a line (3).
+/// - Otherwise the caret moves, extending when dragged or shift-clicked.
+fn press_action(
+    snapshot: &ViewSnapshot,
+    viewport: ViewState,
+    tab_width: usize,
+    mouse: MouseEvent,
+    count: usize,
+) -> Action {
+    let is_press = matches!(mouse.kind, MouseEventKind::Down(_));
+    let offset = pointer_offset(snapshot, viewport, tab_width, mouse.column, mouse.row);
+    let gutter = layout::gutter_width(layout::display_line_count(&snapshot.text));
+    let line = Action::SelectAround {
+        offset,
+        granularity: Granularity::Line,
+    };
+
+    if is_press && mouse.modifiers.contains(KeyModifiers::ALT) {
+        return Action::AddCursorAt { offset };
+    }
+    if is_press && (mouse.column as usize) < gutter {
+        return line;
+    }
+    match count {
+        2 => Action::SelectAround {
+            offset,
+            granularity: Granularity::Word,
+        },
+        3 => line,
+        _ => Action::PlaceCursor {
+            offset,
+            // A drag always extends, so a press-then-drag sweeps out a selection;
+            // shift makes a press extend from the current anchor.
+            extend: matches!(mouse.kind, MouseEventKind::Drag(_))
+                || mouse.modifiers.contains(KeyModifiers::SHIFT),
+        },
+    }
+}
+
 /// RAII terminal setup/teardown: raw mode, alternate screen, and Kitty keyboard
 /// flags. Guarantees the terminal is restored even on an error path - leaving a
 /// user in raw mode is unacceptable (SPEC §8 spirit).
@@ -1943,6 +1998,165 @@ mod tests {
                 file: Some(PathBuf::from("a.txt")),
                 config: None
             }
+        );
+    }
+
+    /// A mouse event at a cell.
+    fn mouse_at(
+        kind: MouseEventKind,
+        column: u16,
+        row: u16,
+        modifiers: KeyModifiers,
+    ) -> MouseEvent {
+        MouseEvent {
+            kind,
+            column,
+            row,
+            modifiers,
+        }
+    }
+
+    fn press_at(column: u16, row: u16) -> MouseEvent {
+        mouse_at(
+            MouseEventKind::Down(MouseButton::Left),
+            column,
+            row,
+            KeyModifiers::NONE,
+        )
+    }
+
+    /// The buffer the pointer-gesture tests aim at, with lines of distinct lengths
+    /// so a selection's size says which line it came from.
+    fn gesture_snapshot() -> ViewSnapshot {
+        snapshot_after(&[Action::Insert(
+            "alpha beta gamma\nsecond line here\nshort\n".into(),
+        )])
+    }
+
+    /// A viewport that has been painted, unlike `ViewState::default()` - which
+    /// reports a page height of 0 and so clamps every pointer row onto the first
+    /// line. A real frame always has a height by the time a click arrives.
+    fn painted_viewport() -> ViewState {
+        ViewState {
+            page_height: 20,
+            ..ViewState::default()
+        }
+    }
+
+    /// The text `action` would select, resolved against `snapshot` - so a test reads
+    /// as the words and lines a user would see selected.
+    fn selected_text(snapshot: &ViewSnapshot, action: &Action) -> String {
+        match action {
+            Action::SelectAround {
+                offset,
+                granularity,
+            } => {
+                let mut set = vortex_core::SelectionSet::at_origin();
+                set.select_around(&snapshot.text, *offset, *granularity);
+                let sel = set.primary();
+                snapshot.text.to_string()[sel.start()..sel.end()].to_string()
+            }
+            other => panic!("expected a selection, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn one_click_places_the_caret_and_two_selects_the_word_under_it() {
+        let snap = gesture_snapshot();
+        let vp = painted_viewport();
+        let single = press_action(&snap, vp, 4, press_at(5, 1), 1);
+        assert!(
+            matches!(single, Action::PlaceCursor { extend: false, .. }),
+            "one click places a caret, got {single:?}"
+        );
+        let double = press_action(&snap, vp, 4, press_at(5, 1), 2);
+        assert_eq!(selected_text(&snap, &double), "alpha");
+    }
+
+    #[test]
+    fn three_clicks_select_the_line_the_pointer_is_on() {
+        // Screen row 2 is the *second* body line - row 0 is the head bar - and the
+        // whole line comes with it, terminator included.
+        let snap = gesture_snapshot();
+        let triple = press_action(&snap, painted_viewport(), 4, press_at(5, 2), 3);
+        assert_eq!(selected_text(&snap, &triple), "second line here\n");
+    }
+
+    #[test]
+    fn a_click_in_the_gutter_selects_that_line_whatever_the_count() {
+        // A line number is a line selector: clicking one twice means what clicking
+        // it once means, so the click run must not turn it into a word selection.
+        let snap = gesture_snapshot();
+        let vp = painted_viewport();
+        for count in 1..=3 {
+            let action = press_action(&snap, vp, 4, press_at(0, 3), count);
+            assert_eq!(
+                selected_text(&snap, &action),
+                "short\n",
+                "count {count} in the gutter"
+            );
+        }
+    }
+
+    #[test]
+    fn alt_still_adds_a_cursor_whatever_the_count_says() {
+        // The multi-cursor gesture outranks the click run: a fast Alt-click on the
+        // same cell must not become a word selection.
+        let snap = gesture_snapshot();
+        let action = press_action(
+            &snap,
+            painted_viewport(),
+            4,
+            mouse_at(
+                MouseEventKind::Down(MouseButton::Left),
+                5,
+                1,
+                KeyModifiers::ALT,
+            ),
+            2,
+        );
+        assert!(matches!(action, Action::AddCursorAt { .. }), "{action:?}");
+    }
+
+    #[test]
+    fn a_drag_extends_and_never_selects() {
+        // A drag is one continuous gesture. It reaches here with count 1 (the loop
+        // resets the run), and dragging over the gutter must keep extending rather
+        // than re-selecting a line and throwing the sweep away.
+        let snap = gesture_snapshot();
+        for column in [8, 0] {
+            let drag = mouse_at(
+                MouseEventKind::Drag(MouseButton::Left),
+                column,
+                1,
+                KeyModifiers::NONE,
+            );
+            let action = press_action(&snap, painted_viewport(), 4, drag, 1);
+            assert!(
+                matches!(action, Action::PlaceCursor { extend: true, .. }),
+                "column {column}: {action:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn shift_click_extends_from_the_anchor() {
+        let snap = gesture_snapshot();
+        let action = press_action(
+            &snap,
+            painted_viewport(),
+            4,
+            mouse_at(
+                MouseEventKind::Down(MouseButton::Left),
+                8,
+                1,
+                KeyModifiers::SHIFT,
+            ),
+            1,
+        );
+        assert!(
+            matches!(action, Action::PlaceCursor { extend: true, .. }),
+            "{action:?}"
         );
     }
 

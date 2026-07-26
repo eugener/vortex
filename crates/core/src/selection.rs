@@ -19,11 +19,13 @@
 //! Cursor motion is **by grapheme cluster** (§4), computed against a single
 //! line's text so cost is bounded by line length, never the file (§10.4).
 
+use std::ops::Range;
 use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 use unicode_segmentation::UnicodeSegmentation;
 
+use crate::action::Granularity;
 use crate::buffer::Text;
 
 /// One selection: a range from `anchor` (fixed) to `head` (the moving caret),
@@ -196,6 +198,22 @@ impl SelectionSet {
             .map(|s| Selection::new(s.anchor.min(len), s.head.min(len)))
             .collect();
         self.normalize(clamped, primary_head);
+    }
+
+    /// Replace the set with the single span of `granularity` around `offset` - the
+    /// double-click, triple-click, and gutter-click gesture (SPEC §2.2).
+    ///
+    /// Collapses a multi-cursor set to one selection, as a plain click does: the
+    /// gesture says "this word", not "this word as well". The anchor lands at the
+    /// start and the head at the end, so a shift-click afterwards extends from the
+    /// far side rather than from wherever the pointer happened to be.
+    pub fn select_around(&mut self, text: &Text, offset: usize, granularity: Granularity) {
+        let offset = offset.min(text.byte_len());
+        let range = match granularity {
+            Granularity::Word => word_at(text, offset),
+            Granularity::Line => line_at(text, offset),
+        };
+        *self = Self::single(Selection::new(range.start, range.end));
     }
 
     /// The selections, in sorted order.
@@ -405,6 +423,94 @@ fn line_content_end(text: &Text, line_index: usize) -> usize {
     // `line_len` reads the slice's byte length without materializing the line.
     let len = text.line_len(line_index).unwrap_or(0);
     start + len
+}
+
+/// What kind of run a word-boundary segment is. Adjacent segments of the same class
+/// belong to the same double-click, which is the whole reason this exists - see
+/// [`word_at`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Class {
+    Space,
+    /// Letters, digits, and the connectors that read as part of an identifier.
+    Word,
+    /// Punctuation, symbols, anything else.
+    Other,
+}
+
+/// Classify a segment by its first character. UAX#29 segments are homogeneous
+/// enough for that: it splits *between* a letter and a bracket, never inside a run
+/// of either.
+fn class_of(segment: &str) -> Class {
+    match segment.chars().next() {
+        Some(c) if c.is_whitespace() => Class::Space,
+        Some(c) if c.is_alphanumeric() || c == '_' => Class::Word,
+        _ => Class::Other,
+    }
+}
+
+/// The run containing `offset` (SPEC §2.2's double-click).
+///
+/// A *run*, not a word: `split_word_bounds` segments the whole line, so clicking
+/// the gap between two words takes the gap and clicking a bracket takes the
+/// bracket. That is what makes a double-click always select something, where a
+/// words-only pass would have to invent an answer off a word.
+///
+/// **Adjacent segments of the same class are joined**, because UAX#29 is finer than
+/// a double-click wants to be: it makes each `.` of `...` its own segment and each
+/// ideograph of 日本 its own, so taking one segment would select a single dot or a
+/// single character where the user aimed at the run. Joining by class is what turns
+/// those back into one gesture without loosening the boundaries that matter -
+/// letters and punctuation are different classes, so `foo(bar)` still selects
+/// `foo`, `(`, or `bar`, never a smear across them.
+///
+/// The offset is resolved against the containing **line**, not the whole buffer, so
+/// a double-click on a 300 MB log costs one line's segmentation rather than the
+/// file's (SPEC §10.4: nothing O(buffer) off the viewport). Segmentation does not
+/// cross a line break in any case - a terminator is its own boundary.
+fn word_at(text: &Text, offset: usize) -> Range<usize> {
+    let line_index = text.line_of_byte(offset);
+    let line_start = text.byte_of_line(line_index).unwrap_or(0);
+    let Some(line) = text.line(line_index) else {
+        return offset..offset;
+    };
+    let within = offset - line_start;
+    let segments: Vec<(usize, &str)> = line.split_word_bound_indices().collect();
+    // Past the last content byte - the caret sits on the terminator, or the line is
+    // empty - so there is no run to take.
+    let Some(hit) = segments
+        .iter()
+        .position(|(start, segment)| within < start + segment.len())
+    else {
+        return offset..offset;
+    };
+
+    let class = class_of(segments[hit].1);
+    let first = segments[..hit]
+        .iter()
+        .rposition(|(_, s)| class_of(s) != class)
+        .map_or(0, |i| i + 1);
+    let last = segments[hit + 1..]
+        .iter()
+        .position(|(_, s)| class_of(s) != class)
+        .map_or(segments.len() - 1, |i| hit + i);
+    let start = segments[first].0;
+    let end = segments[last].0 + segments[last].1.len();
+    line_start + start..line_start + end
+}
+
+/// The whole line containing `offset`, **including its terminator** (SPEC §2.2's
+/// triple-click, and a click in the line-number gutter).
+///
+/// Taking the terminator is what makes the selection a *line*: deleting it removes
+/// the line rather than emptying it and leaving the break behind. The last line of a
+/// buffer that does not end in one has nothing to take, so it runs to the end.
+fn line_at(text: &Text, offset: usize) -> Range<usize> {
+    let line_index = text.line_of_byte(offset);
+    let start = text.byte_of_line(line_index).unwrap_or(0);
+    let end = text
+        .byte_of_line(line_index + 1)
+        .unwrap_or_else(|| text.byte_len());
+    start..end
 }
 
 /// Byte offset one grapheme cluster before `offset`. At column 0, crosses to the
