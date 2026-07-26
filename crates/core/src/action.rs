@@ -94,9 +94,21 @@ pub enum Action {
     /// two round trips and a race, for a conversion the core is holding the line
     /// index for anyway.
     ///
+    /// `in_file` is the file the position was computed against, and the jump is
+    /// **dropped** if the active buffer is not holding it. The open this follows can
+    /// fail - a hit is only as fresh as the walk that found it, and the file can be
+    /// gone, replaced by a directory, or unreadable by the time it is picked - and
+    /// without the guard that failure leaves the caret jumping to a search hit's
+    /// coordinates inside whatever unrelated buffer happened to be focused. `None`
+    /// means "wherever I am", for a jump that never named a file (a `:42`).
+    ///
     /// Both coordinates are clamped to the buffer (SPEC §8): a stale hit against a
-    /// file that has since shrunk lands at its end rather than being refused.
-    PlaceCursorAt { position: Position },
+    /// file that has since shrunk lands at its end rather than being refused, and a
+    /// column that now falls inside a character rounds to that character's start.
+    PlaceCursorAt {
+        position: Position,
+        in_file: Option<PathBuf>,
+    },
     /// Add a cursor one line above the topmost caret at its column, keeping the
     /// existing cursors (the column-select gesture, SPEC §2.2). A no-op at the first
     /// line. Changes only the selection set: no text, so no delta or version bump.

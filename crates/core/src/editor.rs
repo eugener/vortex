@@ -519,15 +519,15 @@ impl Document {
     /// action carries a position rather than an offset: the sender named a place in
     /// a file, possibly before the file was open.
     ///
-    /// A position past the end clamps rather than being refused (SPEC §8) - a hit
-    /// found against the file on disk can name a line the buffer no longer has, and
-    /// landing at the end beats refusing to jump at all.
+    /// A position the buffer cannot honor is clamped rather than refused (SPEC §8),
+    /// which [`Text::byte_of_position_clamped`] owns: a hit found against the file on disk
+    /// can name a line the buffer no longer has, or a column that now falls inside a
+    /// character, and landing nearby beats refusing to jump - or panicking on the
+    /// way, which placing an offset mid-character does.
     fn place_cursor_at(&mut self, position: crate::buffer::Position) {
         let text = self.buffer.text();
-        let line = position.line.min(text.line_count().saturating_sub(1));
-        let line_start = text.byte_of_line(line).unwrap_or(0);
-        let col = position.col.min(text.line_len(line).unwrap_or(0));
-        self.selections.place(&text, line_start + col, false);
+        let offset = text.byte_of_position_clamped(position);
+        self.selections.place(&text, offset, false);
     }
 
     /// Add a cursor above (or below) the current set (SPEC §2.2). Pure selection
@@ -1441,8 +1441,23 @@ async fn run(
                 session.active_mut().add_cursor_vertical(false);
                 Step::Republish
             }
-            Action::PlaceCursorAt { position } => {
-                session.active_mut().place_cursor_at(position);
+            // The jump is dropped when it names a file the active buffer is not
+            // holding: the open it follows can have failed, and the caret must not
+            // land on a search hit's coordinates in an unrelated buffer. Still a
+            // republish either way - the frontend asked for a jump and is entitled
+            // to know where the caret ended up.
+            //
+            // Compared by `file_identity`, never by spelling, for the same reason
+            // `Open` is: argv passes what the user typed and a picker sends an
+            // absolute path, so `src/a.rs` and `/abs/src/a.rs` are one file whose two
+            // buffers would otherwise fail this test and silently swallow the jump.
+            Action::PlaceCursorAt { position, in_file } => {
+                let wanted = in_file.map(|path| file_identity(&path));
+                let doc = session.active_mut();
+                let here = doc.path.as_deref().map(file_identity);
+                if wanted.is_none() || wanted == here {
+                    doc.place_cursor_at(position);
+                }
                 Step::Republish
             }
             Action::AddCursorAt { offset } => {

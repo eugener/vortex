@@ -1110,13 +1110,23 @@ fn dispatch_command(command: Command, handle: &vortex_core::CoreHandle, ui: &mut
         // A hit is an arrival, not just an open: the two actions go down the same
         // channel in order, so the jump resolves against the buffer the open just
         // produced (SPEC §7.5 - the frontend owns "where", the core owns the text).
+        // The jump names the file it was computed against, so an open that fails -
+        // the hit is only as fresh as the walk that found it - drops the jump
+        // instead of moving the caret in whatever buffer is focused.
         Command::OpenAt { path, position } => {
-            if handle.actions.send_blocking(Action::Open(path)).is_err() {
+            if handle
+                .actions
+                .send_blocking(Action::Open(path.clone()))
+                .is_err()
+            {
                 return false;
             }
             if handle
                 .actions
-                .send_blocking(Action::PlaceCursorAt { position })
+                .send_blocking(Action::PlaceCursorAt {
+                    position,
+                    in_file: Some(path),
+                })
                 .is_err()
             {
                 return false;

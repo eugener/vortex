@@ -53,8 +53,9 @@ pub enum Command {
     /// One command rather than two so a picker row can commit a whole arrival: it
     /// dispatches to [`Action::Open`] followed by [`Action::PlaceCursorAt`], both
     /// down the same channel in order, so the jump resolves against the buffer the
-    /// open just produced. Carries data, so like [`Command::SetTheme`] it is emitted
-    /// by its picker rather than bound to a key.
+    /// open just produced. The jump carries `path` too, so an open that fails drops
+    /// it rather than moving the caret in an unrelated buffer. Carries data, so like
+    /// [`Command::SetTheme`] it is emitted by its picker rather than bound to a key.
     OpenAt {
         path: std::path::PathBuf,
         position: vortex_core::Position,

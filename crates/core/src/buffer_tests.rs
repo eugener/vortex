@@ -159,6 +159,55 @@ fn byte_of_position_empty_buffer_end() {
 }
 
 #[test]
+fn byte_of_position_clamped_agrees_with_the_strict_one_where_both_answer() {
+    // The forgiving conversion is not a *different* conversion: wherever the strict
+    // one has an answer, this must give the same one, or a jump and an edit would
+    // disagree about where a position is.
+    let b = RopeBuffer::from("ab\ncde\nf");
+    let text = b.text();
+    for offset in 0..=b.byte_len() {
+        let pos = b.position_of_byte(offset);
+        assert_eq!(
+            text.byte_of_position_clamped(pos),
+            offset,
+            "offset {offset}"
+        );
+    }
+}
+
+#[test]
+fn byte_of_position_clamped_rounds_into_a_character_down_to_its_start() {
+    // Where the two part company, and the reason this exists: a column that falls
+    // inside a character has no valid offset, and handing one out anyway panics the
+    // next slice. A search hit against an edited buffer produces exactly this.
+    let text = RopeBuffer::from("xéaa\nz").text();
+    // 'é' occupies bytes 1..3, so columns 1 and 2 both resolve to its start.
+    assert_eq!(text.byte_of_position_clamped(Position::new(0, 1)), 1);
+    assert_eq!(text.byte_of_position_clamped(Position::new(0, 2)), 1);
+    assert_eq!(text.byte_of_position_clamped(Position::new(0, 3)), 3);
+    // The strict conversion accepts the boundary and rejects what is inside it.
+    let b = RopeBuffer::from("xéaa\nz");
+    assert_eq!(b.byte_of_position(Position::new(0, 2)), None);
+}
+
+#[test]
+fn byte_of_position_clamped_never_refuses() {
+    // Nothing it is handed may be answered with a panic or a refusal - the whole
+    // point, since what it is handed has outlived the text it was measured against.
+    let text = RopeBuffer::from("one\ntwo\n").text();
+    let end = "one\ntwo\n".len();
+    assert_eq!(text.byte_of_position_clamped(Position::new(99, 0)), end);
+    assert_eq!(text.byte_of_position_clamped(Position::new(99, 99)), end);
+    assert_eq!(text.byte_of_position_clamped(Position::new(1, 99)), 7);
+    // The empty buffer, where there is not even a line to clamp against.
+    let empty = RopeBuffer::new();
+    assert_eq!(
+        empty.text().byte_of_position_clamped(Position::new(9, 9)),
+        0
+    );
+}
+
+#[test]
 fn replace_rejects_out_of_bounds() {
     let mut b = RopeBuffer::from("abc");
     assert_eq!(

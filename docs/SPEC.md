@@ -1102,6 +1102,19 @@ Incremental build order so the risky assumptions are validated early, not at the
   from. The search itself is frontend-owned on a worker thread, the shape the LSP client
   and the highlighter already have - a grep is filesystem work, and the actor thread every
   keystroke goes through is the one place it must not run.
+  A review of the arc turned up two defects in that jump, both from the same root: **a hit
+  is only as fresh as the walk that found it**, and it is resolved against a buffer that
+  has moved on. A column measured on disk can fall *inside* a character in an edited
+  buffer, and placing that offset panicked the whole editor on the next conversion - so
+  `Text::byte_of_position_clamped` now owns the rule that every position arriving over the
+  seam rounds down to a boundary (`Buffer::byte_of_position`, its strict twin, refuses one
+  instead; between them no conversion in the module can hand out an offset a later slice
+  will panic on). And the open a jump follows can fail outright - the file deleted or
+  replaced since the walk - which left the caret jumping to the hit's coordinates inside
+  whatever buffer was focused; `PlaceCursorAt` now names the file it was measured against
+  and is dropped when the active buffer is not holding it. The lesson is the general one
+  for anything asynchronous crossing the seam (§2.1): a position that outlived its text
+  must be *clamped and guarded*, never trusted.
   **Still open in M7:** which-key popup (and see §10.5's note on chord sequences, which it
   needs first).
   *Verify:* open a file via the picker, switch buffers, run a command via the palette -
