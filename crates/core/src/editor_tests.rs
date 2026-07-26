@@ -3018,6 +3018,7 @@ fn place_cursor_at_resolves_a_position_against_the_buffer_it_lands_in() {
         Action::Insert("αβγ\nsecond line\nthird\n".into()),
         Action::PlaceCursorAt {
             position: Position::new(1, 7),
+            in_file: None,
         },
     ]);
     let caret = snap.selections[0].head;
@@ -3033,6 +3034,7 @@ fn place_cursor_at_collapses_to_one_cursor() {
         Action::AddCursorAbove,
         Action::PlaceCursorAt {
             position: Position::new(0, 1),
+            in_file: None,
         },
     ]);
     assert_eq!(
@@ -3055,7 +3057,10 @@ fn place_cursor_at_clamps_a_position_the_buffer_no_longer_has() {
     ] {
         let (snap, _) = run_seam(&[
             Action::Insert(text.into()),
-            Action::PlaceCursorAt { position },
+            Action::PlaceCursorAt {
+                position,
+                in_file: None,
+            },
         ]);
         let caret = snap.selections[0].head;
         assert!(
@@ -3066,10 +3071,96 @@ fn place_cursor_at_clamps_a_position_the_buffer_no_longer_has() {
 }
 
 #[test]
+fn place_cursor_at_a_column_inside_a_character_lands_on_its_start() {
+    // The crash this guards: a hit is found against the file *on disk*, and the
+    // buffer it lands in has unsaved edits, so the column can fall inside a
+    // character the file never had there. Placing that offset panicked crop on the
+    // first conversion, taking the editor and every unsaved buffer with it.
+    //
+    // "xé" is one byte then two: column 2 is inside the 'é'.
+    let (snap, _) = run_seam(&[
+        Action::Insert("xéaaNEEDLE\n".into()),
+        Action::PlaceCursorAt {
+            position: Position::new(0, 2),
+            in_file: None,
+        },
+    ]);
+    let caret = snap.selections[0].head;
+    assert_eq!(caret, 1, "rounded down to where 'é' starts");
+    assert!(
+        snap.text.to_string().is_char_boundary(caret),
+        "a caret off a character boundary panics the next conversion"
+    );
+}
+
+#[test]
+fn place_cursor_at_ignores_a_jump_meant_for_a_file_this_is_not() {
+    // The open a jump follows can fail - the file was deleted or replaced between
+    // the walk that found the hit and the pick. Without the guard the queued jump
+    // still applies, moving the caret to a search hit's coordinates inside whatever
+    // buffer happened to be focused.
+    let (snap, _) = run_seam(&[
+        Action::Insert("one\ntwo\nthree\n".into()),
+        Action::PlaceCursorAt {
+            position: Position::new(2, 3),
+            in_file: Some(PathBuf::from("/nowhere/gone.rs")),
+        },
+    ]);
+    assert_eq!(
+        snap.selections[0].head,
+        "one\ntwo\nthree\n".len(),
+        "the caret stayed where the insert left it"
+    );
+}
+
+#[test]
+fn place_cursor_at_takes_a_jump_meant_for_the_file_it_is_in() {
+    // The other half: naming the right file is what a successful open produces, and
+    // the jump must land - the guard is a filter, not a refusal.
+    let dir = TempDir::new();
+    let path = dir.file("hit.rs");
+    std::fs::write(&path, "alpha\nbeta\ngamma\n").unwrap();
+    let (snap, _) = run_seam(&[
+        Action::Open(path.clone()),
+        Action::PlaceCursorAt {
+            position: Position::new(1, 2),
+            in_file: Some(path),
+        },
+    ]);
+    assert_eq!(snap.selections[0].head, 8, "line 1 (\"beta\") plus 2");
+}
+
+#[test]
+#[cfg(unix)] // the spelling that differs is a symlink; Windows models those differently
+fn place_cursor_at_matches_the_file_by_identity_not_by_spelling() {
+    // The two ways a path reaches the core disagree by construction: argv passes
+    // what the user typed, a picker sends an absolute path, and either can arrive
+    // through a symlink. A guard comparing spellings would drop every jump into a
+    // buffer opened the other way - the picker would open the file and then not move
+    // the caret, which reads as the jump silently failing. `Open` matches by
+    // `file_identity` for this exact reason, so the guard has to as well.
+    let dir = TempDir::new();
+    let real = dir.file("real");
+    std::fs::create_dir_all(&real).unwrap();
+    std::fs::write(real.join("hit.rs"), "alpha\nbeta\ngamma\n").unwrap();
+    let link = dir.file("link");
+    std::os::unix::fs::symlink(&real, &link).unwrap();
+    let (snap, _) = run_seam(&[
+        Action::Open(real.join("hit.rs")),
+        Action::PlaceCursorAt {
+            position: Position::new(1, 2),
+            in_file: Some(link.join("hit.rs")), // same file, a path that is not equal
+        },
+    ]);
+    assert_eq!(snap.selections[0].head, 8, "the jump landed anyway");
+}
+
+#[test]
 fn place_cursor_at_the_start_of_an_empty_buffer_is_harmless() {
     // The degenerate case the clamp's `saturating_sub` exists for.
     let (snap, _) = run_seam(&[Action::PlaceCursorAt {
         position: Position::new(0, 0),
+        in_file: None,
     }]);
     assert_eq!(snap.selections[0].head, 0);
 }

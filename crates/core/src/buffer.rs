@@ -156,6 +156,34 @@ impl Text {
         Position::new(line, offset - self.0.byte_of_line(line))
     }
 
+    /// Byte offset of a line/column [`Position`], clamped - the *forgiving* inverse
+    /// of [`Self::position_of_byte`], and the one home for that clamping rule so it
+    /// cannot drift between call sites.
+    ///
+    /// Deliberately not [`Buffer::byte_of_position`], which rejects a position the
+    /// buffer cannot honor: the two exist because their callers differ. A position
+    /// arriving over the seam has usually *outlived* the text it was computed
+    /// against - a search hit names a place in the file on disk and the buffer it
+    /// lands in may have been edited since - and refusing to jump is a worse answer
+    /// than landing nearby (SPEC §8). So a line past the end resolves to the last
+    /// line, a column past the line's end to that line's end, and a column landing
+    /// *inside* a character rounds **down** to that character's start - the same rule
+    /// [`Self::byte_of_utf16_position`] follows, and for the same reason: every
+    /// offset this hands out must be a boundary a later slice cannot panic on.
+    ///
+    /// Cost is bounded by the line's length, not the file's. Called per jump, never
+    /// per keystroke.
+    pub fn byte_of_position_clamped(&self, position: Position) -> usize {
+        let line = position.line.min(self.last_line_index());
+        let line_start = self.byte_of_line(line).unwrap_or(0);
+        let content = self.line(line).unwrap_or_default();
+        let col = position.col.min(content.len());
+        // Walk down to the start of the character the column landed in. `col` is
+        // already within the line, so this cannot run past its start.
+        let col = (0..=col).rev().find(|&i| content.is_char_boundary(i));
+        line_start + col.unwrap_or(0)
+    }
+
     /// Index of the last line a cursor can occupy. For a newline-terminated
     /// buffer that is the virtual empty line *after* the final terminator, which
     /// [`Self::line_count`]'s storage semantics do not count ("a\n" is 1 line to
@@ -270,7 +298,10 @@ pub trait Buffer {
     fn position_of_byte(&self, byte_offset: usize) -> Position;
 
     /// Convert a line/column position to a byte offset. Returns `None` if the
-    /// line is out of range or the column exceeds that line's byte length.
+    /// line is out of range, the column exceeds that line's byte length, or the
+    /// column falls inside a character - every offset this yields is a boundary.
+    /// [`Text::byte_of_position_clamped`] is the forgiving twin, for a position
+    /// that arrived from outside and has to land *somewhere*.
     fn byte_of_position(&self, pos: Position) -> Option<usize>;
 }
 
@@ -393,7 +424,12 @@ impl Buffer for RopeBuffer {
         if pos.col > line_bytes {
             return None;
         }
-        Some(line_start + pos.col)
+        let offset = line_start + pos.col;
+        // A column *inside* a character is as invalid as one past the line, and far
+        // more dangerous: it looks like an answer and panics whatever slices with it.
+        // No conversion in this module hands out an offset that is not a boundary -
+        // the forgiving twin rounds down, this one refuses.
+        self.rope.is_char_boundary(offset).then_some(offset)
     }
 }
 
