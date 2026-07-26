@@ -99,6 +99,22 @@ protocol](https://sw.kovidgoyal.net/kitty/keyboard-protocol/) (Kitty, Ghostty, W
 foot, recent Alacritty). It is negotiated at startup; where it is missing those chords
 simply never fire rather than misfiring.
 
+## Mouse
+
+| | |
+|---|---|
+| Click / drag | Place the caret, or sweep out a selection |
+| Double / triple click | Select the word / the whole line |
+| Click the gutter | Select that line |
+| `Alt+Click` | Add a cursor |
+| `Shift+Click` | Extend the selection |
+| Wheel | Scroll the view (or move the highlight, in a picker) |
+| Click a tab | Switch to that buffer |
+| Click a picker row | Run it - one click, not two |
+| Click outside an overlay | Dismiss it |
+| Click a toast | Dismiss it early |
+| Click the encoding or `LF`/`CRLF` in the status bar | Change it |
+
 ## Themes
 
 Four ship with the editor, compiled into the binary:
