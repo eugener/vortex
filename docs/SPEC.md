@@ -508,7 +508,7 @@ adopt a component framework.**
 | **Message / toast area** | transient layer | consumes `Notification` | **built (M6).** errors, save/LSP status, external-change notices - a real surface, not a status-bar hijack |
 | **Prompt line** | overlay | emits `Action` on submit | single-line input: save-as path, search query, `:command`. Submit/cancel are the only seam traffic |
 | **Command palette** | overlay | emits `Action` on pick | **built (M7).** fuzzy list of commands; nav/filter pure frontend, only the chosen intent hits the core |
-| **Pickers** (file / theme / buffer / global-search / symbol) | overlay | emits `Action` on pick | **file + theme + buffer built (M7).** fuzzy list + optional preview pane; large lists stream in without blocking |
+| **Pickers** (file / theme / buffer / encoding / line-ending / global-search / symbol) | overlay | emits `Action` on pick | **file + theme + buffer + the two format pickers built (M7).** fuzzy list + optional preview pane; large lists stream in without blocking. Mouse-driven: a click on a row picks it, the wheel moves the highlight, a click outside dismisses |
 | **Theme picker** | overlay | **none** | **built (M7).** the one surface whose commit never crosses the seam at all - chrome is frontend-owned, so it also *previews* as the highlight moves (§10.5) |
 | **Which-key popup** | overlay | none | after a prefix key, show the available continuations from the keymap (§10.5) - pure frontend introspection of the binding table |
 | **Completion popup** | overlay | emits `Action`, reads decorations | LSP completion menu; ghost-preview of the selected item as a `VirtualText` decoration |
@@ -804,14 +804,15 @@ None is a correctness bug today.
   at it. **Trigger:** the confirm-on-quit feature. A smaller independent piece can land
   sooner - the frontend currently keeps painting a stale snapshot if the core thread dies
   while the user is idle, since only a later keystroke notices the closed channel.
-- **Overlay modality for mouse and paste is hardcoded in the event loop.** Keys route
-  through the compositor's `handle_key`/`EventResult` seam, but `Event::Mouse` and
-  `Event::Paste` are swallowed by `if !overlays.is_empty()` match guards in the loop, so
-  input routing lives at two altitudes and every new event kind adds another guard.
-  Widening the layer seam to whole events (`handle_event`, with defaults) unifies them.
-  **Deferred because** the per-layer behavior this would enable (clicking inside a picker,
-  pasting into a prompt) is M7 design that does not exist yet. **Trigger:** the first
-  overlay that wants to handle a click or a paste.
+- **Paste modality is still hardcoded in the event loop.** *Half resolved:* the mouse
+  now routes through the compositor exactly as keys do (`Layer::handle_mouse`, defaulting
+  to `Consumed` because an overlay is modal over the screen as well as the keyboard), so
+  clicking inside a picker, a prompt, or a toast is per-layer behavior rather than a match
+  guard. `Event::Paste` is still swallowed by `if !overlays.is_empty()`, so input routing
+  remains at two altitudes for that one kind. Widening the seam to whole events
+  (`handle_event`, with defaults) would finish it. **Trigger:** pasting into the prompt -
+  which is also what the prompt needs before a click can position its caret, since the
+  caret only ever sits at the end of its input today.
 - **"A shortcut fires over a picker" is a convention split across two files.** It works
   only because `Picker::handle_key` returns `Ignored` for any Ctrl/Cmd chord *and* the
   event loop dismisses the whole overlay stack when a fall-through key turns out to be
@@ -1036,9 +1037,10 @@ Incremental build order so the risky assumptions are validated early, not at the
   byte-preservation proptest, fault injection (unwritable files, FIFOs, directories,
   binaries, truncated UTF-16), and the whole arc driven in a real terminal.
   **Deferred within M5:** a statistical encoding detector (`chardetng`) that would *name*
-  Shift-JIS and KOI8-R rather than preserving them as windows-1252 mojibake; a
-  `set encoding` escape hatch for a save the current encoding cannot represent; loading
-  large files off the actor thread (§2.3).
+  Shift-JIS and KOI8-R rather than preserving them as windows-1252 mojibake; loading large
+  files off the actor thread (§2.3). The `set encoding` escape hatch has since landed as
+  `Action::SetEncoding`/`SetLineEnding`, reached by clicking the status bar's own readout
+  of them - the place that shows the guess is the place to correct it.
 - **M6 - Frontend UI shell.** The overlay compositor (§7.5, job 2 only) + a message/toast
   surface (consuming `Notification`) + a prompt line. Proves the layer stack and the
   commit-only seam rule (§7.5): surface navigation stays frontend-local, only the committed
