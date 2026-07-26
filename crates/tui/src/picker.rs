@@ -146,6 +146,9 @@ pub struct Picker {
     /// Set by [`Self::with_item_source`]: rows come from the query rather than from
     /// fuzzy-ranking a fixed list. `None` is the ordinary filtering picker.
     source: Option<Box<dyn ItemSource>>,
+    /// The source's status as of the last tick, so a change in it can ask for a
+    /// repaint. A source may change what it says without producing a row.
+    status: Option<String>,
 }
 
 impl Picker {
@@ -179,6 +182,7 @@ impl Picker {
             previewed: None,
             pane: None,
             source: None,
+            status: None,
         }
     }
 
@@ -580,8 +584,15 @@ impl Layer for Picker {
             return false;
         };
         let arrived = source.take();
+        // A source can change what it *says* without producing a row: a debounced
+        // search starts, or fails to compile, on a tick of its own. Repainting only
+        // on arrival would leave that line saying the wrong thing until the next
+        // keystroke happened to redraw it.
+        let status = source.status();
+        let restated = status != self.status;
+        self.status = status;
         if arrived.is_empty() {
-            return false;
+            return restated;
         }
         // Appended in arrival order and never re-ranked: the rows under the pointer
         // must not move while results are still coming in, or a click lands on
@@ -1187,7 +1198,7 @@ mod tests {
     struct Fake {
         asked: Asked,
         pending: Pending,
-        status: Option<String>,
+        status: Status,
     }
 
     impl ItemSource for Fake {
@@ -1199,7 +1210,7 @@ mod tests {
             std::mem::take(&mut self.pending.borrow_mut())
         }
         fn status(&self) -> Option<String> {
-            self.status.clone()
+            self.status.borrow().clone()
         }
     }
 
@@ -1215,6 +1226,9 @@ mod tests {
     type Asked = Rc<RefCell<Vec<String>>>;
     /// Rows a [`Fake`] will hand over on its next `take`, i.e. "what has arrived".
     type Pending = Rc<RefCell<Vec<Item>>>;
+    /// What a [`Fake`] says where the rows would be, changeable after the picker
+    /// owns it - a real source restates itself on a tick, not on a keystroke.
+    type Status = Rc<RefCell<Option<String>>>;
 
     /// A sourced picker plus handles on what it was asked and what it may receive.
     fn sourced() -> (Picker, Asked, Pending) {
@@ -1223,7 +1237,7 @@ mod tests {
         let source = Fake {
             asked: Rc::clone(&asked),
             pending: Rc::clone(&pending),
-            status: None,
+            status: Status::default(),
         };
         let p = Picker::new(
             "Search",
@@ -1304,7 +1318,7 @@ mod tests {
         // An empty box under a typed query cannot explain itself: a bad pattern and
         // a genuine no-match look identical without this.
         let source = Fake {
-            status: Some("searching…".to_string()),
+            status: Rc::new(RefCell::new(Some("searching…".to_string()))),
             ..Fake::default()
         };
         let p = Picker::new(
@@ -1334,6 +1348,30 @@ mod tests {
             .map(|x| buf.cell((x, list.y + 1)).unwrap().symbol().to_string())
             .collect();
         assert!(row.contains("a real row"), "{row:?}");
+    }
+
+    #[test]
+    fn a_status_that_changes_without_a_row_still_asks_for_a_repaint() {
+        // A debounced search starts - or turns out not to compile - on a tick of its
+        // own, with no row to show for it. Repainting only on arrival would leave the
+        // line where the rows go saying the wrong thing until the next keystroke.
+        let status: Status = Rc::new(RefCell::new(None));
+        let source = Fake {
+            status: Rc::clone(&status),
+            ..Fake::default()
+        };
+        let mut p = Picker::new(
+            "Search",
+            Vec::new(),
+            false,
+            Style::default(),
+            Style::default(),
+        )
+        .with_item_source(Box::new(source));
+        assert!(!p.tick(), "nothing arrived and nothing was restated");
+        *status.borrow_mut() = Some("searching…".to_string());
+        assert!(p.tick(), "the line under the query changed");
+        assert!(!p.tick(), "and stops asking once it has been painted");
     }
 
     #[test]

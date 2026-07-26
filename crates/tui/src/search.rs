@@ -44,10 +44,11 @@ const MAX_HITS: usize = 1000;
 /// (SPEC §6, the same bargain the core's channels make).
 const CHANNEL_DEPTH: usize = 64;
 
-/// Cap on a matched line's length as reported. A minified file matches on a line
-/// megabytes long; the picker shows one row of it, and carrying the rest to throw
-/// away costs more than the match did.
-const MAX_LINE_BYTES: usize = 500;
+/// Cap on a matched line's length as reported, in characters - the unit the row is
+/// clipped in, since the picker paints cells and not bytes. A minified file matches
+/// on a line megabytes long; the picker shows one row of it, and carrying the rest to
+/// throw away costs more than the match did.
+const MAX_LINE_CHARS: usize = 500;
 
 /// One match: the file, where in it, and the line it was on.
 ///
@@ -61,7 +62,7 @@ pub struct Hit {
     pub line: usize,
     pub column: usize,
     /// The matched line's text, trimmed of leading whitespace and capped at
-    /// [`MAX_LINE_BYTES`]. What the picker shows as the row.
+    /// [`MAX_LINE_CHARS`] characters. What the picker shows as the row.
     pub text: String,
 }
 
@@ -203,7 +204,7 @@ fn read_capped(path: &Path) -> Option<Vec<u8>> {
 /// not show as a column of blanks, and capped so one long line cannot be the row.
 fn trim_row(line: &str) -> String {
     let line = line.trim_start();
-    match line.char_indices().nth(MAX_LINE_BYTES) {
+    match line.char_indices().nth(MAX_LINE_CHARS) {
         Some((end, _)) => line[..end].to_string(),
         None => line.to_string(),
     }
@@ -346,7 +347,7 @@ mod tests {
         t.file("min.js", &format!("needle{}\n", "x".repeat(5000)));
         let hits = collect(&t.path, "needle");
         assert_eq!(hits.len(), 1);
-        assert_eq!(hits[0].text.chars().count(), MAX_LINE_BYTES);
+        assert_eq!(hits[0].text.chars().count(), MAX_LINE_CHARS);
     }
 
     #[test]
