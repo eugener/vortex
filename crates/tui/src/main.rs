@@ -50,8 +50,8 @@ use vortex_tui::command::{self, Command};
 use vortex_tui::compositor::{Compositor, EventResult};
 use vortex_tui::toast::{self, Toasts};
 use vortex_tui::{
-    bufferpicker, click, config, filepicker, grammar, keymap, layout, osc52, palette, prompt,
-    theme, themepicker, watcher,
+    bufferpicker, click, config, filepicker, formatpicker, grammar, keymap, layout, osc52, palette,
+    prompt, theme, themepicker, watcher,
 };
 
 /// The frontend's view state: which window of the buffer is on screen. Both axes
@@ -943,6 +943,38 @@ fn event_loop(
                             }
                             continue;
                         }
+                        // The status bar is a readout *and* a control: its encoding
+                        // and line-ending words open a picker for what they show
+                        // (SPEC §7.5). Checked before the body, since the bar is not
+                        // text - and only on the bottom row, so a drag that ends
+                        // there still belongs to the selection it was sweeping.
+                        let bottom = terminal.size()?.height.saturating_sub(1);
+                        if is_press && mouse.row == bottom {
+                            if let Some(target) = status_target_at(
+                                snap,
+                                selected,
+                                terminal.size()?.width as usize,
+                                mouse.column as usize,
+                            ) {
+                                let command = match target {
+                                    layout::StatusTarget::Encoding => Command::OpenEncodingPicker,
+                                    layout::StatusTarget::LineEnding => {
+                                        Command::OpenLineEndingPicker
+                                    }
+                                };
+                                let mut ui = Frontend {
+                                    overlays: &mut overlays,
+                                    config: &mut config,
+                                    toasts: &mut toasts,
+                                    snapshot: latest.as_ref(),
+                                };
+                                if !dispatch_command(command, handle, &mut ui) {
+                                    return Ok(());
+                                }
+                                needs_redraw = true;
+                            }
+                            continue;
+                        }
                         // Only a plain press advances the click run (SPEC §2.2): a
                         // drag is one continuous gesture, and a modified click means
                         // something else entirely, so both end the run rather than
@@ -1073,6 +1105,24 @@ fn dispatch_command(command: Command, handle: &vortex_core::CoreHandle, ui: &mut
                 let buffers = ui.buffers();
                 ui.overlays
                     .push(bufferpicker::open(&ui.config.theme, buffers, active));
+            }
+        }
+        // Both format pickers open on what the buffer currently is, which they read
+        // from the snapshot - the same value the status bar prints, so the readout
+        // and the chooser can never disagree. No snapshot yet means nothing to
+        // change, so they do not open.
+        Command::OpenEncodingPicker => {
+            if let Some(format) = ui.snapshot.map(|s| s.format) {
+                ui.overlays.push(formatpicker::encoding(
+                    &ui.config.theme,
+                    format.encoding_name(),
+                ));
+            }
+        }
+        Command::OpenLineEndingPicker => {
+            if let Some(format) = ui.snapshot.map(|s| s.format) {
+                ui.overlays
+                    .push(formatpicker::line_ending(&ui.config.theme, format.eol));
             }
         }
         // The save-as prompt pre-fills the current path (if any) so a save-as is a
@@ -1571,6 +1621,44 @@ fn paint_status_bar(frame: &mut Frame, area: Rect, snapshot: &ViewSnapshot, stat
     );
     let bar = layout::fit_bar(&left, &right, area.width as usize);
     frame.render_widget(Paragraph::new(bar).style(status.style), area);
+}
+
+/// Which clickable part of the status bar a column falls on, for the snapshot the
+/// bar was painted from.
+///
+/// A thin wrapper that assembles the same arguments `paint_status_bar` does, so the
+/// hit test is asking about the bar that is actually on screen rather than about a
+/// plausible-looking reconstruction of it.
+fn status_target_at(
+    snapshot: &ViewSnapshot,
+    selected: usize,
+    width: usize,
+    column: usize,
+) -> Option<layout::StatusTarget> {
+    let head = snapshot
+        .selections
+        .get(snapshot.primary)
+        .map(|s| s.head)
+        .unwrap_or(0);
+    let (cursor_line, cursor_byte_col, line_text) = layout::cursor_line_col(&snapshot.text, head);
+    let col = layout::grapheme_column(&line_text, cursor_byte_col);
+    let (left, _) = layout::status_bar(
+        cursor_line + 1,
+        col,
+        selected,
+        snapshot.text.byte_len(),
+        snapshot.version,
+        snapshot.format,
+        snapshot.read_only,
+    );
+    layout::status_target(
+        &left,
+        snapshot.text.byte_len(),
+        snapshot.version,
+        snapshot.format,
+        width,
+        column,
+    )
 }
 
 /// What a press or drag in the editor body means, given how many clicks the run has
@@ -2158,6 +2246,48 @@ mod tests {
             matches!(action, Action::PlaceCursor { extend: true, .. }),
             "{action:?}"
         );
+    }
+
+    #[test]
+    fn the_status_bars_format_words_resolve_to_their_pickers() {
+        // The wrapper's job is to ask about the bar that is actually painted, which
+        // means assembling the same left segment `paint_status_bar` does - the part
+        // that decides whether the right segment fits at all.
+        let snap = gesture_snapshot();
+        let width = 80;
+        let (_, right) = layout::status_bar(
+            1,
+            1,
+            0,
+            snap.text.byte_len(),
+            snap.version,
+            snap.format,
+            snap.read_only,
+        );
+        let start = width - right.width();
+        assert_eq!(
+            status_target_at(&snap, 0, width, start),
+            Some(layout::StatusTarget::Encoding)
+        );
+        assert_eq!(
+            status_target_at(&snap, 0, width, start + right.width() - 2),
+            None,
+            "the version is a readout, not a control"
+        );
+    }
+
+    #[test]
+    fn a_terminal_too_narrow_for_the_metrics_offers_nothing_to_click() {
+        // The left segment grows with a selection, and once it crowds the bar the
+        // right segment is dropped - so there is nothing painted there to click.
+        let snap = gesture_snapshot();
+        for column in 0..24 {
+            assert_eq!(
+                status_target_at(&snap, 1234, 24, column),
+                None,
+                "column {column} on a crowded 24-cell bar"
+            );
+        }
     }
 
     #[test]

@@ -2047,3 +2047,56 @@ fn select_around_resolves_a_pointer_offset_to_a_word_or_a_line() {
         assert_eq!(snap.version, version, "selecting changes no text");
     });
 }
+
+#[test]
+fn setting_the_encoding_changes_what_the_next_save_writes() {
+    // The way out of a file the detector guessed wrong about (SPEC §10.1): the
+    // buffer already holds decoded text, so nothing is re-read and nothing on disk
+    // moves until the save.
+    let dir = TempDir::new();
+    let path = dir.file("notes.txt");
+
+    drive(|h| async move {
+        step(&h, Action::Open(path.clone())).await;
+        step(&h, Action::Insert("caf\u{e9}".into())).await;
+        let snap = step(&h, Action::SetEncoding("windows-1252".into())).await;
+        assert_eq!(snap.format.encoding_name(), "windows-1252");
+        assert!(snap.modified, "the edit is still unsaved");
+
+        step(&h, Action::SetLineEnding(crate::file::LineEnding::Crlf)).await;
+        step(&h, Action::Save).await;
+        await_note(&h, |n| matches!(n, Notification::FileSaved { .. })).await;
+        // latin-1 'é' is one byte, and the final newline is the policy's, in CRLF.
+        assert_eq!(std::fs::read(&path).unwrap(), b"caf\xE9\r\n");
+    });
+}
+
+#[test]
+fn an_unknown_encoding_is_reported_and_changes_nothing() {
+    drive(|h| async move {
+        let before = step(&h, Action::RequestSnapshot).await.format;
+        step(&h, Action::SetEncoding("not-an-encoding".into())).await;
+        let note = await_note(&h, |n| matches!(n, Notification::FileError { .. })).await;
+        match note {
+            Notification::FileError { message, .. } => {
+                assert!(message.contains("not-an-encoding"), "message: {message}");
+            }
+            other => panic!("expected a FileError, got {other:?}"),
+        }
+        let after = step(&h, Action::RequestSnapshot).await.format;
+        assert_eq!(before, after, "a bad label leaves the format alone");
+    });
+}
+
+#[test]
+fn switching_to_utf16_adds_the_byte_order_mark_it_needs() {
+    // A UTF-16 file without a BOM is one nothing - including this editor - can
+    // detect, so choosing UTF-16 has to bring one.
+    drive(|h| async move {
+        let snap = step(&h, Action::SetEncoding("UTF-16LE".into())).await;
+        assert!(snap.format.bom);
+        // ...and going back to UTF-8 drops it again rather than carrying it over.
+        let snap = step(&h, Action::SetEncoding("Shift_JIS".into())).await;
+        assert!(!snap.format.bom);
+    });
+}

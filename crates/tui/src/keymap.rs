@@ -208,6 +208,11 @@ pub enum Command {
     OpenThemePicker,
     /// Open the buffer-picker overlay (frontend-local).
     OpenBufferPicker,
+    /// Open the encoding picker (frontend-local until a pick, which commits an
+    /// `Action::SetEncoding`).
+    OpenEncodingPicker,
+    /// Open the line-ending picker (frontend-local until a pick).
+    OpenLineEndingPicker,
     /// Focus the next buffer in the bufferline, wrapping at the end.
     ///
     /// Frontend-local *resolution*, not a frontend-local effect: the core has no
@@ -292,6 +297,8 @@ impl Command {
             "open_file_picker" => Command::OpenFilePicker,
             "open_theme_picker" => Command::OpenThemePicker,
             "open_buffer_picker" => Command::OpenBufferPicker,
+            "open_encoding_picker" => Command::OpenEncodingPicker,
+            "open_line_ending_picker" => Command::OpenLineEndingPicker,
             "next_buffer" => Command::NextBuffer,
             "prev_buffer" => Command::PrevBuffer,
             "close_buffer" => Command::CloseBuffer,
@@ -308,6 +315,8 @@ impl Command {
             Command::OpenFilePicker => return FrontendCommand::OpenFilePicker,
             Command::OpenThemePicker => return FrontendCommand::OpenThemePicker,
             Command::OpenBufferPicker => return FrontendCommand::OpenBufferPicker,
+            Command::OpenEncodingPicker => return FrontendCommand::OpenEncodingPicker,
+            Command::OpenLineEndingPicker => return FrontendCommand::OpenLineEndingPicker,
             Command::SaveAs => return FrontendCommand::OpenSavePrompt,
             // Resolved against the live buffer list at dispatch, where it is known.
             Command::NextBuffer => return FrontendCommand::NextBuffer,

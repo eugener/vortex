@@ -775,14 +775,75 @@ pub fn status_bar(
     } else {
         format!("{lock} Ln {line}, Col {col}")
     };
+    (left, status_right(bytes, version, format).0)
+}
+
+/// Something on the status bar that can be clicked (SPEC §7.5).
+///
+/// The bar is a readout, and these are the parts of it that are also a *control*:
+/// both are settings the file carries and the detector may have guessed, so the
+/// place that shows the answer is the place to change it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StatusTarget {
+    Encoding,
+    LineEnding,
+}
+
+/// The status bar's right segment, plus the display-column span each clickable word
+/// occupies *within it*.
+///
+/// Built in one pass with the string so a span cannot describe a different layout
+/// than the one painted - the same rule the picker's rows and the toast stack
+/// follow. Absolute columns are the caller's to work out, because only the caller
+/// knows where [`fit_bar`] put the segment.
+fn status_right(
+    bytes: usize,
+    version: u64,
+    format: FileFormat,
+) -> (String, [(Range<usize>, StatusTarget); 2]) {
     let bom = if format.bom { " BOM" } else { "" };
-    let right = format!(
-        "{}{bom} · {} · {} · v{version} ",
-        format.encoding_name(),
-        format.eol.name(),
-        human_size(bytes),
-    );
-    (left, right)
+    let encoding = format!("{}{bom}", format.encoding_name());
+    let eol = format.eol.name();
+    let text = format!("{encoding} · {eol} · {} · v{version} ", human_size(bytes),);
+    // Both words sit at the front, separated by " · " (three display columns).
+    let encoding_span = 0..encoding.width();
+    let eol_start = encoding_span.end + SEPARATOR_WIDTH;
+    let eol_span = eol_start..eol_start + eol.width();
+    (
+        text,
+        [
+            (encoding_span, StatusTarget::Encoding),
+            (eol_span, StatusTarget::LineEnding),
+        ],
+    )
+}
+
+/// Display width of the `" · "` the status bar's right segment joins its fields
+/// with. Named because the click spans have to step over it in exactly the width it
+/// paints - the middle dot is one column, not the three bytes it takes to store.
+const SEPARATOR_WIDTH: usize = 3;
+
+/// Which clickable part of the status bar display column `column` falls on, if any.
+///
+/// Returns `None` for the position readout, the size, the version, the gaps - and
+/// for every column when the bar is too narrow to have shown the right segment at
+/// all, since [`fit_bar`] drops it there and nothing that is not painted can be
+/// clicked.
+pub fn status_target(
+    left: &str,
+    bytes: usize,
+    version: u64,
+    format: FileFormat,
+    width: usize,
+    column: usize,
+) -> Option<StatusTarget> {
+    let (right, spans) = status_right(bytes, version, format);
+    let start = right_placement(left, &right, width)?;
+    let within = column.checked_sub(start)?;
+    spans
+        .iter()
+        .find(|(span, _)| span.contains(&within))
+        .map(|(_, target)| *target)
 }
 
 /// Compose a bar of exactly `width` display cells: `left` flush to the start,
@@ -793,6 +854,20 @@ pub fn status_bar(
 /// and the left is truncated to `width` - the left half (name / cursor position)
 /// is the more important one to keep. Truncation is grapheme-aware so a multi-byte
 /// cluster is never split (SPEC §4).
+/// The display column [`fit_bar`] would place `right` at, or `None` when it would
+/// drop it for want of room.
+///
+/// The one home for that rule, so a hit test can never believe a segment is on
+/// screen that the paint left off (or the reverse).
+fn right_placement(left: &str, right: &str, width: usize) -> Option<usize> {
+    if width == 0 {
+        return None;
+    }
+    let left_cells = truncate_to_cells(left, width).1;
+    let right_cells = right.width();
+    (left_cells + 1 + right_cells <= width).then(|| width - right_cells)
+}
+
 pub fn fit_bar(left: &str, right: &str, width: usize) -> String {
     if width == 0 {
         return String::new();
@@ -800,7 +875,7 @@ pub fn fit_bar(left: &str, right: &str, width: usize) -> String {
     let (left_text, left_cells) = truncate_to_cells(left, width);
     let right_cells = right.width();
     // Room for both plus at least one separating space?
-    if left_cells + 1 + right_cells <= width {
+    if right_placement(left, right, width).is_some() {
         let gap = width - left_cells - right_cells;
         let mut out = String::with_capacity(left_text.len() + gap + right.len());
         out.push_str(&left_text);
@@ -1703,6 +1778,89 @@ mod tests {
         assert_eq!(human_size(3 * 1024 * 1024 + 512 * 1024), "3.5MB");
         assert_eq!(human_size(1024 * 1024 * 1024), "1.0GB");
         assert_eq!(human_size(5 * 1024 * 1024 * 1024), "5.0GB"); // caps at GB
+    }
+
+    #[test]
+    fn the_status_bars_encoding_and_terminator_are_clickable() {
+        // The bar shows what the detector guessed; clicking the guess is how it gets
+        // corrected, so the words have to map back to a target (SPEC §7.5, §10.1).
+        let format = FileFormat::default();
+        let (left, right) = status_bar(1, 1, 0, 38, 7, format, false);
+        assert_eq!(right, "UTF-8 · LF · 38B · v7 ");
+        let width = 60;
+        let start = width - right.width();
+        // "UTF-8" occupies the first five columns of the segment, "LF" the two after
+        // the separator.
+        let target = |column| status_target(&left, 38, 7, format, width, column);
+        assert_eq!(target(start), Some(StatusTarget::Encoding));
+        assert_eq!(target(start + 4), Some(StatusTarget::Encoding));
+        assert_eq!(target(start + 5), None, "the separator is not a target");
+        assert_eq!(target(start + 8), Some(StatusTarget::LineEnding));
+        assert_eq!(target(start + 9), Some(StatusTarget::LineEnding));
+        assert_eq!(target(start + 10), None);
+        // The size and version are readouts, not controls.
+        assert_eq!(target(width - 2), None);
+        // ...and so is everything left of the segment.
+        assert_eq!(target(0), None);
+        assert_eq!(target(start - 1), None);
+    }
+
+    #[test]
+    fn a_bom_widens_the_encoding_target_to_match_what_is_painted() {
+        // The BOM marker is part of the encoding word, so it must be part of the
+        // word's hit region too - otherwise its last four columns do nothing.
+        let mut format = FileFormat::default();
+        format.bom = true;
+        let (left, right) = status_bar(1, 1, 0, 4, 0, format, false);
+        assert!(right.starts_with("UTF-8 BOM ·"));
+        let width = 60;
+        let start = width - right.width();
+        assert_eq!(
+            status_target(&left, 4, 0, format, width, start + 8),
+            Some(StatusTarget::Encoding),
+            "the M of BOM"
+        );
+        assert_eq!(
+            status_target(&left, 4, 0, format, width, start + 12),
+            Some(StatusTarget::LineEnding)
+        );
+    }
+
+    #[test]
+    fn nothing_on_a_bar_too_narrow_to_show_the_segment_is_clickable() {
+        // `fit_bar` drops the right segment when it will not fit; a hit test that
+        // still reported targets would open a picker from a blank cell.
+        let format = FileFormat::default();
+        let (left, right) = status_bar(1, 1, 0, 38, 7, format, false);
+        let width = left.width() + right.width(); // one column short of a gap
+        assert!(!fit_bar(&left, &right, width).contains("UTF-8"));
+        for column in 0..width {
+            assert_eq!(
+                status_target(&left, 38, 7, format, width, column),
+                None,
+                "column {column} on a bar with no segment"
+            );
+        }
+    }
+
+    #[test]
+    fn a_wide_encoding_name_moves_the_terminator_target_with_it() {
+        // The spans are computed from the words themselves, so a longer encoding
+        // name shifts the line-ending target rather than leaving it where UTF-8 put
+        // it - the bug a hardcoded offset would have.
+        let format = FileFormat::default().with_encoding("windows-1252").unwrap();
+        let (left, right) = status_bar(1, 1, 0, 4, 0, format, false);
+        let width = 60;
+        let start = width - right.width();
+        assert_eq!(
+            status_target(&left, 4, 0, format, width, start + 11),
+            Some(StatusTarget::Encoding),
+            "windows-1252 is twelve columns"
+        );
+        assert_eq!(
+            status_target(&left, 4, 0, format, width, start + 15),
+            Some(StatusTarget::LineEnding)
+        );
     }
 
     #[test]

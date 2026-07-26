@@ -20,6 +20,7 @@
 use std::borrow::Cow;
 
 use encoding_rs::{Encoding, UTF_8, UTF_16BE, UTF_16LE, WINDOWS_1252};
+use serde::{Deserialize, Serialize};
 
 /// Bytes of a file inspected to decide its encoding and line ending. Bounded so
 /// opening a 300 MB log does not pay a statistical pass over the whole file
@@ -32,7 +33,7 @@ const SAMPLE: usize = 8 * 1024;
 /// Classic-Mac lone `\r` is deliberately not a variant: it is effectively extinct,
 /// and a file holding stray `\r`s round-trips byte-exactly anyway because only
 /// `\r\n` pairs are rewritten.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub enum LineEnding {
     #[default]
     Lf,
@@ -148,6 +149,56 @@ impl FileFormat {
             // encode alone. Rare, and still an honest refusal.
             None => format!("cannot write as {name}: the text is not representable in it"),
         }
+    }
+}
+
+/// The encodings offered when choosing one by hand (SPEC §10.1).
+///
+/// A curated list, not everything `encoding_rs` implements: the Encoding Standard
+/// defines dozens, most of them aliases or legacy single-byte variants nobody picks
+/// from a menu, and a picker's job is to be *choosable*. These are the ones a file
+/// in the wild is actually saved in, plus the two the detector can name on its own.
+///
+/// Names are WHATWG labels, so they round-trip through [`Encoding::for_label`] and
+/// read the way the status bar prints them.
+pub const OFFERED_ENCODINGS: &[&str] = &[
+    "UTF-8",
+    "UTF-16LE",
+    "UTF-16BE",
+    "windows-1252",
+    "ISO-8859-2",
+    "ISO-8859-5",
+    "ISO-8859-7",
+    "ISO-8859-15",
+    "windows-1251",
+    "windows-1256",
+    "KOI8-R",
+    "Shift_JIS",
+    "EUC-JP",
+    "EUC-KR",
+    "GBK",
+    "gb18030",
+    "Big5",
+];
+
+impl FileFormat {
+    /// Rewrite this format to use the encoding `label` names, keeping the line
+    /// ending. Fails on a label the Encoding Standard does not know.
+    ///
+    /// The BOM follows the encoding rather than being carried across: it is only
+    /// meaningful for the three encodings that can have one, and a UTF-8 file that
+    /// had a BOM has no business keeping it once it is Shift-JIS. Switching *to*
+    /// UTF-16 adds one, because a UTF-16 file without a BOM is a file nothing -
+    /// including this editor - can detect.
+    pub fn with_encoding(self, label: &str) -> Result<Self, String> {
+        let encoding = Encoding::for_label(label.as_bytes())
+            .ok_or_else(|| format!("unknown encoding: {label}"))?;
+        let utf16 = is(encoding, UTF_16LE) || is(encoding, UTF_16BE);
+        Ok(Self {
+            encoding,
+            bom: utf16 || (self.bom && is(encoding, UTF_8)),
+            ..self
+        })
     }
 }
 

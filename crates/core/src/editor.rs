@@ -830,6 +830,9 @@ enum Step {
         id: BufferId,
         force: bool,
     },
+    /// Report a rejected request and republish - for the ones that fail before they
+    /// touch anything, so there is nothing to undo and nothing to write.
+    FileError(String),
 }
 
 impl Step {
@@ -848,6 +851,7 @@ impl Step {
             // it is how a read-only buffer catches up with its file, and it can
             // only ever move the buffer *towards* what is on disk.
             Step::Reload { .. }
+            | Step::FileError(_)
             | Step::Republish
             | Step::Open(_)
             | Step::Save
@@ -1445,6 +1449,21 @@ async fn run(
             Action::SwitchBuffer { id } => Step::Switch(id),
             Action::CloseBuffer { id, force } => Step::Close { id, force },
             Action::Reload { id, force } => Step::Reload { id, force },
+            // Changing the file's form changes what the next save writes, never the
+            // buffer - which already holds decoded UTF-8/LF text whatever the file
+            // is. So there is no delta and no version bump, only a republish so the
+            // status bar shows the new answer.
+            Action::SetEncoding(label) => match session.active().format.with_encoding(&label) {
+                Ok(format) => {
+                    session.active_mut().format = format;
+                    Step::Republish
+                }
+                Err(message) => Step::FileError(message),
+            },
+            Action::SetLineEnding(eol) => {
+                session.active_mut().format.eol = eol;
+                Step::Republish
+            }
             // Settings are not an edit and not a file op: swap them in and let the
             // republish carry on, the same as a motion.
             Action::Configure(options) => {
@@ -1505,6 +1524,10 @@ async fn run(
             }
             Step::Reload { id, force } => {
                 reload_buffer(&mut session, id, force, &deltas, &snapshots, &notifications).await
+            }
+            Step::FileError(message) => {
+                let path = session.active().path.clone();
+                report_file_error(&mut session, path, &message, &snapshots, &notifications)
             }
         };
         if !alive {
