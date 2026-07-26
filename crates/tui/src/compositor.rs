@@ -22,7 +22,7 @@
 //! dispatches it identically to a bound key (forward to the core, or open an overlay).
 
 use ratatui::buffer::Buffer;
-use ratatui::crossterm::event::KeyEvent;
+use ratatui::crossterm::event::{KeyEvent, MouseEvent};
 use ratatui::layout::{Position, Rect};
 
 use crate::command::Command;
@@ -59,6 +59,25 @@ pub trait Layer {
     /// layer may also mark itself [finished](Layer::is_finished) here (e.g. Enter
     /// submits, Esc cancels) so the compositor pops it after the dispatch.
     fn handle_key(&mut self, key: KeyEvent) -> EventResult;
+
+    /// Handle a mouse event, with `screen` the full terminal area so the layer can
+    /// hit-test against wherever [`Layer::render`] would put it. Same contract as
+    /// [`Layer::handle_key`]: the layer may mark itself finished here, and the
+    /// commands it commits are drained after.
+    ///
+    /// **Defaults to `Consumed`, unlike keys**, because an overlay is modal over
+    /// the *screen* as well as the keyboard: a click that fell through to the base
+    /// editor would move the caret under a prompt the user is still looking at.
+    /// A layer that wants clicks outside itself to reach something else has to say
+    /// so explicitly, which is the safer thing to have to remember.
+    ///
+    /// Layers are handed the position twice over - once as `mouse.column`/`row` and
+    /// once as the `screen` they were painted into - because a layer stores no
+    /// geometry of its own: it computes where it *would* paint, both to render and
+    /// to hit-test, so the two can never disagree.
+    fn handle_mouse(&mut self, _mouse: MouseEvent, _screen: Rect) -> EventResult {
+        EventResult::Consumed
+    }
 
     /// Drain any [`Command`]s the layer has committed (the §7.5 seam rule: only a
     /// committed choice leaves the layer). Polled by the compositor after each key it
@@ -162,6 +181,25 @@ impl Compositor {
         (result, commands)
     }
 
+    /// Route a mouse event down the stack, exactly as [`Self::handle_key`] routes a
+    /// key: topmost layer first, stopping at the first to consume it, then popping
+    /// whatever finished. `screen` is the full terminal area, which each layer
+    /// hit-tests against its own placement.
+    pub fn handle_mouse(&mut self, mouse: MouseEvent, screen: Rect) -> (EventResult, Vec<Command>) {
+        let mut result = EventResult::Ignored;
+        let mut commands = Vec::new();
+        for layer in self.layers.iter_mut().rev() {
+            let outcome = layer.handle_mouse(mouse, screen);
+            commands.append(&mut layer.take_commands());
+            if outcome == EventResult::Consumed {
+                result = EventResult::Consumed;
+                break;
+            }
+        }
+        self.layers.retain(|l| !l.is_finished());
+        (result, commands)
+    }
+
     /// Paint every layer over `screen`, bottom-to-top, so the topmost overlay wins
     /// any shared cell. The base editor is painted by the caller *before* this, so
     /// the overlays land on top of it.
@@ -182,7 +220,7 @@ impl Compositor {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ratatui::crossterm::event::{KeyCode, KeyModifiers};
+    use ratatui::crossterm::event::{KeyCode, KeyModifiers, MouseButton, MouseEventKind};
     use std::cell::RefCell;
     use std::rc::Rc;
 
@@ -194,6 +232,7 @@ mod tests {
         id: u8,
         consume: bool,
         finish_on: Option<KeyCode>,
+        finish_on_click: bool,
         finished: bool,
         emit: Option<Command>,
         marker: Option<(u16, u16)>,
@@ -207,6 +246,7 @@ mod tests {
                 id,
                 consume,
                 finish_on: None,
+                finish_on_click: false,
                 finished: false,
                 emit: None,
                 marker: None,
@@ -216,6 +256,10 @@ mod tests {
         }
         fn finishing_on(mut self, code: KeyCode) -> Self {
             self.finish_on = Some(code);
+            self
+        }
+        fn finishing_on_click(mut self) -> Self {
+            self.finish_on_click = true;
             self
         }
         fn emitting(mut self, command: Command) -> Self {
@@ -241,6 +285,17 @@ mod tests {
         fn handle_key(&mut self, key: KeyEvent) -> EventResult {
             self.log.borrow_mut().push(self.id);
             if self.finish_on == Some(key.code) {
+                self.finished = true;
+            }
+            if self.consume {
+                EventResult::Consumed
+            } else {
+                EventResult::Ignored
+            }
+        }
+        fn handle_mouse(&mut self, _mouse: MouseEvent, _screen: Rect) -> EventResult {
+            self.log.borrow_mut().push(self.id);
+            if self.finish_on_click {
                 self.finished = true;
             }
             if self.consume {
@@ -447,5 +502,90 @@ mod tests {
         ));
         c.push(boxed(Fake::new(2, false, &log))); // top, no cursor
         assert_eq!(c.cursor(screen), None);
+    }
+
+    fn screen() -> Rect {
+        Rect::new(0, 0, 40, 10)
+    }
+
+    fn click() -> MouseEvent {
+        MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 3,
+            row: 4,
+            modifiers: KeyModifiers::NONE,
+        }
+    }
+
+    #[test]
+    fn a_mouse_event_is_offered_top_down_until_consumed() {
+        // The same routing keys get, for the same reason: the topmost overlay is the
+        // one the pointer is aimed at, whatever is stacked beneath it.
+        let log = Rc::new(RefCell::new(Vec::new()));
+        let mut compositor = Compositor::new();
+        compositor.push(boxed(Fake::new(1, true, &log)));
+        compositor.push(boxed(Fake::new(2, false, &log)));
+        compositor.push(boxed(Fake::new(3, false, &log)));
+        let (result, _) = compositor.handle_mouse(click(), screen());
+        assert_eq!(result, EventResult::Consumed);
+        assert_eq!(
+            *log.borrow(),
+            vec![3, 2, 1],
+            "top down, stopping at the taker"
+        );
+    }
+
+    #[test]
+    fn a_mouse_event_no_layer_takes_falls_through_to_the_editor() {
+        // `Ignored` is how a click reaches the buffer underneath - the escape hatch
+        // from a modal stack that has nothing to say about this particular click.
+        let log = Rc::new(RefCell::new(Vec::new()));
+        let mut compositor = Compositor::new();
+        compositor.push(boxed(Fake::new(1, false, &log)));
+        let (result, _) = compositor.handle_mouse(click(), screen());
+        assert_eq!(result, EventResult::Ignored);
+    }
+
+    #[test]
+    fn an_empty_compositor_ignores_a_mouse_event() {
+        let mut compositor = Compositor::new();
+        let (result, commands) = compositor.handle_mouse(click(), screen());
+        assert_eq!(result, EventResult::Ignored);
+        assert!(commands.is_empty());
+    }
+
+    #[test]
+    fn a_layer_finished_by_a_click_is_popped_and_its_command_returned() {
+        // A click commits and closes in one dispatch, exactly as Enter does: the
+        // command comes back and the layer is gone by the time the caller sees it.
+        let log = Rc::new(RefCell::new(Vec::new()));
+        let mut compositor = Compositor::new();
+        compositor.push(boxed(
+            Fake::new(1, true, &log)
+                .finishing_on_click()
+                .emitting(Command::OpenPalette),
+        ));
+        let (result, commands) = compositor.handle_mouse(click(), screen());
+        assert_eq!(result, EventResult::Consumed);
+        assert_eq!(commands, vec![Command::OpenPalette]);
+        assert!(compositor.is_empty(), "the finished layer was popped");
+    }
+
+    #[test]
+    fn a_layer_that_says_nothing_about_the_mouse_still_swallows_it() {
+        // The trait's default is `Consumed`, unlike keys: an overlay is modal over
+        // the screen too, so a layer that never thought about the pointer must not
+        // leak clicks onto the editor beneath it.
+        struct Silent;
+        impl Layer for Silent {
+            fn render(&self, _screen: Rect, _buf: &mut Buffer) {}
+            fn handle_key(&mut self, _key: KeyEvent) -> EventResult {
+                EventResult::Ignored
+            }
+        }
+        let mut compositor = Compositor::new();
+        compositor.push(Box::new(Silent));
+        let (result, _) = compositor.handle_mouse(click(), screen());
+        assert_eq!(result, EventResult::Consumed);
     }
 }

@@ -2,9 +2,10 @@
 //!
 //! File and edit notices (opened, saved, save failed, edit rejected) surface here
 //! as short-lived toasts in the top-right, **not** by hijacking the status bar's
-//! position readout (the state this replaces). A toast is non-interactive: it paints
-//! over the editor but consumes no input, so editing continues beneath it, and it
-//! auto-fades after a TTL rather than waiting for a keystroke.
+//! position readout (the state this replaces). A toast takes no *keyboard* input -
+//! editing continues beneath it - and auto-fades after a TTL rather than waiting to
+//! be dismissed. Clicking one removes it early, which is the only input it accepts:
+//! an impatient version of the fade, not a decision about anything.
 //!
 //! Time is threaded in as an [`Instant`] argument (`push`/`expire` take `now`), so
 //! the queue and expiry logic are unit-testable without a real clock (SPEC §13); the
@@ -14,7 +15,7 @@
 use std::time::{Duration, Instant};
 
 use ratatui::buffer::Buffer;
-use ratatui::layout::Rect;
+use ratatui::layout::{Position, Rect};
 use ratatui::style::Style;
 use unicode_width::UnicodeWidthStr;
 use vortex_core::Notification;
@@ -144,6 +145,42 @@ impl Toasts {
         self.items.len() != before
     }
 
+    /// The rectangle toast `i` occupies, or `None` when it is scrolled off the
+    /// bottom of a very short screen. The one home for the stack's geometry, shared
+    /// by [`Self::render`] and [`Self::dismiss_at`] so a click can never land on a
+    /// toast that is not where it was painted.
+    fn toast_area(&self, screen: Rect, i: usize) -> Option<Rect> {
+        let toast = self.items.get(i)?;
+        let y = screen.y + 1 + i as u16;
+        if y >= screen.bottom() {
+            return None;
+        }
+        let label_width = format!(" {} ", toast.text).width() as u16;
+        let w = label_width.min(screen.width);
+        Some(Rect::new(screen.right() - w, y, w, 1))
+    }
+
+    /// Dismiss the toast under the pointer, if there is one. Returns whether
+    /// anything was dismissed, so the caller repaints only when it must.
+    ///
+    /// Clicking a notice away is the impatient half of the TTL that would have
+    /// removed it anyway - which is why this needs no confirmation and undoes
+    /// nothing: a toast is a record that something already happened.
+    pub fn dismiss_at(&mut self, screen: Rect, column: u16, row: u16) -> bool {
+        let position = Position::new(column, row);
+        let hit = (0..self.items.len()).find(|&i| {
+            self.toast_area(screen, i)
+                .is_some_and(|r| r.contains(position))
+        });
+        match hit {
+            Some(i) => {
+                self.items.remove(i);
+                true
+            }
+            None => false,
+        }
+    }
+
     /// Paint the stack in the top-right corner, one padded line per toast, oldest at
     /// the top - just below the head bar (row 0). Right-aligned so it reads as chrome
     /// over the text rather than part of it; truncated to the screen width. Consumes
@@ -153,20 +190,16 @@ impl Toasts {
             return;
         }
         for (i, toast) in self.items.iter().enumerate() {
-            let y = screen.y + 1 + i as u16;
-            if y >= screen.bottom() {
-                break;
-            }
+            let Some(rect) = self.toast_area(screen, i) else {
+                break; // off the bottom of the screen, as are all the ones after it
+            };
             let style = match toast.level {
                 Level::Info => self.info,
                 Level::Error => self.error,
             };
             let label = format!(" {} ", toast.text);
-            let w = (label.width() as u16).min(screen.width);
-            let x = screen.right() - w;
-            let rect = Rect::new(x, y, w, 1);
             buf.set_style(rect, style);
-            buf.set_stringn(x, y, &label, w as usize, style);
+            buf.set_stringn(rect.x, rect.y, &label, rect.width as usize, style);
         }
     }
 }
@@ -230,6 +263,48 @@ mod tests {
             }),
             Some(("Edit rejected: nope".into(), Level::Error))
         );
+    }
+
+    #[test]
+    fn clicking_a_toast_dismisses_that_one() {
+        let screen = Rect::new(0, 0, 40, 10);
+        let mut t = toasts();
+        let now = Instant::now();
+        t.push("first".into(), Level::Info, now);
+        t.push("second".into(), Level::Error, now);
+
+        // Toasts are right-aligned, one per row from row 1 down.
+        let second = t.toast_area(screen, 1).expect("painted");
+        assert!(t.dismiss_at(screen, second.x, second.y));
+        assert_eq!(t.items.len(), 1);
+        assert_eq!(t.items[0].text, "first", "the other one is untouched");
+    }
+
+    #[test]
+    fn clicking_beside_a_toast_dismisses_nothing() {
+        // Toasts are right-aligned and only as wide as their text: the empty space
+        // to their left is the editor, and a click there belongs to it.
+        let screen = Rect::new(0, 0, 40, 10);
+        let mut t = toasts();
+        t.push("a notice".into(), Level::Info, Instant::now());
+        assert!(!t.dismiss_at(screen, 0, 1), "left of the toast");
+        assert!(!t.dismiss_at(screen, 39, 0), "the head bar row above it");
+        assert!(!t.dismiss_at(screen, 39, 2), "the row below it");
+        assert_eq!(t.items.len(), 1);
+    }
+
+    #[test]
+    fn a_toast_pushed_off_a_short_screen_cannot_be_clicked() {
+        // Painting stops at the bottom edge, so hit-testing must too - otherwise a
+        // click could dismiss a toast that was never on screen.
+        let screen = Rect::new(0, 0, 40, 2);
+        let mut t = toasts();
+        let now = Instant::now();
+        t.push("visible".into(), Level::Info, now);
+        t.push("off-screen".into(), Level::Info, now);
+        assert!(t.toast_area(screen, 1).is_none());
+        assert!(!t.dismiss_at(screen, 39, 2));
+        assert_eq!(t.items.len(), 2);
     }
 
     #[test]

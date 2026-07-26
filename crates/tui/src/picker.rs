@@ -15,7 +15,9 @@
 use nucleo_matcher::pattern::{CaseMatching, Normalization, Pattern};
 use nucleo_matcher::{Config, Matcher};
 use ratatui::buffer::Buffer;
-use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use ratatui::crossterm::event::{
+    KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+};
 use ratatui::layout::{Position, Rect};
 use ratatui::style::Style;
 use ratatui::widgets::{Block, Clear, Widget};
@@ -170,6 +172,54 @@ impl Picker {
         Rect::new(x, y, w, h)
     }
 
+    /// First visible row of the list. The list scrolls only as far as it must to
+    /// keep the highlight on screen, so the offset is derived from the selection
+    /// rather than stored - one source of truth, and nothing to keep in step when
+    /// the list is refiltered under it.
+    ///
+    /// Shared by [`Layer::render`] and [`Self::row_at`] for the same reason
+    /// [`Self::inner_area`] is: a click must land on the row the user is looking
+    /// at, which can only be guaranteed if both compute it the same way.
+    fn list_scroll(&self, list_h: usize) -> usize {
+        self.selected.saturating_sub(list_h.saturating_sub(1))
+    }
+
+    /// The row of [`Self::filtered`] under the pointer, or `None` if the pointer is
+    /// on the border, the query row, or off the box entirely.
+    fn row_at(&self, screen: Rect, column: u16, row: u16) -> Option<usize> {
+        let inner = Self::inner_area(screen)?;
+        if column < inner.x || column >= inner.right() {
+            return None;
+        }
+        let list_h = inner.height.saturating_sub(1) as usize;
+        if list_h == 0 {
+            return None;
+        }
+        // The query row sits at `inner.y`; the list starts beneath it.
+        let offset = row.checked_sub(inner.y + 1)? as usize;
+        if offset >= list_h {
+            return None;
+        }
+        let index = self.list_scroll(list_h) + offset;
+        // Past the last match: the rows are painted, but there is nothing on them.
+        (index < self.filtered.len()).then_some(index)
+    }
+
+    /// Run the highlighted item and close, the one path a commit takes whether it
+    /// came from Enter or from a click.
+    fn commit(&mut self) {
+        if let Some(idx) = self.highlighted() {
+            self.outbox.push(self.items[idx].command.clone());
+        }
+        self.finished = true;
+    }
+
+    /// Close without running anything, undoing any preview applied on the way here.
+    fn cancel(&mut self) {
+        self.outbox.extend(self.cancel.clone());
+        self.finished = true;
+    }
+
     /// The box's interior, or `None` when the screen is too small to hold a
     /// usable picker (the editor is then left unobstructed). One home for the
     /// minimum-size threshold and the border geometry, shared by [`Self::render`]
@@ -209,7 +259,7 @@ impl Layer for Picker {
         if list_h == 0 {
             return;
         }
-        let scroll = self.selected.saturating_sub(list_h - 1);
+        let scroll = self.list_scroll(list_h);
         for (row, &idx) in self.filtered.iter().enumerate().skip(scroll).take(list_h) {
             let y = inner.y + 1 + (row - scroll) as u16;
             let style = if row == self.selected {
@@ -250,17 +300,8 @@ impl Layer for Picker {
             return EventResult::Ignored;
         }
         match key.code {
-            KeyCode::Esc => {
-                // Undo any preview this picker applied on the way here.
-                self.outbox.extend(self.cancel.clone());
-                self.finished = true;
-            }
-            KeyCode::Enter => {
-                if let Some(idx) = self.highlighted() {
-                    self.outbox.push(self.items[idx].command.clone());
-                }
-                self.finished = true;
-            }
+            KeyCode::Esc => self.cancel(),
+            KeyCode::Enter => self.commit(),
             KeyCode::Up => self.selected = self.selected.saturating_sub(1),
             KeyCode::Down => {
                 let last = self.filtered.len().saturating_sub(1);
@@ -283,6 +324,39 @@ impl Layer for Picker {
         }
         // Enter and Esc have already said their piece (and finished); every other
         // key may have moved the highlight, which is what a preview follows.
+        if !self.finished {
+            self.preview();
+        }
+        EventResult::Consumed
+    }
+
+    fn handle_mouse(&mut self, mouse: MouseEvent, screen: Rect) -> EventResult {
+        match mouse.kind {
+            MouseEventKind::Down(MouseButton::Left) => {
+                if let Some(row) = self.row_at(screen, mouse.column, mouse.row) {
+                    // One click picks. A picker exists to choose something, and the
+                    // row under the pointer is unambiguous in a way a caret position
+                    // is not - so there is nothing for a second click to confirm.
+                    self.selected = row;
+                    self.commit();
+                } else if !Self::area(screen).contains(Position::new(mouse.column, mouse.row)) {
+                    // Outside the box: the click means "not this", which is Esc.
+                    self.cancel();
+                }
+                // Anywhere else in the box - border, query row, empty rows below the
+                // last match - is a click on the picker's own furniture. Swallowed.
+            }
+            // The wheel moves the highlight, which is what scrolls the list: the view
+            // offset is derived from the selection, so there is no way to scroll the
+            // list away from it and then click on a row that is not what it says.
+            // Previewing pickers preview as it moves, exactly as for an arrow key.
+            MouseEventKind::ScrollUp => self.selected = self.selected.saturating_sub(1),
+            MouseEventKind::ScrollDown => {
+                let last = self.filtered.len().saturating_sub(1);
+                self.selected = (self.selected + 1).min(last);
+            }
+            _ => {}
+        }
         if !self.finished {
             self.preview();
         }
@@ -352,6 +426,167 @@ mod tests {
 
     fn selected_label(p: &Picker) -> &str {
         &p.items[p.filtered[p.selected]].label
+    }
+
+    /// The screen every mouse test hit-tests against. Deliberately larger than the
+    /// picker's 60x18 maximum, so the box is genuinely centered and there is an
+    /// *outside* to click - on a smaller screen the box fills it and the
+    /// click-away case cannot be expressed at all.
+    const SCREEN: Rect = Rect {
+        x: 0,
+        y: 0,
+        width: 80,
+        height: 24,
+    };
+
+    /// A left press at a screen cell.
+    fn click(column: u16, row: u16) -> MouseEvent {
+        MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column,
+            row,
+            modifiers: KeyModifiers::NONE,
+        }
+    }
+
+    fn wheel(up: bool) -> MouseEvent {
+        MouseEvent {
+            kind: if up {
+                MouseEventKind::ScrollUp
+            } else {
+                MouseEventKind::ScrollDown
+            },
+            column: 0,
+            row: 0,
+            modifiers: KeyModifiers::NONE,
+        }
+    }
+
+    /// The screen cell of the nth listed row, which is where a user would aim.
+    fn row_cell(n: u16) -> (u16, u16) {
+        let inner = Picker::inner_area(SCREEN).unwrap();
+        (inner.x + 2, inner.y + 1 + n)
+    }
+
+    #[test]
+    fn clicking_a_row_runs_it() {
+        // One click picks: the row under the pointer is unambiguous, so there is
+        // nothing for a second click to confirm.
+        let mut p = picker();
+        let (x, y) = row_cell(2); // "Quit", the third item
+        assert_eq!(p.handle_mouse(click(x, y), SCREEN), EventResult::Consumed);
+        assert!(p.is_finished());
+        assert_eq!(
+            p.take_commands(),
+            vec![Command::Editor(Action::Quit)],
+            "the clicked row's command, not the highlighted one's"
+        );
+    }
+
+    #[test]
+    fn clicking_a_row_of_a_filtered_list_runs_what_is_shown() {
+        // The rows are the *filtered* list, so a click has to resolve through it -
+        // clicking row 0 after filtering must not run item 0.
+        let mut p = picker();
+        type_str(&mut p, "op"); // ranks "Open Palette" (and maybe others)
+        let expected = p.items[p.filtered[0]].command.clone();
+        let (x, y) = row_cell(0);
+        p.handle_mouse(click(x, y), SCREEN);
+        assert_eq!(p.take_commands(), vec![expected]);
+    }
+
+    #[test]
+    fn clicking_outside_the_box_cancels() {
+        let mut p = picker();
+        assert_eq!(p.handle_mouse(click(0, 0), SCREEN), EventResult::Consumed);
+        assert!(p.is_finished());
+        assert!(p.take_commands().is_empty(), "cancelling runs nothing");
+    }
+
+    #[test]
+    fn clicking_outside_a_previewing_picker_undoes_the_preview() {
+        // Esc's other job: a theme picker that previewed as you moved has to put the
+        // old one back. A click outside means the same thing, so it does the same.
+        let mut p = picker().previewing(Command::OpenPalette);
+        p.handle_key(press(KeyCode::Down));
+        let _ = p.take_commands(); // the preview
+        p.handle_mouse(click(0, 0), SCREEN);
+        assert_eq!(p.take_commands(), vec![Command::OpenPalette]);
+    }
+
+    #[test]
+    fn clicking_the_pickers_own_furniture_does_nothing() {
+        // The border, the query row, and the empty rows past the last match are all
+        // part of the picker - a click there is neither a pick nor a dismissal.
+        let inner = Picker::inner_area(SCREEN).unwrap();
+        for (x, y) in [
+            (Picker::area(SCREEN).x, Picker::area(SCREEN).y), // the border corner
+            (inner.x + 1, inner.y),                           // the query row
+            (inner.x + 1, inner.y + 1 + items().len() as u16), // past the last item
+        ] {
+            let mut p = picker();
+            assert_eq!(p.handle_mouse(click(x, y), SCREEN), EventResult::Consumed);
+            assert!(!p.is_finished(), "click at ({x},{y}) closed the picker");
+            assert!(p.take_commands().is_empty());
+        }
+    }
+
+    #[test]
+    fn the_wheel_moves_the_highlight() {
+        let mut p = picker();
+        p.handle_mouse(wheel(false), SCREEN);
+        assert_eq!(selected_label(&p), "Open Palette");
+        p.handle_mouse(wheel(true), SCREEN);
+        assert_eq!(selected_label(&p), "Save File");
+        // ...and stops at each end rather than wrapping or overflowing.
+        p.handle_mouse(wheel(true), SCREEN);
+        assert_eq!(p.selected, 0);
+        for _ in 0..10 {
+            p.handle_mouse(wheel(false), SCREEN);
+        }
+        assert_eq!(p.selected, p.filtered.len() - 1);
+    }
+
+    #[test]
+    fn the_wheel_previews_like_an_arrow_key() {
+        let mut p = picker().previewing(Command::OpenPalette);
+        p.handle_mouse(wheel(false), SCREEN);
+        assert_eq!(
+            p.take_commands(),
+            vec![p.items[p.filtered[1]].command.clone()]
+        );
+    }
+
+    #[test]
+    fn a_click_lands_on_the_row_the_user_sees_after_the_list_has_scrolled() {
+        // The list scrolls by following the highlight, so a long list is offset -
+        // and a hit test that ignored that would run the wrong item entirely.
+        let many: Vec<Item> = (0..40)
+            .map(|n| Item {
+                label: format!("item-{n:02}"),
+                shortcut: None,
+                command: Command::Editor(Action::Insert(format!("{n}"))),
+            })
+            .collect();
+        let mut p = Picker::new("Many", many, false, Style::default(), Style::default());
+        for _ in 0..30 {
+            p.handle_key(press(KeyCode::Down));
+        }
+        let inner = Picker::inner_area(SCREEN).unwrap();
+        let list_h = inner.height.saturating_sub(1) as usize;
+        // The highlight has driven the list down; the top visible row is not item 0.
+        let scroll = p.list_scroll(list_h);
+        assert!(
+            scroll > 0,
+            "the list must have scrolled for this to mean anything"
+        );
+        let (x, y) = row_cell(0);
+        p.handle_mouse(click(x, y), SCREEN);
+        assert_eq!(
+            p.take_commands(),
+            vec![Command::Editor(Action::Insert(format!("{scroll}")))],
+            "the top visible row is the scrolled-to item, not item 0"
+        );
     }
 
     #[test]
