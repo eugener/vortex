@@ -480,7 +480,7 @@ Config:
 Keys:
   Ctrl+S           Save        Ctrl+Q            Quit
   Ctrl+Shift+S     Save as (prompt for a path; needs a Kitty-protocol terminal)
-  Ctrl+O           Open file (fuzzy picker over the working directory)
+  Ctrl+O           Open file (fuzzy picker, previewing the highlighted file)
   Ctrl+P           Command palette (type to filter, Enter runs, Esc cancels)
   Ctrl+T           Theme picker (previews as you move, Esc restores)
   Ctrl+Alt+Up/Down Add cursor above/below        Alt+Click  Add cursor

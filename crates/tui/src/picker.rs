@@ -11,6 +11,13 @@
 //! Filtering runs on this thread; `nucleo-matcher`'s `match_list` is meant for the
 //! small-to-moderate lists here (a command set, a capped file walk). A very large
 //! corpus would want the async high-level `nucleo` crate instead - deferred.
+//!
+//! **Two different things here are called "preview".** [`Picker::previewing`] applies
+//! the highlighted item as you move over it and undoes that on Esc - the theme
+//! picker, where the only way to judge a theme is to see it. [`Picker::with_preview_pane`]
+//! shows the highlighted item's *content* in a second column beside the list, changing
+//! nothing - the file picker, where the list is paths and the question is what is in
+//! them. They are independent: a picker can arm either, both, or neither.
 
 use nucleo_matcher::pattern::{CaseMatching, Normalization, Pattern};
 use nucleo_matcher::{Config, Matcher};
@@ -27,12 +34,47 @@ use crate::command::Command;
 use crate::compositor::{EventResult, Layer};
 use crate::config::Theme;
 
+/// Rows the box is at most tall, and at most wide - with and without a preview
+/// pane, which is the whole reason the wider one exists.
+const MAX_HEIGHT: u16 = 18;
+const MAX_WIDTH: u16 = 60;
+const MAX_WIDTH_WITH_PANE: u16 = 100;
+
+/// Screen width below which the preview pane is dropped and the picker is the plain
+/// list it always was. Half of a narrow screen each would give two columns too thin
+/// to read - a truncated path list next to truncated code is worse than the list
+/// alone, which at least fits.
+const MIN_PANE_SCREEN: u16 = 80;
+
+/// Lines a preview source is asked for: what the tallest possible pane can show
+/// (the interior, which the pane fills - unlike the list it has no query row).
+const PREVIEW_LINES: usize = (MAX_HEIGHT - 2) as usize;
+
 /// One selectable row: a user-facing label, an optional shortcut to show
 /// right-aligned (the key that runs it, if any), and what running it does.
 pub struct Item {
     pub label: String,
     pub shortcut: Option<String>,
     pub command: Command,
+}
+
+/// Fills a preview pane: given the highlighted item and how many lines the pane can
+/// show, the lines to paint (already clipped to that many, control characters
+/// resolved - the pane paints them as given).
+///
+/// Called when the highlight *moves*, not once per frame, so it may do bounded I/O.
+/// It runs on the UI thread, which is the same bargain the file picker's directory
+/// walk already makes: bound the work rather than move it off-thread (see
+/// [`crate::filepicker`]).
+pub type PreviewSource = Box<dyn Fn(&Item, usize) -> Vec<String>>;
+
+/// The preview pane: where its content comes from, that content, and the item it was
+/// fetched for - so a keystroke that leaves the highlight where it was does not read
+/// the same file again.
+struct Pane {
+    source: PreviewSource,
+    lines: Vec<String>,
+    item: Option<usize>,
 }
 
 /// A label paired with its index, so `nucleo`'s `match_list` (which needs
@@ -72,6 +114,9 @@ pub struct Picker {
     /// Item last previewed, so a key that leaves the highlight where it was does not
     /// re-emit (typing a filter that does not move it, Up at the top, …).
     previewed: Option<usize>,
+    /// Set by [`Self::with_preview_pane`]: the second column and its content. `None`
+    /// is a picker that is only a list.
+    pane: Option<Pane>,
 }
 
 impl Picker {
@@ -103,6 +148,7 @@ impl Picker {
             outbox: Vec::new(),
             cancel: None,
             previewed: None,
+            pane: None,
         }
     }
 
@@ -126,9 +172,44 @@ impl Picker {
         self
     }
 
+    /// Show the highlighted item's content beside the list, filled by `source`.
+    ///
+    /// A request, not a guarantee: the pane is dropped on a screen too narrow to
+    /// hold both columns ([`MIN_PANE_SCREEN`]), and the picker is then exactly the
+    /// list it would have been without this call.
+    pub fn with_preview_pane(mut self, source: PreviewSource) -> Self {
+        self.pane = Some(Pane {
+            source,
+            lines: Vec::new(),
+            item: None,
+        });
+        self.fill_pane();
+        self
+    }
+
     /// The item the highlight sits on, if the filtered list is not empty.
     fn highlighted(&self) -> Option<usize> {
         self.filtered.get(self.selected).copied()
+    }
+
+    /// Refill the pane when the highlight has moved to a different item since it was
+    /// last filled. Unlike [`Self::preview`] this also runs on open: a pane that
+    /// stays blank until you press a key is just a hole in the box.
+    fn fill_pane(&mut self) {
+        let highlighted = self.highlighted();
+        let Some(pane) = self.pane.as_mut() else {
+            return;
+        };
+        if pane.item == highlighted {
+            return;
+        }
+        pane.item = highlighted;
+        // Nothing highlighted (a query that matched nothing) empties the pane rather
+        // than leaving the last match's content under a list that no longer has it.
+        pane.lines = match highlighted {
+            Some(idx) => (pane.source)(&self.items[idx], PREVIEW_LINES),
+            None => Vec::new(),
+        };
     }
 
     /// Emit the highlighted item's command if the highlight has moved since the last
@@ -163,13 +244,24 @@ impl Picker {
         self.selected = self.selected.min(self.filtered.len().saturating_sub(1));
     }
 
-    /// The centered box the picker occupies, clamped to the screen.
-    fn area(screen: Rect) -> Rect {
-        let w = screen.width.min(60);
-        let h = screen.height.min(18);
+    /// The centered box the picker occupies, clamped to the screen. Wider when it is
+    /// carrying a preview pane, since the extra width *is* the pane.
+    fn area(&self, screen: Rect) -> Rect {
+        let max = if self.has_pane(screen) {
+            MAX_WIDTH_WITH_PANE
+        } else {
+            MAX_WIDTH
+        };
+        let w = screen.width.min(max);
+        let h = screen.height.min(MAX_HEIGHT);
         let x = screen.x + (screen.width - w) / 2;
         let y = screen.y + (screen.height - h) / 2;
         Rect::new(x, y, w, h)
+    }
+
+    /// Whether this screen gets a preview pane: one was armed, and there is room.
+    fn has_pane(&self, screen: Rect) -> bool {
+        self.pane.is_some() && screen.width >= MIN_PANE_SCREEN
     }
 
     /// First visible row of the list. The list scrolls only as far as it must to
@@ -178,16 +270,16 @@ impl Picker {
     /// the list is refiltered under it.
     ///
     /// Shared by [`Layer::render`] and [`Self::row_at`] for the same reason
-    /// [`Self::inner_area`] is: a click must land on the row the user is looking
+    /// [`Self::columns`] is: a click must land on the row the user is looking
     /// at, which can only be guaranteed if both compute it the same way.
     fn list_scroll(&self, list_h: usize) -> usize {
         self.selected.saturating_sub(list_h.saturating_sub(1))
     }
 
     /// The row of [`Self::filtered`] under the pointer, or `None` if the pointer is
-    /// on the border, the query row, or off the box entirely.
+    /// on the border, the query row, the preview pane, or off the box entirely.
     fn row_at(&self, screen: Rect, column: u16, row: u16) -> Option<usize> {
-        let inner = Self::inner_area(screen)?;
+        let (inner, _) = self.columns(screen)?;
         if column < inner.x || column >= inner.right() {
             return None;
         }
@@ -220,26 +312,63 @@ impl Picker {
         self.finished = true;
     }
 
-    /// The box's interior, or `None` when the screen is too small to hold a
-    /// usable picker (the editor is then left unobstructed). One home for the
-    /// minimum-size threshold and the border geometry, shared by [`Self::render`]
-    /// and [`Self::cursor`] so the caret can never be placed for a box that was
-    /// not drawn (or in the wrong cell after a size change).
-    fn inner_area(screen: Rect) -> Option<Rect> {
+    /// The box's interior split into its columns - the list, and the preview pane
+    /// when there is one - or `None` when the screen is too small to hold a usable
+    /// picker (the editor is then left unobstructed). The column between them is
+    /// left for the divider.
+    ///
+    /// One home for the minimum-size threshold, the border geometry, and the split,
+    /// shared by [`Self::render`], [`Self::row_at`] and [`Self::cursor`], so the
+    /// caret can never be placed for a box that was not drawn (or in the wrong cell
+    /// after a size change) and a click can never resolve against a column the paint
+    /// put somewhere else.
+    fn columns(&self, screen: Rect) -> Option<(Rect, Option<Rect>)> {
         if screen.width < 10 || screen.height < 4 {
             return None;
         }
-        let inner = Block::bordered().inner(Self::area(screen));
-        (inner.width > 0 && inner.height > 0).then_some(inner)
+        let inner = Block::bordered().inner(self.area(screen));
+        if inner.width == 0 || inner.height == 0 {
+            return None;
+        }
+        if !self.has_pane(screen) {
+            return Some((inner, None));
+        }
+        let list_w = inner.width / 2;
+        let list = Rect::new(inner.x, inner.y, list_w, inner.height);
+        let pane = Rect::new(
+            inner.x + list_w + 1,
+            inner.y,
+            inner.width - list_w - 1,
+            inner.height,
+        );
+        Some((list, Some(pane)))
+    }
+
+    /// The preview pane: a divider against the list, then the fetched lines, each
+    /// clipped to the pane rather than wrapped - wrapped code reads as a different
+    /// file than the one you are about to open.
+    fn render_pane(&self, state: &Pane, pane: Rect, buf: &mut Buffer) {
+        for y in pane.y..pane.bottom() {
+            buf.set_stringn(pane.x - 1, y, "│", 1, self.style);
+        }
+        for (row, line) in state.lines.iter().take(pane.height as usize).enumerate() {
+            buf.set_stringn(
+                pane.x,
+                pane.y + row as u16,
+                line,
+                pane.width as usize,
+                self.style,
+            );
+        }
     }
 }
 
 impl Layer for Picker {
     fn render(&self, screen: Rect, buf: &mut Buffer) {
-        let Some(inner) = Self::inner_area(screen) else {
+        let Some((inner, pane)) = self.columns(screen) else {
             return;
         };
-        let area = Self::area(screen);
+        let area = self.area(screen);
         Clear.render(area, buf);
         let block = Block::bordered()
             .title(format!(" {} ", self.title))
@@ -254,6 +383,11 @@ impl Layer for Picker {
             inner.width as usize,
             self.style,
         );
+        // `columns` only hands back a pane when there is one to fill it, so the two
+        // are always Some together.
+        if let (Some(area), Some(state)) = (pane, self.pane.as_ref()) {
+            self.render_pane(state, area, buf);
+        }
         // The list fills the rows beneath it, scrolled to keep the highlight visible.
         let list_h = inner.height.saturating_sub(1) as usize;
         if list_h == 0 {
@@ -326,6 +460,7 @@ impl Layer for Picker {
         // key may have moved the highlight, which is what a preview follows.
         if !self.finished {
             self.preview();
+            self.fill_pane();
         }
         EventResult::Consumed
     }
@@ -339,7 +474,10 @@ impl Layer for Picker {
                     // is not - so there is nothing for a second click to confirm.
                     self.selected = row;
                     self.commit();
-                } else if !Self::area(screen).contains(Position::new(mouse.column, mouse.row)) {
+                } else if !self
+                    .area(screen)
+                    .contains(Position::new(mouse.column, mouse.row))
+                {
                     // Outside the box: the click means "not this", which is Esc.
                     self.cancel();
                 }
@@ -359,6 +497,7 @@ impl Layer for Picker {
         }
         if !self.finished {
             self.preview();
+            self.fill_pane();
         }
         EventResult::Consumed
     }
@@ -373,11 +512,11 @@ impl Layer for Picker {
     }
 
     fn cursor(&self, screen: Rect) -> Option<Position> {
-        let inner = Self::inner_area(screen)?;
+        let (list, _) = self.columns(screen)?;
         // Caret in the query row, after the "> " prompt plus the typed text.
         let col = 2 + self.query.width();
-        let x = (inner.x as usize + col).min(inner.right().saturating_sub(1) as usize) as u16;
-        Some(Position::new(x, inner.y))
+        let x = (list.x as usize + col).min(list.right().saturating_sub(1) as usize) as u16;
+        Some(Position::new(x, list.y))
     }
 
     fn is_finished(&self) -> bool {
@@ -387,6 +526,9 @@ impl Layer for Picker {
 
 #[cfg(test)]
 mod tests {
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
     use super::*;
     use vortex_core::Action;
 
@@ -462,10 +604,12 @@ mod tests {
         }
     }
 
-    /// The screen cell of the nth listed row, which is where a user would aim.
-    fn row_cell(n: u16) -> (u16, u16) {
-        let inner = Picker::inner_area(SCREEN).unwrap();
-        (inner.x + 2, inner.y + 1 + n)
+    /// The screen cell of the nth listed row, which is where a user would aim. Takes
+    /// the picker because the box's own geometry depends on it (a preview pane
+    /// widens it and halves the list column).
+    fn row_cell(p: &Picker, n: u16) -> (u16, u16) {
+        let (list, _) = p.columns(SCREEN).unwrap();
+        (list.x + 2, list.y + 1 + n)
     }
 
     #[test]
@@ -473,7 +617,7 @@ mod tests {
         // One click picks: the row under the pointer is unambiguous, so there is
         // nothing for a second click to confirm.
         let mut p = picker();
-        let (x, y) = row_cell(2); // "Quit", the third item
+        let (x, y) = row_cell(&p, 2); // "Quit", the third item
         assert_eq!(p.handle_mouse(click(x, y), SCREEN), EventResult::Consumed);
         assert!(p.is_finished());
         assert_eq!(
@@ -490,7 +634,7 @@ mod tests {
         let mut p = picker();
         type_str(&mut p, "op"); // ranks "Open Palette" (and maybe others)
         let expected = p.items[p.filtered[0]].command.clone();
-        let (x, y) = row_cell(0);
+        let (x, y) = row_cell(&p, 0);
         p.handle_mouse(click(x, y), SCREEN);
         assert_eq!(p.take_commands(), vec![expected]);
     }
@@ -518,11 +662,13 @@ mod tests {
     fn clicking_the_pickers_own_furniture_does_nothing() {
         // The border, the query row, and the empty rows past the last match are all
         // part of the picker - a click there is neither a pick nor a dismissal.
-        let inner = Picker::inner_area(SCREEN).unwrap();
+        let (list, _) = picker().columns(SCREEN).unwrap();
+        let area = picker().area(SCREEN);
         for (x, y) in [
-            (Picker::area(SCREEN).x, Picker::area(SCREEN).y), // the border corner
-            (inner.x + 1, inner.y),                           // the query row
-            (inner.x + 1, inner.y + 1 + items().len() as u16), // past the last item
+            (area.x, area.y),                                // the border corner
+            (list.x + 1, list.y),                            // the query row
+            (list.x + 1, list.y + 1 + items().len() as u16), // past the last item
+            (list.x + 1, area.bottom() - 1),                 // the bottom border
         ] {
             let mut p = picker();
             assert_eq!(p.handle_mouse(click(x, y), SCREEN), EventResult::Consumed);
@@ -572,15 +718,15 @@ mod tests {
         for _ in 0..30 {
             p.handle_key(press(KeyCode::Down));
         }
-        let inner = Picker::inner_area(SCREEN).unwrap();
-        let list_h = inner.height.saturating_sub(1) as usize;
+        let (list, _) = p.columns(SCREEN).unwrap();
+        let list_h = list.height.saturating_sub(1) as usize;
         // The highlight has driven the list down; the top visible row is not item 0.
         let scroll = p.list_scroll(list_h);
         assert!(
             scroll > 0,
             "the list must have scrolled for this to mean anything"
         );
-        let (x, y) = row_cell(0);
+        let (x, y) = row_cell(&p, 0);
         p.handle_mouse(click(x, y), SCREEN);
         assert_eq!(
             p.take_commands(),
@@ -754,10 +900,10 @@ mod tests {
         assert!(text.contains("Test"), "border title present");
         assert!(text.contains("> sa"), "query row present");
         assert!(text.contains("Save File"), "a matching item is listed");
-        let inner = Block::bordered().inner(Picker::area(Rect::new(0, 0, 40, 16)));
+        let (list, _) = p.columns(Rect::new(0, 0, 40, 16)).unwrap();
         assert_eq!(
             p.cursor(Rect::new(0, 0, 40, 16)),
-            Some(Position::new(inner.x + 4, inner.y))
+            Some(Position::new(list.x + 4, list.y))
         );
     }
 
@@ -772,9 +918,9 @@ mod tests {
             .unwrap();
         let buf = terminal.backend().buffer().clone();
         // "Save File" is the top row of the list (row after the query line).
-        let inner = Block::bordered().inner(Picker::area(Rect::new(0, 0, 40, 16)));
-        let row_y = inner.y + 1;
-        let row: String = (inner.x..inner.right())
+        let (list, _) = p.columns(Rect::new(0, 0, 40, 16)).unwrap();
+        let row_y = list.y + 1;
+        let row: String = (list.x..list.right())
             .map(|x| buf.cell((x, row_y)).unwrap().symbol().to_string())
             .collect();
         assert!(row.contains("Save File"), "label on the left: {row:?}");
@@ -785,5 +931,177 @@ mod tests {
             "shortcut is right of the label: {row:?}"
         );
         assert!(row.trim_end().ends_with("Ctrl+S"), "right-aligned: {row:?}");
+    }
+
+    /// A picker with a preview pane that records which labels it was asked to fill
+    /// from, so a test can tell a refill apart from a repaint.
+    fn paned() -> (Picker, Rc<RefCell<Vec<String>>>) {
+        let asked = Rc::new(RefCell::new(Vec::new()));
+        let log = Rc::clone(&asked);
+        let p = picker().with_preview_pane(Box::new(move |item, lines| {
+            log.borrow_mut().push(item.label.clone());
+            assert!(lines > 0);
+            vec![format!("inside {}", item.label)]
+        }));
+        (p, asked)
+    }
+
+    fn painted(p: &Picker, screen: Rect) -> Buffer {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+        let mut terminal = Terminal::new(TestBackend::new(screen.width, screen.height)).unwrap();
+        terminal
+            .draw(|frame| p.render(frame.area(), frame.buffer_mut()))
+            .unwrap();
+        terminal.backend().buffer().clone()
+    }
+
+    #[test]
+    fn the_preview_pane_shows_the_highlighted_items_content_beside_the_list() {
+        let (p, asked) = paned();
+        // Filled on open: a pane that stays blank until you press a key is a hole.
+        assert_eq!(*asked.borrow(), vec!["Save File"]);
+
+        let buf = painted(&p, SCREEN);
+        let (list, pane) = p.columns(SCREEN).unwrap();
+        let pane = pane.expect("a pane on a screen with room for one");
+        let row: String = (pane.x..pane.right())
+            .map(|x| buf.cell((x, pane.y)).unwrap().symbol().to_string())
+            .collect();
+        assert!(row.starts_with("inside Save File"), "{row:?}");
+        // Beside the list, with the divider between - not over it.
+        assert_eq!(pane.x, list.right() + 1);
+        assert_eq!(buf.cell((list.right(), pane.y)).unwrap().symbol(), "│");
+        // The caret still belongs to the query row, which is the list's.
+        assert!(p.cursor(SCREEN).unwrap().x < list.right());
+    }
+
+    #[test]
+    fn the_pane_refills_when_the_highlight_moves_and_not_otherwise() {
+        // Every keystroke repaints; only a *move* is worth re-reading a file for.
+        let (mut p, asked) = paned();
+        p.handle_key(press(KeyCode::Down));
+        assert_eq!(*asked.borrow(), vec!["Save File", "Open Palette"]);
+        p.handle_key(press(KeyCode::Up));
+        assert_eq!(asked.borrow().len(), 3);
+        p.handle_key(press(KeyCode::Up)); // already at the top: nothing moved
+        assert_eq!(asked.borrow().len(), 3, "re-read without moving");
+        // The wheel is a move like any other.
+        p.handle_mouse(wheel(false), SCREEN);
+        assert_eq!(asked.borrow().len(), 4);
+    }
+
+    #[test]
+    fn filtering_refills_the_pane_for_whatever_is_now_highlighted() {
+        let (mut p, asked) = paned();
+        type_str(&mut p, "quit");
+        assert_eq!(asked.borrow().last().unwrap(), "Quit");
+        // A query that matches nothing empties it, rather than leaving the last
+        // match's content sitting under a list that no longer has that row.
+        type_str(&mut p, "zzz");
+        assert!(p.filtered.is_empty());
+        assert!(p.pane.as_ref().unwrap().lines.is_empty());
+        let buf = painted(&p, SCREEN);
+        let pane = p.columns(SCREEN).unwrap().1.unwrap();
+        let painted_pane: String = (pane.y..pane.bottom())
+            .flat_map(|y| (pane.x..pane.right()).map(move |x| (x, y)))
+            .map(|cell| buf.cell(cell).unwrap().symbol().to_string())
+            .collect();
+        assert!(painted_pane.trim().is_empty(), "{painted_pane:?}");
+    }
+
+    #[test]
+    fn a_screen_too_narrow_for_two_columns_drops_the_pane() {
+        // Half of a narrow screen each is two unreadable columns instead of one
+        // usable one - so the picker falls back to exactly the list it would be
+        // without a source at all, geometry included.
+        let (p, _) = paned();
+        let narrow = Rect::new(0, 0, MIN_PANE_SCREEN - 1, 24);
+        let (list, pane) = p.columns(narrow).unwrap();
+        assert!(pane.is_none());
+        assert_eq!(p.area(narrow).width, MAX_WIDTH);
+        assert_eq!(Some(list), picker().columns(narrow).map(|(l, _)| l));
+    }
+
+    #[test]
+    fn a_click_lands_on_the_row_it_shows_when_a_pane_has_narrowed_the_list() {
+        // The pane widens the box and halves the list column, moving every row: a hit
+        // test against the pane-less geometry would resolve to the wrong cell.
+        let (mut p, _) = paned();
+        let (x, y) = row_cell(&p, 2);
+        p.handle_mouse(click(x, y), SCREEN);
+        assert_eq!(p.take_commands(), vec![Command::Editor(Action::Quit)]);
+    }
+
+    #[test]
+    fn a_click_in_the_preview_is_furniture_not_a_pick() {
+        let (mut p, _) = paned();
+        let pane = p.columns(SCREEN).unwrap().1.unwrap();
+        assert_eq!(
+            p.handle_mouse(click(pane.x + 1, pane.y + 1), SCREEN),
+            EventResult::Consumed
+        );
+        assert!(!p.is_finished());
+        assert!(p.take_commands().is_empty());
+    }
+
+    #[test]
+    fn the_pane_asks_for_every_line_it_could_show() {
+        // The source is asked once per move, so it cannot be asked per-frame for the
+        // height of *this* frame - the constant has to cover the tallest pane there
+        // can be, or the bottom of a full-height pane would paint blank.
+        let requested = Rc::new(RefCell::new(0));
+        let log = Rc::clone(&requested);
+        let p = picker().with_preview_pane(Box::new(move |_, lines| {
+            *log.borrow_mut() = lines;
+            Vec::new()
+        }));
+        assert_eq!(*requested.borrow(), PREVIEW_LINES);
+        let tallest = Rect::new(0, 0, 200, 200);
+        let pane = p.columns(tallest).unwrap().1.unwrap();
+        assert_eq!(pane.height as usize, PREVIEW_LINES);
+    }
+
+    #[test]
+    fn a_pane_longer_than_its_height_is_clipped_rather_than_overflowing() {
+        // A source may hand back more than fits (the pane it was sized for is the
+        // tallest one, not this one); the extra must not spill past the border.
+        let p = picker().with_preview_pane(Box::new(|_, lines| {
+            (0..lines).map(|n| format!("line{n}")).collect()
+        }));
+        let screen = Rect::new(0, 0, 100, 8);
+        let buf = painted(&p, screen);
+        let pane = p.columns(screen).unwrap().1.unwrap();
+        let shown: String = buf.content().iter().map(|c| c.symbol()).collect();
+        assert!(shown.contains("line0"));
+        assert!(
+            !shown.contains(&format!("line{}", pane.height)),
+            "painted past the bottom of the pane"
+        );
+    }
+
+    #[test]
+    fn a_screen_too_small_for_a_usable_box_gets_no_picker_at_all() {
+        // The editor is left unobstructed rather than covered by a box with no room
+        // for a row in it - and nothing may then place a caret or resolve a click
+        // against geometry that was never painted.
+        let (p, _) = paned();
+        let tiny = Rect::new(0, 0, 8, 3);
+        assert!(p.columns(tiny).is_none());
+        assert_eq!(p.cursor(tiny), None);
+        assert_eq!(p.row_at(tiny, 1, 1), None);
+        let mut buf = Buffer::empty(tiny);
+        p.render(tiny, &mut buf);
+        let painted: String = buf.content().iter().map(|c| c.symbol()).collect();
+        assert!(painted.trim().is_empty(), "{painted:?}");
+    }
+
+    #[test]
+    fn a_picker_with_no_pane_is_geometrically_unchanged() {
+        // The pane is opt-in: the palette and the format pickers must be exactly the
+        // 60-column box they were.
+        let p = picker();
+        assert_eq!(p.area(SCREEN).width, MAX_WIDTH);
+        assert!(p.columns(SCREEN).unwrap().1.is_none());
     }
 }
