@@ -16,6 +16,10 @@ path = "src/main.rs"
 # Cargo unifies these to one version, which is what makes the handle's `Sender`
 # and `Receiver` the same types on both sides.
 async-channel = "2.5.0"
+# Global search (M7): the gitignore-aware directory walker ripgrep is built on.
+# Frontend-side with the rest of the search, and it is what makes the walk respect
+# a project's own .gitignore instead of the file picker's hardcoded skip list.
+ignore = "0.4.31"
 # Load grammar libraries at runtime (M4): the frontend `dlopen`s a `grammar-*`
 # cdylib and resolves its `vortex_grammar` entry point. This is the "genuinely
 # dynamic" half of syntax highlighting - grammars are config-driven runtime data,
@@ -32,6 +36,12 @@ nucleo-matcher = "0.3.1"
 # types the render loop and event reader share are guaranteed identical - a
 # separate crossterm dep risks version skew against ratatui's bundled 0.29.
 ratatui = "0.30.2"
+# Global search patterns (M7). SPEC §3 names `regex` for the core's eventual search
+# subsystem (select-all-matches, split-on-regex); it arrives here first because
+# cross-file search is filesystem work and so is frontend-owned. When the core
+# subsystem lands, the dependency joins vortex-core too - one crate, two callers,
+# and the match semantics stay the same because the engine does.
+regex = "1.13.1"
 serde = { version = "1.0.229", features = ["derive"] }
 smol = "2.0.2"
 # Theme files (SPEC §3 "Config" row, §10.5): the format the config seam was always

@@ -77,6 +77,32 @@ struct Pane {
     item: Option<usize>,
 }
 
+/// Supplies a picker's rows from the query instead of holding them all up front.
+///
+/// The ordinary picker ranks a list it was handed - every command, every open
+/// buffer. Some lists cannot be handed over: the matches for a pattern across a
+/// project are not knowable until the pattern is, and arrive over time once it is.
+/// Such a picker implements this instead, and the query text stops being a filter
+/// and becomes the search.
+///
+/// [`Self::query`] starts (or restarts, or clears) the work; [`Self::take`] is
+/// called once per render tick for whatever has arrived since. Neither may block:
+/// both run on the UI thread.
+pub trait ItemSource {
+    /// Start over for a new query. An empty query means "no results wanted" - the
+    /// picker is open but nothing has been asked for yet.
+    fn query(&mut self, query: &str);
+
+    /// Rows that have arrived since the last call, if any.
+    fn take(&mut self) -> Vec<Item>;
+
+    /// A line to show in place of the list when there are no rows yet: what went
+    /// wrong, or what the picker is waiting for. `None` shows nothing.
+    fn status(&self) -> Option<String> {
+        None
+    }
+}
+
 /// A label paired with its index, so `nucleo`'s `match_list` (which needs
 /// `AsRef<str>` haystacks) hands the index straight back after ranking - no lookup.
 struct Ranked<'a> {
@@ -117,6 +143,9 @@ pub struct Picker {
     /// Set by [`Self::with_preview_pane`]: the second column and its content. `None`
     /// is a picker that is only a list.
     pane: Option<Pane>,
+    /// Set by [`Self::with_item_source`]: rows come from the query rather than from
+    /// fuzzy-ranking a fixed list. `None` is the ordinary filtering picker.
+    source: Option<Box<dyn ItemSource>>,
 }
 
 impl Picker {
@@ -149,7 +178,18 @@ impl Picker {
             cancel: None,
             previewed: None,
             pane: None,
+            source: None,
         }
+    }
+
+    /// Draw the rows from `source`, keyed on the query, instead of fuzzy-filtering
+    /// the items the picker was built with (see [`ItemSource`]).
+    ///
+    /// The items passed to [`Self::new`] are then the *starting* list, which for a
+    /// search picker is empty: every row after that comes from the source.
+    pub fn with_item_source(mut self, source: Box<dyn ItemSource>) -> Self {
+        self.source = Some(source);
+        self
     }
 
     /// Start with row `index` highlighted instead of the first - so a picker over
@@ -226,7 +266,17 @@ impl Picker {
 
     /// Recompute the ranked subset for the current query. An empty query lists every
     /// item in its original order; otherwise `nucleo` ranks by fuzzy score.
+    ///
+    /// A picker with an [`ItemSource`] does neither: the query *is* the search, so
+    /// the rows are discarded and asked for again rather than ranked.
     fn refilter(&mut self) {
+        if let Some(source) = self.source.as_mut() {
+            source.query(&self.query);
+            self.items.clear();
+            self.filtered.clear();
+            self.selected = 0;
+            return;
+        }
         self.filtered = if self.query.is_empty() {
             (0..self.items.len()).collect()
         } else {
@@ -393,6 +443,20 @@ impl Layer for Picker {
         if list_h == 0 {
             return;
         }
+        // Nothing to list yet: say why, if the source knows. An empty box under a
+        // typed query is the one state a picker cannot explain by itself - a bad
+        // pattern and a genuine no-match look identical.
+        if self.filtered.is_empty()
+            && let Some(status) = self.source.as_ref().and_then(|s| s.status())
+        {
+            buf.set_stringn(
+                inner.x,
+                inner.y + 1,
+                format!("  {status}"),
+                inner.width as usize,
+                self.style,
+            );
+        }
         let scroll = self.list_scroll(list_h);
         for (row, &idx) in self.filtered.iter().enumerate().skip(scroll).take(list_h) {
             let y = inner.y + 1 + (row - scroll) as u16;
@@ -509,6 +573,26 @@ impl Layer for Picker {
     fn restyle(&mut self, theme: &Theme) {
         self.style = theme.palette;
         self.selected_style = theme.palette_selected;
+    }
+
+    fn tick(&mut self) -> bool {
+        let Some(source) = self.source.as_mut() else {
+            return false;
+        };
+        let arrived = source.take();
+        if arrived.is_empty() {
+            return false;
+        }
+        // Appended in arrival order and never re-ranked: the rows under the pointer
+        // must not move while results are still coming in, or a click lands on
+        // something other than what it was aimed at.
+        self.filtered
+            .extend(self.items.len()..self.items.len() + arrived.len());
+        self.items.extend(arrived);
+        // The first result to arrive is what the highlight (and so the pane) was
+        // waiting for.
+        self.fill_pane();
+        true
     }
 
     fn cursor(&self, screen: Rect) -> Option<Position> {
@@ -1094,6 +1178,169 @@ mod tests {
         p.render(tiny, &mut buf);
         let painted: String = buf.content().iter().map(|c| c.symbol()).collect();
         assert!(painted.trim().is_empty(), "{painted:?}");
+    }
+
+    /// An [`ItemSource`] a test can drive by hand: `query` records what it was
+    /// asked, and rows are handed over only when a test says they have "arrived",
+    /// which is how a worker thread's timing is expressed without one.
+    #[derive(Default)]
+    struct Fake {
+        asked: Asked,
+        pending: Pending,
+        status: Option<String>,
+    }
+
+    impl ItemSource for Fake {
+        fn query(&mut self, query: &str) {
+            self.asked.borrow_mut().push(query.to_string());
+            self.pending.borrow_mut().clear();
+        }
+        fn take(&mut self) -> Vec<Item> {
+            std::mem::take(&mut self.pending.borrow_mut())
+        }
+        fn status(&self) -> Option<String> {
+            self.status.clone()
+        }
+    }
+
+    fn item(label: &str) -> Item {
+        Item {
+            label: label.to_string(),
+            shortcut: None,
+            command: Command::Editor(Action::Insert(label.to_string())),
+        }
+    }
+
+    /// The queries a [`Fake`] was asked, shared with the test that drives it.
+    type Asked = Rc<RefCell<Vec<String>>>;
+    /// Rows a [`Fake`] will hand over on its next `take`, i.e. "what has arrived".
+    type Pending = Rc<RefCell<Vec<Item>>>;
+
+    /// A sourced picker plus handles on what it was asked and what it may receive.
+    fn sourced() -> (Picker, Asked, Pending) {
+        let asked = Rc::new(RefCell::new(Vec::new()));
+        let pending = Rc::new(RefCell::new(Vec::new()));
+        let source = Fake {
+            asked: Rc::clone(&asked),
+            pending: Rc::clone(&pending),
+            status: None,
+        };
+        let p = Picker::new(
+            "Search",
+            Vec::new(),
+            false,
+            Style::default(),
+            Style::default(),
+        )
+        .with_item_source(Box::new(source));
+        (p, asked, pending)
+    }
+
+    #[test]
+    fn a_sourced_picker_asks_its_source_instead_of_fuzzy_filtering() {
+        let (mut p, asked, _) = sourced();
+        type_str(&mut p, "ab");
+        assert_eq!(*asked.borrow(), vec!["a", "ab"], "asked on every keystroke");
+        p.handle_key(press(KeyCode::Backspace));
+        assert_eq!(asked.borrow().last().unwrap(), "a");
+    }
+
+    #[test]
+    fn rows_arriving_between_keystrokes_join_the_list() {
+        // The whole point of the tick seam: results come from a worker, not from the
+        // keystroke, so they must appear without one.
+        let (mut p, _, pending) = sourced();
+        type_str(&mut p, "x");
+        assert!(p.filtered.is_empty(), "nothing has arrived yet");
+        assert!(!p.tick(), "an empty tick is not a repaint");
+
+        *pending.borrow_mut() = vec![item("first"), item("second")];
+        assert!(p.tick(), "arrivals need a repaint");
+        assert_eq!(p.filtered.len(), 2);
+        assert_eq!(selected_label(&p), "first");
+
+        // A second batch appends rather than replacing: a search delivers in pieces.
+        *pending.borrow_mut() = vec![item("third")];
+        p.tick();
+        assert_eq!(p.items.len(), 3);
+        assert_eq!(
+            p.filtered,
+            vec![0, 1, 2],
+            "in arrival order, never re-ranked"
+        );
+    }
+
+    #[test]
+    fn a_new_query_clears_the_rows_the_last_one_produced() {
+        // Otherwise the previous pattern's hits stay listed under the new one, and a
+        // click runs a row that matches nothing on screen.
+        let (mut p, _, pending) = sourced();
+        type_str(&mut p, "x");
+        *pending.borrow_mut() = vec![item("old hit")];
+        p.tick();
+        assert_eq!(p.filtered.len(), 1);
+
+        type_str(&mut p, "y");
+        assert!(p.items.is_empty(), "the old rows outlived their query");
+        assert_eq!(p.selected, 0);
+    }
+
+    #[test]
+    fn committing_a_sourced_row_runs_the_row_that_arrived() {
+        let (mut p, _, pending) = sourced();
+        type_str(&mut p, "x");
+        *pending.borrow_mut() = vec![item("a"), item("b")];
+        p.tick();
+        p.handle_key(press(KeyCode::Down));
+        p.handle_key(press(KeyCode::Enter));
+        assert_eq!(
+            p.take_commands(),
+            vec![Command::Editor(Action::Insert("b".to_string()))]
+        );
+    }
+
+    #[test]
+    fn a_source_status_is_shown_where_the_rows_would_be() {
+        // An empty box under a typed query cannot explain itself: a bad pattern and
+        // a genuine no-match look identical without this.
+        let source = Fake {
+            status: Some("searching…".to_string()),
+            ..Fake::default()
+        };
+        let p = Picker::new(
+            "Search",
+            Vec::new(),
+            false,
+            Style::default(),
+            Style::default(),
+        )
+        .with_item_source(Box::new(source));
+        let buf = painted(&p, SCREEN);
+        let (list, _) = p.columns(SCREEN).unwrap();
+        let row: String = (list.x..list.right())
+            .map(|x| buf.cell((x, list.y + 1)).unwrap().symbol().to_string())
+            .collect();
+        assert!(row.contains("searching…"), "{row:?}");
+    }
+
+    #[test]
+    fn a_status_is_not_shown_over_rows_that_did_arrive() {
+        let (mut p, _, pending) = sourced();
+        *pending.borrow_mut() = vec![item("a real row")];
+        p.tick();
+        let buf = painted(&p, SCREEN);
+        let (list, _) = p.columns(SCREEN).unwrap();
+        let row: String = (list.x..list.right())
+            .map(|x| buf.cell((x, list.y + 1)).unwrap().symbol().to_string())
+            .collect();
+        assert!(row.contains("a real row"), "{row:?}");
+    }
+
+    #[test]
+    fn a_picker_without_a_source_ignores_the_tick() {
+        let mut p = picker();
+        assert!(!p.tick());
+        assert_eq!(p.items.len(), 4, "the fixed list is untouched");
     }
 
     #[test]

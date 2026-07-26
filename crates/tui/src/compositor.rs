@@ -108,6 +108,18 @@ pub trait Layer {
     /// painted in the old one. The theme picker previews as you move, which makes
     /// that the normal case rather than a corner. Default: nothing to re-read.
     fn restyle(&mut self, _theme: &crate::config::Theme) {}
+
+    /// Take in whatever has arrived from work the layer started, once per render
+    /// tick. Returns whether anything changed, so an idle tick still costs nothing
+    /// to paint.
+    ///
+    /// This is the seam for a layer that is fed by something other than input: the
+    /// global-search picker's results arrive on a channel from a worker thread, and
+    /// without a tick they would only appear on the next keystroke - a search whose
+    /// list fills when you type and freezes when you stop. Default: nothing arrives.
+    fn tick(&mut self) -> bool {
+        false
+    }
 }
 
 /// The stack of overlay [`Layer`]s above the base editor view (SPEC §7.5).
@@ -155,6 +167,18 @@ impl Compositor {
         for layer in &mut self.layers {
             layer.restyle(theme);
         }
+    }
+
+    /// Let every layer take in what has arrived since the last tick (see
+    /// [`Layer::tick`]), and report whether any of them changed and so needs a
+    /// repaint. Every layer rather than the top one, for the same reason `restyle`
+    /// is: a buried layer that stopped taking its results in would be wrong the
+    /// moment the one above it closed.
+    pub fn tick(&mut self) -> bool {
+        // Collected before the test, not `.any()`: that short-circuits, which would
+        // leave the layers under the first changed one unticked.
+        let changed: Vec<bool> = self.layers.iter_mut().map(|layer| layer.tick()).collect();
+        changed.into_iter().any(|c| c)
     }
 
     /// Offer a key to the stack, top-down, stopping at the first layer that
@@ -237,6 +261,8 @@ mod tests {
         emit: Option<Command>,
         marker: Option<(u16, u16)>,
         cursor: Option<Position>,
+        /// What this layer claims changed on a tick.
+        ticks: bool,
         log: Rc<RefCell<Vec<u8>>>,
     }
 
@@ -251,8 +277,13 @@ mod tests {
                 emit: None,
                 marker: None,
                 cursor: None,
+                ticks: false,
                 log: Rc::clone(log),
             }
+        }
+        fn ticking(mut self) -> Self {
+            self.ticks = true;
+            self
         }
         fn finishing_on(mut self, code: KeyCode) -> Self {
             self.finish_on = Some(code);
@@ -314,9 +345,36 @@ mod tests {
             self.finished
         }
 
+        fn tick(&mut self) -> bool {
+            self.log.borrow_mut().push(self.id);
+            self.ticks
+        }
+
         fn restyle(&mut self, _theme: &crate::config::Theme) {
             self.log.borrow_mut().push(self.id);
         }
+    }
+
+    #[test]
+    fn tick_reaches_every_layer_and_reports_whether_anything_changed() {
+        // Every layer, not just the top: one that stopped taking its results in
+        // would be stale the moment the layer above it closed. And the report has to
+        // survive a quiet layer, or a search under an open prompt stops repainting.
+        let log = Rc::new(RefCell::new(Vec::new()));
+        let mut compositor = Compositor::new();
+        compositor.push(Box::new(Fake::new(1, true, &log).ticking()));
+        compositor.push(Box::new(Fake::new(2, true, &log)));
+        assert!(compositor.tick(), "the bottom layer had something");
+        assert_eq!(*log.borrow(), vec![1, 2], "both were ticked, bottom-up");
+    }
+
+    #[test]
+    fn a_stack_with_nothing_arriving_needs_no_repaint() {
+        let log = Rc::new(RefCell::new(Vec::new()));
+        let mut compositor = Compositor::new();
+        compositor.push(Box::new(Fake::new(1, true, &log)));
+        assert!(!compositor.tick());
+        assert!(!Compositor::new().tick(), "an empty stack is quiet too");
     }
 
     #[test]

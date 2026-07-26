@@ -1,4 +1,5 @@
 use super::*;
+use crate::buffer::Position;
 use crate::selection::Motion;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -3005,4 +3006,70 @@ fn producer_sync_is_a_noop_with_nothing_attached() {
 
     assert!(s.active().lsp_dirty);
     assert!(s.active().syntax_dirty);
+}
+
+#[test]
+fn place_cursor_at_resolves_a_position_against_the_buffer_it_lands_in() {
+    // The point of carrying a position rather than an offset: the sender named a
+    // line in a file, and the core converts it against the document it has - here
+    // one whose earlier lines are wide enough that a byte offset guessed frontend-
+    // side from a line number would be nowhere near right.
+    let (snap, _) = run_seam(&[
+        Action::Insert("αβγ\nsecond line\nthird\n".into()),
+        Action::PlaceCursorAt {
+            position: Position::new(1, 7),
+        },
+    ]);
+    let caret = snap.selections[0].head;
+    assert_eq!(&snap.text.to_string()[caret..caret + 4], "line");
+}
+
+#[test]
+fn place_cursor_at_collapses_to_one_cursor() {
+    // A jump is an arrival, not an addition: whatever set was there is replaced,
+    // the same way a click does.
+    let (snap, _) = run_seam(&[
+        Action::Insert("one\ntwo\nthree\n".into()),
+        Action::AddCursorAbove,
+        Action::PlaceCursorAt {
+            position: Position::new(0, 1),
+        },
+    ]);
+    assert_eq!(
+        snap.selections.as_ref(),
+        &[Selection::cursor(1)],
+        "a jump arrives as one plain cursor, replacing whatever set was there"
+    );
+}
+
+#[test]
+fn place_cursor_at_clamps_a_position_the_buffer_no_longer_has() {
+    // A hit found against the file on disk can name a line the buffer has since
+    // lost. Landing at the end beats refusing to jump (SPEC §8) - and must not
+    // panic on the way, which is the part that matters.
+    let text = "one\ntwo\n";
+    for position in [
+        Position::new(99, 0),  // past the last line
+        Position::new(1, 99),  // past that line's end
+        Position::new(99, 99), // both
+    ] {
+        let (snap, _) = run_seam(&[
+            Action::Insert(text.into()),
+            Action::PlaceCursorAt { position },
+        ]);
+        let caret = snap.selections[0].head;
+        assert!(
+            caret <= text.len(),
+            "{position:?} resolved to {caret}, past the buffer"
+        );
+    }
+}
+
+#[test]
+fn place_cursor_at_the_start_of_an_empty_buffer_is_harmless() {
+    // The degenerate case the clamp's `saturating_sub` exists for.
+    let (snap, _) = run_seam(&[Action::PlaceCursorAt {
+        position: Position::new(0, 0),
+    }]);
+    assert_eq!(snap.selections[0].head, 0);
 }
