@@ -4,9 +4,10 @@ A terminal text editor built as a **headless core plus a thin frontend**, so the
 is one possible frontend rather than the only one.
 
 > **Status: early. Not usable as your daily editor yet.** It opens, edits, and saves files
-> with multiple cursors, undo, and a working UI shell, and shows `rust-analyzer`
-> diagnostics on Rust files - but there is no syntax highlighting, no LSP features beyond
-> diagnostics, and no encoding handling beyond UTF-8. See
+> with multiple cursors, undo, syntax colors, and a working UI shell, and shows
+> `rust-analyzer` diagnostics - but Rust is the only language with either a grammar or a
+> language server, there are no LSP features past diagnostics, and there is no way to
+> search *within* the buffer you are editing. See
 > [Where it actually is](#where-it-actually-is) before trying it.
 
 ---
@@ -58,15 +59,20 @@ milestones landed before earlier ones - that is a real gap, not a rounding error
 | M8 | Chrome and polish | not started |
 
 What works today: open/save a file, edit with multiple cursors, undo/redo with coalescing,
-mouse selection, system clipboard (including over SSH via OSC 52), a fuzzy file picker, a
-command palette, switchable themes, project-wide regex search that jumps to the match, and
-live `rust-analyzer` diagnostics on Rust files (underlined by span, with a colored gutter
-mark, if `rust-analyzer` is on your PATH).
+mouse selection everywhere (including the overlays and the status bar), the system
+clipboard (including over SSH via OSC 52), several buffers with a tab strip, tree-sitter
+syntax colors on Rust, a fuzzy file picker and a buffer picker (both with a preview pane),
+a command palette, switchable themes, project-wide regex search that jumps to the match,
+a config file for keys and settings, files in their own encoding and line endings (saved
+back as they were found), a warning when a file changes underneath you, and live
+`rust-analyzer` diagnostics (underlined by span, with a colored gutter mark, if
+`rust-analyzer` is on your PATH).
 
-What does not: syntax colors, LSP features past diagnostics (no completion, hover, or
-goto), a language server for anything but Rust, search **within** the open buffer (the
-project search above is a different thing - it finds a place to go, not a selection), any
-file that is not valid UTF-8, and detecting that a file changed underneath you.
+What does not: syntax colors or a language server for **any language but Rust** - a
+grammar is a separate crate the editor loads at runtime, and only `grammar-rust` is
+written; LSP features past diagnostics (no completion, hover, or goto); search **within**
+the open buffer (the project search above is a different thing - it finds a place to go,
+not a selection); and the which-key popup, the last outstanding M7 item.
 
 ## Build and run
 
@@ -85,10 +91,13 @@ cargo build --release
 | | |
 |---|---|
 | `Ctrl+S` / `Ctrl+Q` | Save / quit |
+| `Ctrl+Shift+S` | Save as (Kitty terminals only - elsewhere it folds to an ordinary save) |
 | `Ctrl+O` | Open a file (fuzzy picker over the working directory, previewing the highlighted one) |
 | `Ctrl+F` | Search the project (regex, gitignore-aware; Enter jumps to the match) |
 | `Ctrl+P` | Command palette |
 | `Ctrl+T` | Theme picker (previews as you move, `Esc` restores) |
+| `Ctrl+B` / `Ctrl+W` | Buffer picker / close the current buffer |
+| `Ctrl+PageUp` / `Ctrl+PageDown` | Previous / next buffer |
 | `Ctrl+Alt+Up/Down` | Add a cursor above/below |
 | `Alt+Click` | Add a cursor at the pointer |
 | `Esc` | Collapse back to one cursor |
@@ -197,7 +206,9 @@ crates/
             No crossterm. No ratatui. The compiler enforces it.
   tui/      vortex-tui  - the `vortex` binary: keymap, viewport math, overlay
             compositor, pickers, themes. Thin by design.
-  tui/themes/  the built-in theme files
+  tui/themes/     the built-in theme files
+  grammar-rust/   a tree-sitter grammar as a cdylib, `dlopen`ed at runtime.
+            Not a dependency of the editor - that is what makes a language addable.
 docs/SPEC.md   the architecture and its decision record
 ```
 
