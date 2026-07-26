@@ -858,6 +858,18 @@ None is a correctness bug today.
   loads. (The global-search picker went the other way and put its walk on a worker thread
   from the start, feeding the list through `Layer::tick` - the machinery this entry wants
   now exists next door.)
+- **The search jump's guard infers its target from the *active* buffer.**
+  `PlaceCursorAt { in_file }` decides whether to place the caret by comparing the named
+  file against `session.active()`'s path - a proxy for "did the `Open` this jump follows
+  actually land". The equivalence holds only because every successful open activates what
+  it opened, which nothing in the type system enforces. A combined `Action::OpenAt` would
+  thread the buffer the open *produced* straight to the placement instead of re-deriving
+  it from ambient state. **Deferred because** `PlaceCursorAt` has to stay a standalone
+  action anyway (a `:42` goto uses it with `in_file: None`), the guard reuses the
+  `file_identity` comparison `Open` already makes, and with one window there is no way for
+  the proxy to be wrong. **Trigger:** any feature that opens a buffer *without* focusing it
+  - a split, a background open, "open all N search results" - at which point the guard
+  starts silently dropping legitimate jumps.
 - ~~**Global search restarts on every keystroke, with no debounce.**~~ *Taken.* A query
   now waits 150ms (the `HIGHLIGHT_WAIT` shape `main.rs` already uses) before it is walked,
   so typing `needle` starts one search rather than six, and the intermediate prefixes are
