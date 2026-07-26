@@ -37,6 +37,13 @@ pub enum Command {
     /// Close the active buffer. Sent unforced, so the core refuses when there is
     /// unsaved work and the frontend turns that refusal into a confirmation.
     CloseBuffer,
+    /// Open the encoding picker overlay (frontend-local). A pick commits an
+    /// [`Action::SetEncoding`], so the choice reaches the core the same way a
+    /// bound key's would.
+    OpenEncodingPicker,
+    /// Open the line-ending picker overlay (frontend-local), the twin of
+    /// [`Command::OpenEncodingPicker`].
+    OpenLineEndingPicker,
     /// Switch to the named theme (frontend-local: chrome never crosses the seam).
     ///
     /// Carries data, so unlike the openers above it is not a bindable

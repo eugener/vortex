@@ -13,6 +13,7 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
+use crate::file::LineEnding;
 use crate::selection::Motion;
 use crate::view::BufferId;
 
@@ -205,6 +206,22 @@ pub enum Action {
     /// changed somewhere other than where the user was looking, and sending the
     /// caret home would be its own kind of lost work.
     Reload { id: BufferId, force: bool },
+    /// Write this buffer in the encoding `label` names from now on (SPEC §10.1) -
+    /// the way out of a file the detector guessed wrong about, and the way to
+    /// convert one on purpose.
+    ///
+    /// Changes only what the *next save* writes: the buffer already holds decoded
+    /// text, so nothing is re-read and nothing on disk moves until the user saves.
+    /// That is also why this cannot lose data - a character the new encoding cannot
+    /// represent is caught by the save, which refuses (SPEC §8).
+    ///
+    /// `label` is a WHATWG encoding label (`"UTF-8"`, `"Shift_JIS"`); an unknown one
+    /// is reported as a `Notification::FileError` and changes nothing.
+    SetEncoding(String),
+    /// Write this buffer with `eol` line terminators from now on (SPEC §10.1).
+    /// Like [`Action::SetEncoding`], it changes what the next save writes and not
+    /// the buffer, which always holds LF.
+    SetLineEnding(LineEnding),
     /// Replace the core's settings with `options` (SPEC §10.5). Sent once at
     /// startup with whatever the frontend's config file resolved to, and again if
     /// it is ever reloaded; nothing is merged, so the value sent is the value in

@@ -22,6 +22,7 @@ pub mod command;
 pub mod compositor;
 pub mod config;
 pub mod filepicker;
+pub mod formatpicker;
 pub mod grammar;
 pub mod keymap;
 pub mod layout;
