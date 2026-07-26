@@ -498,3 +498,123 @@ fn byte_of_position_consistency_smoke() {
         assert_eq!(b.byte_of_position(pos), Some(off));
     }
 }
+
+// --- Pointer-gesture selection (SPEC §2.2) ------------------------------------
+
+/// The span `select_around` produces, as `(start, end)`, so a test reads as the
+/// text it selected rather than as two offsets.
+fn around(body: &str, offset: usize, granularity: Granularity) -> (usize, usize) {
+    let t = text(body);
+    let mut set = SelectionSet::at_origin();
+    set.select_around(&t, offset, granularity);
+    let sel = set.primary();
+    (sel.start(), sel.end())
+}
+
+fn selected(body: &str, offset: usize, granularity: Granularity) -> &str {
+    let (start, end) = around(body, offset, granularity);
+    &body[start..end]
+}
+
+#[test]
+fn a_word_is_selected_from_anywhere_inside_it() {
+    // Every offset within a word, including its first and last byte, takes the
+    // whole word - a double-click is aimed at a word, not at a character.
+    for offset in 6..=10 {
+        assert_eq!(
+            selected("hello world again", offset, Granularity::Word),
+            "world"
+        );
+    }
+}
+
+#[test]
+fn a_double_click_off_a_word_still_selects_something() {
+    // The run under the pointer, whatever it is made of: clicking the gap between
+    // two words takes the gap rather than guessing which neighbour was meant.
+    assert_eq!(selected("a    b", 2, Granularity::Word), "    ");
+    assert_eq!(selected("foo(bar)", 3, Granularity::Word), "(");
+    // A run of punctuation is one run, though UAX#29 makes each mark its own
+    // segment - a double-click on `...` is aimed at all three.
+    assert_eq!(selected("end...", 4, Granularity::Word), "...");
+    // ...and the boundaries that matter still hold: letters and punctuation are
+    // different classes, so this never smears across them.
+    assert_eq!(selected("foo(bar)", 5, Granularity::Word), "bar");
+}
+
+#[test]
+fn word_selection_does_not_cross_a_line_break() {
+    // Segmentation is per line, so the word at the end of one line cannot swallow
+    // the start of the next.
+    assert_eq!(selected("alpha\nbeta", 2, Granularity::Word), "alpha");
+    assert_eq!(selected("alpha\nbeta", 7, Granularity::Word), "beta");
+}
+
+#[test]
+fn a_word_click_past_a_lines_content_selects_nothing() {
+    // The caret sits on the terminator, or the line is empty: there is no run to
+    // take, and inventing the previous line's last word would be worse than a
+    // no-op the user can see.
+    assert_eq!(around("ab\ncd", 2, Granularity::Word), (2, 2));
+    assert_eq!(around("\nx", 0, Granularity::Word), (0, 0));
+}
+
+#[test]
+fn word_selection_is_by_grapheme_not_byte() {
+    // Multibyte content must not be split mid-character (SPEC §4).
+    assert_eq!(selected("héllo wörld", 1, Granularity::Word), "héllo");
+    // UAX#29 gives each ideograph its own segment; a double-click wants the run.
+    assert_eq!(selected("日本 語", 0, Granularity::Word), "日本");
+}
+
+#[test]
+fn a_line_selection_takes_its_terminator() {
+    // What makes it a *line*: deleting the selection removes the line rather than
+    // emptying it and leaving the break behind.
+    assert_eq!(selected("one\ntwo\n", 1, Granularity::Line), "one\n");
+    assert_eq!(selected("one\ntwo\n", 5, Granularity::Line), "two\n");
+}
+
+#[test]
+fn the_last_line_without_a_terminator_runs_to_the_end() {
+    assert_eq!(selected("one\ntwo", 5, Granularity::Line), "two");
+    assert_eq!(selected("only", 2, Granularity::Line), "only");
+}
+
+#[test]
+fn an_offset_past_the_buffer_is_clamped_rather_than_panicking() {
+    // The frontend resolves a *screen cell* to an offset; a resize or a stale
+    // snapshot can put that past the end, and it must not take the editor with it
+    // (SPEC §8).
+    assert_eq!(around("abc", 999, Granularity::Word), (3, 3));
+    assert_eq!(selected("abc", 999, Granularity::Line), "abc");
+}
+
+#[test]
+fn an_empty_buffer_has_nothing_to_select() {
+    // No line to segment and no terminator to take: both granularities collapse to
+    // a cursor rather than reaching for a line that is not there.
+    assert_eq!(around("", 0, Granularity::Word), (0, 0));
+    assert_eq!(around("", 0, Granularity::Line), (0, 0));
+}
+
+#[test]
+fn selecting_around_collapses_a_multi_cursor_set() {
+    // The gesture says "this word", not "this word as well".
+    let t = text("hello world");
+    let mut set =
+        SelectionSet::from_sorted_cursors(vec![Selection::cursor(0), Selection::cursor(6)]);
+    assert_eq!(set.len(), 2);
+    set.select_around(&t, 7, Granularity::Word);
+    assert_eq!(set.len(), 1);
+    assert_eq!(set.primary(), &Selection::new(6, 11));
+}
+
+#[test]
+fn the_anchor_leads_so_a_later_shift_click_extends_from_the_far_side() {
+    let t = text("hello world");
+    let mut set = SelectionSet::at_origin();
+    set.select_around(&t, 7, Granularity::Word);
+    let sel = set.primary();
+    assert_eq!((sel.anchor, sel.head), (6, 11));
+}

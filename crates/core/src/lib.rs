@@ -18,7 +18,7 @@ pub mod syntax;
 pub mod view;
 pub mod watch;
 
-pub use action::Action;
+pub use action::{Action, CoreOptions, Granularity};
 pub use buffer::{Buffer, ByteRange, EditError, Position, RopeBuffer, Text, Utf16Position};
 pub use decoration::{
     Decoration, DecorationSet, DecorationSource, GutterKind, HighlightKind, Severity,

@@ -48,6 +48,23 @@ impl Default for CoreOptions {
     }
 }
 
+/// How much text a [`Action::SelectAround`] takes: the unit a repeated click grows
+/// the selection by (SPEC §2.2).
+///
+/// A *unit of text*, not a screen measure, which is why the core resolves it: word
+/// boundaries are Unicode segmentation and line bounds are the buffer's own, and
+/// neither is something a frontend should be re-deriving from a rendered row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
+pub enum Granularity {
+    /// The word under the offset - or, off a word, the run of whitespace or
+    /// punctuation under it, so a double-click always selects *something*.
+    Word,
+    /// The whole line including its terminator, so selecting one and deleting it
+    /// removes the line rather than leaving a blank one behind.
+    Line,
+}
+
 /// A single intent from a frontend to the core.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[non_exhaustive]
@@ -77,6 +94,22 @@ pub enum Action {
     /// Collapse a multi-cursor set back to the primary selection alone (Escape,
     /// SPEC §2.2). The primary keeps its span; the rest are dropped.
     CollapseSelections,
+    /// Select the whole word or line at `offset`, replacing the selection set with
+    /// that one span (the double- and triple-click gestures, and a click in the line
+    /// number gutter).
+    ///
+    /// The frontend resolves the pointer to an offset, as it does for
+    /// [`Action::PlaceCursor`] - it owns display↔buffer mapping (SPEC §4/§5) - and
+    /// the *core* resolves the offset to a range, because where a word ends is a
+    /// question about text, not about the screen. `offset` is clamped to the buffer
+    /// defensively (SPEC §8); the anchor lands at the range's start and the head at
+    /// its end, so a subsequent shift-click extends from the far side as expected.
+    ///
+    /// Changes only the selection set: no text, so no delta and no version bump.
+    SelectAround {
+        offset: usize,
+        granularity: Granularity,
+    },
     /// Insert `text` at every selection, replacing any non-empty selection first.
     /// A bracketed paste is ONE such action, not a key-per-character (SPEC §6).
     Insert(String),

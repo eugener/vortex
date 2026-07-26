@@ -27,7 +27,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use async_channel::{Receiver, Sender};
 use futures::future::Either;
 
-use crate::action::{Action, CoreOptions};
+use crate::action::{Action, CoreOptions, Granularity as CoreGranularity};
 use crate::anchor::{Anchor, Edit};
 use crate::buffer::{Buffer, RopeBuffer};
 use crate::decoration::DecorationSet;
@@ -536,6 +536,14 @@ impl Document {
     /// SPEC §2.2). Pure selection change; no buffer access needed.
     fn collapse_selections(&mut self) {
         self.selections.collapse_to_primary();
+    }
+
+    /// Select the word or line at `offset` (a double/triple click, or a click in
+    /// the gutter). Pure selection change, like the other pointer gestures: no
+    /// delta, no version bump.
+    fn select_around(&mut self, offset: usize, granularity: CoreGranularity) {
+        let text = self.buffer.text();
+        self.selections.select_around(&text, offset, granularity);
     }
 
     /// Compute the edits an `Insert`/`Delete` action produces over the selection
@@ -1419,6 +1427,13 @@ async fn run(
             }
             Action::CollapseSelections => {
                 session.active_mut().collapse_selections();
+                Step::Republish
+            }
+            Action::SelectAround {
+                offset,
+                granularity,
+            } => {
+                session.active_mut().select_around(offset, granularity);
                 Step::Republish
             }
             Action::Undo => Step::Undo,
