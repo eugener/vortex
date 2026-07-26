@@ -25,6 +25,9 @@ use ratatui::buffer::Buffer;
 use ratatui::crossterm::event::{
     KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
 };
+use std::borrow::Cow;
+use std::path::Path;
+
 use ratatui::layout::{Position, Rect};
 use ratatui::style::Style;
 use ratatui::widgets::{Block, Clear, Widget};
@@ -45,6 +48,24 @@ const MAX_WIDTH_WITH_PANE: u16 = 100;
 /// to read - a truncated path list next to truncated code is worse than the list
 /// alone, which at least fits.
 const MIN_PANE_SCREEN: u16 = 80;
+
+/// A file's path as a picker row shows it: relative to `cwd` when it is under it,
+/// absolute otherwise.
+///
+/// Rows are narrow, and within one project the part that tells two of them apart is
+/// the end of the path - but a file opened from elsewhere must not read as a local
+/// one, so it keeps its full path. Shared by every picker whose rows are files (the
+/// buffer picker, the global-search picker), because two rules would mean the same
+/// file reading differently depending on which picker you found it in.
+///
+/// `cwd` is passed rather than resolved here: a search delivers up to a thousand
+/// rows, and that is a syscall each.
+pub fn display_path(path: &Path, cwd: Option<&Path>) -> String {
+    cwd.and_then(|cwd| path.strip_prefix(cwd).ok())
+        .unwrap_or(path)
+        .to_string_lossy()
+        .into_owned()
+}
 
 /// Lines a preview source is asked for: what the tallest possible pane can show
 /// (the interior, which the pane fills - unlike the list it has no query row).
@@ -98,7 +119,12 @@ pub trait ItemSource {
 
     /// A line to show in place of the list when there are no rows yet: what went
     /// wrong, or what the picker is waiting for. `None` shows nothing.
-    fn status(&self) -> Option<String> {
+    ///
+    /// Borrowed, not owned, because this is read once per render tick to notice a
+    /// change - roughly sixty times a second for as long as the picker is open, and
+    /// almost always to conclude that nothing changed. A `String` return would be an
+    /// allocation per tick to answer "still the same".
+    fn status(&self) -> Option<Cow<'_, str>> {
         None
     }
 }
@@ -587,10 +613,12 @@ impl Layer for Picker {
         // A source can change what it *says* without producing a row: a debounced
         // search starts, or fails to compile, on a tick of its own. Repainting only
         // on arrival would leave that line saying the wrong thing until the next
-        // keystroke happened to redraw it.
-        let status = source.status();
-        let restated = status != self.status;
-        self.status = status;
+        // keystroke happened to redraw it. Compared borrowed and only copied when it
+        // actually differs, since the answer is "unchanged" on almost every tick.
+        let restated = source.status().as_deref() != self.status.as_deref();
+        if restated {
+            self.status = source.status().map(Cow::into_owned);
+        }
         if arrived.is_empty() {
             return restated;
         }
@@ -1209,8 +1237,10 @@ mod tests {
         fn take(&mut self) -> Vec<Item> {
             std::mem::take(&mut self.pending.borrow_mut())
         }
-        fn status(&self) -> Option<String> {
-            self.status.borrow().clone()
+        fn status(&self) -> Option<Cow<'_, str>> {
+            // Owned here only because the fake keeps its status behind a `RefCell`
+            // for the test to change mid-run; a real source borrows from its state.
+            self.status.borrow().clone().map(Cow::Owned)
         }
     }
 
@@ -1372,6 +1402,30 @@ mod tests {
         *status.borrow_mut() = Some("searching…".to_string());
         assert!(p.tick(), "the line under the query changed");
         assert!(!p.tick(), "and stops asking once it has been painted");
+    }
+
+    #[test]
+    fn a_path_under_the_working_directory_is_shown_relative() {
+        // Long absolute paths push the distinguishing part off a narrow row, which
+        // is the opposite of what a picker over same-named files is for.
+        let cwd = std::path::PathBuf::from("/home/u/project");
+        assert_eq!(
+            display_path(&cwd.join("src/deep/thing.rs"), Some(&cwd)),
+            "src/deep/thing.rs"
+        );
+    }
+
+    #[test]
+    fn a_path_outside_the_working_directory_stays_absolute() {
+        // It must not read as a local file when it is not one.
+        let cwd = std::path::PathBuf::from("/home/u/project");
+        assert_eq!(
+            display_path(Path::new("/etc/hosts"), Some(&cwd)),
+            "/etc/hosts"
+        );
+        // And with no working directory to be relative to (deleted, or unreadable),
+        // every row stays absolute rather than the picker losing its labels.
+        assert_eq!(display_path(Path::new("/etc/hosts"), None), "/etc/hosts");
     }
 
     #[test]

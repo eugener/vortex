@@ -24,6 +24,7 @@
 //! as fresh as the walk that found it, and an unguarded jump would then land in
 //! whatever buffer happened to be focused.
 
+use std::borrow::Cow;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -32,7 +33,7 @@ use vortex_core::Position;
 use crate::command::Command;
 use crate::compositor::Layer;
 use crate::config::Theme;
-use crate::picker::{Item, ItemSource, Picker, PreviewSource};
+use crate::picker::{Item, ItemSource, Picker, PreviewSource, display_path};
 use crate::search::{self, Hit, Search};
 
 /// Lines of context shown above the matched line in the preview pane. A match with
@@ -146,12 +147,12 @@ impl ItemSource for Matches {
             .collect()
     }
 
-    fn status(&self) -> Option<String> {
+    fn status(&self) -> Option<Cow<'_, str>> {
         match &self.state {
             State::Idle => None,
-            State::Searching => Some("searching…".to_string()),
-            State::Done => Some("no matches".to_string()),
-            State::Failed(err) => Some(err.clone()),
+            State::Searching => Some(Cow::Borrowed("searching…")),
+            State::Done => Some(Cow::Borrowed("no matches")),
+            State::Failed(err) => Some(Cow::Borrowed(err)),
         }
     }
 }
@@ -175,15 +176,6 @@ fn row(hit: &Hit, cwd: Option<&Path>) -> Item {
             position: Position::new(hit.line, hit.column),
         },
     }
-}
-
-/// The path as shown: relative to `cwd` when it is under it, absolute otherwise -
-/// the same rule the buffer picker's rows follow.
-fn display_path(path: &Path, cwd: Option<&Path>) -> String {
-    cwd.and_then(|cwd| path.strip_prefix(cwd).ok())
-        .unwrap_or(path)
-        .to_string_lossy()
-        .into_owned()
 }
 
 /// `regex`'s errors are several lines of caret diagram; a picker row is one line.
@@ -498,22 +490,6 @@ mod tests {
         assert!(
             !shown.contains("needle"),
             "nothing is searched until something is typed"
-        );
-    }
-
-    #[test]
-    fn a_path_outside_the_working_directory_stays_absolute() {
-        let cwd = std::env::current_dir().unwrap();
-        assert_eq!(
-            display_path(Path::new("/etc/hosts"), Some(&cwd)),
-            "/etc/hosts"
-        );
-        assert_eq!(display_path(&cwd.join("src/x.rs"), Some(&cwd)), "src/x.rs");
-        // No working directory to be relative to (it was deleted, or unreadable):
-        // an absolute row still names the file, which is the job.
-        assert_eq!(
-            display_path(&cwd.join("src/x.rs"), None),
-            cwd.join("src/x.rs").to_string_lossy()
         );
     }
 }

@@ -177,11 +177,13 @@ impl Text {
         let line = position.line.min(self.last_line_index());
         let line_start = self.byte_of_line(line).unwrap_or(0);
         let content = self.line(line).unwrap_or_default();
-        let col = position.col.min(content.len());
-        // Walk down to the start of the character the column landed in. `col` is
-        // already within the line, so this cannot run past its start.
-        let col = (0..=col).rev().find(|&i| content.is_char_boundary(i));
-        line_start + col.unwrap_or(0)
+        // Walk down to the start of the character the column landed in. Terminates
+        // at 0 at the latest, which is a boundary of every string including "".
+        let mut col = position.col.min(content.len());
+        while !content.is_char_boundary(col) {
+            col -= 1;
+        }
+        line_start + col
     }
 
     /// Index of the last line a cursor can occupy. For a newline-terminated

@@ -15,7 +15,7 @@ use crate::command::Command;
 use crate::compositor::Layer;
 use crate::config::Theme;
 use crate::layout::{buffer_display_name, with_modified_marker};
-use crate::picker::{Item, Picker};
+use crate::picker::{Item, Picker, display_path};
 
 /// One row per open buffer. The label is the file's *full* path where it has one
 /// (not just the file name, which the bufferline shows): the picker is where you go
@@ -23,10 +23,12 @@ use crate::picker::{Item, Picker};
 /// that tells them apart. The modified marker rides along from
 /// [`buffer_display_name`], so a dirty buffer is as obvious here as on its tab.
 fn items(buffers: &[BufferInfo], active: BufferId) -> Vec<Item> {
+    // Resolved once for the whole list rather than per row (see `display_path`).
+    let cwd = std::env::current_dir().ok();
     buffers
         .iter()
         .map(|info| Item {
-            label: label_for(info),
+            label: label_for(info, cwd.as_deref()),
             // The active buffer is marked where a shortcut would go: picking it is a
             // no-op, and saying so beats leaving the current buffer unidentifiable.
             shortcut: (info.id == active).then(|| "current".to_string()),
@@ -37,23 +39,11 @@ fn items(buffers: &[BufferInfo], active: BufferId) -> Vec<Item> {
 
 /// A buffer's picker label: its path when it has one, otherwise the unnamed-buffer
 /// placeholder, with any modified marker.
-fn label_for(info: &BufferInfo) -> String {
+fn label_for(info: &BufferInfo, cwd: Option<&Path>) -> String {
     let Some(path) = info.path.as_deref() else {
         return buffer_display_name(None, info.modified);
     };
-    with_modified_marker(&display_path(path), info.modified)
-}
-
-/// The path as shown: relative to the working directory when it is under it, so the
-/// rows stay short in the common case of editing within one project, and absolute
-/// otherwise (a buffer opened from elsewhere must not read as a local file).
-fn display_path(path: &Path) -> String {
-    std::env::current_dir()
-        .ok()
-        .and_then(|cwd| path.strip_prefix(&cwd).ok())
-        .unwrap_or(path)
-        .to_string_lossy()
-        .into_owned()
+    with_modified_marker(&display_path(path, cwd), info.modified)
 }
 
 /// Open the buffer picker over the snapshot's buffer list.
@@ -122,19 +112,15 @@ mod tests {
     }
 
     #[test]
-    fn a_path_under_the_working_directory_is_shown_relative() {
+    fn a_row_shows_its_path_relative_to_the_working_directory() {
         // Long absolute paths would push the distinguishing part off the row, which
-        // is the opposite of what a picker over same-named files is for.
+        // is the opposite of what a picker over same-named files is for. The rule
+        // itself is `picker::display_path`'s; what this pins is that the rows are
+        // built against the working directory rather than against nothing.
         let cwd = std::env::current_dir().unwrap();
         let nested = cwd.join("src/deep/thing.rs");
-        assert_eq!(display_path(&nested), "src/deep/thing.rs");
-    }
-
-    #[test]
-    fn a_path_outside_the_working_directory_stays_absolute() {
-        // It must not read as a local file when it is not one.
-        let outside = PathBuf::from("/etc/hosts");
-        assert_eq!(display_path(&outside), "/etc/hosts");
+        let list = [info(1, Some(nested.to_str().unwrap()), false)];
+        assert_eq!(items(&list, BufferId(1))[0].label, "src/deep/thing.rs");
     }
 
     #[test]
