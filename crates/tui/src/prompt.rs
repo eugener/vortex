@@ -15,7 +15,9 @@
 use std::path::PathBuf;
 
 use ratatui::buffer::Buffer;
-use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use ratatui::crossterm::event::{
+    KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+};
 use ratatui::layout::{Position, Rect};
 use ratatui::style::Style;
 use unicode_width::UnicodeWidthStr;
@@ -109,6 +111,22 @@ impl Layer for Prompt {
         EventResult::Consumed
     }
 
+    fn handle_mouse(&mut self, mouse: MouseEvent, screen: Rect) -> EventResult {
+        let on_row = Self::row(screen)
+            .is_some_and(|row| row.contains(Position::new(mouse.column, mouse.row)));
+        if mouse.kind == MouseEventKind::Down(MouseButton::Left) && !on_row {
+            // Clicking away means "never mind", the same as Esc. Nothing has been
+            // committed, so nothing is lost by reading it that way.
+            self.finished = true;
+        }
+        // A click *on* the row is swallowed and does nothing. Moving the caret to it
+        // is the obvious next step, but the caret only ever sits at the end of the
+        // input here - typing appends and backspace removes, with no way to be
+        // anywhere else - so a mid-line caret has to arrive as a prompt-editing
+        // change, not be smuggled in as a mouse one.
+        EventResult::Consumed
+    }
+
     fn take_commands(&mut self) -> Vec<Command> {
         std::mem::take(&mut self.outbox)
     }
@@ -199,6 +217,17 @@ impl Layer for Confirm {
         // Every other key answers no. Nothing is swallowed silently into a "keep
         // asking" state: one keypress always closes the question.
         self.finished = true;
+        EventResult::Consumed
+    }
+
+    fn handle_mouse(&mut self, mouse: MouseEvent, _screen: Rect) -> EventResult {
+        // Every answer but one is no, and a click is not that one: `y` is the only
+        // way to commit something destructive, so a click anywhere - on the question
+        // or away from it - closes it as a decline. Nothing here is worth a
+        // misclick's worth of a discarded buffer.
+        if mouse.kind == MouseEventKind::Down(MouseButton::Left) {
+            self.finished = true;
+        }
         EventResult::Consumed
     }
 
@@ -467,6 +496,56 @@ mod tests {
         let mut layer = close_confirm();
         layer.handle_key(key('Y'));
         assert_eq!(layer.take_commands().len(), 1);
+    }
+
+    /// A left press at a screen cell.
+    fn click(column: u16, row: u16) -> MouseEvent {
+        MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column,
+            row,
+            modifiers: KeyModifiers::NONE,
+        }
+    }
+
+    #[test]
+    fn clicking_away_from_a_prompt_cancels_it() {
+        let screen = Rect::new(0, 0, 40, 10);
+        let mut p = echo_prompt();
+        type_str(&mut p, "half-typed");
+        // Row 9 is the prompt itself; row 0 is the editor above it.
+        assert_eq!(p.handle_mouse(click(5, 0), screen), EventResult::Consumed);
+        assert!(p.is_finished());
+        assert!(p.take_commands().is_empty(), "cancelling commits nothing");
+    }
+
+    #[test]
+    fn clicking_on_the_prompt_row_leaves_it_open() {
+        // The prompt's own row is not a dismissal - it is where the user is typing.
+        let screen = Rect::new(0, 0, 40, 10);
+        let mut p = echo_prompt();
+        type_str(&mut p, "still typing");
+        assert_eq!(p.handle_mouse(click(5, 9), screen), EventResult::Consumed);
+        assert!(!p.is_finished());
+    }
+
+    #[test]
+    fn a_click_never_answers_yes_to_a_confirmation() {
+        // The destructive answer takes a deliberate `y`. A click closes the question
+        // as a decline, wherever it lands - a misclick must not discard a buffer.
+        let screen = Rect::new(0, 0, 40, 10);
+        for (x, y) in [(5, 9), (5, 0)] {
+            let mut layer = close_confirm();
+            assert_eq!(
+                layer.handle_mouse(click(x, y), screen),
+                EventResult::Consumed
+            );
+            assert!(layer.is_finished());
+            assert!(
+                layer.take_commands().is_empty(),
+                "a click at ({x},{y}) committed the close"
+            );
+        }
     }
 
     #[test]

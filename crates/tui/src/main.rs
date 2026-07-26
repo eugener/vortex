@@ -857,10 +857,52 @@ fn event_loop(
                         }
                     }
                 }
-                // While an overlay owns the screen (SPEC §7.5) it is modal: mouse
-                // input is swallowed rather than moving the editor caret beneath the
-                // prompt. (Routing clicks into overlays is an M7 concern.)
-                Event::Mouse(_) if !overlays.is_empty() => {}
+                // An overlay owns the screen as well as the keyboard (SPEC §7.5), so
+                // it gets first refusal on the pointer too. What it does not consume
+                // falls through to the editor below, exactly as a key does - which is
+                // how a click *outside* a dismissable overlay can both close it and
+                // land where the user aimed.
+                // Bare pointer motion, which mode 1003 reports for every cell the
+                // pointer crosses. Nothing hovers today, and acting on it would mean
+                // a repaint per cell of mouse travel, so it is dropped before it can
+                // cost anything. The moment something does hover, this is where it
+                // starts.
+                Event::Mouse(mouse) if mouse.kind == MouseEventKind::Moved => {}
+                Event::Mouse(mouse) if !overlays.is_empty() => {
+                    let screen = terminal.size()?;
+                    let (result, commands) =
+                        overlays.handle_mouse(mouse, Rect::new(0, 0, screen.width, screen.height));
+                    for command in commands {
+                        let mut ui = Frontend {
+                            overlays: &mut overlays,
+                            config: &mut config,
+                            toasts: &mut toasts,
+                            snapshot: latest.as_ref(),
+                        };
+                        if !dispatch_command(command, handle, &mut ui) {
+                            return Ok(());
+                        }
+                    }
+                    needs_redraw = true;
+                    if result == EventResult::Consumed {
+                        continue;
+                    }
+                }
+                // A toast sits over the editor, so a click on one is a click on it
+                // rather than on the text underneath - dismissing it early instead of
+                // waiting out the fade. Checked before the editor's own handling and
+                // only for a press, so a drag that happens to pass under a toast
+                // keeps sweeping out its selection.
+                Event::Mouse(mouse)
+                    if mouse.kind == MouseEventKind::Down(MouseButton::Left)
+                        && toasts.dismiss_at(
+                            Rect::new(0, 0, terminal.size()?.width, terminal.size()?.height),
+                            mouse.column,
+                            mouse.row,
+                        ) =>
+                {
+                    needs_redraw = true;
+                }
                 Event::Mouse(mouse) => match mouse.kind {
                     // Left press or drag places/extends the caret at the pointer.
                     // A press is a plain click unless Shift is held (extend from the
