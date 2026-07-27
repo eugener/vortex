@@ -24,6 +24,12 @@ async-lsp = { version = "0.2.4", default-features = false, features = [
 # core stays executor-agnostic (SPEC §2.3).
 async-process = "2.5.0"
 crop = "0.4.3"
+# In-buffer search (SPEC §3, §11): the pattern engine behind `search.rs` -
+# select-all-matches, next/previous match, and replace. `vortex-tui` already
+# depends on it for the cross-file walk, which is the point: one engine, two
+# callers, so the two searches in the editor cannot disagree about what a pattern
+# means. Cargo unifies them to one version.
+regex = "1.13.1"
 # Encoding detection + transcoding on the file boundary (SPEC §3, §10.1). Gecko's
 # implementation of the WHATWG Encoding Standard: it is what makes "open a
 # latin-1 file and save it back byte-for-byte" possible instead of refusing every

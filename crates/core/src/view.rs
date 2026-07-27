@@ -214,6 +214,24 @@ pub enum Notification {
         buffer_id: BufferId,
         path: Option<PathBuf>,
     },
+    /// A search did not happen: the pattern is not a valid regex, or it matches
+    /// nowhere in the buffer (SPEC §11). Nothing changed either way.
+    ///
+    /// Both are the same kind of event to a frontend - the keypress did nothing and
+    /// the user is owed a reason - so they are one variant carrying the reason rather
+    /// than two the frontend would render identically. A pattern is user input, so
+    /// this is a notification and never a panic (SPEC §8); `matched` tells a valid
+    /// pattern that found nothing (`true`, worth a quiet "no matches") apart from one
+    /// that could not be compiled (`false`, worth showing the engine's complaint).
+    SearchFailed {
+        buffer_id: BufferId,
+        /// The pattern as sent, so a toast can quote what found nothing.
+        pattern: String,
+        /// `regex`'s compile error, or a "no matches" message.
+        message: String,
+        /// Whether the pattern compiled. `false` means `message` is a syntax error.
+        compiled: bool,
+    },
     /// The core has stopped its loop and will send nothing further.
     ShuttingDown,
 }

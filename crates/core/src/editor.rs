@@ -562,6 +562,94 @@ impl Document {
         self.selections.select_around(&text, offset, granularity);
     }
 
+    /// Select the next match of `regex` after the primary caret, wrapping (SPEC §11).
+    /// Returns whether anything was found; a pattern that matches nowhere leaves the
+    /// selection alone so the caller can say so.
+    ///
+    /// The search starts from the primary's **end** going forward and its **start**
+    /// going back, so repeating the action walks the matches instead of re-finding
+    /// the one already selected. Pure selection change: no delta, no version bump.
+    fn select_next_match(&mut self, regex: &regex::Regex, backward: bool) -> bool {
+        let text = self.buffer.text();
+        let primary = *self.selections.primary();
+        let from = if backward {
+            primary.start()
+        } else {
+            primary.end()
+        };
+        let Some(found) = crate::search::next_match(&text, regex, from, backward) else {
+            return false;
+        };
+        self.selections =
+            SelectionSet::single(crate::selection::Selection::new(found.start, found.end));
+        true
+    }
+
+    /// Put a selection on every match of `regex` in the buffer (SPEC §12.2's
+    /// `select-all-matches`). Returns whether anything was found.
+    ///
+    /// The whole buffer, not the viewport: "every match" means every one, and a
+    /// multi-cursor set that stopped at the bottom of the screen would be a trap -
+    /// the edit that follows would silently miss the matches below it. This is the
+    /// one search path that is deliberately O(buffer), and it runs once per keypress
+    /// rather than per frame (SPEC §10.4).
+    fn select_all_matches(&mut self, regex: &regex::Regex) -> bool {
+        let text = self.buffer.text();
+        let found = crate::search::matches_in(&text, regex, 0..text.line_count());
+        if found.is_empty() {
+            return false;
+        }
+        self.selections
+            .select_matches(&found, self.selections.primary().start());
+        true
+    }
+
+    /// The edits a replace-all produces: every match of `regex` in the buffer paired
+    /// with its expanded `replacement` (SPEC §11).
+    ///
+    /// Sorted **descending by start**, the order [`Self::plan_edit`] returns and the
+    /// apply path expects, so the whole replace lands as one edit list and therefore
+    /// one undo unit (SPEC §2.4).
+    fn plan_replace_all(
+        &self,
+        regex: &regex::Regex,
+        replacement: &str,
+    ) -> Vec<(std::ops::Range<usize>, String)> {
+        let text = self.buffer.text();
+        let mut edits =
+            crate::search::replacements_in(&text, regex, 0..text.line_count(), replacement);
+        edits.sort_by_key(|e| std::cmp::Reverse(e.0.start));
+        edits
+    }
+
+    /// The edit replacing the *currently selected* match, if the primary selection is
+    /// exactly a match of `regex` - the "replace this one" half of a find-and-replace
+    /// (SPEC §11).
+    ///
+    /// `None` when the primary is not a match, which is the state before anything has
+    /// been found: the caller then finds instead of replacing, so a first press never
+    /// edits text the user has not been shown.
+    ///
+    /// The match is re-derived from the *line* the primary sits on rather than
+    /// trusted from the selection, because the capture groups a replacement expands
+    /// only exist inside that pass - and because a selection that merely looks like a
+    /// match is not one the pattern would have produced in context.
+    fn plan_replace_current(
+        &self,
+        regex: &regex::Regex,
+        replacement: &str,
+    ) -> Option<(std::ops::Range<usize>, String)> {
+        let text = self.buffer.text();
+        let primary = self.selections.primary();
+        if primary.is_cursor() {
+            return None;
+        }
+        let line = text.line_of_byte(primary.start());
+        crate::search::replacements_in(&text, regex, line..line + 1, replacement)
+            .into_iter()
+            .find(|(range, _)| range.start == primary.start() && range.end == primary.end())
+    }
+
     /// Compute the edits an `Insert`/`Delete` action produces over the selection
     /// set, as `(range, new_text)` pairs in the current buffer's coordinates.
     ///
@@ -849,9 +937,37 @@ enum Step {
     /// Report a rejected request and republish - for the ones that fail before they
     /// touch anything, so there is nothing to undo and nothing to write.
     FileError(String),
+    /// Report a search that found nothing or would not compile, and republish
+    /// (SPEC §11). The search twin of [`Step::FileError`]: nothing was touched, and
+    /// the frontend is owed a reason the keypress appeared to do nothing.
+    SearchFailed {
+        pattern: String,
+        message: String,
+        compiled: bool,
+    },
 }
 
 impl Step {
+    /// The step reporting a pattern that would not compile, quoting `regex`'s own
+    /// complaint - which names the position in the pattern, and so beats anything
+    /// this module could say about it.
+    fn search_failed(pattern: String, error: regex::Error) -> Self {
+        Step::SearchFailed {
+            pattern,
+            message: error.to_string(),
+            compiled: false,
+        }
+    }
+
+    /// The step reporting a valid pattern that matched nowhere.
+    fn no_match(pattern: String) -> Self {
+        Step::SearchFailed {
+            pattern,
+            message: "no matches".to_string(),
+            compiled: true,
+        }
+    }
+
     /// Whether this step would change the active buffer's text, and so must be
     /// refused on a read-only buffer (SPEC §10.3).
     ///
@@ -868,6 +984,9 @@ impl Step {
             // only ever move the buffer *towards* what is on disk.
             Step::Reload { .. }
             | Step::FileError(_)
+            // A failed search changed nothing by definition; the *successful*
+            // replaces are `Step::Edit` and are refused above like any other edit.
+            | Step::SearchFailed { .. }
             | Step::Republish
             | Step::Open(_)
             | Step::Save
@@ -1390,6 +1509,63 @@ async fn run(
         // actions then share one apply_edit call instead of repeating the
         // apply/break plumbing per variant.
         let step = match action {
+            // Search (SPEC §11). Every arm compiles the pattern first and reports a
+            // bad one rather than unwrapping it: a pattern is user input, and it
+            // arrives here from a remote frontend just as readily as from the prompt
+            // that already validated it (SPEC §8).
+            Action::SelectNextMatch { pattern, backward } => {
+                match crate::search::compile(&pattern) {
+                    Err(error) => Step::search_failed(pattern, error),
+                    Ok(regex) => {
+                        if session.active_mut().select_next_match(&regex, backward) {
+                            Step::Republish
+                        } else {
+                            Step::no_match(pattern)
+                        }
+                    }
+                }
+            }
+            Action::SelectAllMatches { pattern } => match crate::search::compile(&pattern) {
+                Err(error) => Step::search_failed(pattern, error),
+                Ok(regex) => {
+                    if session.active_mut().select_all_matches(&regex) {
+                        Step::Republish
+                    } else {
+                        Step::no_match(pattern)
+                    }
+                }
+            },
+            // A replace whose primary is not a match plans no edits, which the apply
+            // path already treats as a clean no-op - so "press replace before
+            // finding anything" costs a republish and changes nothing, and the
+            // `SelectNextMatch` the frontend sends next does the finding.
+            Action::ReplaceMatch {
+                pattern,
+                replacement,
+            } => match crate::search::compile(&pattern) {
+                Err(error) => Step::search_failed(pattern, error),
+                Ok(regex) => Step::Edit(
+                    session
+                        .active()
+                        .plan_replace_current(&regex, &replacement)
+                        .into_iter()
+                        .collect(),
+                ),
+            },
+            Action::ReplaceAllMatches {
+                pattern,
+                replacement,
+            } => match crate::search::compile(&pattern) {
+                Err(error) => Step::search_failed(pattern, error),
+                Ok(regex) => {
+                    let edits = session.active().plan_replace_all(&regex, &replacement);
+                    if edits.is_empty() {
+                        Step::no_match(pattern)
+                    } else {
+                        Step::Edit(edits)
+                    }
+                }
+            },
             Action::Insert(text) => Step::Edit(session.active().plan_edit(EditKind::Insert(text))),
             Action::DeleteBackward => {
                 Step::Edit(session.active().plan_edit(EditKind::DeleteBackward))
@@ -1563,6 +1739,19 @@ async fn run(
             Step::FileError(message) => {
                 let path = session.active().path.clone();
                 report_file_error(&mut session, path, &message, &snapshots, &notifications)
+            }
+            Step::SearchFailed {
+                pattern,
+                message,
+                compiled,
+            } => {
+                let _ = notifications.try_send(Notification::SearchFailed {
+                    buffer_id: session.active().id,
+                    pattern,
+                    message,
+                    compiled,
+                });
+                snapshots.publish(session.snapshot(None))
             }
         };
         if !alive {

@@ -2100,3 +2100,409 @@ fn switching_to_utf16_adds_the_byte_order_mark_it_needs() {
         assert!(!snap.format.bom);
     });
 }
+
+// --- In-buffer search (SPEC §11, §12.2) -----------------------------------
+
+/// Type `text` into a fresh buffer and leave the caret at the origin, the state a
+/// search starts from.
+async fn typed(h: &CoreHandle, text: &str) -> ViewSnapshot {
+    step(h, Action::Insert(text.into())).await;
+    step(
+        h,
+        Action::MoveCursor {
+            motion: Motion::BufferStart,
+            extend: false,
+        },
+    )
+    .await
+}
+
+/// The primary selection's span.
+fn primary_span(snap: &ViewSnapshot) -> (usize, usize) {
+    let sel = snap.selections[snap.primary];
+    (sel.start(), sel.end())
+}
+
+/// Send `SelectNextMatch` for `pattern` and return the resulting snapshot.
+async fn find(h: &CoreHandle, pattern: &str, backward: bool) -> ViewSnapshot {
+    step(
+        h,
+        Action::SelectNextMatch {
+            pattern: pattern.into(),
+            backward,
+        },
+    )
+    .await
+}
+
+#[test]
+fn finding_a_match_selects_it_rather_than_only_moving_the_caret() {
+    // Cursor state is a selection set (SPEC §2.2), so the match *being* the
+    // selection is what makes it visible and what makes replacing it an ordinary
+    // edit over a selection.
+    drive(|h| async move {
+        typed(&h, "one two three").await;
+        let snap = find(&h, "two", false).await;
+        assert_eq!(primary_span(&snap), (4, 7));
+        assert_eq!(snap.selections.len(), 1);
+        assert_eq!(snap.version, 1, "a search is not an edit");
+    });
+}
+
+#[test]
+fn repeating_the_search_walks_forward_and_wraps() {
+    drive(|h| async move {
+        typed(&h, "x a x a x").await;
+        assert_eq!(primary_span(&find(&h, "x", false).await), (0, 1));
+        assert_eq!(primary_span(&find(&h, "x", false).await), (4, 5));
+        assert_eq!(primary_span(&find(&h, "x", false).await), (8, 9));
+        // Past the last one it comes back around rather than sticking at the end.
+        assert_eq!(primary_span(&find(&h, "x", false).await), (0, 1));
+    });
+}
+
+#[test]
+fn searching_backward_walks_the_other_way_and_wraps_at_the_start() {
+    drive(|h| async move {
+        typed(&h, "x a x a x").await;
+        // From the origin, backward wraps straight to the last match.
+        assert_eq!(primary_span(&find(&h, "x", true).await), (8, 9));
+        assert_eq!(primary_span(&find(&h, "x", true).await), (4, 5));
+        assert_eq!(primary_span(&find(&h, "x", true).await), (0, 1));
+    });
+}
+
+#[test]
+fn a_search_finds_across_lines_and_collapses_a_multi_cursor_set() {
+    // "find the next one" says *this* one - the same reset a plain click makes.
+    drive(|h| async move {
+        typed(&h, "alpha\nbeta\ngamma").await;
+        step(&h, Action::AddCursorBelow).await;
+        let before = step(&h, Action::RequestSnapshot).await;
+        assert_eq!(before.selections.len(), 2, "two carets to collapse");
+
+        let snap = find(&h, "gamma", false).await;
+        assert_eq!(snap.selections.len(), 1);
+        assert_eq!(primary_span(&snap), (11, 16));
+    });
+}
+
+#[test]
+fn select_all_matches_puts_a_cursor_on_every_one() {
+    // The gesture that makes a search editable: every subsequent motion and edit
+    // maps over the set, so "rename every occurrence" is just typing.
+    drive(|h| async move {
+        typed(&h, "cat\ndog\ncat\ncat").await;
+        let snap = step(
+            &h,
+            Action::SelectAllMatches {
+                pattern: "cat".into(),
+            },
+        )
+        .await;
+        assert_eq!(snap.selections.len(), 3);
+        let spans: Vec<_> = snap
+            .selections
+            .iter()
+            .map(|s| (s.start(), s.end()))
+            .collect();
+        assert_eq!(spans, vec![(0, 3), (8, 11), (12, 15)]);
+
+        // ...and typing over them replaces all three as one undo unit.
+        let typed_over = step(&h, Action::Insert("bird".into())).await;
+        assert_eq!(typed_over.text.to_string(), "bird\ndog\nbird\nbird");
+        let undone = step(&h, Action::Undo).await;
+        assert_eq!(undone.text.to_string(), "cat\ndog\ncat\ncat");
+    });
+}
+
+#[test]
+fn select_all_matches_keeps_the_primary_near_where_the_caret_was() {
+    // The primary drives viewport-follow (SPEC §2.2): designating match zero would
+    // scroll a long file to the top for a search run in the middle of it.
+    drive(|h| async move {
+        typed(&h, "hit\nhit\nhit\nhit").await;
+        step(
+            &h,
+            Action::PlaceCursor {
+                offset: 9,
+                extend: false,
+            },
+        )
+        .await;
+        let snap = step(
+            &h,
+            Action::SelectAllMatches {
+                pattern: "hit".into(),
+            },
+        )
+        .await;
+        assert_eq!(snap.selections.len(), 4);
+        assert_eq!(primary_span(&snap), (8, 11), "the match the caret was in");
+    });
+}
+
+#[test]
+fn a_pattern_matching_nothing_reports_it_and_changes_nothing() {
+    drive(|h| async move {
+        typed(&h, "alpha beta").await;
+        let before = step(&h, Action::RequestSnapshot).await;
+        let snap = find(&h, "zeta", false).await;
+        assert_eq!(snap.selections, before.selections, "the caret stayed put");
+        assert_eq!(snap.text.to_string(), "alpha beta");
+
+        match drain_notifications(&h).as_slice() {
+            [
+                Notification::SearchFailed {
+                    pattern,
+                    compiled,
+                    message,
+                    ..
+                },
+            ] => {
+                assert_eq!(pattern, "zeta");
+                assert!(compiled, "the pattern was fine, it just found nothing");
+                assert!(message.contains("no matches"), "{message}");
+            }
+            other => panic!("expected one SearchFailed, got {other:?}"),
+        }
+    });
+}
+
+#[test]
+fn a_pattern_that_is_not_a_regex_is_reported_not_panicked_on() {
+    // A pattern is user input and arrives from a remote frontend just as readily as
+    // from a prompt that already validated it (SPEC §8).
+    drive(|h| async move {
+        typed(&h, "some text").await;
+        let snap = find(&h, "unclosed(", false).await;
+        assert_eq!(snap.text.to_string(), "some text");
+        match drain_notifications(&h).as_slice() {
+            [
+                Notification::SearchFailed {
+                    compiled, message, ..
+                },
+            ] => {
+                assert!(!compiled, "it did not compile");
+                assert!(!message.is_empty(), "the engine's own complaint");
+            }
+            other => panic!("expected one SearchFailed, got {other:?}"),
+        }
+    });
+}
+
+#[test]
+fn replacing_the_found_match_edits_only_that_one() {
+    drive(|h| async move {
+        typed(&h, "cat dog cat").await;
+        find(&h, "cat", false).await;
+        let snap = step(
+            &h,
+            Action::ReplaceMatch {
+                pattern: "cat".into(),
+                replacement: "bird".into(),
+            },
+        )
+        .await;
+        assert_eq!(snap.text.to_string(), "bird dog cat");
+    });
+}
+
+#[test]
+fn replacing_before_anything_is_found_changes_nothing() {
+    // The first press finds and the second replaces: a press with no match selected
+    // must not edit text the user has not been shown.
+    drive(|h| async move {
+        typed(&h, "cat dog cat").await;
+        let snap = step(
+            &h,
+            Action::ReplaceMatch {
+                pattern: "cat".into(),
+                replacement: "bird".into(),
+            },
+        )
+        .await;
+        assert_eq!(snap.text.to_string(), "cat dog cat");
+        assert_eq!(snap.version, 1, "no edit, so no version bump");
+    });
+}
+
+#[test]
+fn a_selection_that_is_not_a_match_is_not_replaced() {
+    // A selection that merely overlaps a match is not one the pattern produced.
+    drive(|h| async move {
+        typed(&h, "cat dog").await;
+        step(
+            &h,
+            Action::SelectAround {
+                offset: 5,
+                granularity: Granularity::Word,
+            },
+        )
+        .await;
+        let snap = step(
+            &h,
+            Action::ReplaceMatch {
+                pattern: "cat".into(),
+                replacement: "bird".into(),
+            },
+        )
+        .await;
+        assert_eq!(snap.text.to_string(), "cat dog", "the selection was `dog`");
+    });
+}
+
+#[test]
+fn replace_all_rewrites_every_match_as_one_undo_unit() {
+    // A replace-all the user got wrong is one Undo away, not one per occurrence.
+    drive(|h| async move {
+        typed(&h, "cat\ndog\ncat cat").await;
+        let snap = step(
+            &h,
+            Action::ReplaceAllMatches {
+                pattern: "cat".into(),
+                replacement: "bird".into(),
+            },
+        )
+        .await;
+        assert_eq!(snap.text.to_string(), "bird\ndog\nbird bird");
+        let undone = step(&h, Action::Undo).await;
+        assert_eq!(undone.text.to_string(), "cat\ndog\ncat cat");
+    });
+}
+
+#[test]
+fn a_replacement_puts_back_what_the_pattern_captured() {
+    // A regex search with no regex replace could not restore its own captures.
+    drive(|h| async move {
+        typed(&h, "alpha beta\ngamma delta").await;
+        let snap = step(
+            &h,
+            Action::ReplaceAllMatches {
+                pattern: r"(\w+) (\w+)".into(),
+                replacement: "$2 $1".into(),
+            },
+        )
+        .await;
+        assert_eq!(snap.text.to_string(), "beta alpha\ndelta gamma");
+    });
+}
+
+#[test]
+fn replace_all_with_nothing_to_replace_reports_and_leaves_the_buffer_alone() {
+    drive(|h| async move {
+        typed(&h, "alpha").await;
+        let snap = step(
+            &h,
+            Action::ReplaceAllMatches {
+                pattern: "zeta".into(),
+                replacement: "x".into(),
+            },
+        )
+        .await;
+        assert_eq!(snap.text.to_string(), "alpha");
+        assert_eq!(snap.version, 1, "no edit, so no version bump");
+        assert!(matches!(
+            drain_notifications(&h).as_slice(),
+            [Notification::SearchFailed { compiled: true, .. }]
+        ));
+    });
+}
+
+#[test]
+fn a_read_only_buffer_can_be_searched_but_not_replaced_in() {
+    // Searching is not a mutation, so it is allowed; the replace is refused by the
+    // one read-only choke point every text change funnels through (SPEC §10.3).
+    drive(|h| async move {
+        let dir = TempDir::new();
+        let path = dir.0.join("locked.txt");
+        std::fs::write(&path, "cat dog cat").unwrap();
+        let mut perms = std::fs::metadata(&path).unwrap().permissions();
+        perms.set_readonly(true);
+        std::fs::set_permissions(&path, perms).unwrap();
+
+        let opened = step(&h, Action::Open(path)).await;
+        assert!(opened.read_only, "the fixture is actually read-only");
+        drain_notifications(&h);
+
+        let found = find(&h, "cat", false).await;
+        assert_eq!(
+            primary_span(&found),
+            (0, 3),
+            "search works on a read-only buffer"
+        );
+
+        let snap = step(
+            &h,
+            Action::ReplaceAllMatches {
+                pattern: "cat".into(),
+                replacement: "bird".into(),
+            },
+        )
+        .await;
+        assert_eq!(snap.text.to_string(), "cat dog cat");
+        assert!(
+            drain_notifications(&h)
+                .iter()
+                .any(|n| matches!(n, Notification::EditRejected { .. })),
+            "the refusal was reported"
+        );
+    });
+}
+
+#[test]
+fn every_search_action_reports_a_pattern_that_will_not_compile() {
+    // The guard is on each arm, not on one shared path, so each has to be shown to
+    // report rather than unwrap - a pattern reaches any of them from a remote
+    // frontend just as readily as from the prompt that already validated it.
+    drive(|h| async move {
+        typed(&h, "some text").await;
+        let bad = "unclosed(".to_string();
+        for action in [
+            Action::SelectAllMatches {
+                pattern: bad.clone(),
+            },
+            Action::ReplaceMatch {
+                pattern: bad.clone(),
+                replacement: "x".into(),
+            },
+            Action::ReplaceAllMatches {
+                pattern: bad.clone(),
+                replacement: "x".into(),
+            },
+        ] {
+            let snap = step(&h, action.clone()).await;
+            assert_eq!(snap.text.to_string(), "some text", "{action:?} edited");
+            assert!(
+                matches!(
+                    drain_notifications(&h).as_slice(),
+                    [Notification::SearchFailed {
+                        compiled: false,
+                        ..
+                    }]
+                ),
+                "{action:?} did not report"
+            );
+        }
+    });
+}
+
+#[test]
+fn select_all_matches_with_no_match_reports_and_keeps_the_selection() {
+    drive(|h| async move {
+        typed(&h, "alpha beta").await;
+        let before = step(&h, Action::RequestSnapshot).await;
+        let snap = step(
+            &h,
+            Action::SelectAllMatches {
+                pattern: "zeta".into(),
+            },
+        )
+        .await;
+        assert_eq!(snap.selections, before.selections, "the caret stayed put");
+        assert!(matches!(
+            drain_notifications(&h).as_slice(),
+            [Notification::SearchFailed { compiled: true, .. }]
+        ));
+    });
+}

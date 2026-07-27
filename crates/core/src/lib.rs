@@ -13,6 +13,7 @@ pub mod editor;
 pub mod file;
 mod history;
 pub mod lsp;
+pub mod search;
 pub mod selection;
 pub mod syntax;
 pub mod view;
