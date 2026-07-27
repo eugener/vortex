@@ -265,6 +265,15 @@ pub struct Theme {
     /// (SPEC §2.2). The terminal has a single real cursor, which the primary caret
     /// uses; the others are painted as a one-cell reversed block so they are visible.
     pub secondary_cursor: Style,
+    /// Every other match of the live search (SPEC §11) - the ones you are not on.
+    /// A wash, not an accent: on a `.` pattern this fills the screen, so it has to
+    /// read as "these too" behind the text rather than compete with it.
+    pub search_match: Style,
+    /// The match the search is *on* - the one Enter would take you to, and the one a
+    /// replace would rewrite. Distinct from [`Self::search_match`] because a screen
+    /// of identically-marked hits does not answer "which one is next", which is the
+    /// only question a live search is really asking.
+    pub search_current: Style,
     /// Informational toasts (SPEC §7.5): file opened/saved. Calm, so they inform
     /// without alarming.
     pub toast_info: Style,
@@ -388,6 +397,15 @@ impl Default for Theme {
             secondary_cursor: Style::new()
                 .fg(Color::Rgb(0x15, 0x18, 0x23))
                 .bg(Color::Rgb(0x7d, 0x6c, 0xe0)),
+            // Search (SPEC §11): amber, the one hue nothing else in the theme uses -
+            // a match must not read as a selection or a diagnostic. The other matches
+            // get a dim ground that leaves the syntax colors legible through it; the
+            // current one gets the full fill, so "which one is next" is answerable at
+            // a glance on a screen full of hits.
+            search_match: Style::new().bg(Color::Rgb(0x54, 0x42, 0x1c)),
+            search_current: Style::new()
+                .fg(Color::Rgb(0x1a, 0x14, 0x08))
+                .bg(Color::Rgb(0xe0, 0xa8, 0x3e)),
             // Toasts (SPEC §7.5): a sunk slate for info, a strong red for errors, so
             // a failure is unmistakable (SPEC §8: never silent).
             toast_info: Style::new()

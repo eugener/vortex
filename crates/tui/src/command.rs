@@ -60,6 +60,40 @@ pub enum Command {
         path: std::path::PathBuf,
         position: vortex_core::Position,
     },
+    /// Open the in-buffer find prompt (frontend-local), or the find-and-replace one
+    /// when `replacing` (SPEC §11). Seeded with the last pattern, so reopening offers
+    /// it back rather than making the user retype it.
+    OpenFindPrompt {
+        replacing: bool,
+    },
+    /// The find prompt's pattern as it now stands - emitted on **every keystroke**,
+    /// unlike every other command here, which is what makes the preview live.
+    ///
+    /// It never reaches the core. The frontend holds the buffer's text and owns the
+    /// viewport, so highlighting the matches and scrolling to the next one are both
+    /// answerable locally (SPEC §5, §7.5) - and a search the user then cancels has
+    /// therefore changed nothing at all.
+    PreviewSearch {
+        pattern: String,
+        replacement: String,
+    },
+    /// Forget the current search: highlights down, pattern gone. Escape, and the only
+    /// gesture that means "done searching" - closing the prompt by committing keeps
+    /// the query so find-next has something to repeat.
+    ClearSearch,
+    /// Go to the next (or previous) match of the remembered pattern - the find-next
+    /// key, and what the query-replace walk advances with. Resolved against the
+    /// frontend's own memory of the search at dispatch: with no pattern yet it is a
+    /// no-op rather than a round trip, the same shape as [`Command::NextBuffer`].
+    FindNext,
+    FindPrevious,
+    /// Put a cursor on every match of the remembered pattern - the multi-cursor
+    /// gesture that turns a search into an edit.
+    SelectAllMatches,
+    /// Begin the query-replace walk over the current query (SPEC §11): the surface
+    /// that asks what to do with each match in turn. Committed by the replace
+    /// prompt, which is where both halves of the query were typed.
+    StartReplace,
     /// Switch to the named theme (frontend-local: chrome never crosses the seam).
     ///
     /// Carries data, so unlike the openers above it is not a bindable

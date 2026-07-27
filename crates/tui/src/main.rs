@@ -50,8 +50,8 @@ use vortex_tui::command::{self, Command};
 use vortex_tui::compositor::{Compositor, EventResult};
 use vortex_tui::toast::{self, Toasts};
 use vortex_tui::{
-    bufferpicker, click, config, filepicker, formatpicker, globalsearch, grammar, keymap, layout,
-    osc52, palette, prompt, theme, themepicker, watcher,
+    bufferpicker, buffersearch, click, config, filepicker, formatpicker, globalsearch, grammar,
+    keymap, layout, osc52, palette, prompt, theme, themepicker, watcher,
 };
 
 /// The frontend's view state: which window of the buffer is on screen. Both axes
@@ -639,6 +639,10 @@ fn event_loop(
     // palette/picker when one is open. Overlays get first refusal on keys and paint
     // over the base editor; an empty stack is a no-op on the hot path.
     let mut overlays = Compositor::new();
+    // The live search (SPEC §11): empty while nothing is being searched for, holding
+    // the query whose matches the body paints and whose pattern find-next repeats.
+    // Frontend state, never core state - the preview it drives crosses no seam.
+    let mut search = buffersearch::SearchState::default();
     // Set when a highlightable buffer has just opened but not yet painted: the first
     // paint is held until its highlights arrive (or `HIGHLIGHT_WAIT` elapses) so the
     // file never flashes plain-then-colored. Any input cancels the hold - a keystroke
@@ -786,6 +790,7 @@ fn event_loop(
                     follow,
                     selected,
                     tab_width: config.tab_width,
+                    search: &search,
                 },
                 &overlays,
                 &toasts,
@@ -824,6 +829,7 @@ fn event_loop(
                                 config: &mut config,
                                 toasts: &mut toasts,
                                 snapshot: latest.as_ref(),
+                                search: &mut search,
                             };
                             if !dispatch_command(command, handle, &mut ui) {
                                 return Ok(());
@@ -861,6 +867,7 @@ fn event_loop(
                             config: &mut config,
                             toasts: &mut toasts,
                             snapshot: latest.as_ref(),
+                            search: &mut search,
                         };
                         if !dispatch_command(command, handle, &mut ui) {
                             return Ok(());
@@ -888,6 +895,7 @@ fn event_loop(
                             config: &mut config,
                             toasts: &mut toasts,
                             snapshot: latest.as_ref(),
+                            search: &mut search,
                         };
                         if !dispatch_command(command, handle, &mut ui) {
                             return Ok(());
@@ -974,6 +982,7 @@ fn event_loop(
                                     config: &mut config,
                                     toasts: &mut toasts,
                                     snapshot: latest.as_ref(),
+                                    search: &mut search,
                                 };
                                 if !dispatch_command(command, handle, &mut ui) {
                                     return Ok(());
@@ -1051,6 +1060,11 @@ struct Frontend<'a> {
     /// it, and every new one would otherwise mean another field threaded through
     /// every construction site.
     snapshot: Option<&'a ViewSnapshot>,
+    /// What the frontend remembers about searching (SPEC §11): the live query, the
+    /// previewed match, and the pattern a find-next key repeats. Frontend-side
+    /// because all three are frontend facts - the preview never crosses the seam, and
+    /// a core that also remembered a pattern could disagree with what is on screen.
+    search: &'a mut buffersearch::SearchState,
 }
 
 impl Frontend<'_> {
@@ -1067,6 +1081,13 @@ impl Frontend<'_> {
     /// The buffer on screen.
     fn active(&self) -> Option<BufferId> {
         Some(self.snapshot?.buffer_id)
+    }
+
+    /// The primary caret's byte offset - where a search starts from.
+    fn caret(&self) -> usize {
+        self.snapshot
+            .and_then(|s| s.selections.get(s.primary))
+            .map_or(0, |s| s.head)
     }
 
     /// The buffer `offset` positions from the active one, or `None` when there is
@@ -1088,6 +1109,13 @@ impl Frontend<'_> {
 fn dispatch_command(command: Command, handle: &vortex_core::CoreHandle, ui: &mut Frontend) -> bool {
     match command {
         Command::Editor(action) => {
+            // Escape means "back to one cursor" *and* "done searching" (SPEC §11).
+            // Without this the highlights from a committed search would stay up with
+            // no way to dismiss them short of searching for something else - the
+            // prompt's own Escape is gone by then, having closed the prompt.
+            if action == Action::CollapseSelections {
+                ui.search.clear();
+            }
             let quit = action == Action::Quit;
             if handle.actions.send_blocking(action).is_err() || quit {
                 return false;
@@ -1187,6 +1215,92 @@ fn dispatch_command(command: Command, handle: &vortex_core::CoreHandle, ui: &mut
                 return false;
             }
         }
+        // In-buffer search (SPEC §11). The prompt is seeded with the last pattern -
+        // reopening a search offers it back rather than making it be retyped - and
+        // the search begins from wherever the caret is, which is what the preview
+        // measures "the next match" from as the query is refined.
+        Command::OpenFindPrompt { replacing } => {
+            let seed = ui
+                .search
+                .query()
+                .map(|q| q.pattern.clone())
+                .unwrap_or_default();
+            ui.search.begin(ui.caret());
+            ui.overlays.push(Box::new(buffersearch::Find::new(
+                &ui.config.theme,
+                seed,
+                replacing,
+            )));
+        }
+        // Per keystroke, and it goes no further than here: the highlights and the
+        // previewed match are painted from the frontend's own copy of the text
+        // (SPEC §5), so a search in progress has changed nothing that needs undoing.
+        Command::PreviewSearch {
+            pattern,
+            replacement,
+        } => ui.search.refresh(
+            buffersearch::Query::new(pattern, replacement),
+            ui.snapshot.map(|s| &s.text),
+        ),
+        Command::ClearSearch => ui.search.clear(),
+        // The pattern lives here, so these fill it in and send a complete action.
+        // Nothing searched for yet means nothing to repeat - a no-op, not a round
+        // trip, the same shape as a buffer switch with one buffer open.
+        Command::FindNext | Command::FindPrevious | Command::SelectAllMatches => {
+            ui.search.commit();
+            let backward = command == Command::FindPrevious;
+            let action = match command {
+                Command::SelectAllMatches => ui.search.query().map(|q| Action::SelectAllMatches {
+                    pattern: q.pattern.clone(),
+                }),
+                _ => ui.search.repeat(backward),
+            };
+            if let Some(action) = action
+                && handle.actions.send_blocking(action).is_err()
+            {
+                return false;
+            }
+        }
+        // The replace prompt committed both halves; the walk asks about each match in
+        // turn from here. It starts by *finding* rather than replacing, so the first
+        // question is always about a match the user can see.
+        Command::StartReplace => {
+            let Some((pattern, replacement)) = ui
+                .search
+                .query()
+                .map(|q| (q.pattern.clone(), q.replacement.clone()))
+                .filter(|(pattern, _)| !pattern.is_empty())
+            else {
+                return true;
+            };
+            // Whether there is anything to walk is answerable here, against the same
+            // text the preview used - so a pattern that matches nothing gets the
+            // core's one "no matches" and no walk. Opening it anyway would ask the
+            // user to agree to replacing something that does not exist, and every
+            // answer would fire another notification for the match it failed to find.
+            let any_match = ui
+                .snapshot
+                .zip(ui.search.query())
+                .is_some_and(|(snap, query)| query.next_from(&snap.text, ui.caret()).is_some());
+            ui.search.commit();
+            if handle
+                .actions
+                .send_blocking(Action::SelectNextMatch {
+                    pattern: pattern.clone(),
+                    backward: false,
+                })
+                .is_err()
+            {
+                return false;
+            }
+            if any_match {
+                ui.overlays.push(Box::new(buffersearch::QueryReplace::new(
+                    &ui.config.theme,
+                    pattern,
+                    replacement,
+                )));
+            }
+        }
         // Chrome is frontend-owned, so a theme change never crosses the seam: swap
         // the live config and hand the new styles to the surfaces that cached them.
         // A theme file that will not load must say so (SPEC §8: never silent) - and
@@ -1270,7 +1384,7 @@ fn draw(
 /// [`ViewState`]/[`Body`]) so `draw`/`paint` stay within the argument budget as
 /// per-frame inputs grow.
 #[derive(Clone, Copy)]
-struct PaintInputs {
+struct PaintInputs<'a> {
     /// The view state carried from the previous frame.
     viewport: ViewState,
     /// The active theme.
@@ -1284,6 +1398,15 @@ struct PaintInputs {
     /// Display width of a tab stop (SPEC §4, §10.5). Carried per frame rather than
     /// read from a constant so a config change takes effect without a restart.
     tab_width: usize,
+    /// The live search (SPEC §11), borrowed rather than copied so the highlights can
+    /// never be a frame behind what the prompt is showing.
+    ///
+    /// Its matches are resolved **per frame over the visible lines only**, not
+    /// cached: the buffer beneath a search can change - an undo, an external reload -
+    /// and a cached set of byte ranges would then paint over text that has moved. The
+    /// scan is viewport-bounded, which is what makes recomputing it every frame the
+    /// cheap option rather than the careful one (SPEC §10.4).
+    search: &'a buffersearch::SearchState,
 }
 
 /// Compose the whole frame: head bar, gutter + text, status bar, and the cursor.
@@ -1298,6 +1421,7 @@ fn paint(frame: &mut Frame, snapshot: &ViewSnapshot, inputs: PaintInputs) -> Vie
         follow,
         selected,
         tab_width,
+        search,
     } = inputs;
     let area = frame.area();
     // Head bar (1 row), text body (rest), status bar (1 row). `Min(0)` lets the
@@ -1319,6 +1443,18 @@ fn paint(frame: &mut Frame, snapshot: &ViewSnapshot, inputs: PaintInputs) -> Vie
     let (cursor_line, cursor_byte_col, line_text) = layout::cursor_line_col(&snapshot.text, head);
     let cursor_display_col = layout::display_column(&line_text, cursor_byte_col, tab_width);
 
+    // While a find prompt is open the viewport follows the *previewed match* instead
+    // of the caret (SPEC §11): that is what makes typing a query show you where you
+    // would land, and it is a pure frontend move - the caret has not gone anywhere,
+    // so cancelling the search leaves nothing to put back. Only the vertical axis
+    // follows it; horizontal scrolling to a match on a long line would yank the view
+    // sideways on every keystroke.
+    let preview = search.preview();
+    let follow_line = match &preview {
+        Some(range) => snapshot.text.line_of_byte(range.start),
+        None => cursor_line,
+    };
+
     // Gutter width is fixed for the frame; the text column budget is what's left of
     // the body after it. Both scroll axes follow the cursor minimally (SPEC §5):
     // vertical by line, horizontal by display column within the text area.
@@ -1338,8 +1474,10 @@ fn paint(frame: &mut Frame, snapshot: &ViewSnapshot, inputs: PaintInputs) -> Vie
     // to keep it visible; a wheel scroll turns follow off and paints the viewport's
     // own offset instead, so the view can move away from the caret. Both are clamped
     // to the content extent so a stale offset never paints blank rows/columns.
-    let scroll = if follow {
-        layout::scroll_to_show(cursor_line, viewport.scroll, text_height)
+    // A live preview overrides the wheel's "stay put": the user is asking to be shown
+    // the match, which is the one case where the view must move without the caret.
+    let scroll = if follow || preview.is_some() {
+        layout::scroll_to_show(follow_line, viewport.scroll, text_height)
     } else {
         viewport.scroll
     }
@@ -1364,6 +1502,13 @@ fn paint(frame: &mut Frame, snapshot: &ViewSnapshot, inputs: PaintInputs) -> Vie
             cursor_line,
             theme,
             tab_width,
+            // Only the lines about to be painted are searched, which is the whole
+            // reason `matches_in` takes a line range (SPEC §10.4).
+            matches: search
+                .query()
+                .map(|q| q.matches_in(&snapshot.text, scroll..scroll + text_height))
+                .unwrap_or_default(),
+            current: preview,
         },
     );
     paint_status_bar(
@@ -1450,6 +1595,13 @@ struct Body {
     gutter_width: usize,
     /// Display-column budget for text, right of the gutter.
     text_width: usize,
+    /// The live search's matches within the visible lines, in buffer bytes, ascending
+    /// (SPEC §11). Empty when nothing is being searched for, which is the common case
+    /// and costs the paint nothing.
+    matches: Vec<std::ops::Range<usize>>,
+    /// Which match the search is *on* - painted in the accent so "which one is next"
+    /// is answerable on a screen full of hits.
+    current: Option<std::ops::Range<usize>>,
     /// The cursor's line, so its gutter number can be emphasized.
     cursor_line: usize,
     /// The active theme, read straight through for the chrome styles this paints
@@ -1532,6 +1684,31 @@ fn paint_body(frame: &mut Frame, area: Rect, snapshot: &ViewSnapshot, body: Body
                     .map(|range| (range, body.theme.selection))
                 })
                 .collect();
+            // Search matches (SPEC §11), pushed with the selection washes and so
+            // *under* the syntax highlights: a match sets a ground, and the
+            // highlight that follows patches only the foreground, so matched code
+            // keeps its syntax colors exactly as selected code does. The one the
+            // search is on takes the accent instead of the wash.
+            for span in body.matches.iter().filter(|m| {
+                // The set spans the whole viewport; this row wants its own slice.
+                m.start < line_end_excl && m.end > line_start
+            }) {
+                if let Some(range) = layout::selection_columns(
+                    raw,
+                    line_start,
+                    line_end_excl,
+                    body.tab_width,
+                    span.start,
+                    span.end,
+                ) {
+                    let style = if body.current.as_ref() == Some(span) {
+                        body.theme.search_current
+                    } else {
+                        body.theme.search_match
+                    };
+                    overlays.push((range, style));
+                }
+            }
             // Syntax highlights (M4): each span clipped to this line's byte range,
             // mapped to display columns, painted as a foreground color over the
             // selection ground and under the diagnostic underline and carets.
@@ -1873,6 +2050,16 @@ mod tests {
         setup: &[Action],
         commands: &[Command],
     ) -> (ViewSnapshot, Vec<vortex_core::Notification>) {
+        let (snap, notes, _) = dispatch_watching_overlays(setup, commands);
+        (snap, notes)
+    }
+
+    /// [`dispatch_against_core`], additionally reporting whether an overlay was left
+    /// open - for the commands whose whole point is whether a surface appears.
+    fn dispatch_watching_overlays(
+        setup: &[Action],
+        commands: &[Command],
+    ) -> (ViewSnapshot, Vec<vortex_core::Notification>, bool) {
         let ex = smol::Executor::new();
         let Core { handle, run } = vortex_core::new(64);
         ex.spawn(run).detach();
@@ -1888,6 +2075,7 @@ mod tests {
             let mut config = config::Config::default();
             let mut overlays = Compositor::new();
             let mut toasts = Toasts::new(config.theme.toast_info, config.theme.toast_error);
+            let mut search = buffersearch::SearchState::default();
             for command in commands {
                 {
                     let mut ui = Frontend {
@@ -1895,6 +2083,7 @@ mod tests {
                         config: &mut config,
                         toasts: &mut toasts,
                         snapshot: latest.as_ref(),
+                        search: &mut search,
                     };
                     assert!(dispatch_command(command.clone(), &handle, &mut ui));
                 }
@@ -1911,7 +2100,11 @@ mod tests {
                 }
             }
             let notes = std::iter::from_fn(|| handle.notifications.try_recv().ok()).collect();
-            (latest.expect("a snapshot was produced"), notes)
+            (
+                latest.expect("a snapshot was produced"),
+                notes,
+                !overlays.is_empty(),
+            )
         }))
     }
 
@@ -1957,6 +2150,271 @@ mod tests {
             "needle",
             "landed at {caret} in {text:?}"
         );
+    }
+
+    /// Render `snapshot` with a live search for `pattern` begun at `origin`, so a
+    /// test can assert on what the highlights and the preview do to the frame.
+    fn render_searching(
+        snapshot: &ViewSnapshot,
+        w: u16,
+        h: u16,
+        pattern: &str,
+        origin: usize,
+    ) -> ratatui::buffer::Buffer {
+        let mut search = buffersearch::SearchState::default();
+        search.begin(origin);
+        search.refresh(
+            buffersearch::Query::new(pattern.into(), String::new()),
+            Some(&snapshot.text),
+        );
+        render_with(
+            snapshot,
+            w,
+            h,
+            PaintInputs {
+                search: &search,
+                ..paint_inputs(0)
+            },
+        )
+    }
+
+    /// The style of the cell at `(x, y)`.
+    fn cell_style(buf: &ratatui::buffer::Buffer, x: u16, y: u16) -> Style {
+        let cell = &buf[(x, y)];
+        Style::new().fg(cell.fg).bg(cell.bg)
+    }
+
+    #[test]
+    fn a_live_search_paints_every_visible_match_and_marks_the_current_one() {
+        // The preview is what makes typing a query useful: the matches are marked
+        // where they are, and the one Enter would take you to is marked differently,
+        // because a screen of identical marks does not answer "which one is next".
+        let snap = snapshot_after(&[
+            Action::Insert("cat dog cat".into()),
+            Action::MoveCursor {
+                motion: vortex_core::Motion::BufferStart,
+                extend: false,
+            },
+        ]);
+        let theme = config::Theme::default();
+        let buf = render_searching(&snap, 40, 5, "cat", 0);
+        // Row 1 is the first text row; the gutter is 2 cells wide for a 1-line file.
+        let gutter = layout::gutter_width(1) as u16;
+        assert_eq!(
+            cell_style(&buf, gutter, 1).bg,
+            theme.search_current.bg,
+            "the first match is the one the search is on"
+        );
+        assert_eq!(
+            cell_style(&buf, gutter + 8, 1).bg,
+            theme.search_match.bg,
+            "the second is marked as a match, not as the current one"
+        );
+        // The cursor row carries the current-line tint, so "untouched" means neither
+        // search style rather than the theme's plain ground.
+        assert_eq!(
+            cell_style(&buf, gutter + 4, 1).bg,
+            theme.current_line.bg,
+            "the text between them is untouched"
+        );
+    }
+
+    #[test]
+    fn nothing_is_painted_for_a_pattern_that_matches_nothing() {
+        let snap = snapshot_after(&[Action::Insert("cat dog".into())]);
+        let theme = config::Theme::default();
+        let buf = render_searching(&snap, 40, 5, "zebra", 0);
+        let gutter = layout::gutter_width(1) as u16;
+        for x in gutter..gutter + 7 {
+            // The cursor row's own tint, not either search style.
+            assert_eq!(
+                cell_style(&buf, x, 1).bg,
+                theme.current_line.bg,
+                "at column {x}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_viewport_follows_the_previewed_match_without_the_caret_moving() {
+        // The half of the preview that is not a highlight: the view goes to the
+        // match while the caret stays where it was, so cancelling the search puts
+        // nothing back - there was nothing to put back.
+        let mut body = "filler\n".repeat(80);
+        body.push_str("needle here\n");
+        let snap = snapshot_after(&[
+            Action::Insert(body),
+            Action::MoveCursor {
+                motion: vortex_core::Motion::BufferStart,
+                extend: false,
+            },
+        ]);
+        assert_eq!(snap.selections[0].head, 0, "the caret is at the top");
+
+        let buf = render_searching(&snap, 40, 10, "needle", 0);
+        let rows: Vec<String> = (1..9).map(|y| row_text(&buf, y)).collect();
+        assert!(
+            rows.iter().any(|r| r.contains("needle")),
+            "the match was scrolled into view: {rows:?}"
+        );
+    }
+
+    #[test]
+    fn escape_takes_down_the_highlights_a_committed_search_left_up() {
+        // The prompt's own Escape is gone once a search has been committed, so the
+        // editor's has to mean "done searching" as well as "one cursor" - otherwise
+        // the highlights have no way off the screen.
+        let (snap, _) = dispatch_against_core(
+            &[Action::Insert("cat dog cat".into())],
+            &[
+                Command::PreviewSearch {
+                    pattern: "cat".into(),
+                    replacement: String::new(),
+                },
+                Command::FindNext,
+                Command::Editor(Action::CollapseSelections),
+            ],
+        );
+        // The search is gone from the frontend's memory; the buffer is untouched.
+        assert_eq!(snap.text.to_string(), "cat dog cat");
+    }
+
+    #[test]
+    fn find_next_walks_the_matches_of_the_previewed_pattern() {
+        // The frontend is what remembers the pattern, so the repeat key fills it in
+        // and only the complete `SelectNextMatch` crosses the seam (SPEC §7.5).
+        let (snap, _) = dispatch_against_core(
+            &[
+                Action::Insert("cat dog cat".into()),
+                Action::MoveCursor {
+                    motion: vortex_core::Motion::BufferStart,
+                    extend: false,
+                },
+            ],
+            &[
+                Command::PreviewSearch {
+                    pattern: "cat".into(),
+                    replacement: String::new(),
+                },
+                Command::FindNext,
+                Command::FindNext,
+            ],
+        );
+        let primary = snap.selections[snap.primary];
+        assert_eq!(
+            (primary.start(), primary.end()),
+            (8, 11),
+            "the second match is selected"
+        );
+    }
+
+    #[test]
+    fn find_next_before_any_search_is_a_no_op() {
+        // Nothing to repeat means no round trip, not an empty-pattern search that
+        // would match nowhere and cost a notification per keypress.
+        let (snap, notes) = dispatch_against_core(
+            &[Action::Insert("cat".into())],
+            &[Command::FindNext, Command::SelectAllMatches],
+        );
+        assert_eq!(snap.text.to_string(), "cat");
+        assert!(
+            !notes
+                .iter()
+                .any(|n| matches!(n, vortex_core::Notification::SearchFailed { .. })),
+            "{notes:?}"
+        );
+    }
+
+    #[test]
+    fn a_replace_walks_the_matches_and_edits_only_the_ones_agreed_to() {
+        // The whole query-replace flow through the real dispatch: find, replace one,
+        // skip one, replace the third.
+        let (snap, _) = dispatch_against_core(
+            &[
+                Action::Insert("cat cat cat".into()),
+                Action::MoveCursor {
+                    motion: vortex_core::Motion::BufferStart,
+                    extend: false,
+                },
+            ],
+            &[
+                Command::PreviewSearch {
+                    pattern: "cat".into(),
+                    replacement: "dog".into(),
+                },
+                // The walk starts by finding, so the first question is about a match
+                // the user can see.
+                Command::StartReplace,
+                Command::Editor(Action::ReplaceMatch {
+                    pattern: "cat".into(),
+                    replacement: "dog".into(),
+                }),
+                Command::Editor(Action::SelectNextMatch {
+                    pattern: "cat".into(),
+                    backward: false,
+                }),
+                // ...skip the second.
+                Command::Editor(Action::SelectNextMatch {
+                    pattern: "cat".into(),
+                    backward: false,
+                }),
+                Command::Editor(Action::ReplaceMatch {
+                    pattern: "cat".into(),
+                    replacement: "dog".into(),
+                }),
+            ],
+        );
+        assert_eq!(snap.text.to_string(), "dog cat dog");
+    }
+
+    #[test]
+    fn a_replace_whose_pattern_matches_nothing_opens_no_walk() {
+        // Regression: the walk used to open regardless, asking the user to agree to
+        // replacing something that does not exist - and every answer fired another
+        // "no matches" notification for the match it kept failing to find.
+        let (snap, notes, overlay_open) = dispatch_watching_overlays(
+            &[Action::Insert("cat dog".into())],
+            &[
+                Command::PreviewSearch {
+                    pattern: "zebra".into(),
+                    replacement: "X".into(),
+                },
+                Command::StartReplace,
+            ],
+        );
+        assert!(!overlay_open, "the walk opened with nothing to walk");
+        assert_eq!(snap.text.to_string(), "cat dog");
+        // Exactly one "no matches", from the find the commit still sends - the user
+        // is owed that much, and no more.
+        assert_eq!(
+            notes
+                .iter()
+                .filter(|n| matches!(n, vortex_core::Notification::SearchFailed { .. }))
+                .count(),
+            1,
+            "{notes:?}"
+        );
+    }
+
+    #[test]
+    fn a_replace_with_matches_does_open_the_walk() {
+        let (_, _, overlay_open) = dispatch_watching_overlays(
+            &[
+                Action::Insert("cat dog".into()),
+                Action::MoveCursor {
+                    motion: vortex_core::Motion::BufferStart,
+                    extend: false,
+                },
+            ],
+            &[
+                Command::PreviewSearch {
+                    pattern: "cat".into(),
+                    replacement: "bird".into(),
+                },
+                Command::StartReplace,
+            ],
+        );
+        assert!(overlay_open, "there was a match to ask about");
     }
 
     #[test]
@@ -2011,13 +2469,19 @@ mod tests {
     /// Default per-frame paint inputs for tests: fresh view state, default theme,
     /// caret-follow on, and the given selection count. Tests needing a different
     /// viewport or follow flag override via struct update syntax.
-    fn paint_inputs(selected: usize) -> PaintInputs {
+    fn paint_inputs(selected: usize) -> PaintInputs<'static> {
+        // A shared empty search: most paint tests are not about searching, and
+        // threading a borrow through every call site to say "no search" would be
+        // noise. The tests that *are* about it build their own and call `paint`.
+        static NO_SEARCH: std::sync::OnceLock<buffersearch::SearchState> =
+            std::sync::OnceLock::new();
         PaintInputs {
             viewport: ViewState::default(),
             theme: config::Theme::default(),
             follow: true,
             selected,
             tab_width: config::DEFAULT_TAB_WIDTH,
+            search: NO_SEARCH.get_or_init(buffersearch::SearchState::default),
         }
     }
 
