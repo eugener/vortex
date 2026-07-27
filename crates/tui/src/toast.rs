@@ -86,6 +86,21 @@ pub fn toast_for(note: &Notification) -> Option<(String, Level)> {
             ),
             Level::Error,
         )),
+        // A search that found nothing (SPEC §11). Info, not error: a pattern that
+        // does not appear in this file is an ordinary answer, and it is the *only*
+        // answer the user gets - a find that changes nothing on screen is otherwise
+        // indistinguishable from a key that did not register. A pattern that would
+        // not compile is the error case, and quotes the engine's own complaint.
+        Notification::SearchFailed {
+            pattern,
+            message,
+            compiled,
+            ..
+        } => Some(if *compiled {
+            (format!("No matches for `{pattern}`"), Level::Info)
+        } else {
+            (format!("Bad pattern `{pattern}`: {message}"), Level::Error)
+        }),
         // Non-exhaustive: unknown/silent notifications surface no toast.
         _ => None,
     }

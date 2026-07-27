@@ -17,6 +17,7 @@
 //! benchmarkable precisely because they live here.
 
 pub mod bufferpicker;
+pub mod buffersearch;
 pub mod click;
 pub mod command;
 pub mod compositor;
