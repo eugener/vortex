@@ -138,6 +138,7 @@ fn key_display(code: KeyCode) -> String {
         KeyCode::Backspace => "Backspace".to_string(),
         KeyCode::Delete => "Delete".to_string(),
         KeyCode::Esc => "Esc".to_string(),
+        KeyCode::F(n) => format!("F{n}"),
         other => format!("{other:?}"),
     }
 }
@@ -160,6 +161,10 @@ fn parse_key_code(token: &str) -> Option<KeyCode> {
         "delete" | "del" => KeyCode::Delete,
         "esc" | "escape" => KeyCode::Esc,
         "space" => KeyCode::Char(' '),
+        // Function keys. `F3` is the conventional find-next, which is what brought
+        // them in; the whole range is parsed rather than the one key, so a config can
+        // bind any of them without another edit here.
+        f if f.starts_with('f') && f.len() > 1 => KeyCode::F(f[1..].parse().ok()?),
         one if one.chars().count() == 1 => KeyCode::Char(one.chars().next()?),
         _ => return None,
     })
@@ -228,6 +233,20 @@ pub enum Command {
     /// Close the active buffer. Resolved against the live buffer list like the two
     /// above; the core refuses if there is unsaved work, and the frontend then asks.
     CloseBuffer,
+    /// Open the in-buffer find prompt (SPEC §11) - frontend-local until Enter, since
+    /// the preview needs nothing the frontend does not already hold.
+    OpenFind,
+    /// Open the in-buffer find-and-replace prompt: the same surface with a second
+    /// field, committing into the query-replace walk.
+    OpenReplace,
+    /// Go to the next match of the last pattern searched for. Frontend-local
+    /// *resolution* like [`Command::NextBuffer`]: the frontend is what remembers the
+    /// pattern, so it fills it in and only the complete `SelectNextMatch` crosses.
+    FindNext,
+    /// Go to the previous match of the last pattern. See [`Command::FindNext`].
+    FindPrevious,
+    /// Put a cursor on every match of the last pattern (SPEC §12.2).
+    SelectAllMatches,
 }
 
 /// A motion with the page size left abstract, so a binding is frame-independent;
@@ -271,14 +290,23 @@ impl Command {
     /// `select_page_down`. Returns `None` for an unknown name.
     pub fn parse(name: &str) -> Option<Self> {
         let name = name.trim();
-        if let Some(kind) = name.strip_prefix("move_") {
-            return parse_move_kind(kind).map(|kind| Command::Move {
+        // The motion prefixes are tried first but do **not** claim the name: a
+        // `select_` that is not a motion (`select_all_matches`) falls through to the
+        // table below rather than being rejected as a bad motion. Reserving the whole
+        // prefix would make the naming scheme a trap for every future selection
+        // command that is not a movement.
+        if let Some(rest) = name.strip_prefix("move_")
+            && let Some(kind) = parse_move_kind(rest)
+        {
+            return Some(Command::Move {
                 kind,
                 extend: false,
             });
         }
-        if let Some(kind) = name.strip_prefix("select_") {
-            return parse_move_kind(kind).map(|kind| Command::Move { kind, extend: true });
+        if let Some(rest) = name.strip_prefix("select_")
+            && let Some(kind) = parse_move_kind(rest)
+        {
+            return Some(Command::Move { kind, extend: true });
         }
         Some(match name {
             "quit" => Command::Quit,
@@ -306,6 +334,11 @@ impl Command {
             "next_buffer" => Command::NextBuffer,
             "prev_buffer" => Command::PrevBuffer,
             "close_buffer" => Command::CloseBuffer,
+            "find" => Command::OpenFind,
+            "replace" => Command::OpenReplace,
+            "find_next" => Command::FindNext,
+            "find_previous" => Command::FindPrevious,
+            "select_all_matches" => Command::SelectAllMatches,
             _ => return None,
         })
     }
@@ -327,6 +360,17 @@ impl Command {
             Command::NextBuffer => return FrontendCommand::NextBuffer,
             Command::PrevBuffer => return FrontendCommand::PrevBuffer,
             Command::CloseBuffer => return FrontendCommand::CloseBuffer,
+            // Search, all resolved at dispatch: the prompts are frontend surfaces,
+            // and the repeat commands need the pattern only the frontend remembers.
+            Command::OpenFind => {
+                return FrontendCommand::OpenFindPrompt { replacing: false };
+            }
+            Command::OpenReplace => {
+                return FrontendCommand::OpenFindPrompt { replacing: true };
+            }
+            Command::FindNext => return FrontendCommand::FindNext,
+            Command::FindPrevious => return FrontendCommand::FindPrevious,
+            Command::SelectAllMatches => return FrontendCommand::SelectAllMatches,
             Command::Quit => Action::Quit,
             Command::Save => Action::Save,
             Command::Undo => Action::Undo,
@@ -417,12 +461,30 @@ const DEFAULT_BINDINGS: &[(&str, &str)] = &[
     ("ctrl+pageup", "prev_buffer"),
     ("ctrl+w", "close_buffer"),
     ("ctrl+b", "open_buffer_picker"),
-    // Global search (M7). Ctrl+F rather than the Ctrl+Shift+F "find in files" chord,
-    // because that one needs the Kitty protocol and would leave the feature
-    // unreachable by key on a classic terminal. There is no in-buffer search to
-    // shadow yet; when one lands, that is the moment to split the two - plain
-    // Ctrl+F for this buffer, and this moves to the shift chord.
-    ("ctrl+f", "open_search_picker"),
+    // Search (M7). Ctrl+F is *this buffer*, which is what it means nearly everywhere,
+    // and the project-wide search moved to the conventional "find in files" chord
+    // when in-buffer search landed - the split the global-search binding was written
+    // waiting for.
+    //
+    // Ctrl+Shift+F needs the Kitty protocol's modifier reporting, so **Alt+F is bound
+    // alongside it** rather than leaving project search unreachable by key on a
+    // classic terminal. The cost is that Option+F no longer composes a character on a
+    // Mac terminal configured to send Option as Meta; the palette reaches both
+    // searches for anyone that costs.
+    ("ctrl+f", "find"),
+    ("ctrl+h", "replace"),
+    ("ctrl+shift+f", "open_search_picker"),
+    ("alt+f", "open_search_picker"),
+    // Repeat the last search. F3 is the conventional key and is reported by classic
+    // terminals; Ctrl+G is the Mac-flavored alias for the same thing, and gives
+    // find-next a chord for terminals that swallow the function keys.
+    ("f3", "find_next"),
+    ("ctrl+g", "find_next"),
+    ("shift+f3", "find_previous"),
+    // Multi-cursor over every match (SPEC §12.2) - VS Code's Ctrl+Shift+L, with the
+    // same Kitty caveat and no plain-terminal alias: it is a discovery-surface
+    // command, reachable from the palette, not one worth spending another Alt chord.
+    ("ctrl+shift+l", "select_all_matches"),
 ];
 
 /// Bindings on the platform's native command modifier: Cmd on macOS (crossterm
@@ -912,10 +974,10 @@ mod tests {
     }
 
     #[test]
-    fn command_for_key_routes_ctrl_f_to_the_global_search_picker() {
-        // Ctrl+F rather than the Ctrl+Shift+F "find in files" chord: that one needs
-        // the Kitty protocol, which would leave the feature unreachable by key on a
-        // classic terminal.
+    fn ctrl_f_searches_this_buffer_and_the_project_search_took_the_shift_chord() {
+        // The split the global-search binding was written waiting for: Ctrl+F means
+        // "find in this file" nearly everywhere, so in-buffer search took it when it
+        // landed and the project-wide search moved to the "find in files" chord.
         let km = Keymap::default();
         assert_eq!(
             command_for_key(
@@ -923,12 +985,87 @@ mod tests {
                 with_mods(KeyCode::Char('f'), KeyModifiers::CONTROL),
                 PAGE
             ),
+            Some(FrontendCommand::OpenFindPrompt { replacing: false })
+        );
+        assert_eq!(
+            command_for_key(
+                &km,
+                with_mods(
+                    KeyCode::Char('f'),
+                    KeyModifiers::CONTROL | KeyModifiers::SHIFT
+                ),
+                PAGE
+            ),
             Some(FrontendCommand::OpenSearchPicker)
         );
         assert_eq!(
-            km.shortcut_for(Command::OpenSearchPicker).as_deref(),
+            km.shortcut_for(Command::OpenFind).as_deref(),
             Some("Ctrl+F")
         );
+    }
+
+    #[test]
+    fn project_search_keeps_an_alt_chord_a_classic_terminal_can_reach() {
+        // Ctrl+Shift+F needs the Kitty protocol's modifier reporting, so leaving it
+        // as the only binding would make project search unreachable by key on a
+        // classic terminal.
+        let km = Keymap::default();
+        assert_eq!(
+            command_for_key(&km, with_mods(KeyCode::Char('f'), KeyModifiers::ALT), PAGE),
+            Some(FrontendCommand::OpenSearchPicker)
+        );
+        // The conventional chord is the one the palette advertises, of the two.
+        assert_eq!(
+            km.shortcut_for(Command::OpenSearchPicker).as_deref(),
+            Some("Ctrl+Shift+F")
+        );
+    }
+
+    #[test]
+    fn f3_repeats_the_last_search() {
+        // The conventional find-next key, and one classic terminals do report -
+        // unlike the Ctrl+Shift chords.
+        let km = Keymap::default();
+        assert_eq!(
+            command_for_key(&km, press(KeyCode::F(3)), PAGE),
+            Some(FrontendCommand::FindNext)
+        );
+        assert_eq!(
+            command_for_key(&km, with_mods(KeyCode::F(3), KeyModifiers::SHIFT), PAGE),
+            Some(FrontendCommand::FindPrevious)
+        );
+        assert_eq!(km.shortcut_for(Command::FindNext).as_deref(), Some("F3"));
+    }
+
+    #[test]
+    fn a_function_key_chord_parses_and_displays_by_number() {
+        assert_eq!(Chord::parse("f12").map(|c| c.code), Some(KeyCode::F(12)));
+        assert_eq!(
+            Chord::parse("shift+f1").map(|c| c.code),
+            Some(KeyCode::F(1))
+        );
+        // Not a function key: `f` alone is still the letter, and `fx` is no key.
+        assert_eq!(Chord::parse("f").map(|c| c.code), Some(KeyCode::Char('f')));
+        assert_eq!(Chord::parse("fx"), None);
+        assert_eq!(key_display(KeyCode::F(7)), "F7");
+    }
+
+    #[test]
+    fn a_select_command_that_is_not_a_motion_still_parses() {
+        // The `select_` prefix must not claim every name beginning with it, or every
+        // future selection command that is not a movement becomes unnameable.
+        assert_eq!(
+            Command::parse("select_all_matches"),
+            Some(Command::SelectAllMatches)
+        );
+        assert_eq!(
+            Command::parse("select_left"),
+            Some(Command::Move {
+                kind: MoveKind::Left,
+                extend: true,
+            })
+        );
+        assert_eq!(Command::parse("select_nonsense"), None);
     }
 
     #[test]

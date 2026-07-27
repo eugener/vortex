@@ -21,6 +21,11 @@ use crate::picker::{Item, Picker};
 /// Motions and text entry are deliberately absent: they are not palette-worthy.
 const PALETTE: &[(&str, Bindable)] = &[
     ("Find File…", Bindable::OpenFilePicker),
+    ("Find in Buffer…", Bindable::OpenFind),
+    ("Replace in Buffer…", Bindable::OpenReplace),
+    ("Find Next", Bindable::FindNext),
+    ("Find Previous", Bindable::FindPrevious),
+    ("Select All Matches", Bindable::SelectAllMatches),
     ("Search in Project…", Bindable::OpenSearchPicker),
     ("Switch Buffer…", Bindable::OpenBufferPicker),
     ("Change Theme…", Bindable::OpenThemePicker),
@@ -97,7 +102,13 @@ mod tests {
             .iter()
             .find(|i| i.command == Command::OpenSearchPicker)
             .expect("Search in Project listed");
-        assert_eq!(search.shortcut.as_deref(), Some("Ctrl+F"));
+        assert_eq!(search.shortcut.as_deref(), Some("Ctrl+Shift+F"));
+        // In-buffer search took the plain Ctrl+F, which is what it means elsewhere.
+        let find_here = items
+            .iter()
+            .find(|i| i.command == Command::OpenFindPrompt { replacing: false })
+            .expect("Find in Buffer listed");
+        assert_eq!(find_here.shortcut.as_deref(), Some("Ctrl+F"));
         // Save-as opens the prompt overlay (frontend-local) and shows its shortcut.
         let save_as = items
             .iter()
