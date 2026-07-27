@@ -166,6 +166,41 @@ impl SelectionSet {
         set
     }
 
+    /// Replace the set with one selection per range in `found` - the search's
+    /// `select-all-matches` (SPEC §12.2).
+    ///
+    /// Each selection runs anchor-at-start to head-at-end, the direction
+    /// [`Self::select_around`] uses and for the same reason: the matched text reads
+    /// forwards, so extending from it afterwards grows from its far side.
+    ///
+    /// The **primary lands on the first match at or after `near`** (the caret before
+    /// the search), falling back to the last match when every one is behind it. That
+    /// is what keeps the viewport where the user was looking: the primary drives
+    /// viewport-follow, so designating match zero would scroll a 4000-line file to
+    /// the top for a search the user ran in the middle of it.
+    ///
+    /// `found` must be ascending and non-overlapping, which is what
+    /// [`crate::search::matches_in`] produces; overlapping ranges would merge, as
+    /// they do for any other set. An empty `found` leaves the set untouched - a
+    /// search that matched nothing must not collapse the caret to nowhere.
+    pub(crate) fn select_matches(&mut self, found: &[Range<usize>], near: usize) {
+        if found.is_empty() {
+            return;
+        }
+        // `found` is non-empty (returned above), so the last index is a valid one -
+        // the invariant is proven three lines up.
+        let last = found[found.len() - 1].end;
+        let primary = found
+            .iter()
+            .find(|range| range.end >= near)
+            .map_or(last, |range| range.end);
+        let sels = found
+            .iter()
+            .map(|range| Selection::new(range.start, range.end))
+            .collect();
+        self.normalize(sels, primary);
+    }
+
     /// Point the primary at whichever selection covers byte `head`, leaving it
     /// unchanged if none does. An edit uses this to keep the *same* caret primary
     /// across the change (its head transformed like the rest), so the viewport keeps

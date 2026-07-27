@@ -2671,6 +2671,7 @@ dependencies = [
  "encoding_rs",
  "futures",
  "proptest",
+ "regex",
  "serde",
  "smol",
  "thiserror 2.0.18",

@@ -139,6 +139,73 @@ pub enum Action {
         offset: usize,
         granularity: Granularity,
     },
+    /// Select the next match of `pattern` after the primary caret, wrapping at the
+    /// end of the buffer (SPEC §11, §12.2). `backward` searches the other way and
+    /// wraps at the start.
+    ///
+    /// The match *becomes the selection* rather than merely moving the caret to it:
+    /// cursor state is a selection set (SPEC §2.2), so the found text being selected
+    /// is what makes the match visible, what lets the next edit act on it, and what
+    /// makes replace-this-one nothing more than an insert over the selection.
+    ///
+    /// A multi-cursor set collapses to the one match, as a plain click does - "find
+    /// the next one" says *this* one, not "this one as well"
+    /// ([`Action::SelectAllMatches`] is the one that says as well).
+    ///
+    /// The pattern rides on every send rather than being remembered by the core: a
+    /// find-next key and a find-next after re-typing the query are then the same
+    /// message, and the core holds no search state that could disagree with what the
+    /// frontend is showing. A pattern that is not a valid regex is reported as a
+    /// [`Notification::SearchFailed`](crate::Notification::SearchFailed) and changes
+    /// nothing; so is a pattern that matches nowhere, so the frontend can say so
+    /// rather than leaving a keypress looking broken.
+    ///
+    /// Changes only the selection set: no text, so no delta and no version bump.
+    SelectNextMatch { pattern: String, backward: bool },
+    /// Replace the selection set with one selection per match of `pattern` in the
+    /// whole buffer - the multi-cursor gesture that makes a search editable
+    /// (SPEC §12.2's `select-all-matches`).
+    ///
+    /// Every subsequent motion and edit then maps over that set, which is how
+    /// "rename every occurrence" is typing rather than a dedicated feature. The
+    /// primary lands on the first match at or after where the caret already was, so
+    /// the viewport stays where the user was looking instead of jumping to the top of
+    /// the file.
+    ///
+    /// A pattern matching nothing leaves the set alone and reports it, rather than
+    /// collapsing the selection to nowhere.
+    SelectAllMatches { pattern: String },
+    /// Replace the current match of `pattern` with `replacement` - one press of
+    /// "replace" in a find-and-replace flow (SPEC §11).
+    ///
+    /// The *current* match is the primary selection when it is exactly a match of
+    /// `pattern`, which is what [`Action::SelectNextMatch`] leaves behind. When it is
+    /// not - the first press, before anything has been found - this is a no-op, so a
+    /// first press never edits text the user has not been shown yet.
+    ///
+    /// Advancing to the next match is [`Action::SelectNextMatch`], which the frontend
+    /// sends straight after this one down the same channel - the shape a picker's
+    /// jump already uses for `Open` then `PlaceCursorAt`. Two intents stay two
+    /// messages: "replace this" and "find the next" are separately bindable, and the
+    /// no-op case above is exactly what makes the pair read as "find, then replace".
+    ///
+    /// `replacement` expands `$1` / `$name` capture references against the match
+    /// (`regex`'s own syntax; `$$` is a literal `$`), because a regex search with no
+    /// regex replace could not put back what it captured.
+    ReplaceMatch {
+        pattern: String,
+        replacement: String,
+    },
+    /// Replace every match of `pattern` in the buffer with `replacement`, as **one
+    /// edit and so one undo unit** - a replace-all the user got wrong is one Undo
+    /// away, not one per occurrence (SPEC §2.4).
+    ///
+    /// Capture expansion is [`Action::ReplaceMatch`]'s. A pattern matching nothing
+    /// changes nothing and is reported.
+    ReplaceAllMatches {
+        pattern: String,
+        replacement: String,
+    },
     /// Insert `text` at every selection, replacing any non-empty selection first.
     /// A bracketed paste is ONE such action, not a key-per-character (SPEC §6).
     Insert(String),

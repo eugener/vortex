@@ -618,3 +618,51 @@ fn the_anchor_leads_so_a_later_shift_click_extends_from_the_far_side() {
     let sel = set.primary();
     assert_eq!((sel.anchor, sel.head), (6, 11));
 }
+
+#[test]
+fn select_matches_puts_one_selection_on_each_range() {
+    let mut s = SelectionSet::at_origin();
+    s.select_matches(&[0..3, 8..11, 12..15], 0);
+    assert_eq!(s.len(), 3);
+    // Anchor at the start and head at the end, as `select_around` does: the matched
+    // text reads forwards, so extending afterwards grows from its far side.
+    assert_eq!(s.all()[0], Selection::new(0, 3));
+    assert_eq!(s.all()[2], Selection::new(12, 15));
+}
+
+#[test]
+fn select_matches_designates_the_match_nearest_the_old_caret() {
+    // The primary drives viewport-follow (SPEC §2.2): a search run in the middle of
+    // a file must not scroll it to the top.
+    let mut s = SelectionSet::at_origin();
+    s.select_matches(&[0..3, 40..43, 80..83], 41);
+    assert_eq!(
+        *s.primary(),
+        Selection::new(40, 43),
+        "the one it was inside"
+    );
+
+    let mut later = SelectionSet::at_origin();
+    later.select_matches(&[0..3, 40..43, 80..83], 44);
+    assert_eq!(
+        *later.primary(),
+        Selection::new(80, 83),
+        "the next one down"
+    );
+}
+
+#[test]
+fn select_matches_falls_back_to_the_last_match_when_all_are_behind() {
+    let mut s = SelectionSet::at_origin();
+    s.select_matches(&[0..3, 10..13], 500);
+    assert_eq!(*s.primary(), Selection::new(10, 13));
+}
+
+#[test]
+fn select_matches_with_nothing_found_leaves_the_set_alone() {
+    // A search that matched nothing must not collapse the caret to nowhere.
+    let mut s = SelectionSet::single(Selection::new(4, 9));
+    s.select_matches(&[], 4);
+    assert_eq!(s.len(), 1);
+    assert_eq!(*s.primary(), Selection::new(4, 9));
+}
