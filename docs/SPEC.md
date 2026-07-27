@@ -195,7 +195,7 @@ held-lock-across-`.await` deadlocks. Instead:
 | Terminal render | **`ratatui` + `crossterm`** | immediate-mode cell-diffing; we own the loop |
 | Frame atomicity | crossterm `BeginSynchronizedUpdate` / `EndSynchronizedUpdate` | anti-tearing (§7) |
 | Fuzzy match | **`nucleo-matcher`** | palette/picker ranking (Helix's matcher); on-thread for small lists (§7.5) |
-| Search patterns | **`regex`** | global search (M7). In `vortex-tui` first, since cross-file search is filesystem work and so frontend-owned; joins `vortex-core` when its own search subsystem lands (§11) - one engine, so the match semantics cannot diverge |
+| Search patterns | **`regex`** | both searches (M7). Reached `vortex-tui` first, since cross-file search is filesystem work and so frontend-owned, and joined `vortex-core` with the in-buffer one (§11) - **one engine, two crates**, so the two searches cannot diverge on what a pattern means, and the frontend's live preview compiles through the core's own `search::compile` rather than a second copy |
 | Project walk | **`ignore`** | gitignore-aware walker (ripgrep's). Global search respects a project's own `.gitignore` rather than a hardcoded skip list |
 | Config | **`toml` + `serde`** | Helix-style; in `vortex-tui` now, carrying theme files (§10.5) |
 | Encoding | `encoding_rs` | detect on load; edit as UTF-8 internally (§10.1) |
@@ -783,13 +783,15 @@ early milestones is a deliberate scope choice, not an oversight:
   the OS clipboard. Must include **OSC 52** (clipboard over the terminal) so copy/paste
   works over SSH - directly relevant to the remote-frontend future (§0). Target: M1-M3
   band.
-- **Search + regex.** *Half built (M7).* **Cross-file** search landed as a frontend
+- **Search + regex.** *Built (M7), in both halves.* **Cross-file** search is a frontend
   subsystem (`vortex-tui::search`) behind the global-search picker: `regex` + `ignore` on a
-  worker thread, searching the files on disk. What is still absent is search **in the
-  buffer** - `select-all-matches` / `split-on-regex` (§12.2), which are selection
-  operations over the rope the core owns and so belong in `vortex-core`, with `regex`
-  joining that crate's dependencies when they land. The two are deliberately different
-  jobs: one finds a place to go, the other builds a selection set. Target: M3 band.
+  worker thread, searching the files on disk. **In-buffer** search is a *core* one
+  (`vortex-core::search`), because its answers are selections over the rope the core owns -
+  `regex` joined that crate's dependencies as this section said it would, so one engine
+  serves both callers and the two searches cannot disagree about what a pattern means. The
+  jobs stay deliberately different: one finds a place to go, the other builds a selection
+  set. Still absent: `split-on-regex` (§12.2), the one selection operation of the three
+  that has no UI asking for it yet.
 - **Keymap configuration.** Built (M5): a `[keys]` table in `config.toml` is layered over
   the built-in bindings through the same `Chord`/`Command` string format the defaults are
   written in. What remains is the richer *modal* design - chord sequences, per-mode maps,
@@ -1127,6 +1129,42 @@ Incremental build order so the risky assumptions are validated early, not at the
   and is dropped when the active buffer is not holding it. The lesson is the general one
   for anything asynchronous crossing the seam (§2.1): a position that outlived its text
   must be *clamped and guarded*, never trusted.
+  **In-buffer search** closed the other half of §11's search entry, and it is a *core*
+  subsystem where the cross-file one is a frontend subsystem - the split follows from what
+  each produces. A grep produces a place to go, which is filesystem work; a find produces
+  *selections*, which are over the rope the core owns, so `select-all-matches` computed
+  frontend-side would mean re-deriving the buffer's own text to hand back offsets into it.
+  `vortex-core::search` is the whole of it: smart-case compile, line-bounded match
+  iteration over a caller-supplied line range, a lazy next/previous with wrap, and capture
+  expansion for replace. Four actions ride on it - `SelectNextMatch`, `SelectAllMatches`,
+  `ReplaceMatch`, `ReplaceAllMatches` - and **the pattern rides on every one of them**
+  rather than being remembered by the core, so a find-next key and a find-next after
+  retyping are the same message and the core holds no search state that could disagree with
+  what the frontend is showing. The frontend is what remembers, because it is what a
+  find-next key has to ask.
+  The decision worth recording is that **the live preview never crosses the seam**. Typing
+  a query highlights every match on screen and scrolls the viewport to the one Enter would
+  take you to, and none of that is an `Action`: the frontend holds the text (§5's snapshot
+  rope) and owns the viewport (§5), so both halves of "show me what I would get" are
+  answerable locally - which makes cancelling a search free, because nothing happened. Only
+  Enter commits, and only then does the caret move. The preview compiles through the core's
+  own `search::compile` rather than a second engine, since a preview that disagreed with
+  the commit about what matches would be worse than no preview. The highlights are resolved
+  **per frame over the visible lines only** and never cached: a cached set of byte ranges
+  would paint over text an undo or a reload had moved, and the scan is viewport-bounded
+  (§10.4), which is what makes recomputing it the cheap option rather than the careful one.
+  Replace is a *walk*, not a chord: after the two-field prompt commits, a surface asks
+  `y`/`n`/`a`/`q` about each match in turn. That is what a terminal can actually offer -
+  replace-and-advance-while-the-prompt-is-open needs a modifier combination classic
+  terminals cannot report (§9) - and the walk holds no match list, re-finding from wherever
+  the caret ended up after each answer, so it can never be following positions an edit has
+  moved (§2.1). Deliberately absent: a match **count** in the prompt, which would be a scan
+  of the whole buffer per keystroke - the one thing §10.4 rules out off the viewport - to
+  answer a question the highlights already answer.
+  *Verify:* driven in a pty - typing a query previews and scrolls, `F3` walks the matches,
+  a `y`/`n`/`y`/`q` walk edited exactly the matches agreed to, `a` replaced the rest with
+  `$1`/`$2` capture expansion, and select-all-matches plus typing rewrote all five
+  occurrences at once.
   **Still open in M7:** which-key popup (and see §10.5's note on chord sequences, which it
   needs first).
   *Verify:* open a file via the picker, switch buffers, run a command via the palette -

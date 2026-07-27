@@ -6,8 +6,7 @@ is one possible frontend rather than the only one.
 > **Status: early. Not usable as your daily editor yet.** It opens, edits, and saves files
 > with multiple cursors, undo, syntax colors, and a working UI shell, and shows
 > `rust-analyzer` diagnostics - but Rust is the only language with either a grammar or a
-> language server, there are no LSP features past diagnostics, and there is no way to
-> search *within* the buffer you are editing. See
+> language server, and there are no LSP features past diagnostics. See
 > [Where it actually is](#where-it-actually-is) before trying it.
 
 ---
@@ -55,24 +54,24 @@ milestones landed before earlier ones - that is a real gap, not a rounding error
 | M4 | Syntax highlighting (tree-sitter) | done - grammars are `dlopen`ed at runtime, never linked in |
 | M5 | File handling (encoding, EOL, conflicts) | done - encoding and line endings survive a round trip, external changes are noticed, config is a file |
 | M6 | UI shell: compositor, toasts | done |
-| M7 | Pickers, palette, themes | in progress - file/theme/buffer/global-search pickers with a preview pane, the palette, and multi-buffer done; which-key outstanding |
+| M7 | Pickers, palette, themes | in progress - file/theme/buffer/global-search pickers with a preview pane, the palette, multi-buffer, and find/replace done; which-key outstanding |
 | M8 | Chrome and polish | not started |
 
 What works today: open/save a file, edit with multiple cursors, undo/redo with coalescing,
 mouse selection everywhere (including the overlays and the status bar), the system
 clipboard (including over SSH via OSC 52), several buffers with a tab strip, tree-sitter
 syntax colors on Rust, a fuzzy file picker and a buffer picker (both with a preview pane),
-a command palette, switchable themes, project-wide regex search that jumps to the match,
-a config file for keys and settings, files in their own encoding and line endings (saved
+a command palette, switchable themes, regex find-and-replace in the buffer (matches
+highlighted as you type, capture groups in the replacement, and a query-replace walk),
+project-wide regex search that jumps to the match, a config file for keys and settings, files in their own encoding and line endings (saved
 back as they were found), a warning when a file changes underneath you, and live
 `rust-analyzer` diagnostics (underlined by span, with a colored gutter mark, if
 `rust-analyzer` is on your PATH).
 
 What does not: syntax colors or a language server for **any language but Rust** - a
 grammar is a separate crate the editor loads at runtime, and only `grammar-rust` is
-written; LSP features past diagnostics (no completion, hover, or goto); search **within**
-the open buffer (the project search above is a different thing - it finds a place to go,
-not a selection); and the which-key popup, the last outstanding M7 item.
+written; LSP features past diagnostics (no completion, hover, or goto); and the which-key
+popup, the last outstanding M7 item.
 
 ## Build and run
 
@@ -93,23 +92,28 @@ cargo build --release
 | `Ctrl+S` / `Ctrl+Q` | Save / quit |
 | `Ctrl+Shift+S` | Save as (Kitty terminals only - elsewhere it folds to an ordinary save) |
 | `Ctrl+O` | Open a file (fuzzy picker over the working directory, previewing the highlighted one) |
-| `Ctrl+F` | Search the project (regex, gitignore-aware; Enter jumps to the match) |
+| `Ctrl+F` | Find in this buffer (regex; matches highlight and the view follows as you type, `Enter` goes there) |
+| `F3` / `Shift+F3` | Next / previous match (`Ctrl+G` also finds the next) |
+| `Ctrl+H` | Find and replace (`Tab` between the fields; then `y`/`n`/`a`/`q` per match) |
+| `Ctrl+Shift+F` or `Alt+F` | Search the project (regex, gitignore-aware; Enter jumps to the match) |
+| `Ctrl+Shift+L` | Put a cursor on every match of the last search |
 | `Ctrl+P` | Command palette |
 | `Ctrl+T` | Theme picker (previews as you move, `Esc` restores) |
 | `Ctrl+B` / `Ctrl+W` | Buffer picker / close the current buffer |
 | `Ctrl+PageUp` / `Ctrl+PageDown` | Previous / next buffer |
 | `Ctrl+Alt+Up/Down` | Add a cursor above/below |
 | `Alt+Click` | Add a cursor at the pointer |
-| `Esc` | Collapse back to one cursor |
+| `Esc` | Collapse back to one cursor, and clear the search highlights |
 | Arrows, `Home`/`End`, `PageUp`/`PageDown` | Move; hold `Shift` to select |
 
 Undo/redo and clipboard follow each OS: `Cmd+Z`/`Cmd+Y` and `Cmd+C`/`X`/`V` on macOS,
 `Ctrl+` the same keys elsewhere. On macOS `Ctrl+C` stays quit, since copy is `Cmd+C` there.
 
-The `Ctrl+Alt` chords need a terminal that speaks the [Kitty keyboard
+The `Ctrl+Alt` and `Ctrl+Shift` chords need a terminal that speaks the [Kitty keyboard
 protocol](https://sw.kovidgoyal.net/kitty/keyboard-protocol/) (Kitty, Ghostty, WezTerm,
 foot, recent Alacritty). It is negotiated at startup; where it is missing those chords
-simply never fire rather than misfiring.
+simply never fire rather than misfiring. Project search is bound to `Alt+F` as well for
+that reason, and everything else in this table is reachable from the palette.
 
 ## Mouse
 
