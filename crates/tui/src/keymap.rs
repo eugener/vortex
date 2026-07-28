@@ -216,6 +216,11 @@ pub enum Command {
     /// Open the global-search picker (frontend-local: the walk, the matching and the
     /// results are all this side; only a picked hit becomes an `Action`).
     OpenSearchPicker,
+    /// Swap the gutter between absolute and relative numbering (frontend-local: the
+    /// core has no idea a margin exists). Config sets the mode you *start* in; this
+    /// is the same switch reachable mid-session, since which numbering helps depends
+    /// on what you are doing rather than on the machine you are on.
+    ToggleLineNumbers,
     /// Open the encoding picker (frontend-local until a pick, which commits an
     /// `Action::SetEncoding`).
     OpenEncodingPicker,
@@ -329,6 +334,7 @@ impl Command {
             "open_theme_picker" => Command::OpenThemePicker,
             "open_buffer_picker" => Command::OpenBufferPicker,
             "open_search_picker" => Command::OpenSearchPicker,
+            "toggle_line_numbers" => Command::ToggleLineNumbers,
             "open_encoding_picker" => Command::OpenEncodingPicker,
             "open_line_ending_picker" => Command::OpenLineEndingPicker,
             "next_buffer" => Command::NextBuffer,
@@ -353,6 +359,7 @@ impl Command {
             Command::OpenThemePicker => return FrontendCommand::OpenThemePicker,
             Command::OpenBufferPicker => return FrontendCommand::OpenBufferPicker,
             Command::OpenSearchPicker => return FrontendCommand::OpenSearchPicker,
+            Command::ToggleLineNumbers => return FrontendCommand::ToggleLineNumbers,
             Command::OpenEncodingPicker => return FrontendCommand::OpenEncodingPicker,
             Command::OpenLineEndingPicker => return FrontendCommand::OpenLineEndingPicker,
             Command::SaveAs => return FrontendCommand::OpenSavePrompt,
@@ -951,6 +958,29 @@ mod tests {
         assert_eq!(
             km.shortcut_for(Command::OpenThemePicker).as_deref(),
             Some("Ctrl+T")
+        );
+    }
+
+    #[test]
+    fn the_line_number_toggle_is_nameable_but_unbound_by_default() {
+        // Chrome switches are named commands first and chords only if they earn one.
+        // This one is reached from the palette, so it costs no chord - but it parses
+        // like any other, which is what lets a config file bind it (SPEC §10.5).
+        let km = Keymap::default();
+        assert_eq!(
+            Command::parse("toggle_line_numbers"),
+            Some(Command::ToggleLineNumbers)
+        );
+        assert_eq!(
+            Command::ToggleLineNumbers.resolve(PAGE),
+            FrontendCommand::ToggleLineNumbers
+        );
+        assert_eq!(km.shortcut_for(Command::ToggleLineNumbers), None);
+        // A config file can give it one, and the palette then shows that chord.
+        let bound = Keymap::from_pairs([("ctrl+l", "toggle_line_numbers")]).unwrap();
+        assert_eq!(
+            bound.shortcut_for(Command::ToggleLineNumbers).as_deref(),
+            Some("Ctrl+L")
         );
     }
 

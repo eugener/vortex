@@ -532,7 +532,17 @@ add noise, each on/off switch a key in the config file the M5 loader now reads:
 
 - **Indent guides** - vertical rules per indent level (display-column math already in
   `layout.rs`).
-- **Relative line numbers** - gutter mode toggle; motion-friendly for modal use.
+- **Relative line numbers** - *built (M8).* `line_numbers = "absolute" | "relative"` in
+  the config file, plus `toggle_line_numbers` for mid-session (named like any other
+  command, palette-listed, and left unbound - chrome switches earn a chord only if they
+  are used enough to deserve one). There is deliberately **no third "pure relative" mode**
+  printing `0` on the caret's row: the number a relative gutter exists to give you is the
+  count you type before a motion, and the one row that never needs it is the row you are
+  on - so that slot carries the absolute number instead, which is the thing relative
+  numbering otherwise costs you. The field is sized from the buffer in **both** modes,
+  never from the numbers relative mode happens to print: a gutter that narrowed to fit
+  them would resize every time the caret crossed a power of ten, sliding the whole text
+  body sideways under the reader.
 - **Cursor shape per mode** - bar/block/underline via the terminal cursor (the frontend
   already drives the real cursor).
 - **Rulers / colorcolumn** - vertical rule at configured columns.
@@ -1187,10 +1197,24 @@ Incremental build order so the risky assumptions are validated early, not at the
   arrives with them**; until then M7's answer to "what can I do here" is `Ctrl+P`.
   *Verify:* open a file via the picker, switch buffers, run a command via the palette -
   in-terminal.
-- **M8 - Chrome + polish.** Git diff signs (a git-diff task feeding `GutterMark`s; its git
-  source - `gix` / `git2` - is a §3 stack addition to raise), indent guides, relative line
-  numbers, scrollbar, sticky context (tree-sitter), cursor-shape-per-mode, rulers. *Verify:*
-  each renders against real buffers / a real repo.
+- **M8 - Chrome + polish.** *(in progress: relative line numbers have landed.)* Git diff
+  signs (a git-diff task feeding `GutterMark`s; its git source - `gix` / `git2` - is a §3
+  stack addition to raise), indent guides, relative line numbers, scrollbar, sticky context
+  (tree-sitter), cursor-shape-per-mode, rulers. Unlike the earlier milestones these are
+  **independent items sharing one shape** rather than an arc: each reads data the snapshot
+  or decoration channel already carries, each is a config key over a theme slot (§7.5), and
+  none needs a seam change - so they land one at a time and in any order, and the milestone
+  is a list rather than a build sequence. Only the git signs have a prerequisite (the
+  dependency choice above), which is why they are not first.
+  **Relative line numbers** set the pattern the rest follow: a `LineNumbers` enum on the
+  resolved `Config`, read per frame by the painter, with the decision recorded in §7.5 -
+  no pure-relative mode, and the gutter width sized from the buffer in both modes so the
+  text body never slides sideways. The runtime toggle mutates the live `Config` rather than
+  a paint-only flag, which is what a theme pick already does (§10.5): the resolved value
+  *is* the running setting, and the file only says what it starts as.
+  *Verify:* each renders against real buffers / a real repo. Relative numbering driven in a
+  pty - caret on line 5 of 9, the palette's toggle run, gutter repainting `4 3 2 1 _ 1 2 3
+  4` with the caret's own row keeping its absolute `5`.
 
 Extensibility (§12.1) sits after the M0-M8 build order and is gated on that decision.
 

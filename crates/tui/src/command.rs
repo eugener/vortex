@@ -37,6 +37,13 @@ pub enum Command {
     /// Close the active buffer. Sent unforced, so the core refuses when there is
     /// unsaved work and the frontend turns that refusal into a confirmation.
     CloseBuffer,
+    /// Swap the gutter between absolute and relative numbering (frontend-local).
+    ///
+    /// It mutates the live [`crate::config::Config`] rather than a paint-only flag,
+    /// which is what the theme picker already does to swap themes mid-session: the
+    /// config value *is* the running setting, and the file only says what it starts
+    /// as. Like a theme pick, this lasts the session and is not written back to disk.
+    ToggleLineNumbers,
     /// Open the encoding picker overlay (frontend-local). A pick commits an
     /// [`Action::SetEncoding`], so the choice reaches the core the same way a
     /// bound key's would.

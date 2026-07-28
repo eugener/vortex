@@ -29,6 +29,7 @@ const PALETTE: &[(&str, Bindable)] = &[
     ("Search in Project…", Bindable::OpenSearchPicker),
     ("Switch Buffer…", Bindable::OpenBufferPicker),
     ("Change Theme…", Bindable::OpenThemePicker),
+    ("Toggle Relative Line Numbers", Bindable::ToggleLineNumbers),
     ("Set Encoding…", Bindable::OpenEncodingPicker),
     ("Set Line Endings…", Bindable::OpenLineEndingPicker),
     ("Save File", Bindable::Save),

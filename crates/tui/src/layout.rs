@@ -20,6 +20,8 @@ use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 use vortex_core::{BufferId, BufferInfo, FileFormat, Selection, Text};
 
+use crate::config::LineNumbers;
+
 /// Shown in the head bar when the buffer has no bound file (SPEC §10 lifecycle).
 pub const NO_NAME: &str = "[No Name]";
 
@@ -453,13 +455,29 @@ fn digit_count(n: usize) -> usize {
     n.ilog10() as usize + 1
 }
 
-/// The gutter text for the buffer line at 0-based `line_index`: its 1-based
-/// number, right-aligned in `gutter_width` columns with the trailing separator
-/// space (absolute numbering). `gutter_width` includes that space, so the digit
-/// field is one narrower.
-pub fn gutter_label(line_index: usize, gutter_width: usize) -> String {
+/// The gutter text for the buffer line at 0-based `line_index`, right-aligned in
+/// `gutter_width` columns with the trailing separator space. `gutter_width`
+/// includes that space, so the digit field is one narrower.
+///
+/// Under [`LineNumbers::Relative`] the number is the row's distance from
+/// `cursor_line` - the count you would type before a motion - except on the
+/// cursor's own row, which keeps its absolute number (see [`LineNumbers`]). The
+/// *width* is sized from the buffer either way, deliberately: a field that shrank
+/// to fit the relative numbers would resize the gutter every time the cursor
+/// crossed a power of ten, sliding the whole text body sideways under the reader.
+pub fn gutter_label(
+    line_index: usize,
+    cursor_line: usize,
+    gutter_width: usize,
+    mode: LineNumbers,
+) -> String {
     let field = gutter_width.saturating_sub(1);
-    format!("{:>field$} ", line_index + 1)
+    let number = match mode {
+        LineNumbers::Absolute => line_index + 1,
+        LineNumbers::Relative if line_index == cursor_line => line_index + 1,
+        LineNumbers::Relative => line_index.abs_diff(cursor_line),
+    };
+    format!("{number:>field$} ")
 }
 
 /// 1-based grapheme column of `byte_col` within `line`, for the status readout.
@@ -1424,10 +1442,38 @@ mod tests {
 
     #[test]
     fn gutter_label_is_one_based_and_right_aligned() {
-        // width 4 = 3-digit field + trailing space.
-        assert_eq!(gutter_label(0, 4), "  1 ");
-        assert_eq!(gutter_label(41, 4), " 42 ");
-        assert_eq!(gutter_label(998, 4), "999 ");
+        // width 4 = 3-digit field + trailing space. The cursor line is irrelevant
+        // to absolute numbering, so a far-away one must change nothing.
+        let abs = LineNumbers::Absolute;
+        assert_eq!(gutter_label(0, 500, 4, abs), "  1 ");
+        assert_eq!(gutter_label(41, 500, 4, abs), " 42 ");
+        assert_eq!(gutter_label(998, 500, 4, abs), "999 ");
+    }
+
+    #[test]
+    fn gutter_label_relative_counts_distance_in_both_directions() {
+        let rel = LineNumbers::Relative;
+        // Cursor on line index 41 (displayed 42).
+        assert_eq!(gutter_label(39, 41, 4, rel), "  2 "); // two above
+        assert_eq!(gutter_label(40, 41, 4, rel), "  1 ");
+        assert_eq!(gutter_label(42, 41, 4, rel), "  1 "); // one below reads the same
+        assert_eq!(gutter_label(44, 41, 4, rel), "  3 ");
+    }
+
+    #[test]
+    fn gutter_label_relative_keeps_the_absolute_number_on_the_cursor_line() {
+        // The one row whose relative number would be a useless 0 shows where you
+        // actually are instead.
+        assert_eq!(gutter_label(41, 41, 4, LineNumbers::Relative), " 42 ");
+        assert_eq!(gutter_label(0, 0, 4, LineNumbers::Relative), "  1 ");
+    }
+
+    #[test]
+    fn gutter_label_relative_does_not_narrow_the_field() {
+        // Width is sized from the buffer, not from the numbers relative mode
+        // happens to print, so the text body never slides sideways as the cursor
+        // moves. A 5-wide gutter stays 5 wide for a distance of 1.
+        assert_eq!(gutter_label(1000, 999, 5, LineNumbers::Relative), "   1 ");
     }
 
     #[test]
