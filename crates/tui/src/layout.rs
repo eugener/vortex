@@ -212,11 +212,16 @@ pub fn visible_lines(
 /// them is in the margin.
 const INDENT_GUIDE: &str = "│";
 
-/// How far past the window [`indent_guides`] will look for a blank line's indent
-/// before giving up. Bounded because nothing off the viewport may scan the whole
-/// buffer (SPEC §10.4), and a run of blank lines longer than this gets no guides -
-/// which is the honest answer, since past a screenful of nothing "what block is this
-/// inside" has stopped being a question the eye is asking.
+/// How far **past the window** [`indent_guides`] will look for a blank line's indent
+/// before giving up. Bounded because nothing off the viewport may scan the whole buffer
+/// (SPEC §10.4); a blank row whose nearest non-blank neighbour is further away than this
+/// gets no guides, which is the honest answer, since past a screenful of nothing "what
+/// block is this inside" has stopped being a question the eye is asking.
+///
+/// It bounds **only** the search outside the window. The search *within* it is already
+/// bounded by the viewport's own height, which is the thing §10.4 is about - so a run of
+/// blank lines that fits on screen still inherits from whatever encloses it, however
+/// long the run is.
 const GUIDE_SCAN: usize = 64;
 
 /// Display width of `line`'s leading whitespace, or `None` when the line is blank
@@ -227,10 +232,18 @@ const GUIDE_SCAN: usize = 64;
 /// it should show is inherited instead ([`indent_guides`]) - without that, the blank
 /// line between two statements would punch a hole through every guide crossing it,
 /// which is exactly the case that makes the feature look broken.
+/// **Indentation is spaces and tabs, not every character Unicode calls whitespace.**
+/// That is narrower than `char::is_whitespace` on purpose, and the narrowness is what
+/// makes the two halves of the feature agree: [`expand_tabs`] turns a tab into spaces,
+/// so a prefix of spaces and tabs is a prefix of *spaces* by the time it is painted,
+/// and every column [`indent_guides`] hands to [`with_indent_guides`] is therefore a
+/// cell holding `' '`. Counting a NO-BREAK SPACE as indentation would break that: the
+/// guide's column would land on a character that cannot be replaced, leaving the cell
+/// recolored but unmarked. A line indented with those is simply not indented here.
 pub fn indent_width(line: &str, tab_width: usize) -> Option<usize> {
     let mut col = 0;
     for g in line.graphemes(true) {
-        if !g.chars().all(char::is_whitespace) {
+        if !matches!(g, " " | "\t") {
             return Some(col);
         }
         col += cells_for(g, col, tab_width);
@@ -330,8 +343,11 @@ pub fn with_indent_guides<'a>(line: &'a str, columns: &[usize]) -> Cow<'a, str> 
             tail = &line[at..];
             break;
         }
-        // The guard on `g` is belt-and-braces: `columns` are inside the indentation,
-        // so the cell is a space unless a caller passed columns of its own devising.
+        // The cell is a space whenever `columns` came from `indent_guides`, which only
+        // counts spaces and tabs as indentation and so cannot name a column holding
+        // anything else. The guard keeps that a property of this function rather than
+        // of its caller: a column list of someone else's devising recolors nothing it
+        // could not also replace.
         if g == " " && columns.contains(&col) {
             out.push_str(INDENT_GUIDE);
         } else {
@@ -392,15 +408,17 @@ pub fn scroll_to_show(cursor: usize, offset: usize, size: usize) -> usize {
 /// available at that ratio: no single cell can stand for the viewport, so the two
 /// roundings have nothing left to agree on. Reaching both ends of the file is the
 /// property worth keeping there, and it is the one this keeps.
-pub fn scroll_at_track_row(row: usize, track: usize, max_scroll: usize) -> usize {
-    // A one-row track has no range to express, and dividing by its span would be a
-    // divide by zero; every press on it means the one offset it can show.
-    let Some(span) = track.checked_sub(1).filter(|&s| s > 0) else {
-        return 0;
-    };
+///
+/// `None` when the track is too short to mean anything - a single row (a three-line
+/// terminal) has every offset and no way to tell them apart. Answering `0` there would
+/// throw a reader at line 900 back to line 1 for touching the only cell the bar has,
+/// which is worse than the press doing nothing.
+pub fn scroll_at_track_row(row: usize, track: usize, max_scroll: usize) -> Option<usize> {
+    // Also the guard against dividing by a zero span.
+    let span = track.checked_sub(1).filter(|&s| s > 0)?;
     // Rounded rather than truncated, so the row nearest an offset selects it instead
     // of the whole track drifting one line toward the top.
-    (row.min(span) * max_scroll + span / 2) / span
+    Some((row.min(span) * max_scroll + span / 2) / span)
 }
 
 /// Render the tab-expanded `line` into styled spans for the display-column window
@@ -1628,6 +1646,29 @@ mod tests {
     }
 
     #[test]
+    fn only_spaces_and_tabs_count_as_indentation() {
+        // Narrower than `char::is_whitespace` on purpose. A NO-BREAK SPACE (common in
+        // pasted text) is a character `with_indent_guides` cannot replace, so counting
+        // it would name a guide column that gets recolored but never marked - a dimmed
+        // character where a rule should be.
+        assert_eq!(indent_width("\u{a0}\u{a0}code", 4), Some(0));
+        // Same for the ideographic space, which is two cells wide and would otherwise
+        // put a guide column inside a glyph.
+        assert_eq!(indent_width("\u{3000}\u{3000}code", 4), Some(0));
+        // A line of nothing but those is content at column 0, not a blank line.
+        assert_eq!(indent_width("\u{a0}", 4), Some(0));
+        // The invariant this buys: every column offered for substitution holds a space
+        // once the tabs are expanded.
+        let indent = indent_width("\t  code", 4).unwrap();
+        let expanded = expand_tabs("\t  code", 4);
+        assert!(
+            expanded[..indent].chars().all(|c| c == ' '),
+            "guide columns must land on spaces, got {:?}",
+            &expanded[..indent]
+        );
+    }
+
+    #[test]
     fn guides_sit_at_every_stop_inside_the_indent() {
         // Column 0 is included - it marks the left edge of the block the indented
         // text is inside, and dropping it would leave line 2 with no guide at all.
@@ -1691,12 +1732,26 @@ mod tests {
     }
 
     #[test]
-    fn a_run_of_blank_lines_longer_than_the_scan_gets_no_guides() {
-        // Bounded off the viewport (SPEC §10.4): past a screenful of nothing, the
-        // guide stops rather than the scan walking the whole buffer.
-        let src = format!("fn a() {{\n{}    x();", "\n".repeat(GUIDE_SCAN + 2));
-        let guides = guides_of(&src, 4);
-        assert_eq!(guides[1], Vec::<usize>::new(), "first blank of the run");
+    fn the_scan_gives_up_when_the_nearest_neighbour_is_too_far_outside_the_window() {
+        // The bound is on the search that leaves the window (SPEC §10.4), so exercising
+        // it needs a window sitting *inside* a run of blanks with the enclosing code
+        // further than GUIDE_SCAN away - a whole-file window would answer from `own`
+        // and never consult the rope at all.
+        // A blank line takes the *shallower* of its two sides, so a side that gives up
+        // counts as column 0 and settles it alone - which means the window has to sit
+        // far enough into the run for *both* scans to run out.
+        let long = 2 * GUIDE_SCAN + 4;
+        let t = text_of(&format!("    x();\n{}    y();", "\n".repeat(long)));
+        let middle = long / 2;
+        let lines = visible_lines(&t, middle, 2, 4);
+        assert_eq!(indent_guides(&t, &lines, middle, 4)[0], Vec::<usize>::new());
+
+        // The bound is the only reason for that: the same shape with a run short enough
+        // to see across inherits normally. Without this half, deleting GUIDE_SCAN
+        // outright would leave the assertion above passing.
+        let t = text_of(&format!("    x();\n{}    y();", "\n".repeat(4)));
+        let lines = visible_lines(&t, 2, 2, 4);
+        assert_eq!(indent_guides(&t, &lines, 2, 4)[0], vec![0]);
     }
 
     #[test]
@@ -1728,26 +1783,28 @@ mod tests {
     fn the_scrollbar_tracks_ends_are_the_buffers_ends() {
         // The property that rules out "put the thumb's top at the pointer": the last
         // row has to reach the last line, which that mapping cannot do.
-        assert_eq!(scroll_at_track_row(0, 10, 90), 0);
-        assert_eq!(scroll_at_track_row(9, 10, 90), 90);
+        assert_eq!(scroll_at_track_row(0, 10, 90), Some(0));
+        assert_eq!(scroll_at_track_row(9, 10, 90), Some(90));
         // Linear between them, rounded to the nearest offset.
-        assert_eq!(scroll_at_track_row(5, 10, 90), 50);
-        assert_eq!(scroll_at_track_row(4, 10, 9), 4);
+        assert_eq!(scroll_at_track_row(5, 10, 90), Some(50));
+        assert_eq!(scroll_at_track_row(4, 10, 9), Some(4));
     }
 
     #[test]
     fn a_press_past_the_scrollbar_track_lands_on_its_last_row() {
         // A drag pulled below the body still means "the bottom", not an offset past
         // the end that the paint would silently clamp back.
-        assert_eq!(scroll_at_track_row(99, 10, 90), 90);
+        assert_eq!(scroll_at_track_row(99, 10, 90), Some(90));
     }
 
     #[test]
-    fn a_scrollbar_track_with_no_span_has_one_answer() {
-        // Guard: a one-row (or zero-row) track cannot express a range, and dividing by
-        // its span would be a divide by zero.
-        assert_eq!(scroll_at_track_row(0, 1, 90), 0);
-        assert_eq!(scroll_at_track_row(3, 0, 90), 0);
+    fn a_scrollbar_track_too_short_to_mean_anything_answers_nothing() {
+        // A single-row track has every offset and no way to tell them apart. Answering
+        // `0` would throw a reader at line 90 back to the top for touching the only
+        // cell the bar has - so the press has to mean nothing instead. Also the guard
+        // against dividing by a zero span.
+        assert_eq!(scroll_at_track_row(0, 1, 90), None);
+        assert_eq!(scroll_at_track_row(3, 0, 90), None);
     }
 
     #[test]

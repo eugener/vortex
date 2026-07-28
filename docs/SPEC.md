@@ -546,6 +546,21 @@ add noise, each on/off switch a key in the config file the M5 loader now reads:
   slot (`indent_guide`) sets a foreground only and no ground, so a selection or a
   current-line tint flows over a guide instead of being broken by it - the glyph survives
   the wash, which is what a tint could not have done.
+  The overlay is pushed **with the syntax highlights, not with the rulers**, and that is
+  the correction worth recording: a guide is the same *kind* of thing a highlight is, a
+  foreground over whatever ground the washes have laid down. Ordered under the rulers'
+  rule it lost its color to any selection crossing it, since the theme's `selection` sets
+  a foreground too - and a guide at full selection brightness stops reading as a margin
+  and starts reading as a `│` the user typed. Its ground is untouched either way, so the
+  selection still owns the cell; only the glyph keeps its dimness.
+  **Indentation here is spaces and tabs, not every character Unicode calls whitespace**,
+  and the narrowness is what makes the two halves agree. `expand_tabs` turns a tab into
+  spaces, so a prefix of spaces and tabs is a prefix of *spaces* by the time it is
+  painted, and every column the guide computation hands to the substitution is therefore
+  a cell holding `' '`. Counting a NO-BREAK SPACE would break that: the column would land
+  on a character the glyph cannot replace, leaving the cell recolored but unmarked - a
+  dimmed character where a rule should be. A line indented with those is simply not
+  indented as far as the guides are concerned.
   **A blank line inherits the shallower of its nearest non-blank neighbours.** This is
   not a refinement: a run of blank lines is what punches a hole through every guide
   crossing it, and blank lines between statements are the common case, so without
@@ -556,9 +571,12 @@ add noise, each on/off switch a key in the config file the M5 loader now reads:
   the top or the bottom of a file. The search answers from the visible window where it
   can and crosses into the rope only at the window's edges, resolved once per frame - a
   blank row at the top of the screen must still inherit, or guides would flicker as you
-  scrolled - and it is **bounded** (SPEC §10.4): past a screenful of blank lines the
-  guides simply stop, which is the honest answer, since "what block is this inside" has
-  stopped being a question the eye is asking.
+  scrolled - and the part that leaves the window is **bounded** (§10.4): a blank row
+  whose nearest non-blank neighbour is further off-screen than that gets no guides,
+  which is the honest answer, since "what block is this inside" has stopped being a
+  question the eye is asking. The bound is on the outside search *only*; the search
+  within the window is already bounded by the viewport's own height, which is what
+  §10.4 is actually about.
 - **Relative line numbers** - *built (M8).* `line_numbers = "absolute" | "relative"` in
   the config file, plus `toggle_line_numbers` for mid-session (named like any other
   command, palette-listed, and left unbound - chrome switches earn a chord only if they
@@ -625,7 +643,16 @@ add noise, each on/off switch a key in the config file the M5 loader now reads:
   answer** rather than re-asking, so pulling a cell sideways off the column keeps
   scrolling instead of becoming a text selection halfway through. That is the second
   piece of pointer state in the frontend (after `click::Clicks`), and it exists for the
-  same reason: terminals report positions, not gestures.
+  same reason: terminals report positions, not gestures. A track too short to tell its
+  offsets apart - a single row, on a three-line terminal - answers *nothing* rather than
+  `0`: throwing a reader at line 900 back to line 1 for touching the only cell the bar
+  has is worse than the press doing nothing at all.
+  The reserved column also carries the **row's own ground**. `render_line` pads only to
+  the text width, which the column is outside of, so without that the current-line wash
+  would stop one cell short of the body's edge and the caret's row would show a notch -
+  and the gutter already takes the tint, so the row would be washed at both ends and
+  broken at one. The bar paints over it afterwards and its styles set a foreground only,
+  so the track and thumb land on the row's ground rather than punching the hole back in.
 - **Sticky context header** - pin the enclosing scope (function/class) at the viewport top;
   needs tree-sitter, so it pairs with M4.
 - **Current-line tint, selection wash, multi-cursor carets** - already built (M1-M3); listed
@@ -900,6 +927,39 @@ Cleanups that were identified, judged real, and deliberately not taken yet. Each
 the condition that should pull it forward, so they are scheduled rather than forgotten.
 None is a correctness bug today.
 
+- **The head-bar / body / status split is written out in four places.** `paint` owns the
+  real one (`Layout::vertical([Length(1), Min(0), Length(1)])`), and three hit tests
+  re-derive it independently: `on_scrollbar` as `row >= 1 && row < height - 1`,
+  `pointer_offset` and the scrollbar's drag handler each as `row.saturating_sub(1)`. Every
+  copy agrees today. **Deferred because** collapsing them means a shared
+  `body_rect(area) -> Rect` threaded through hit tests that currently take a
+  `page_height`, which is a refactor of tested code reaching well past whatever change
+  prompts it. **Trigger: the head bar growing a second row** - sticky context is on M8's
+  own list, and it is exactly the change that would make the copies disagree with no
+  compile error and no failing test: the bar would paint one row lower while the hit tests
+  answered for the old geometry, so presses land a row off and the track's top row goes
+  dead.
+- **A guide is a glyph substitution outside `render_line` plus a style overlay inside it.**
+  Every other marker (ruler, selection, search, syntax, diagnostic, secondary caret) is one
+  `(Range<usize>, Style)` in the overlay list; the indent guide alone needs a second
+  mechanism, because an overlay can restyle a cell but not rewrite it. Widening the tuple
+  to carry an optional replacement glyph would let `render_line` emit the character where
+  it already resolves the style, and delete the per-row `String`. **Deferred because**
+  there is exactly one consumer, and none of the chrome still queued would be a second
+  one: git signs paint in the *gutter*, sticky context is its own pinned widget, and the
+  completion popup's ghost preview is `VirtualText`, which **inserts** rather than
+  substituting a same-width cell. Widening the frontend's one intra-line styling seam for
+  a single caller is the premature abstraction CLAUDE.md rules out. **Trigger: a second
+  marker that replaces a cell it did not widen** - whitespace visualization (`·` for
+  spaces, `→` for tabs) is the obvious candidate, and it would want exactly this seam.
+- **The scrollbar's drag state is a bare `bool` in the event loop.** Press sets it from
+  the hit test, a drag inherits it, a release and a `scrollbar = false` clear it - a small
+  state machine living in `event_loop`, which no test drives, so it is covered only by the
+  pty run recorded in §14. `click::Clicks` is the precedent for lifting exactly this kind
+  of pointer state into a tested module. **Deferred because** `Clicks` earned its module
+  by needing a clock injected; this has no logic a struct would make clearer, only a
+  boundary a test could reach. **Trigger: a third stateful gesture** (a fold drag, a split
+  resize) - at two, the coordination between them is still readable in one screen.
 - **Quit is detected by sniffing the `Action` value in the frontend.** `dispatch_command`
   compares against `Action::Quit` and exits the loop immediately after sending it, while
   the core's own `Notification::ShuttingDown` (which exists for exactly this) is drained
@@ -1276,11 +1336,10 @@ Incremental build order so the risky assumptions are validated early, not at the
   arrives with them**; until then M7's answer to "what can I do here" is `Ctrl+P`.
   *Verify:* open a file via the picker, switch buffers, run a command via the palette -
   in-terminal.
-- **M8 - Chrome + polish.** *(in progress: relative line numbers, rulers, indent guides
-  and the scrollbar have landed.)* Git diff
-  signs (a git-diff task feeding `GutterMark`s; its git source - `gix` / `git2` - is a §3
-  stack addition to raise), indent guides, relative line numbers, scrollbar, sticky context
-  (tree-sitter), cursor-shape-per-mode, rulers. Unlike the earlier milestones these are
+- **M8 - Chrome + polish.** *(in progress.)* **Landed:** relative line numbers, rulers,
+  indent guides, the scrollbar. **Left:** git diff signs (a git-diff task feeding
+  `GutterMark`s; its git source - `gix` / `git2` - is a §3 stack addition to raise),
+  sticky context (tree-sitter), cursor-shape-per-mode. Unlike the earlier milestones these are
   **independent items sharing one shape** rather than an arc: each reads data the snapshot
   or decoration channel already carries, each is a config key over a theme slot (§7.5), and
   none needs a seam change - so they land one at a time and in any order, and the milestone
