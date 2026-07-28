@@ -1028,10 +1028,13 @@ fn event_loop(
                             let track = viewport.page_height;
                             let max_scroll =
                                 layout::display_line_count(&snap.text).saturating_sub(track);
-                            // A drag can be pulled off the top or the bottom of the
-                            // body; clamping to the track keeps both ends reachable
-                            // rather than letting the gesture slide off one.
-                            let row = (mouse.row as usize).clamp(1, track.max(1)) - 1;
+                            // Screen row to track row is one subtraction - the head bar
+                            // owns row 0. A drag pulled past either end of the body
+                            // still means that end: `saturating_sub` holds the top and
+                            // `scroll_at_track_row` already clamps the bottom, so
+                            // repeating that clamp here would be a second copy of a
+                            // bound that has one owner.
+                            let row = (mouse.row as usize).saturating_sub(1);
                             viewport.scroll = layout::scroll_at_track_row(row, track, max_scroll);
                             // The caret has not moved, so the view must be allowed to
                             // leave it - the same rule the wheel follows.
@@ -3049,6 +3052,76 @@ mod tests {
         // Proportional, not a single cell: 10 rows of a 31-line buffer is about a
         // third of the track.
         assert!((2..=5).contains(&top.len()), "thumb spans {}", top.len());
+    }
+
+    #[test]
+    fn the_pointer_stays_inside_the_thumb_it_is_dragging() {
+        // Why the linear row->offset map still reads as *grabbing* the thumb rather
+        // than throwing it: the thumb actually painted for the offset a press returns
+        // covers the row that was pressed.
+        //
+        // Asserted against the painted cells, not against a transcription of ratatui's
+        // thumb geometry - a copy of that formula would keep agreeing with itself if
+        // the widget ever rounded differently, which is the one thing this needs to
+        // notice. The bar is what the user grabs, so the bar is what gets measured.
+        let thumb = config::Theme::default().scrollbar_thumb.fg.unwrap();
+        let painted_thumb = |snap: &ViewSnapshot, track: usize, scroll: usize| {
+            let buf = render_with(
+                snap,
+                20,
+                track as u16 + 2,
+                PaintInputs {
+                    follow: false,
+                    viewport: ViewState {
+                        scroll,
+                        h_scroll: 0,
+                        page_height: track,
+                    },
+                    scrollbar: true,
+                    ..paint_inputs(0)
+                },
+            );
+            (0..track)
+                .filter(|&r| buf.cell((19, r as u16 + 1)).unwrap().fg == thumb)
+                .collect::<Vec<usize>>()
+        };
+
+        for track in [6usize, 15] {
+            // Both of these stay under `track²` lines, where the thumb is still drawn
+            // proportionally and the pointer lands squarely inside it.
+            for lines in [track + 2, track * 4] {
+                let text: String = (1..lines).map(|n| format!("l{n}\n")).collect();
+                let snap = snapshot_after(&[Action::Insert(text)]);
+                let max_scroll = layout::display_line_count(&snap.text) - track;
+                for row in 0..track {
+                    let scroll = layout::scroll_at_track_row(row, track, max_scroll);
+                    let rows = painted_thumb(&snap, track, scroll);
+                    assert!(
+                        rows.contains(&row),
+                        "track {track}, {lines} lines, row {row}: \
+                         scroll {scroll} painted the thumb at {rows:?}"
+                    );
+                }
+            }
+        }
+
+        // Past `track²` lines the thumb has collapsed to its one-cell floor, no cell
+        // can stand for a viewport any more, and the pointer is allowed to sit a cell
+        // off the thumb - the limit the doc comment on `scroll_at_track_row` names.
+        let track = 5;
+        let text: String = (1..250).map(|n| format!("l{n}\n")).collect();
+        let snap = snapshot_after(&[Action::Insert(text)]);
+        let max_scroll = layout::display_line_count(&snap.text) - track;
+        for row in 0..track {
+            let scroll = layout::scroll_at_track_row(row, track, max_scroll);
+            let rows = painted_thumb(&snap, track, scroll);
+            assert_eq!(rows.len(), 1, "the thumb is down to its floor");
+            let off_by = rows[0].abs_diff(row);
+            assert!(
+                off_by <= 1,
+                "row {row}: thumb at {rows:?}, {off_by} cells away"
+            );
+        }
     }
 
     #[test]

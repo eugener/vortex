@@ -269,15 +269,22 @@ pub fn indent_guides(
         .iter()
         .map(|line| indent_width(&line.raw, tab_width))
         .collect();
-    // Both searches stop at the first non-blank line, which in real text is the very
-    // next one - the `GUIDE_SCAN` bound only costs anything inside a long run of blanks.
-    let outside = |index: usize| indent_width(&text.line(index).unwrap_or_default(), tab_width);
-    let above_window = (scroll.saturating_sub(GUIDE_SCAN)..scroll)
-        .rev()
-        .find_map(outside);
-    let after = scroll + own.len();
-    let below_window =
-        (after..(after + GUIDE_SCAN).min(display_line_count(text))).find_map(outside);
+    // Only a blank row can ever consult the lines outside the window, and most windows
+    // have none - so the rope is not touched at all unless one does. Each search then
+    // stops at the first non-blank line, which in real text is the very next one; the
+    // `GUIDE_SCAN` bound only costs anything inside a long run of blanks.
+    let (above_window, below_window) = if own.iter().any(Option::is_none) {
+        let outside = |index: usize| indent_width(&text.line(index).unwrap_or_default(), tab_width);
+        let after = scroll + own.len();
+        (
+            (scroll.saturating_sub(GUIDE_SCAN)..scroll)
+                .rev()
+                .find_map(outside),
+            (after..(after + GUIDE_SCAN).min(display_line_count(text))).find_map(outside),
+        )
+    } else {
+        (None, None)
+    };
 
     own.iter()
         .enumerate()
@@ -313,7 +320,16 @@ pub fn with_indent_guides<'a>(line: &'a str, columns: &[usize]) -> Cow<'a, str> 
     };
     let mut out = String::with_capacity(line.len() + columns.len() * INDENT_GUIDE.len());
     let mut col = 0;
-    for g in line.graphemes(true) {
+    // Everything past the deepest guide is copied verbatim, so the walk stops there and
+    // hands the remainder over in one piece. Guides only ever land in a line's
+    // indentation, so this is a few cells of a line that is often hundreds - and it is
+    // per visible row, per frame.
+    let mut tail = "";
+    for (at, g) in line.grapheme_indices(true) {
+        if col > deepest {
+            tail = &line[at..];
+            break;
+        }
         // The guard on `g` is belt-and-braces: `columns` are inside the indentation,
         // so the cell is a space unless a caller passed columns of its own devising.
         if g == " " && columns.contains(&col) {
@@ -323,6 +339,9 @@ pub fn with_indent_guides<'a>(line: &'a str, columns: &[usize]) -> Cow<'a, str> 
         }
         col += g.width();
     }
+    out.push_str(tail);
+    // Reached only when the line ended inside the guides (`tail` is then empty): an
+    // inherited indent can reach past a blank line's own end.
     while col <= deepest {
         out.push_str(if columns.contains(&col) {
             INDENT_GUIDE
@@ -1729,37 +1748,6 @@ mod tests {
         // its span would be a divide by zero.
         assert_eq!(scroll_at_track_row(0, 1, 90), 0);
         assert_eq!(scroll_at_track_row(3, 0, 90), 0);
-    }
-
-    #[test]
-    fn the_pointer_stays_inside_the_thumb_it_is_dragging() {
-        // Why the linear mapping still reads as grabbing the thumb rather than
-        // throwing it: at every row, the thumb ratatui draws for the offset this
-        // returns covers the row that was pressed. Checked against ratatui's own
-        // geometry rather than against a restatement of it - `part_lengths`
-        // transcribed, which rounds half-up and clamps both parts into the track.
-        let round_div = |n: usize, d: usize| (n + d / 2) / d;
-        for track in [2usize, 5, 12, 40] {
-            for lines in [track + 1, track + 3, track * 3, track * 50] {
-                let max_scroll = lines - track;
-                // Below `track²` lines the thumb is still proportional and the two
-                // roundings agree exactly; above it the thumb is pinned at one cell,
-                // which no offset can make stand for a whole viewport, so the pointer
-                // is allowed to sit a cell off it.
-                let slack = usize::from(lines > track * track);
-                for row in 0..track {
-                    let scroll = scroll_at_track_row(row, track, max_scroll);
-                    let len = round_div(track * track, lines).clamp(1, track);
-                    let start = round_div(scroll * track, lines).min(track - len);
-                    assert!(
-                        (start.saturating_sub(slack)..start + len + slack).contains(&row),
-                        "track {track}, lines {lines}, row {row}: \
-                         scroll {scroll}, thumb {start}..{}",
-                        start + len
-                    );
-                }
-            }
-        }
     }
 
     #[test]
