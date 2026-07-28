@@ -54,7 +54,7 @@ milestones landed before earlier ones - that is a real gap, not a rounding error
 | M4 | Syntax highlighting (tree-sitter) | done - grammars are `dlopen`ed at runtime, never linked in |
 | M5 | File handling (encoding, EOL, conflicts) | done - encoding and line endings survive a round trip, external changes are noticed, config is a file |
 | M6 | UI shell: compositor, toasts | done |
-| M7 | Pickers, palette, themes | in progress - file/theme/buffer/global-search pickers with a preview pane, the palette, multi-buffer, and find/replace done; which-key outstanding |
+| M7 | Pickers, palette, themes, search | done - file/theme/buffer/global-search pickers with a preview pane, the palette, multi-buffer, find/replace in the buffer and across the project |
 | M8 | Chrome and polish | not started |
 
 What works today: open/save a file, edit with multiple cursors, undo/redo with coalescing,
@@ -70,8 +70,13 @@ back as they were found), a warning when a file changes underneath you, and live
 
 What does not: syntax colors or a language server for **any language but Rust** - a
 grammar is a separate crate the editor loads at runtime, and only `grammar-rust` is
-written; LSP features past diagnostics (no completion, hover, or goto); and the which-key
-popup, the last outstanding M7 item.
+written; LSP features past diagnostics (no completion, hover, or goto); and most of the
+M8 chrome (git diff signs, indent guides, a scrollbar, sticky context, rulers).
+
+There is no which-key popup and no leader-key sequences: bindings are single chords, and
+"what can I do here" is answered by the command palette, which lists every command by name
+with its shortcut beside it. [SPEC §11](docs/SPEC.md) records the trigger for revisiting
+that.
 
 ## Build and run
 
