@@ -577,6 +577,26 @@ add noise, each on/off switch a key in the config file the M5 loader now reads:
   question the eye is asking. The bound is on the outside search *only*; the search
   within the window is already bounded by the viewport's own height, which is what
   §10.4 is actually about.
+  **The guides a row is offered are clipped to the horizontal window before anything
+  paints them** (`guides_in_window`), and this is §10.4 biting on a surface that looked
+  exempt from it. A guide is one per tab stop of a line's *indentation*, and indentation
+  is a length the **file** chooses - so a line carrying thousands of columns of leading
+  whitespace hands the frame thousands of guides, and pays for them twice: once walking
+  cells in the substitution, and again in `render_line`, whose `style_at` scans every
+  overlay for every painted cell. To draw none of them. Clipping is a subslice rather
+  than a filter, since the columns are ascending, so it costs two binary searches and no
+  allocation. Measured on the bench that ships with it (`indent_guides/raw` against
+  `/clipped`): at a 16 384-column indent the unclipped substitution is 186 µs per row
+  per frame and the clipped one 1.1 µs, and the clipped series stays flat from 16
+  columns to 16 384 while the raw one grows linearly. The clipping leaves **no trace in
+  the painted output** - it removes work, not marks - which is exactly why it is a named
+  function with its own test rather than three lines inside the paint loop: nothing
+  downstream can observe whether it happened.
+  The substitution itself walks `columns` with **one cursor** rather than searching it
+  per cell (the trick `ColumnWalker` plays for syntax spans, and for the same reason:
+  the query sequence is monotonic). Without that it was quadratic in the indent - 4.4 ms
+  per row at 16 384 columns - which is the shape a security review flagged as the one
+  paint input a file can size.
 - **Relative line numbers** - *built (M8).* `line_numbers = "absolute" | "relative"` in
   the config file, plus `toggle_line_numbers` for mid-session (named like any other
   command, palette-listed, and left unbound - chrome switches earn a chord only if they

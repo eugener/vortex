@@ -314,6 +314,31 @@ pub fn indent_guides(
         .collect()
 }
 
+/// The stretch of `columns` falling inside the horizontal window
+/// `[h_scroll, h_scroll + width)` - the guides a row can actually show.
+///
+/// A **subslice, not a filter**: [`indent_guides`] produces ascending columns, so the
+/// window is a contiguous range within them and clipping costs two binary searches and
+/// no allocation.
+///
+/// Worth doing rather than leaving to the painter's own clipping, because the guides a
+/// row is offered are one per tab stop of its *indentation*, and indentation is a length
+/// the file chooses. An absurdly indented line otherwise makes the frame pay for
+/// thousands of guides twice over - once walking cells in [`with_indent_guides`], and
+/// again in [`render_line`], whose `style_at` scans every overlay for every painted
+/// cell - to draw none of them. That is the §10.4 rule: work in a frame is bounded by
+/// the viewport, never by the buffer.
+///
+/// The clipping is **invisible in the painted output**, which is the whole point - it
+/// removes work, not marks. That is also why it is a function with its own test rather
+/// than three lines inside the paint loop: nothing downstream can observe whether it
+/// happened.
+pub fn guides_in_window(columns: &[usize], h_scroll: usize, width: usize) -> &[usize] {
+    let first = columns.partition_point(|&col| col < h_scroll);
+    let last = columns.partition_point(|&col| col < h_scroll.saturating_add(width));
+    &columns[first..last]
+}
+
 /// `line` (tab-expanded, as painted) with an indent guide standing in for the
 /// whitespace at each of `columns`.
 ///
@@ -327,12 +352,23 @@ pub fn indent_guides(
 ///
 /// The tail pads out to the deepest guide, because an *inherited* indent can reach
 /// past a blank line's own end, where the cells the guide wants do not exist yet.
+///
+/// `columns` must be **ascending**, which is what [`indent_guides`] produces. Both
+/// walks below advance a single cursor through it rather than searching it per cell -
+/// the trick [`ColumnWalker`] plays for syntax spans, and for the same reason: the
+/// query sequence is monotonic, so a re-scan per cell is pure waste. It is not a
+/// micro-optimization here. This runs per visible row per frame, and the length it
+/// walks is a line's *indentation* - a number the file chooses, not the viewport - so
+/// searching per cell makes the paint quadratic in something an input controls.
 pub fn with_indent_guides<'a>(line: &'a str, columns: &[usize]) -> Cow<'a, str> {
     let Some(&deepest) = columns.iter().max() else {
         return Cow::Borrowed(line);
     };
     let mut out = String::with_capacity(line.len() + columns.len() * INDENT_GUIDE.len());
     let mut col = 0;
+    // The cursor, shared by both loops: `col` only grows across the two, so `next`
+    // never has to walk back.
+    let mut next = 0;
     // Everything past the deepest guide is copied verbatim, so the walk stops there and
     // hands the remainder over in one piece. Guides only ever land in a line's
     // indentation, so this is a few cells of a line that is often hundreds - and it is
@@ -343,23 +379,31 @@ pub fn with_indent_guides<'a>(line: &'a str, columns: &[usize]) -> Cow<'a, str> 
             tail = &line[at..];
             break;
         }
+        while next < columns.len() && columns[next] < col {
+            next += 1;
+        }
         // The cell is a space whenever `columns` came from `indent_guides`, which only
         // counts spaces and tabs as indentation and so cannot name a column holding
         // anything else. The guard keeps that a property of this function rather than
         // of its caller: a column list of someone else's devising recolors nothing it
         // could not also replace.
-        if g == " " && columns.contains(&col) {
+        if g == " " && columns.get(next) == Some(&col) {
             out.push_str(INDENT_GUIDE);
         } else {
             out.push_str(g);
         }
+        // A wide grapheme can step straight over a guide column; the cursor skips it on
+        // the next pass, which is right - a guide cannot be drawn inside a glyph.
         col += g.width();
     }
     out.push_str(tail);
     // Reached only when the line ended inside the guides (`tail` is then empty): an
     // inherited indent can reach past a blank line's own end.
     while col <= deepest {
-        out.push_str(if columns.contains(&col) {
+        while next < columns.len() && columns[next] < col {
+            next += 1;
+        }
+        out.push_str(if columns.get(next) == Some(&col) {
             INDENT_GUIDE
         } else {
             " "
@@ -1758,6 +1802,30 @@ mod tests {
     fn a_zero_tab_width_draws_no_guides() {
         // Guard: there are no stops to hang them on, and stepping by zero panics.
         assert_eq!(guides_of("    x", 0)[0], Vec::<usize>::new());
+    }
+
+    #[test]
+    fn only_the_guides_the_window_can_show_are_kept() {
+        // The clip removes work rather than marks, so nothing downstream can observe
+        // it - this is the only place it is checkable at all.
+        let columns: Vec<usize> = (0..1_000).step_by(4).collect();
+        // A 36-column window at the left edge holds nine tab stops.
+        assert_eq!(guides_in_window(&columns, 0, 36), &columns[..9]);
+        // Scrolled right, both ends move: the low end is trimmed as well, not just the
+        // far edge, since a guide left of the window is as unpaintable as one past it.
+        assert_eq!(
+            guides_in_window(&columns, 100, 36),
+            &[100, 104, 108, 112, 116, 120, 124, 128, 132]
+        );
+        // Scrolled past every guide, nothing is left to draw.
+        assert!(guides_in_window(&columns, 5_000, 36).is_empty());
+        // A window landing between two stops keeps only the stop inside it.
+        assert_eq!(guides_in_window(&columns, 5, 4), &[8]);
+        // Degenerate windows are empty rather than a panic, and a huge offset must not
+        // overflow the addition.
+        assert!(guides_in_window(&columns, 0, 0).is_empty());
+        assert!(guides_in_window(&columns, usize::MAX, 36).is_empty());
+        assert!(guides_in_window(&[], 0, 36).is_empty());
     }
 
     #[test]

@@ -15,6 +15,17 @@
 //!   The gap between the two is the win from resolving highlights in one pass,
 //!   quantified rather than asserted.
 //!
+//! - **`indent_guides`** - substituting the guide glyphs into a row's painted text
+//!   ([`layout::with_indent_guides`]), measured as a line's *indentation* grows - the
+//!   one input here that **file content** sizes rather than the viewport. Two series,
+//!   and the gap between them is the point. `raw` passes every guide the line offers,
+//!   so it is the function's own curve: it should be **linear** in the indent, and
+//!   anything steeper means the membership cursor has regressed to a per-cell scan.
+//!   `clipped` runs [`layout::guides_in_window`] first, which is the shipped path, and
+//!   should stay **flat** as the indent grows however long the line's whitespace is. If
+//!   `clipped` ever starts tracking `raw`, the viewport bound (SPEC §10.4) is gone and a
+//!   file can size the frame again.
+//!
 //! - **`bufferline`** - fitting the head bar's tab strip, which repaints every
 //!   frame and allocates per open buffer. Measured across buffer counts and at
 //!   both widths that matter: `fits` (every tab shown, the common case) and
@@ -109,6 +120,46 @@ fn span_columns(c: &mut Criterion) {
     group.finish();
 }
 
+/// Indent guides run per visible row per frame, and their cost is driven by *file
+/// content* (a line's indentation) rather than by the viewport - so a line with a
+/// pathological amount of leading whitespace is the case to watch, not a deeply nested
+/// one. Depths here run from realistic (16 columns, four levels of Rust) to absurd
+/// (16 384) precisely to show which term dominates as the indent grows: linear in the
+/// indent is the cost of walking cells that exist, anything steeper is the membership
+/// test being re-scanned per cell.
+fn indent_guides(c: &mut Criterion) {
+    let mut group = c.benchmark_group("indent_guides");
+    let tab_width = 4;
+    // An 80-column window, which is what the painter actually hands this.
+    let window = 80usize;
+    for &indent in &[16usize, 256, 4096, 16_384] {
+        let line = format!("{}code();", " ".repeat(indent));
+        let columns: Vec<usize> = (0..indent).step_by(tab_width).collect();
+
+        // `raw` is the function's own curve: every guide the line offers, which is what
+        // it costs before the painter clips. Read it to check the curve is linear -
+        // anything steeper means the membership cursor has regressed to a scan.
+        group.bench_with_input(BenchmarkId::new("raw", indent), &indent, |b, _| {
+            b.iter(|| {
+                let out = layout::with_indent_guides(black_box(&line), black_box(&columns));
+                black_box(out.len())
+            })
+        });
+
+        // `clipped` is the shipped path: `guides_in_window` first, so the work is the
+        // window's and not the file's. This is the line that should stay flat as the
+        // indent grows - if it tracks `raw`, the clip is gone.
+        group.bench_with_input(BenchmarkId::new("clipped", indent), &indent, |b, _| {
+            b.iter(|| {
+                let visible = layout::guides_in_window(black_box(&columns), 0, window);
+                let out = layout::with_indent_guides(black_box(&line), visible);
+                black_box(out.len())
+            })
+        });
+    }
+    group.finish();
+}
+
 /// The bufferline is refitted on every frame, so its cost scales with how many
 /// buffers are open, not with how often they change. Both widths are measured: one
 /// where every tab fits (the fast path) and one narrow enough to force the window to
@@ -136,5 +187,11 @@ fn bufferline(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, render_line_overlays, span_columns, bufferline);
+criterion_group!(
+    benches,
+    render_line_overlays,
+    span_columns,
+    indent_guides,
+    bufferline
+);
 criterion_main!(benches);
