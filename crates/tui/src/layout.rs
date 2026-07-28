@@ -201,6 +201,139 @@ pub fn visible_lines(
         .collect()
 }
 
+/// The glyph an indent guide paints (SPEC §7.5). A *character*, unlike a ruler's
+/// ground tint, because the two markers want different cells: a ruler's cell is the
+/// one a long line is already using, while a guide's is by construction whitespace,
+/// so a guide can occupy its cell without displacing anything. It is one cell wide,
+/// so it stands in for the space it replaces without shifting the columns after it.
+///
+/// Deliberately not the same glyph as the scrollbar's track (`║`): the two are both
+/// full-height vertical rules, and a reader should not have to work out which of
+/// them is in the margin.
+const INDENT_GUIDE: &str = "│";
+
+/// How far past the window [`indent_guides`] will look for a blank line's indent
+/// before giving up. Bounded because nothing off the viewport may scan the whole
+/// buffer (SPEC §10.4), and a run of blank lines longer than this gets no guides -
+/// which is the honest answer, since past a screenful of nothing "what block is this
+/// inside" has stopped being a question the eye is asking.
+const GUIDE_SCAN: usize = 64;
+
+/// Display width of `line`'s leading whitespace, or `None` when the line is blank
+/// (empty, or whitespace all the way to its end).
+///
+/// A blank line reports `None` rather than a width because the whitespace it carries
+/// is trailing, not leading, and so says nothing about which block it sits in. What
+/// it should show is inherited instead ([`indent_guides`]) - without that, the blank
+/// line between two statements would punch a hole through every guide crossing it,
+/// which is exactly the case that makes the feature look broken.
+pub fn indent_width(line: &str, tab_width: usize) -> Option<usize> {
+    let mut col = 0;
+    for g in line.graphemes(true) {
+        if !g.chars().all(char::is_whitespace) {
+            return Some(col);
+        }
+        col += cells_for(g, col, tab_width);
+    }
+    None
+}
+
+/// The display columns to draw an indent guide at, for each row of the window
+/// `lines` (already fetched by [`visible_lines`], starting at line `scroll`).
+///
+/// A line's guides sit at every tab stop strictly inside its indentation - so a line
+/// indented 8 with 4-wide tabs gets guides at columns 0 and 4, and its text starts at
+/// 8. **Column 0 is included**: it is the left edge of the block the indented text is
+/// inside, which is the one level a reader cannot otherwise see, and dropping it would
+/// leave a singly-indented line with no guide at all.
+///
+/// A blank line inherits the *shallower* of its nearest non-blank neighbours, so a
+/// guide runs through the gaps inside a block but stops at the blank line that follows
+/// its last statement rather than running past the closing brace.
+///
+/// The neighbour search is answered from `lines` where it can be, and crosses into
+/// `text` only at the window's edges - resolved once for the whole frame rather than
+/// per row, since every blank row that runs off an edge wants the same answer and a
+/// screenful of blank lines would otherwise pay a rope fetch each (SPEC §10.4).
+pub fn indent_guides(
+    text: &Text,
+    lines: &[VisibleLine],
+    scroll: usize,
+    tab_width: usize,
+) -> Vec<Vec<usize>> {
+    // A zero tab width has no stops to hang guides on, and `step_by(0)` panics.
+    if tab_width == 0 {
+        return vec![Vec::new(); lines.len()];
+    }
+    let own: Vec<Option<usize>> = lines
+        .iter()
+        .map(|line| indent_width(&line.raw, tab_width))
+        .collect();
+    // Both searches stop at the first non-blank line, which in real text is the very
+    // next one - the `GUIDE_SCAN` bound only costs anything inside a long run of blanks.
+    let outside = |index: usize| indent_width(&text.line(index).unwrap_or_default(), tab_width);
+    let above_window = (scroll.saturating_sub(GUIDE_SCAN)..scroll)
+        .rev()
+        .find_map(outside);
+    let after = scroll + own.len();
+    let below_window =
+        (after..(after + GUIDE_SCAN).min(display_line_count(text))).find_map(outside);
+
+    own.iter()
+        .enumerate()
+        .map(|(row, &indent)| {
+            let indent = indent.unwrap_or_else(|| {
+                let above = own[..row].iter().rev().find_map(|&i| i).or(above_window);
+                let below = own[row + 1..].iter().find_map(|&i| i).or(below_window);
+                // A missing neighbour is column 0, not "ignore this side": a blank
+                // line at the very top of the file is inside nothing.
+                above.unwrap_or(0).min(below.unwrap_or(0))
+            });
+            (0..indent).step_by(tab_width).collect()
+        })
+        .collect()
+}
+
+/// `line` (tab-expanded, as painted) with an indent guide standing in for the
+/// whitespace at each of `columns`.
+///
+/// Substituted into the text rather than pushed as a style, because a guide is a
+/// glyph and [`render_line`]'s overlays only restyle the cell they cover. That is
+/// sound here for the reason a ruler's tint is not: `columns` come from
+/// [`indent_guides`] and so always land in indentation, which is whitespace - the
+/// guide replaces a space and takes its width, so nothing after it moves. The raw
+/// line is untouched, so every byte↔column mapping still measures the buffer's own
+/// text rather than what the row happens to show.
+///
+/// The tail pads out to the deepest guide, because an *inherited* indent can reach
+/// past a blank line's own end, where the cells the guide wants do not exist yet.
+pub fn with_indent_guides<'a>(line: &'a str, columns: &[usize]) -> Cow<'a, str> {
+    let Some(&deepest) = columns.iter().max() else {
+        return Cow::Borrowed(line);
+    };
+    let mut out = String::with_capacity(line.len() + columns.len() * INDENT_GUIDE.len());
+    let mut col = 0;
+    for g in line.graphemes(true) {
+        // The guard on `g` is belt-and-braces: `columns` are inside the indentation,
+        // so the cell is a space unless a caller passed columns of its own devising.
+        if g == " " && columns.contains(&col) {
+            out.push_str(INDENT_GUIDE);
+        } else {
+            out.push_str(g);
+        }
+        col += g.width();
+    }
+    while col <= deepest {
+        out.push_str(if columns.contains(&col) {
+            INDENT_GUIDE
+        } else {
+            " "
+        });
+        col += 1;
+    }
+    Cow::Owned(out)
+}
+
 /// Keep index `cursor` visible within a window of `size` starting at `offset`,
 /// returning the new offset. Generic 1-D scroll shared by both axes (SPEC §5):
 /// pass `(cursor_line, top, rows)` for vertical scroll or
@@ -1420,6 +1553,125 @@ mod tests {
             displayed(&visible_lines(&text_of("a\n"), 0, 10, 4)),
             vec!["a", ""]
         );
+    }
+
+    /// The guide columns for every line of `src`, painted from the top.
+    fn guides_of(src: &str, tab_width: usize) -> Vec<Vec<usize>> {
+        let t = text_of(src);
+        let lines = visible_lines(&t, 0, 100, tab_width);
+        indent_guides(&t, &lines, 0, tab_width)
+    }
+
+    #[test]
+    fn indent_width_measures_leading_whitespace_and_blanks_report_none() {
+        assert_eq!(indent_width("code", 4), Some(0));
+        assert_eq!(indent_width("    code", 4), Some(4));
+        // A tab counts as its stop, not as one cell, so guide columns land where the
+        // painted glyphs do.
+        assert_eq!(indent_width("\tcode", 4), Some(4));
+        assert_eq!(indent_width("\t\tcode", 4), Some(8));
+        // Blank lines - empty, spaces, or a lone tab - have no indent to report: the
+        // whitespace is trailing, not leading.
+        assert_eq!(indent_width("", 4), None);
+        assert_eq!(indent_width("   ", 4), None);
+        assert_eq!(indent_width("\t", 4), None);
+    }
+
+    #[test]
+    fn guides_sit_at_every_stop_inside_the_indent() {
+        // Column 0 is included - it marks the left edge of the block the indented
+        // text is inside, and dropping it would leave line 2 with no guide at all.
+        let guides = guides_of("fn a() {\n    x();\n        y();\n}", 4);
+        assert_eq!(
+            guides[0],
+            Vec::<usize>::new(),
+            "top level has no block above"
+        );
+        assert_eq!(guides[1], vec![0]);
+        assert_eq!(guides[2], vec![0, 4]);
+        assert_eq!(guides[3], Vec::<usize>::new());
+    }
+
+    #[test]
+    fn a_misaligned_indent_only_gets_the_stops_it_passed() {
+        // 6 columns of indent with 4-wide tabs passes stop 0 and stop 4, and stop 8
+        // is still ahead of it - a guide there would sit on text.
+        assert_eq!(guides_of("x\n      y", 4)[1], vec![0, 4]);
+    }
+
+    #[test]
+    fn a_blank_line_inside_a_block_keeps_the_guides_running_through_it() {
+        // The case the feature lives or dies on: without inheritance the blank line
+        // punches a hole through every guide crossing it.
+        let guides = guides_of("fn a() {\n    x();\n\n    y();\n}", 4);
+        assert_eq!(guides[2], vec![0], "inherited from both sides");
+    }
+
+    #[test]
+    fn a_blank_line_takes_the_shallower_neighbour() {
+        // Trailing a block, the blank sits between an indented statement and the
+        // closing brace: the shallower side wins, so the guide stops rather than
+        // running past the brace.
+        let guides = guides_of("fn a() {\n    x();\n\n}", 4);
+        assert_eq!(guides[2], Vec::<usize>::new());
+        // Leading one, the same rule read the other way.
+        let guides = guides_of("fn a() {\n\n    x();\n}", 4);
+        assert_eq!(guides[1], Vec::<usize>::new());
+    }
+
+    #[test]
+    fn a_blank_line_at_the_edge_of_the_file_is_inside_nothing() {
+        // A missing neighbour is column 0, not "use the other side": nothing encloses
+        // the top or the bottom of a file.
+        let guides = guides_of("\n    x();", 4);
+        assert_eq!(guides[0], Vec::<usize>::new());
+        let guides = guides_of("    x();\n", 4);
+        assert_eq!(guides[1], Vec::<usize>::new());
+    }
+
+    #[test]
+    fn a_blank_row_inherits_across_the_window_edge() {
+        // The scan crosses out of the window into the rope, or the top row of the
+        // screen would lose its guides every time a scroll landed a blank line there.
+        let t = text_of("fn a() {\n    x();\n\n    y();\n}");
+        let lines = visible_lines(&t, 2, 2, 4);
+        // The window is [blank, "    y();"]; the blank's *above* neighbour is line 1,
+        // which is off screen.
+        assert_eq!(indent_guides(&t, &lines, 2, 4)[0], vec![0]);
+    }
+
+    #[test]
+    fn a_run_of_blank_lines_longer_than_the_scan_gets_no_guides() {
+        // Bounded off the viewport (SPEC §10.4): past a screenful of nothing, the
+        // guide stops rather than the scan walking the whole buffer.
+        let src = format!("fn a() {{\n{}    x();", "\n".repeat(GUIDE_SCAN + 2));
+        let guides = guides_of(&src, 4);
+        assert_eq!(guides[1], Vec::<usize>::new(), "first blank of the run");
+    }
+
+    #[test]
+    fn a_zero_tab_width_draws_no_guides() {
+        // Guard: there are no stops to hang them on, and stepping by zero panics.
+        assert_eq!(guides_of("    x", 0)[0], Vec::<usize>::new());
+    }
+
+    #[test]
+    fn a_guide_stands_in_for_the_space_it_replaces() {
+        // One cell for one cell, so nothing after the indent moves.
+        assert_eq!(with_indent_guides("        x", &[0, 4]), "│   │   x");
+        // No columns is the untouched line, borrowed rather than rebuilt.
+        assert!(matches!(
+            with_indent_guides("        x", &[]),
+            Cow::Borrowed(_)
+        ));
+    }
+
+    #[test]
+    fn an_inherited_guide_pads_out_past_a_blank_line_s_end() {
+        // A blank line has no cells for its inherited guides to replace, so the tail
+        // grows to reach them - the guide marks a column the line has not reached.
+        assert_eq!(with_indent_guides("", &[0, 4]), "│   │");
+        assert_eq!(with_indent_guides("  ", &[0, 4]), "│   │");
     }
 
     #[test]

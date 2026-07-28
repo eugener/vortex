@@ -530,8 +530,35 @@ decoration channel. All are theme-driven (§10.5) - theme *files* exist now, so 
 of chrome adds a slot to that format rather than a constant - and default-off where they
 add noise, each on/off switch a key in the config file the M5 loader now reads:
 
-- **Indent guides** - vertical rules per indent level (display-column math already in
-  `layout.rs`).
+- **Indent guides** - *built (M8).* `indent_guides = true` in the config file, plus
+  `toggle_indent_guides` for mid-session. A rule at every tab stop strictly inside a
+  line's indentation, so a line indented 8 with 4-wide tabs carries guides at columns 0
+  and 4. **Column 0 is included**: it is the left edge of the block the indented text
+  sits in, which is the one level nothing else on screen shows, and dropping it would
+  leave a singly-indented line with no guide at all.
+  Painted as a **glyph, not a ground tint** - the opposite call from the ruler above,
+  and for the reason that made the ruler a tint: the cell a marker wants decides what it
+  can be. A ruler's cell is the one a long line is already using, so a glyph there would
+  displace text; a guide's cell is by construction *indentation*, so its glyph stands in
+  for a space, takes the same one cell, and nothing after it moves. The substitution is
+  into the row's painted text, never into the line the core holds, so every byte↔column
+  mapping still measures the buffer's own bytes rather than what the row shows. Its theme
+  slot (`indent_guide`) sets a foreground only and no ground, so a selection or a
+  current-line tint flows over a guide instead of being broken by it - the glyph survives
+  the wash, which is what a tint could not have done.
+  **A blank line inherits the shallower of its nearest non-blank neighbours.** This is
+  not a refinement: a run of blank lines is what punches a hole through every guide
+  crossing it, and blank lines between statements are the common case, so without
+  inheritance the feature looks broken exactly where it is most used. Taking the
+  *shallower* side is what stops a guide running past a closing brace - the blank line
+  trailing a block belongs to the block outside it, not the one that just ended. A
+  missing neighbour counts as column 0 rather than "use the other side": nothing encloses
+  the top or the bottom of a file. The search answers from the visible window where it
+  can and crosses into the rope only at the window's edges, resolved once per frame - a
+  blank row at the top of the screen must still inherit, or guides would flicker as you
+  scrolled - and it is **bounded** (SPEC §10.4): past a screenful of blank lines the
+  guides simply stop, which is the honest answer, since "what block is this inside" has
+  stopped being a question the eye is asking.
 - **Relative line numbers** - *built (M8).* `line_numbers = "absolute" | "relative"` in
   the config file, plus `toggle_line_numbers` for mid-session (named like any other
   command, palette-listed, and left unbound - chrome switches earn a chord only if they
@@ -1219,7 +1246,8 @@ Incremental build order so the risky assumptions are validated early, not at the
   arrives with them**; until then M7's answer to "what can I do here" is `Ctrl+P`.
   *Verify:* open a file via the picker, switch buffers, run a command via the palette -
   in-terminal.
-- **M8 - Chrome + polish.** *(in progress: relative line numbers and rulers have landed.)* Git diff
+- **M8 - Chrome + polish.** *(in progress: relative line numbers, rulers and indent guides
+  have landed.)* Git diff
   signs (a git-diff task feeding `GutterMark`s; its git source - `gix` / `git2` - is a §3
   stack addition to raise), indent guides, relative line numbers, scrollbar, sticky context
   (tree-sitter), cursor-shape-per-mode, rulers. Unlike the earlier milestones these are
@@ -1236,7 +1264,11 @@ Incremental build order so the risky assumptions are validated early, not at the
   *is* the running setting, and the file only says what it starts as.
   *Verify:* each renders against real buffers / a real repo. Relative numbering driven in a
   pty - caret on line 5 of 9, the palette's toggle run, gutter repainting `4 3 2 1 _ 1 2 3
-  4` with the caret's own row keeping its absolute `5`.
+  4` with the caret's own row keeping its absolute `5`. Indent guides driven in a pty over
+  a nested Rust file - guides at columns 0, 4 and 8 by depth, running through the blank
+  line inside a block and stopping at the one trailing it, with the whole frame identical
+  to the guides-off frame once the glyphs are replaced by spaces (the "nothing moves"
+  claim, checked rather than argued), and the palette's toggle turning them on live.
 
 Extensibility (§12.1) sits after the M0-M8 build order and is gated on that decision.
 

@@ -15,6 +15,7 @@ gutter_current   = { fg = "#1f2422", bold = true }
 selection        = { fg = "#1f2422", bg = "#f6dc86" }
 current_line     = { bg = "#e3e6e0" }
 ruler            = { bg = "#dcdfd8" }
+indent_guide     = { fg = "#c6ccc6" }
 secondary_cursor = { fg = "#eceee9", bg = "#8c3a2c" }
 toast_info       = { fg = "#eceee9", bg = "#4a544d" }
 toast_error      = { fg = "#f7efe9", bg = "#9c2f37", bold = true }

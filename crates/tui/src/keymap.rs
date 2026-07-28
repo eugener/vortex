@@ -221,6 +221,10 @@ pub enum Command {
     /// is the same switch reachable mid-session, since which numbering helps depends
     /// on what you are doing rather than on the machine you are on.
     ToggleLineNumbers,
+    /// Draw or stop drawing the indent guides (frontend-local: the guides are derived
+    /// from the text's own whitespace, so the core is not involved in showing them).
+    /// Config sets what you start with, the same as the gutter's numbering mode.
+    ToggleIndentGuides,
     /// Open the encoding picker (frontend-local until a pick, which commits an
     /// `Action::SetEncoding`).
     OpenEncodingPicker,
@@ -335,6 +339,7 @@ impl Command {
             "open_buffer_picker" => Command::OpenBufferPicker,
             "open_search_picker" => Command::OpenSearchPicker,
             "toggle_line_numbers" => Command::ToggleLineNumbers,
+            "toggle_indent_guides" => Command::ToggleIndentGuides,
             "open_encoding_picker" => Command::OpenEncodingPicker,
             "open_line_ending_picker" => Command::OpenLineEndingPicker,
             "next_buffer" => Command::NextBuffer,
@@ -360,6 +365,7 @@ impl Command {
             Command::OpenBufferPicker => return FrontendCommand::OpenBufferPicker,
             Command::OpenSearchPicker => return FrontendCommand::OpenSearchPicker,
             Command::ToggleLineNumbers => return FrontendCommand::ToggleLineNumbers,
+            Command::ToggleIndentGuides => return FrontendCommand::ToggleIndentGuides,
             Command::OpenEncodingPicker => return FrontendCommand::OpenEncodingPicker,
             Command::OpenLineEndingPicker => return FrontendCommand::OpenLineEndingPicker,
             Command::SaveAs => return FrontendCommand::OpenSavePrompt,
