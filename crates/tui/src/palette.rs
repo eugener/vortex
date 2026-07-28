@@ -31,6 +31,7 @@ const PALETTE: &[(&str, Bindable)] = &[
     ("Change Theme…", Bindable::OpenThemePicker),
     ("Toggle Relative Line Numbers", Bindable::ToggleLineNumbers),
     ("Toggle Indent Guides", Bindable::ToggleIndentGuides),
+    ("Toggle Scrollbar", Bindable::ToggleScrollbar),
     ("Set Encoding…", Bindable::OpenEncodingPicker),
     ("Set Line Endings…", Bindable::OpenLineEndingPicker),
     ("Save File", Bindable::Save),

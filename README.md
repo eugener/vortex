@@ -63,7 +63,7 @@ clipboard (including over SSH via OSC 52), several buffers with a tab strip, tre
 syntax colors on Rust, a fuzzy file picker and a buffer picker (both with a preview pane),
 a command palette, switchable themes, regex find-and-replace in the buffer (matches
 highlighted as you type, capture groups in the replacement, and a query-replace walk),
-project-wide regex search that jumps to the match, indent guides, a config file for keys and settings, files in their own encoding and line endings (saved
+project-wide regex search that jumps to the match, indent guides, a click-and-drag scrollbar, a config file for keys and settings, files in their own encoding and line endings (saved
 back as they were found), a warning when a file changes underneath you, and live
 `rust-analyzer` diagnostics (underlined by span, with a colored gutter mark, if
 `rust-analyzer` is on your PATH).
@@ -71,7 +71,7 @@ back as they were found), a warning when a file changes underneath you, and live
 What does not: syntax colors or a language server for **any language but Rust** - a
 grammar is a separate crate the editor loads at runtime, and only `grammar-rust` is
 written; LSP features past diagnostics (no completion, hover, or goto); and most of the
-M8 chrome (git diff signs, a scrollbar, sticky context).
+M8 chrome (git diff signs, sticky context).
 
 There is no which-key popup and no leader-key sequences: bindings are single chords, and
 "what can I do here" is answered by the command palette, which lists every command by name
@@ -168,6 +168,8 @@ selection        = { fg = "#eef2f4", bg = "#2f383e" }
 current_line     = { bg = "#1b1f22" }
 ruler            = { bg = "#23282b" }
 indent_guide     = { fg = "#31383d" }
+scrollbar_track  = { fg = "#31383d" }
+scrollbar_thumb  = { fg = "#69747b" }
 secondary_cursor = { fg = "#141719", bg = "#e04b3c" }
 toast_info       = { fg = "#c9ced2", bg = "#242a2e" }
 toast_error      = { fg = "#141719", bg = "#e04b3c", bold = true }
@@ -198,6 +200,7 @@ tab_width     = 4            # display width of a tab stop
 line_numbers  = "absolute"   # or "relative" - see below
 rulers        = [80, 100]    # tint these columns; [] (the default) draws none
 indent_guides = true         # a rule down each indent level; off by default
+scrollbar     = true         # reserve the right column for one; off by default
 final_newline = true         # add a trailing newline on save if the file lacks one
 
 [keys]                       # layered over the built-in bindings, not replacing them
@@ -226,6 +229,15 @@ block a line belongs to is readable without counting spaces. Unlike a ruler it i
 without displacing anything. A blank line takes the shallower of its neighbours' indents,
 which keeps a guide running through the gaps inside a block while stopping it at the
 blank line that trails one. **Toggle Indent Guides** in the palette flips it for the
+session.
+
+`scrollbar` puts a bar down the body's rightmost column, and it is a control rather than
+a readout: a press on the track throws the view to that point in the file and a drag
+tracks the pointer, including when the drag wanders off the column. The caret does not
+move, so the view can leave it, exactly as the wheel already does. The column is
+**reserved whenever the setting is on**, even when the file fits on screen and no bar is
+drawn - one that appeared only once a file outgrew the viewport would slide every line
+one cell sideways at that moment. **Toggle Scrollbar** in the palette flips it for the
 session.
 
 Like a theme file, **an unknown key is an error rather than a shrug** - but a config that

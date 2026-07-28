@@ -225,6 +225,9 @@ pub enum Command {
     /// from the text's own whitespace, so the core is not involved in showing them).
     /// Config sets what you start with, the same as the gutter's numbering mode.
     ToggleIndentGuides,
+    /// Show or hide the scrollbar (frontend-local: the viewport is this side's, so
+    /// what stands for it is too).
+    ToggleScrollbar,
     /// Open the encoding picker (frontend-local until a pick, which commits an
     /// `Action::SetEncoding`).
     OpenEncodingPicker,
@@ -340,6 +343,7 @@ impl Command {
             "open_search_picker" => Command::OpenSearchPicker,
             "toggle_line_numbers" => Command::ToggleLineNumbers,
             "toggle_indent_guides" => Command::ToggleIndentGuides,
+            "toggle_scrollbar" => Command::ToggleScrollbar,
             "open_encoding_picker" => Command::OpenEncodingPicker,
             "open_line_ending_picker" => Command::OpenLineEndingPicker,
             "next_buffer" => Command::NextBuffer,
@@ -366,6 +370,7 @@ impl Command {
             Command::OpenSearchPicker => return FrontendCommand::OpenSearchPicker,
             Command::ToggleLineNumbers => return FrontendCommand::ToggleLineNumbers,
             Command::ToggleIndentGuides => return FrontendCommand::ToggleIndentGuides,
+            Command::ToggleScrollbar => return FrontendCommand::ToggleScrollbar,
             Command::OpenEncodingPicker => return FrontendCommand::OpenEncodingPicker,
             Command::OpenLineEndingPicker => return FrontendCommand::OpenLineEndingPicker,
             Command::SaveAs => return FrontendCommand::OpenSavePrompt,

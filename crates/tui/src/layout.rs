@@ -353,6 +353,37 @@ pub fn scroll_to_show(cursor: usize, offset: usize, size: usize) -> usize {
     }
 }
 
+/// The scroll offset a press on row `row` of a `track`-tall scrollbar asks for,
+/// given the buffer's largest useful offset (SPEC §7.5).
+///
+/// The track's ends are the buffer's ends: row 0 is the top of the file and the last
+/// row is `max_scroll`, with everything between them linear. The obvious alternative -
+/// put the *thumb's top* where the pointer is - cannot reach the bottom at all, since
+/// the thumb's own height is then always left over below it.
+///
+/// This is not at odds with grabbing the thumb, which is the gesture it has to feel
+/// like: the thumb covers the fraction of the track that the viewport covers of the
+/// buffer, and under this mapping the pointer sits **inside** it at every offset - so a
+/// drag reads as dragging the thumb rather than as throwing it.
+///
+/// That holds while the thumb is drawn proportionally, which is while the buffer is
+/// under `track²` lines - some 1600 for a full-height terminal. Past that the thumb has
+/// collapsed to its one-cell floor, one row of track is worth several screens of text,
+/// and the pointer can land a cell off the thumb it is dragging. Nothing better is
+/// available at that ratio: no single cell can stand for the viewport, so the two
+/// roundings have nothing left to agree on. Reaching both ends of the file is the
+/// property worth keeping there, and it is the one this keeps.
+pub fn scroll_at_track_row(row: usize, track: usize, max_scroll: usize) -> usize {
+    // A one-row track has no range to express, and dividing by its span would be a
+    // divide by zero; every press on it means the one offset it can show.
+    let Some(span) = track.checked_sub(1).filter(|&s| s > 0) else {
+        return 0;
+    };
+    // Rounded rather than truncated, so the row nearest an offset selects it instead
+    // of the whole track drifting one line toward the top.
+    (row.min(span) * max_scroll + span / 2) / span
+}
+
 /// Render the tab-expanded `line` into styled spans for the display-column window
 /// `[h_scroll, h_scroll + width)` - the frontend's one intra-line styling seam,
 /// shared by selection highlighting now and syntax highlighting (M4) later.
@@ -1672,6 +1703,63 @@ mod tests {
         // grows to reach them - the guide marks a column the line has not reached.
         assert_eq!(with_indent_guides("", &[0, 4]), "│   │");
         assert_eq!(with_indent_guides("  ", &[0, 4]), "│   │");
+    }
+
+    #[test]
+    fn the_scrollbar_tracks_ends_are_the_buffers_ends() {
+        // The property that rules out "put the thumb's top at the pointer": the last
+        // row has to reach the last line, which that mapping cannot do.
+        assert_eq!(scroll_at_track_row(0, 10, 90), 0);
+        assert_eq!(scroll_at_track_row(9, 10, 90), 90);
+        // Linear between them, rounded to the nearest offset.
+        assert_eq!(scroll_at_track_row(5, 10, 90), 50);
+        assert_eq!(scroll_at_track_row(4, 10, 9), 4);
+    }
+
+    #[test]
+    fn a_press_past_the_scrollbar_track_lands_on_its_last_row() {
+        // A drag pulled below the body still means "the bottom", not an offset past
+        // the end that the paint would silently clamp back.
+        assert_eq!(scroll_at_track_row(99, 10, 90), 90);
+    }
+
+    #[test]
+    fn a_scrollbar_track_with_no_span_has_one_answer() {
+        // Guard: a one-row (or zero-row) track cannot express a range, and dividing by
+        // its span would be a divide by zero.
+        assert_eq!(scroll_at_track_row(0, 1, 90), 0);
+        assert_eq!(scroll_at_track_row(3, 0, 90), 0);
+    }
+
+    #[test]
+    fn the_pointer_stays_inside_the_thumb_it_is_dragging() {
+        // Why the linear mapping still reads as grabbing the thumb rather than
+        // throwing it: at every row, the thumb ratatui draws for the offset this
+        // returns covers the row that was pressed. Checked against ratatui's own
+        // geometry rather than against a restatement of it - `part_lengths`
+        // transcribed, which rounds half-up and clamps both parts into the track.
+        let round_div = |n: usize, d: usize| (n + d / 2) / d;
+        for track in [2usize, 5, 12, 40] {
+            for lines in [track + 1, track + 3, track * 3, track * 50] {
+                let max_scroll = lines - track;
+                // Below `track²` lines the thumb is still proportional and the two
+                // roundings agree exactly; above it the thumb is pinned at one cell,
+                // which no offset can make stand for a whole viewport, so the pointer
+                // is allowed to sit a cell off it.
+                let slack = usize::from(lines > track * track);
+                for row in 0..track {
+                    let scroll = scroll_at_track_row(row, track, max_scroll);
+                    let len = round_div(track * track, lines).clamp(1, track);
+                    let start = round_div(scroll * track, lines).min(track - len);
+                    assert!(
+                        (start.saturating_sub(slack)..start + len + slack).contains(&row),
+                        "track {track}, lines {lines}, row {row}: \
+                         scroll {scroll}, thumb {start}..{}",
+                        start + len
+                    );
+                }
+            }
+        }
     }
 
     #[test]

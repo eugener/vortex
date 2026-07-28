@@ -595,7 +595,37 @@ add noise, each on/off switch a key in the config file the M5 loader now reads:
   a short line has *not* reached rather than one it has. They stop at the end of the
   buffer: a ruler marks a column of a line, and past the last line there is no line to
   hold one.
-- **Scrollbar** - ratatui `Scrollbar` on the right edge, from viewport + line count.
+- **Scrollbar** - *built (M8).* `scrollbar = true` in the config file, plus
+  `toggle_scrollbar`. ratatui's `Scrollbar` on the body's right edge, as this section
+  said - the one place a shipped widget was the whole answer, since the layer stack we
+  build is job 2 and a bar in a column is job 1's business.
+  **The column is reserved whenever the setting is on, painted or not.** This is the
+  decision the feature turns on: the tempting version claims the column only once a file
+  outgrows the viewport, and that version slides every line one cell sideways at exactly
+  the moment the file crosses that boundary - a reflow triggered by typing. So the text
+  width is `body - gutter - 1` for the whole session, and what comes and goes is only
+  what is drawn *in* the reserved column. Nothing is drawn there when the buffer fits: a
+  bar answers "where am I in something bigger than the screen", and with nothing bigger
+  there is nothing to answer - a full-height thumb would be a loud way of saying so.
+  Its `content_length` is the number of scroll **positions** (`max_scroll + 1`), not of
+  lines, with `viewport_content_length` set to the visible rows. That is what makes
+  ratatui's own geometry produce a thumb covering exactly the fraction of the track that
+  the screen covers of the buffer, at exactly the fraction the offset has travelled;
+  passing the line count instead yields a half-height thumb for a file that just fits.
+  **It takes the pointer** (§2.2's gesture rules): a press on the track throws the view
+  there, a drag follows it. The row→offset map is *linear over the whole track*, so the
+  last row reaches the last line - the obvious alternative, putting the thumb's *top*
+  under the pointer, can never reach the bottom, since the thumb's own height is always
+  left over below it. That is not at odds with the feel of grabbing the thumb: under this
+  map the pointer sits inside the thumb at every offset, up to the point where the buffer
+  passes `track²` lines and the thumb collapses to its one-cell floor, past which no
+  single cell can stand for a viewport and the two roundings have nothing left to agree
+  on. Reaching both ends is what is worth keeping there.
+  A press decides whether the gesture belongs to the bar and a **drag inherits that
+  answer** rather than re-asking, so pulling a cell sideways off the column keeps
+  scrolling instead of becoming a text selection halfway through. That is the second
+  piece of pointer state in the frontend (after `click::Clicks`), and it exists for the
+  same reason: terminals report positions, not gestures.
 - **Sticky context header** - pin the enclosing scope (function/class) at the viewport top;
   needs tree-sitter, so it pairs with M4.
 - **Current-line tint, selection wash, multi-cursor carets** - already built (M1-M3); listed
@@ -1246,8 +1276,8 @@ Incremental build order so the risky assumptions are validated early, not at the
   arrives with them**; until then M7's answer to "what can I do here" is `Ctrl+P`.
   *Verify:* open a file via the picker, switch buffers, run a command via the palette -
   in-terminal.
-- **M8 - Chrome + polish.** *(in progress: relative line numbers, rulers and indent guides
-  have landed.)* Git diff
+- **M8 - Chrome + polish.** *(in progress: relative line numbers, rulers, indent guides
+  and the scrollbar have landed.)* Git diff
   signs (a git-diff task feeding `GutterMark`s; its git source - `gix` / `git2` - is a §3
   stack addition to raise), indent guides, relative line numbers, scrollbar, sticky context
   (tree-sitter), cursor-shape-per-mode, rulers. Unlike the earlier milestones these are
@@ -1268,7 +1298,13 @@ Incremental build order so the risky assumptions are validated early, not at the
   a nested Rust file - guides at columns 0, 4 and 8 by depth, running through the blank
   line inside a block and stopping at the one trailing it, with the whole frame identical
   to the guides-off frame once the glyphs are replaced by spaces (the "nothing moves"
-  claim, checked rather than argued), and the palette's toggle turning them on live.
+  claim, checked rather than argued), and the palette's toggle turning them on live. The
+  scrollbar driven in a pty over a 60-line file in an 18-row body, by mouse: a press on
+  the track's last row landing on the file's last line, a press near the top and two
+  drags each landing on the offset the linear map predicts to the line, the second of
+  those drags twenty columns *off* the bar and still scrolling rather than selecting
+  text, and `Ln 1, Col 1` unmoved in the status bar throughout - the view goes where it
+  is thrown and the caret stays where it was.
 
 Extensibility (§12.1) sits after the M0-M8 build order and is gated on that decision.
 
