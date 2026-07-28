@@ -1015,15 +1015,24 @@ fn event_loop(
                         // drag inherits that answer rather than re-asking, so pulling
                         // a cell sideways off the bar keeps scrolling instead of
                         // turning into a text selection halfway through the gesture.
-                        let screen = terminal.size()?;
+                        // Asked only on a press, and only when the column is there at
+                        // all: mouse mode reports a drag per cell crossed, so querying
+                        // the terminal's size here unconditionally would charge every
+                        // selection sweep an ioctl per column with the bar switched off.
                         if is_press {
-                            dragging_scrollbar = on_scrollbar(
-                                Rect::new(0, 0, screen.width, screen.height),
-                                config.scrollbar,
-                                mouse.column,
-                                mouse.row,
-                            );
+                            dragging_scrollbar = config.scrollbar && {
+                                let screen = terminal.size()?;
+                                on_scrollbar(
+                                    Rect::new(0, 0, screen.width, screen.height),
+                                    mouse.column,
+                                    mouse.row,
+                                )
+                            };
                         }
+                        // The column can be taken away mid-gesture - the palette's
+                        // toggle is reachable with the button still down - and a drag
+                        // must not keep scrolling over what has become text.
+                        dragging_scrollbar &= config.scrollbar;
                         if dragging_scrollbar {
                             let track = viewport.page_height;
                             let max_scroll =
@@ -1033,13 +1042,19 @@ fn event_loop(
                             // still means that end: `saturating_sub` holds the top and
                             // `scroll_at_track_row` already clamps the bottom, so
                             // repeating that clamp here would be a second copy of a
-                            // bound that has one owner.
+                            // bound that has one owner. A track too short to tell its
+                            // offsets apart answers `None`, and then the press moves
+                            // nothing rather than throwing the reader to line 1.
                             let row = (mouse.row as usize).saturating_sub(1);
-                            viewport.scroll = layout::scroll_at_track_row(row, track, max_scroll);
-                            // The caret has not moved, so the view must be allowed to
-                            // leave it - the same rule the wheel follows.
-                            follow = false;
-                            needs_redraw = true;
+                            if let Some(scroll) =
+                                layout::scroll_at_track_row(row, track, max_scroll)
+                            {
+                                viewport.scroll = scroll;
+                                // The caret has not moved, so the view must be allowed
+                                // to leave it - the same rule the wheel follows.
+                                follow = false;
+                                needs_redraw = true;
+                            }
                             continue;
                         }
                         // Only a plain press advances the click run (SPEC §2.2): a
@@ -1592,6 +1607,7 @@ fn paint(frame: &mut Frame, snapshot: &ViewSnapshot, inputs: PaintInputs) -> Vie
                 .iter()
                 .map(|&col| (col..col + 1, theme.ruler))
                 .collect(),
+            reserved: usize::from(scrollbar),
             indent_guides,
             // Only the lines about to be painted are searched, which is the whole
             // reason `matches_in` takes a line range (SPEC §10.4).
@@ -1743,6 +1759,10 @@ struct Body {
     /// than per row - and they seed each row's overlay list, which is what puts them
     /// *under* everything else that paints.
     rulers: Vec<(std::ops::Range<usize>, Style)>,
+    /// Cells of the body reserved to the right of the text - the scrollbar's column,
+    /// or 0 when it is off. The row's own ground is extended across them so the
+    /// current-line wash reaches the body's edge (SPEC §7.5).
+    reserved: usize,
     /// Draw a vertical rule at each indent level (SPEC §7.5). Unlike the rulers this
     /// cannot be resolved once for the frame: the columns are a property of each
     /// line's own indentation, so they are computed for the window in [`paint_body`],
@@ -1822,17 +1842,7 @@ fn paint_body(frame: &mut Frame, area: Rect, snapshot: &ViewSnapshot, body: Body
             // selection's ground rather than being flattened to the selection's own
             // foreground (SPEC §5, later overlays win in `render_line`).
             let mut overlays: Vec<(std::ops::Range<usize>, Style)> = body.rulers.clone();
-            // Indent guides sit just above the rulers and below everything else, for
-            // the same reason: both are margin markers, and a selection or a match
-            // crossing one must not be the thing that gives way. The overlay carries
-            // only the guide's *color* - the glyph itself is substituted into the row's
-            // text below, since an overlay can restyle a cell but not rewrite it.
             let columns: &[usize] = guides.get(row).map_or(&[], Vec::as_slice);
-            overlays.extend(
-                columns
-                    .iter()
-                    .map(|&col| (col..col + 1, body.theme.indent_guide)),
-            );
             overlays.extend(snapshot.selections.iter().filter_map(|s| {
                 layout::selection_columns(
                     raw,
@@ -1869,6 +1879,23 @@ fn paint_body(frame: &mut Frame, area: Rect, snapshot: &ViewSnapshot, body: Body
                     overlays.push((range, style));
                 }
             }
+            // Indent guides, pushed with the syntax highlights rather than with the
+            // rulers, because a guide is the same *kind* of thing a highlight is: a
+            // foreground over whatever ground the washes above have laid down. Under
+            // the rulers' rule it would lose its color to any selection crossing it -
+            // the theme's `selection` sets a foreground too - and a guide at full
+            // selection brightness stops reading as a margin and starts reading as a
+            // `│` the user typed. Its ground is untouched either way, so the selection
+            // still owns the cell; only the glyph keeps its own dimness.
+            //
+            // The overlay carries the guide's *color* alone. The glyph is substituted
+            // into the row's text below, because an overlay can restyle a cell but not
+            // rewrite it.
+            overlays.extend(
+                columns
+                    .iter()
+                    .map(|&col| (col..col + 1, body.theme.indent_guide)),
+            );
             // Syntax highlights (M4): each span clipped to this line's byte range,
             // mapped to display columns, painted as a foreground color over the
             // selection ground and under the diagnostic underline and carets.
@@ -1957,6 +1984,17 @@ fn paint_body(frame: &mut Frame, area: Rect, snapshot: &ViewSnapshot, body: Body
                 base,
                 &overlays,
             ));
+            // Carry the row's ground across the scrollbar's reserved column, which
+            // `render_line` stops short of because it is not text. Without this the
+            // current-line wash ends one cell before the body's edge and the caret's
+            // row shows a notch - the gutter already takes the tint for the same
+            // reason, so the row would be washed at both ends and broken at one. The
+            // bar paints over this afterwards, and its styles set a foreground only,
+            // so the track and thumb end up on the row's own ground rather than
+            // punching the hole back in.
+            if body.reserved > 0 {
+                spans.push(Span::styled(" ".repeat(body.reserved), base));
+            }
             Line::from(spans)
         })
         .collect();
@@ -2051,14 +2089,17 @@ fn status_target_at(
 /// The whole reserved column answers, painted or not. When the buffer fits on screen
 /// nothing is drawn there, but the column still belongs to the scrollbar - falling
 /// through to the text would put a caret in a column that holds no text.
-fn on_scrollbar(screen: Rect, scrollbar: bool, column: u16, row: u16) -> bool {
-    scrollbar
-        && screen.width > 0
+/// Whether the setting is on is the caller's question, not this one's - it gates the
+/// terminal-size query that produces `screen`.
+fn on_scrollbar(screen: Rect, column: u16, row: u16) -> bool {
+    screen.width > 0
         && column == screen.width - 1
         // Row 0 is the bufferline and the last row is the status bar; both are their
-        // own controls and answered before this one.
+        // own controls and answered before this one. Saturating rather than `row + 1`,
+        // because `row` arrives from a terminal and a report of `u16::MAX` must not be
+        // an overflow on an input path.
         && row >= 1
-        && row + 1 < screen.height
+        && row < screen.height.saturating_sub(1)
 }
 
 /// What a press or drag in the editor body means, given how many clicks the run has
@@ -2910,6 +2951,75 @@ mod tests {
     }
 
     #[test]
+    fn a_tab_indented_row_puts_its_guide_where_a_space_indented_row_does() {
+        // The one seam where the feature's halves measure differently: `indent_guides`
+        // walks the *raw* line, where a tab advances to its stop, while
+        // `with_indent_guides` walks the *expanded* line, where the tab is already
+        // spaces. They agree only because `expand_tabs` fills to the same stop, so hold
+        // them to painting the same cells rather than to that being obviously true.
+        let tabs = snapshot_after(&[Action::Insert("fn a() {\n\tx();\n\t\ty();".into())]);
+        let spaces = snapshot_after(&[Action::Insert("fn a() {\n    x();\n        y();".into())]);
+        let guided = |snap: &ViewSnapshot| {
+            let buf = render_with(
+                snap,
+                40,
+                8,
+                PaintInputs {
+                    indent_guides: true,
+                    ..paint_inputs(0)
+                },
+            );
+            (1..4).map(|r| row_text(&buf, r)).collect::<Vec<_>>()
+        };
+        assert_eq!(guided(&tabs), guided(&spaces));
+        // And mixed indentation lands on the stops it actually passed, not on a count
+        // of whitespace characters.
+        let mixed = snapshot_after(&[Action::Insert("fn a() {\n\t    y();".into())]);
+        let buf = render_with(
+            &mixed,
+            40,
+            8,
+            PaintInputs {
+                indent_guides: true,
+                ..paint_inputs(0)
+            },
+        );
+        let gutter = layout::gutter_width(layout::display_line_count(&mixed.text)) as u16;
+        // A tab to column 4 then four spaces is an indent of 8: guides at 0 and 4.
+        assert_eq!(buf.cell((gutter, 2)).unwrap().symbol(), "│");
+        assert_eq!(buf.cell((gutter + 4, 2)).unwrap().symbol(), "│");
+        assert_eq!(buf.cell((gutter + 8, 2)).unwrap().symbol(), "y");
+    }
+
+    #[test]
+    fn indentation_a_guide_cannot_replace_is_left_alone() {
+        // A NO-BREAK SPACE is whitespace to Unicode but not indentation here, because
+        // the glyph cannot stand in for it. The cell must come out untouched - the bug
+        // this guards is the overlay landing without the glyph, dimming a character
+        // instead of drawing a rule.
+        let snap = snapshot_after(&[Action::Insert(
+            "fn a() {\n\u{a0}\u{a0}\u{a0}\u{a0}x();".into(),
+        )]);
+        let buf = render_with(
+            &snap,
+            40,
+            8,
+            PaintInputs {
+                indent_guides: true,
+                ..paint_inputs(0)
+            },
+        );
+        let gutter = layout::gutter_width(layout::display_line_count(&snap.text)) as u16;
+        let cell = buf.cell((gutter, 2)).unwrap();
+        assert_eq!(cell.symbol(), "\u{a0}", "the character is left as it was");
+        assert_ne!(
+            cell.fg,
+            config::Theme::default().indent_guide.fg.unwrap(),
+            "and is not recolored as though a guide were drawn"
+        );
+    }
+
+    #[test]
     fn indent_guides_are_off_unless_asked() {
         // Off has to mean the row is exactly what it was: chrome that leaves a faint
         // mark when disabled is worse than chrome that does not exist.
@@ -2950,13 +3060,21 @@ mod tests {
             },
         );
         let gutter = layout::gutter_width(layout::display_line_count(&snap.text)) as u16;
+        let theme = config::Theme::default();
         let cell = buf.cell((gutter, 1)).unwrap();
         assert_eq!(cell.symbol(), "│", "the glyph survives the wash");
         assert_eq!(
             cell.bg,
-            config::Theme::default().selection.bg.unwrap(),
+            theme.selection.bg.unwrap(),
             "and sits on the selection's ground"
         );
+        // The guide keeps its *own* dimness, which is the whole reason it is pushed
+        // with the syntax highlights instead of with the rulers. The theme's selection
+        // sets a foreground too, so an overlay ordered under it would come out at full
+        // selection brightness - a guide that bright stops reading as a margin and
+        // starts reading as a `│` in the user's text.
+        assert_eq!(cell.fg, theme.indent_guide.fg.unwrap());
+        assert_ne!(cell.fg, theme.selection.fg.unwrap());
     }
 
     /// A 30-line buffer, which overflows every viewport these tests use.
@@ -2993,6 +3111,37 @@ mod tests {
         assert_eq!(short_bar, ' ', "nothing to say, so nothing is said");
         // ...while the tall one carries the bar in that same column.
         assert_ne!(with(&tall).chars().last().unwrap(), ' ');
+    }
+
+    #[test]
+    fn the_current_line_wash_reaches_the_scrollbars_column() {
+        // `render_line` pads only to `text_width`, which the reserved column is outside
+        // of - so without carrying the row's ground across it the caret's row ends in a
+        // notch one cell short of the body's edge. The gutter already takes the tint,
+        // which is what makes stopping short at the other end look like a defect rather
+        // than a boundary.
+        let snap = snapshot_after(&[Action::Insert("abc".into())]);
+        let buf = render_with(
+            &snap,
+            20,
+            6,
+            PaintInputs {
+                scrollbar: true,
+                ..paint_inputs(0)
+            },
+        );
+        let wash = config::Theme::default().current_line.bg.unwrap();
+        // Row 1 is the caret's row: every cell of it, out to the last, carries the wash.
+        for col in 0..20 {
+            assert_eq!(
+                buf.cell((col, 1)).unwrap().bg,
+                wash,
+                "column {col} of the caret's row is outside the wash"
+            );
+        }
+        // And a row that is not the caret's is left alone, so this is the wash reaching
+        // further rather than the column being painted unconditionally.
+        assert_ne!(buf.cell((19, 2)).unwrap().bg, wash);
     }
 
     #[test]
@@ -3095,7 +3244,8 @@ mod tests {
             let snap = snapshot_after(&[Action::Insert(text)]);
             let max_scroll = layout::display_line_count(&snap.text) - track;
             for row in 0..track {
-                let scroll = layout::scroll_at_track_row(row, track, max_scroll);
+                let scroll = layout::scroll_at_track_row(row, track, max_scroll)
+                    .expect("a track of two rows or more can express a range");
                 let rows = painted_thumb(&snap, track, scroll);
                 assert!(
                     rows.contains(&row),
@@ -3113,7 +3263,8 @@ mod tests {
         let snap = snapshot_after(&[Action::Insert(text)]);
         let max_scroll = layout::display_line_count(&snap.text) - track;
         for row in 0..track {
-            let scroll = layout::scroll_at_track_row(row, track, max_scroll);
+            let scroll = layout::scroll_at_track_row(row, track, max_scroll)
+                .expect("a five-row track can express a range");
             let rows = painted_thumb(&snap, track, scroll);
             assert_eq!(rows.len(), 1, "the thumb is down to its floor");
             let off_by = rows[0].abs_diff(row);
@@ -3140,18 +3291,20 @@ mod tests {
     fn the_scrollbar_column_is_hit_tested_where_it_paints() {
         let screen = Rect::new(0, 0, 80, 24);
         // The rightmost column, on a body row.
-        assert!(on_scrollbar(screen, true, 79, 1));
-        assert!(on_scrollbar(screen, true, 79, 22));
+        assert!(on_scrollbar(screen, 79, 1));
+        assert!(on_scrollbar(screen, 79, 22));
         // Not the column to its left.
-        assert!(!on_scrollbar(screen, true, 78, 5));
+        assert!(!on_scrollbar(screen, 78, 5));
         // Row 0 is the bufferline and row 23 the status bar; both are their own
         // controls, and each answers before this one.
-        assert!(!on_scrollbar(screen, true, 79, 0));
-        assert!(!on_scrollbar(screen, true, 79, 23));
-        // Off, the column is text like any other.
-        assert!(!on_scrollbar(screen, false, 79, 5));
+        assert!(!on_scrollbar(screen, 79, 0));
+        assert!(!on_scrollbar(screen, 79, 23));
         // A screen with no width at all has no column to hit.
-        assert!(!on_scrollbar(Rect::new(0, 0, 0, 24), true, 0, 5));
+        assert!(!on_scrollbar(Rect::new(0, 0, 0, 24), 0, 5));
+        // A row a terminal should never report still has to be an answer rather than
+        // an overflow - this arrives from outside (CLAUDE.md: no panics on input paths).
+        assert!(!on_scrollbar(screen, 79, u16::MAX));
+        assert!(!on_scrollbar(Rect::new(0, 0, 80, 0), 79, u16::MAX));
     }
 
     #[test]
