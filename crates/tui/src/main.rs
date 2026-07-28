@@ -1842,7 +1842,14 @@ fn paint_body(frame: &mut Frame, area: Rect, snapshot: &ViewSnapshot, body: Body
             // selection's ground rather than being flattened to the selection's own
             // foreground (SPEC §5, later overlays win in `render_line`).
             let mut overlays: Vec<(std::ops::Range<usize>, Style)> = body.rulers.clone();
-            let columns: &[usize] = guides.get(row).map_or(&[], Vec::as_slice);
+            // Only the guides the window can show: a line's indentation is a length the
+            // file chooses, and paying for guides off screen would let it size the
+            // frame's work (SPEC §10.4 - see `guides_in_window` for what that costs).
+            let columns = layout::guides_in_window(
+                guides.get(row).map_or(&[], Vec::as_slice),
+                body.h_scroll,
+                body.text_width,
+            );
             overlays.extend(snapshot.selections.iter().filter_map(|s| {
                 layout::selection_columns(
                     raw,
@@ -3017,6 +3024,43 @@ mod tests {
             config::Theme::default().indent_guide.fg.unwrap(),
             "and is not recolored as though a guide were drawn"
         );
+    }
+
+    #[test]
+    fn a_deeply_indented_line_only_costs_the_guides_on_screen() {
+        // Indentation is a length the file chooses, so an absurd one must not turn into
+        // per-frame work: the guides outside the horizontal window are clipped away
+        // before either the substitution or the overlay scan sees them (SPEC §10.4).
+        // The clip itself is checked in `layout::guides_in_window` - it removes work,
+        // not marks, so it leaves no trace here. What this pins is the other half: that
+        // clipping did not cost the row a guide it should have drawn, at either edge.
+        let snap = snapshot_after(&[Action::Insert(format!("{}x();", " ".repeat(4_000)))]);
+        // The window is pinned rather than followed, so the columns under test are the
+        // ones named here instead of wherever the caret dragged the view.
+        let guides_at = |h_scroll: usize| {
+            let buf = render_with(
+                &snap,
+                40,
+                6,
+                PaintInputs {
+                    indent_guides: true,
+                    follow: false,
+                    viewport: ViewState {
+                        scroll: 0,
+                        h_scroll,
+                        page_height: 4,
+                    },
+                    ..paint_inputs(0)
+                },
+            );
+            row_text(&buf, 1).matches('│').count()
+        };
+        // A 4-wide gutter leaves 36 columns, which hold nine tab stops. The line offers
+        // a thousand guides; the window is what decides how many are paid for.
+        assert_eq!(guides_at(0), 9);
+        // Scrolled right the count holds, so the clip trims the low end too rather than
+        // only stopping at the window's far edge.
+        assert_eq!(guides_at(100), 9);
     }
 
     #[test]
