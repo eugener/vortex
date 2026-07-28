@@ -857,9 +857,14 @@ fn event_loop(
                             overlays.dismiss();
                             needs_redraw = true;
                         }
-                        // A UI overlay (any non-`Editor` command) opens locally, so
-                        // repaint now; a core intent repaints when its snapshot
-                        // returns, so it need not force one.
+                        // Any non-`Editor` command takes effect *locally* - it opens
+                        // an overlay, or changes a frontend-owned setting the painter
+                        // reads (`toggle_line_numbers`) - so nothing else will ask for
+                        // a frame and this must. A core intent repaints when its
+                        // snapshot returns, so it need not force one.
+                        //
+                        // Narrowing this to the overlay-openers would leave the
+                        // settings commands changing nothing until the next keystroke.
                         if !matches!(&command, Command::Editor(_)) {
                             needs_redraw = true;
                         }
@@ -1617,7 +1622,13 @@ struct Body {
     /// Which match the search is *on* - painted in the accent so "which one is next"
     /// is answerable on a screen full of hits.
     current: Option<std::ops::Range<usize>>,
-    /// The cursor's line, so its gutter number can be emphasized.
+    /// The primary caret's line: the row whose gutter number is emphasized, and the
+    /// origin relative numbering measures from ([`Body::line_numbers`]).
+    ///
+    /// This is the caret's line even when the caret is not on screen - a wheel
+    /// scroll, or a search preview scrolling to a match the caret has not moved to
+    /// (SPEC §7.5). Both jobs key off the caret deliberately, so neither follows the
+    /// viewport away from it.
     cursor_line: usize,
     /// The active theme, read straight through for the chrome styles this paints
     /// (gutter, selection, current line, secondary caret). `Theme` is `Copy`, so
@@ -2569,6 +2580,9 @@ mod tests {
         // is the only place it is visible (SPEC §7.5, §10.5). Five lines, and the
         // caret ends on the last one.
         let snap = snapshot_after(&[Action::Insert("l1\nl2\nl3\nl4\nl5".into())]);
+        // Derived, not hardcoded: a change to the minimum digit field would other-
+        // wise slice mid-number and fail as a panic instead of a diff.
+        let width = layout::gutter_width(layout::display_line_count(&snap.text));
         let gutters = |mode| {
             let buf = render_with(
                 &snap,
@@ -2579,9 +2593,12 @@ mod tests {
                     ..paint_inputs(0)
                 },
             );
-            // Body rows start at 1 (row 0 is the head bar); take the 4-cell gutter.
+            // Body rows start at 1 (row 0 is the head bar).
             (1..=5)
-                .map(|row| row_text(&buf, row)[..4].to_string())
+                .map(|row| {
+                    let text = row_text(&buf, row);
+                    text.chars().take(width).collect::<String>()
+                })
                 .collect::<Vec<_>>()
         };
         assert_eq!(
