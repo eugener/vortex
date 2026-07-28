@@ -30,6 +30,24 @@ use crate::keymap::Keymap;
 /// nothing. Four is the width the editor used before it was configurable.
 pub const DEFAULT_TAB_WIDTH: usize = 4;
 
+/// How the gutter numbers its rows (SPEC §7.5 chrome, M8).
+///
+/// There is deliberately no third "pure relative" mode that prints `0` on the
+/// cursor's own row. The number a relative gutter is *for* is the count you type
+/// before a motion, and the one row you never need that count for is the one you
+/// are on - so the slot is free to carry the absolute number, which is the thing a
+/// relative gutter otherwise costs you (a jump target, a line to quote in a review).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum LineNumbers {
+    /// Every row shows its own 1-based number.
+    #[default]
+    Absolute,
+    /// Every row shows its distance from the cursor's row; the cursor's own row
+    /// shows its absolute number.
+    Relative,
+}
+
 /// All user-configurable settings, resolved once at startup and threaded into the
 /// render and input paths. Grows as configurable surfaces land, so it is passed as
 /// a whole rather than field-by-field (SPEC §10.5).
@@ -46,6 +64,9 @@ pub struct Config {
     /// Display width of a tab stop (SPEC §4). Frontend-owned because a tab's width
     /// is a rendering question - the buffer holds one byte either way.
     pub tab_width: usize,
+    /// How the gutter numbers its rows (SPEC §7.5). Frontend-owned for the same
+    /// reason the gutter itself is: the core has no idea a margin exists.
+    pub line_numbers: LineNumbers,
     /// Append a trailing newline on save when the buffer lacks one (SPEC §10.1).
     /// Held here because this is where the user's file is read, and handed to the
     /// core, which is what acts on it.
@@ -59,6 +80,7 @@ impl Default for Config {
             theme_name: crate::theme::DEFAULT.to_string(),
             keymap: Keymap::default(),
             tab_width: DEFAULT_TAB_WIDTH,
+            line_numbers: LineNumbers::default(),
             final_newline: CoreOptions::default().final_newline,
         }
     }
@@ -88,6 +110,7 @@ impl Config {
 struct ConfigFile {
     theme: Option<String>,
     tab_width: Option<usize>,
+    line_numbers: Option<LineNumbers>,
     final_newline: Option<bool>,
     /// Chord → command name, merged over the built-in bindings rather than
     /// replacing them: a user who binds one key keeps the other fifty. Binding a
@@ -178,6 +201,9 @@ fn parse(text: &str) -> (Config, Option<String>) {
         } else {
             config.tab_width = width;
         }
+    }
+    if let Some(mode) = file.line_numbers {
+        config.line_numbers = mode;
     }
     if let Some(final_newline) = file.final_newline {
         config.final_newline = final_newline;
@@ -483,6 +509,32 @@ mod tests {
         assert_eq!(problem, None);
         assert!(!config.final_newline);
         assert_eq!(config.tab_width, DEFAULT_TAB_WIDTH);
+
+        let (config, problem) = parse(r#"line_numbers = "relative""#);
+        assert_eq!(problem, None);
+        assert_eq!(config.line_numbers, LineNumbers::Relative);
+        assert_eq!(config.tab_width, DEFAULT_TAB_WIDTH);
+    }
+
+    #[test]
+    fn the_gutter_numbers_absolutely_unless_asked_otherwise() {
+        assert_eq!(Config::default().line_numbers, LineNumbers::Absolute);
+        let (config, problem) = parse(r#"line_numbers = "absolute""#);
+        assert_eq!(problem, None);
+        assert_eq!(config.line_numbers, LineNumbers::Absolute);
+    }
+
+    #[test]
+    fn an_unknown_line_number_mode_is_reported_rather_than_ignored() {
+        // A misspelled *value* has to fail as loudly as a misspelled key - both
+        // leave the user staring at a setting that did not apply.
+        let (config, problem) = parse(r#"line_numbers = "hybrid""#);
+        assert_eq!(config.line_numbers, LineNumbers::Absolute);
+        let problem = problem.expect("an unknown mode is reported");
+        // serde names the bad value *and* lists the accepted ones, which is more
+        // use than naming the key: the key is the part the user got right.
+        assert!(problem.contains("hybrid"), "message: {problem}");
+        assert!(problem.contains("absolute"), "message: {problem}");
     }
 
     #[test]

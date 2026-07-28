@@ -790,6 +790,7 @@ fn event_loop(
                     follow,
                     selected,
                     tab_width: config.tab_width,
+                    line_numbers: config.line_numbers,
                     search: &search,
                 },
                 &overlays,
@@ -1163,6 +1164,15 @@ fn dispatch_command(command: Command, handle: &vortex_core::CoreHandle, ui: &mut
         Command::OpenThemePicker => ui
             .overlays
             .push(themepicker::open(&ui.config.theme, &ui.config.theme_name)),
+        // Mutating the live config is what a theme pick already does (SPEC §10.5):
+        // the resolved value *is* the running setting, and the file only says what
+        // it starts as. Nothing to restyle - the gutter reads the mode each frame.
+        Command::ToggleLineNumbers => {
+            ui.config.line_numbers = match ui.config.line_numbers {
+                config::LineNumbers::Absolute => config::LineNumbers::Relative,
+                config::LineNumbers::Relative => config::LineNumbers::Absolute,
+            };
+        }
         // No I/O and no round trip: the rows come from the snapshot's buffer list.
         // Nothing to pick from before the first snapshot, so it simply does not open.
         Command::OpenBufferPicker => {
@@ -1398,6 +1408,9 @@ struct PaintInputs<'a> {
     /// Display width of a tab stop (SPEC §4, §10.5). Carried per frame rather than
     /// read from a constant so a config change takes effect without a restart.
     tab_width: usize,
+    /// How the gutter numbers its rows (SPEC §7.5), carried per frame for the same
+    /// reason as `tab_width`.
+    line_numbers: config::LineNumbers,
     /// The live search (SPEC §11), borrowed rather than copied so the highlights can
     /// never be a frame behind what the prompt is showing.
     ///
@@ -1421,6 +1434,7 @@ fn paint(frame: &mut Frame, snapshot: &ViewSnapshot, inputs: PaintInputs) -> Vie
         follow,
         selected,
         tab_width,
+        line_numbers,
         search,
     } = inputs;
     let area = frame.area();
@@ -1502,6 +1516,7 @@ fn paint(frame: &mut Frame, snapshot: &ViewSnapshot, inputs: PaintInputs) -> Vie
             cursor_line,
             theme,
             tab_width,
+            line_numbers,
             // Only the lines about to be painted are searched, which is the whole
             // reason `matches_in` takes a line range (SPEC §10.4).
             matches: search
@@ -1610,6 +1625,10 @@ struct Body {
     theme: config::Theme,
     /// Display width of a tab stop (SPEC §4, §10.5).
     tab_width: usize,
+    /// How the gutter numbers its rows (SPEC §7.5). Relative numbering is measured
+    /// from [`Body::cursor_line`], which this already carries for the current-line
+    /// tint.
+    line_numbers: config::LineNumbers,
 }
 
 /// Paint the text body with a line-number gutter. Each visible row is a gutter
@@ -1782,7 +1801,12 @@ fn paint_body(frame: &mut Frame, area: Rect, snapshot: &ViewSnapshot, body: Body
                 _ => gutter_style,
             };
             let mut spans = vec![Span::styled(
-                layout::gutter_label(line_index, body.gutter_width),
+                layout::gutter_label(
+                    line_index,
+                    body.cursor_line,
+                    body.gutter_width,
+                    body.line_numbers,
+                ),
                 gutter_style,
             )];
             spans.extend(layout::render_line(
@@ -2481,6 +2505,7 @@ mod tests {
             follow: true,
             selected,
             tab_width: config::DEFAULT_TAB_WIDTH,
+            line_numbers: config::LineNumbers::default(),
             search: NO_SEARCH.get_or_init(buffersearch::SearchState::default),
         }
     }
@@ -2536,6 +2561,71 @@ mod tests {
             "a tab stop at 2 puts 'b' in the next column pair"
         );
         assert_eq!(gap(8), 7);
+    }
+
+    #[test]
+    fn the_configured_line_number_mode_is_what_gets_painted() {
+        // The config value has to reach the paint path, not just parse - the gutter
+        // is the only place it is visible (SPEC §7.5, §10.5). Five lines, and the
+        // caret ends on the last one.
+        let snap = snapshot_after(&[Action::Insert("l1\nl2\nl3\nl4\nl5".into())]);
+        let gutters = |mode| {
+            let buf = render_with(
+                &snap,
+                40,
+                8,
+                PaintInputs {
+                    line_numbers: mode,
+                    ..paint_inputs(0)
+                },
+            );
+            // Body rows start at 1 (row 0 is the head bar); take the 4-cell gutter.
+            (1..=5)
+                .map(|row| row_text(&buf, row)[..4].to_string())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            gutters(config::LineNumbers::Absolute),
+            ["  1 ", "  2 ", "  3 ", "  4 ", "  5 "]
+        );
+        // Distance from the caret's line (the 5th), which keeps its own number.
+        assert_eq!(
+            gutters(config::LineNumbers::Relative),
+            ["  4 ", "  3 ", "  2 ", "  1 ", "  5 "]
+        );
+    }
+
+    #[test]
+    fn toggling_line_numbers_flips_the_live_config_both_ways() {
+        // A purely frontend-local command: it never touches the handle, so this
+        // needs no running core - which is the point worth pinning, since a setting
+        // the core had to hear about would be the wrong design (SPEC §10.5).
+        let Core { handle, run: _ } = vortex_core::new(64);
+        let mut config = config::Config::default();
+        let mut overlays = Compositor::new();
+        let mut toasts = Toasts::new(config.theme.toast_info, config.theme.toast_error);
+        let mut search = buffersearch::SearchState::default();
+        let mut toggle = |config: &mut config::Config| {
+            let mut ui = Frontend {
+                overlays: &mut overlays,
+                config,
+                toasts: &mut toasts,
+                snapshot: None,
+                search: &mut search,
+            };
+            assert!(dispatch_command(
+                Command::ToggleLineNumbers,
+                &handle,
+                &mut ui
+            ));
+        };
+
+        assert_eq!(config.line_numbers, config::LineNumbers::Absolute);
+        toggle(&mut config);
+        assert_eq!(config.line_numbers, config::LineNumbers::Relative);
+        // Back again: this is a toggle, not a one-way switch to relative.
+        toggle(&mut config);
+        assert_eq!(config.line_numbers, config::LineNumbers::Absolute);
     }
 
     /// Parse a slice of string args (skipping argv[0]) the way `main` does.

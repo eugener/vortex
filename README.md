@@ -55,7 +55,7 @@ milestones landed before earlier ones - that is a real gap, not a rounding error
 | M5 | File handling (encoding, EOL, conflicts) | done - encoding and line endings survive a round trip, external changes are noticed, config is a file |
 | M6 | UI shell: compositor, toasts | done |
 | M7 | Pickers, palette, themes, search | done - file/theme/buffer/global-search pickers with a preview pane, the palette, multi-buffer, find/replace in the buffer and across the project |
-| M8 | Chrome and polish | not started |
+| M8 | Chrome and polish | in progress |
 
 What works today: open/save a file, edit with multiple cursors, undo/redo with coalescing,
 mouse selection everywhere (including the overlays and the status bar), the system
@@ -193,6 +193,7 @@ optional, so the file can be one line; `--config PATH` reads a different one.
 ```toml
 theme         = "phosphor"   # any built-in or one of your own
 tab_width     = 4            # display width of a tab stop
+line_numbers  = "absolute"   # or "relative" - see below
 final_newline = true         # add a trailing newline on save if the file lacks one
 
 [keys]                       # layered over the built-in bindings, not replacing them
@@ -202,6 +203,12 @@ final_newline = true         # add a trailing newline on save if the file lacks 
 
 Chords are `mod+mod+key` with `ctrl`/`shift`/`alt` in any order; command names are the
 same identifiers the palette lists. Rebinding one chord leaves every other binding alone.
+
+`line_numbers = "relative"` numbers each row by its distance from the cursor - the count
+you would type before a motion - except the cursor's own row, which shows its absolute
+number rather than a useless `0`. The gutter keeps the width the buffer needs in both
+modes, so switching never slides the text sideways. **Toggle Relative Line Numbers** in
+the palette flips it for the session; the config key is what you start in.
 
 Like a theme file, **an unknown key is an error rather than a shrug** - but a config that
 does not load never stops the editor coming up. It starts on the defaults and says what
