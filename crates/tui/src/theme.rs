@@ -228,6 +228,7 @@ struct ThemeFile {
     selection: Option<StyleSpec>,
     current_line: Option<StyleSpec>,
     ruler: Option<StyleSpec>,
+    indent_guide: Option<StyleSpec>,
     secondary_cursor: Option<StyleSpec>,
     search_match: Option<StyleSpec>,
     search_current: Option<StyleSpec>,
@@ -278,6 +279,7 @@ impl ThemeFile {
             selection: slot("selection", self.selection, base.selection)?,
             current_line: slot("current_line", self.current_line, base.current_line)?,
             ruler: slot("ruler", self.ruler, base.ruler)?,
+            indent_guide: slot("indent_guide", self.indent_guide, base.indent_guide)?,
             secondary_cursor: slot(
                 "secondary_cursor",
                 self.secondary_cursor,

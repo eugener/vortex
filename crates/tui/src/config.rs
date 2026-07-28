@@ -75,6 +75,10 @@ pub struct Config {
     /// come in pairs (a soft width and a hard one), and because the cost of drawing
     /// several is the same as drawing one.
     pub rulers: Vec<usize>,
+    /// Draw a vertical rule at each indent level (SPEC §7.5). Off by default, like
+    /// every piece of chrome that puts a mark on every row: the editor spends the
+    /// screen on text unless asked otherwise.
+    pub indent_guides: bool,
     /// Append a trailing newline on save when the buffer lacks one (SPEC §10.1).
     /// Held here because this is where the user's file is read, and handed to the
     /// core, which is what acts on it.
@@ -90,6 +94,7 @@ impl Default for Config {
             tab_width: DEFAULT_TAB_WIDTH,
             line_numbers: LineNumbers::default(),
             rulers: Vec::new(),
+            indent_guides: false,
             final_newline: CoreOptions::default().final_newline,
         }
     }
@@ -121,6 +126,7 @@ struct ConfigFile {
     tab_width: Option<usize>,
     line_numbers: Option<LineNumbers>,
     rulers: Option<Vec<usize>>,
+    indent_guides: Option<bool>,
     final_newline: Option<bool>,
     /// Chord → command name, merged over the built-in bindings rather than
     /// replacing them: a user who binds one key keeps the other fifty. Binding a
@@ -218,6 +224,9 @@ fn parse(text: &str) -> (Config, Option<String>) {
     if let Some(rulers) = file.rulers {
         config.rulers = rulers;
     }
+    if let Some(on) = file.indent_guides {
+        config.indent_guides = on;
+    }
     if let Some(final_newline) = file.final_newline {
         config.final_newline = final_newline;
     }
@@ -306,6 +315,12 @@ pub struct Theme {
     /// margin rather than as a highlight. Distinct from it too, since the two cross
     /// on the caret's row and a ruler that matched would vanish exactly there.
     pub ruler: Style,
+    /// The indent guide glyph (SPEC §7.5) - a foreground only, no ground of its own,
+    /// so a selection or a current-line tint flows over it rather than being broken
+    /// by it. Dimmer than the text it aligns: a guide is read out of the corner of the
+    /// eye while scanning structure, and one loud enough to read directly would
+    /// compete with the code for attention on every single row.
+    pub indent_guide: Style,
     /// The marker for a *secondary* (non-primary) caret in a multi-cursor set
     /// (SPEC §2.2). The terminal has a single real cursor, which the primary caret
     /// uses; the others are painted as a one-cell reversed block so they are visible.
@@ -440,6 +455,10 @@ impl Default for Theme {
             // A step lighter than the current-line tint, so where the two cross the
             // ruler is still the thing you see (an overlay patches the row's base).
             ruler: Style::new().bg(Color::Rgb(0x21, 0x26, 0x3a)),
+            // Quieter than the gutter's own numbers, which are already the dimmest
+            // text on screen: a guide repeats on every row of every indented block,
+            // so it has to sit below the threshold at which the eye stops on it.
+            indent_guide: Style::new().fg(Color::Rgb(0x2f, 0x36, 0x50)),
             // A violet block: the terminal has one real cursor, which the primary
             // caret uses, so the others need a color of their own (SPEC §2.2).
             secondary_cursor: Style::new()
@@ -550,6 +569,19 @@ mod tests {
         let (config, problem) = parse("rulers = []");
         assert_eq!(problem, None);
         assert!(config.rulers.is_empty());
+    }
+
+    #[test]
+    fn indent_guides_are_off_unless_the_file_asks_for_them() {
+        assert!(!Config::default().indent_guides, "off unless asked");
+
+        let (config, problem) = parse("indent_guides = true");
+        assert_eq!(problem, None);
+        assert!(config.indent_guides);
+
+        let (config, problem) = parse("indent_guides = false");
+        assert_eq!(problem, None);
+        assert!(!config.indent_guides);
     }
 
     #[test]

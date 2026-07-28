@@ -30,6 +30,7 @@ const PALETTE: &[(&str, Bindable)] = &[
     ("Switch Buffer…", Bindable::OpenBufferPicker),
     ("Change Theme…", Bindable::OpenThemePicker),
     ("Toggle Relative Line Numbers", Bindable::ToggleLineNumbers),
+    ("Toggle Indent Guides", Bindable::ToggleIndentGuides),
     ("Set Encoding…", Bindable::OpenEncodingPicker),
     ("Set Line Endings…", Bindable::OpenLineEndingPicker),
     ("Save File", Bindable::Save),

@@ -44,6 +44,9 @@ pub enum Command {
     /// config value *is* the running setting, and the file only says what it starts
     /// as. Like a theme pick, this lasts the session and is not written back to disk.
     ToggleLineNumbers,
+    /// Draw or stop drawing the indent guides (frontend-local), the same live-config
+    /// switch [`Command::ToggleLineNumbers`] is.
+    ToggleIndentGuides,
     /// Open the encoding picker overlay (frontend-local). A pick commits an
     /// [`Action::SetEncoding`], so the choice reaches the core the same way a
     /// bound key's would.

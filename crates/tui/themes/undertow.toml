@@ -15,6 +15,7 @@ gutter_current   = { fg = "#ccd2e4", bold = true }
 selection        = { fg = "#eef1fa", bg = "#2b3557" }
 current_line     = { bg = "#1c2031" }
 ruler            = { bg = "#21263a" }
+indent_guide     = { fg = "#2f3650" }
 secondary_cursor = { fg = "#151823", bg = "#7d6ce0" }
 # Search (SPEC §11): amber, a hue nothing else here uses, so a match reads as
 # neither a selection nor a diagnostic. The dim ground marks the other matches and

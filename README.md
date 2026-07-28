@@ -63,7 +63,7 @@ clipboard (including over SSH via OSC 52), several buffers with a tab strip, tre
 syntax colors on Rust, a fuzzy file picker and a buffer picker (both with a preview pane),
 a command palette, switchable themes, regex find-and-replace in the buffer (matches
 highlighted as you type, capture groups in the replacement, and a query-replace walk),
-project-wide regex search that jumps to the match, a config file for keys and settings, files in their own encoding and line endings (saved
+project-wide regex search that jumps to the match, indent guides, a config file for keys and settings, files in their own encoding and line endings (saved
 back as they were found), a warning when a file changes underneath you, and live
 `rust-analyzer` diagnostics (underlined by span, with a colored gutter mark, if
 `rust-analyzer` is on your PATH).
@@ -71,7 +71,7 @@ back as they were found), a warning when a file changes underneath you, and live
 What does not: syntax colors or a language server for **any language but Rust** - a
 grammar is a separate crate the editor loads at runtime, and only `grammar-rust` is
 written; LSP features past diagnostics (no completion, hover, or goto); and most of the
-M8 chrome (git diff signs, indent guides, a scrollbar, sticky context, rulers).
+M8 chrome (git diff signs, a scrollbar, sticky context).
 
 There is no which-key popup and no leader-key sequences: bindings are single chords, and
 "what can I do here" is answered by the command palette, which lists every command by name
@@ -167,6 +167,7 @@ gutter_current   = { fg = "#eef2f4", bold = true }
 selection        = { fg = "#eef2f4", bg = "#2f383e" }
 current_line     = { bg = "#1b1f22" }
 ruler            = { bg = "#23282b" }
+indent_guide     = { fg = "#31383d" }
 secondary_cursor = { fg = "#141719", bg = "#e04b3c" }
 toast_info       = { fg = "#c9ced2", bg = "#242a2e" }
 toast_error      = { fg = "#141719", bg = "#e04b3c", bold = true }
@@ -196,6 +197,7 @@ theme         = "phosphor"   # any built-in or one of your own
 tab_width     = 4            # display width of a tab stop
 line_numbers  = "absolute"   # or "relative" - see below
 rulers        = [80, 100]    # tint these columns; [] (the default) draws none
+indent_guides = true         # a rule down each indent level; off by default
 final_newline = true         # add a trailing newline on save if the file lacks one
 
 [keys]                       # layered over the built-in bindings, not replacing them
@@ -217,6 +219,14 @@ width limit is visible without counting. Columns are 0-based - `80` marks the fi
 column *past* an 80-wide limit. The tint runs past the end of short lines too, since a
 ruler marks a limit those lines have not reached; anything else painted there (a
 selection, a search match) wins the cell.
+
+`indent_guides` draws a faint rule at every tab stop inside a line's indentation, so the
+block a line belongs to is readable without counting spaces. Unlike a ruler it is a
+*glyph*, not a tint - the cell it wants is indentation, so it can stand in for a space
+without displacing anything. A blank line takes the shallower of its neighbours' indents,
+which keeps a guide running through the gaps inside a block while stopping it at the
+blank line that trails one. **Toggle Indent Guides** in the palette flips it for the
+session.
 
 Like a theme file, **an unknown key is an error rather than a shrug** - but a config that
 does not load never stops the editor coming up. It starts on the defaults and says what

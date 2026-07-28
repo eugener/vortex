@@ -792,6 +792,7 @@ fn event_loop(
                     tab_width: config.tab_width,
                     line_numbers: config.line_numbers,
                     rulers: &config.rulers,
+                    indent_guides: config.indent_guides,
                     search: &search,
                 },
                 &overlays,
@@ -1179,6 +1180,7 @@ fn dispatch_command(command: Command, handle: &vortex_core::CoreHandle, ui: &mut
                 config::LineNumbers::Relative => config::LineNumbers::Absolute,
             };
         }
+        Command::ToggleIndentGuides => ui.config.indent_guides = !ui.config.indent_guides,
         // No I/O and no round trip: the rows come from the snapshot's buffer list.
         // Nothing to pick from before the first snapshot, so it simply does not open.
         Command::OpenBufferPicker => {
@@ -1420,6 +1422,9 @@ struct PaintInputs<'a> {
     /// Display columns to draw a ruler down (SPEC §7.5). Borrowed rather than owned
     /// so [`PaintInputs`] stays `Copy`; it is read-only for the whole frame.
     rulers: &'a [usize],
+    /// Draw a vertical rule at each indent level (SPEC §7.5), carried per frame for
+    /// the same reason as `tab_width` - the palette's toggle mutates the live config.
+    indent_guides: bool,
     /// The live search (SPEC §11), borrowed rather than copied so the highlights can
     /// never be a frame behind what the prompt is showing.
     ///
@@ -1445,6 +1450,7 @@ fn paint(frame: &mut Frame, snapshot: &ViewSnapshot, inputs: PaintInputs) -> Vie
         tab_width,
         line_numbers,
         rulers,
+        indent_guides,
         search,
     } = inputs;
     let area = frame.area();
@@ -1531,6 +1537,7 @@ fn paint(frame: &mut Frame, snapshot: &ViewSnapshot, inputs: PaintInputs) -> Vie
                 .iter()
                 .map(|&col| (col..col + 1, theme.ruler))
                 .collect(),
+            indent_guides,
             // Only the lines about to be painted are searched, which is the whole
             // reason `matches_in` takes a line range (SPEC §10.4).
             matches: search
@@ -1654,6 +1661,11 @@ struct Body {
     /// than per row - and they seed each row's overlay list, which is what puts them
     /// *under* everything else that paints.
     rulers: Vec<(std::ops::Range<usize>, Style)>,
+    /// Draw a vertical rule at each indent level (SPEC §7.5). Unlike the rulers this
+    /// cannot be resolved once for the frame: the columns are a property of each
+    /// line's own indentation, so they are computed for the window in [`paint_body`],
+    /// where the visible lines have already been fetched.
+    indent_guides: bool,
 }
 
 /// Paint the text body with a line-number gutter. Each visible row is a gutter
@@ -1670,6 +1682,14 @@ fn paint_body(frame: &mut Frame, area: Rect, snapshot: &ViewSnapshot, body: Body
     let text = &snapshot.text;
     let height = area.height as usize;
     let lines = layout::visible_lines(text, body.scroll, height, body.tab_width);
+    // Indent guides (SPEC §7.5), resolved for the whole window at once: a blank line
+    // takes its guides from its neighbours, so a per-row answer would re-walk the
+    // same run of blanks for every row of it.
+    let guides = if body.indent_guides {
+        layout::indent_guides(text, &lines, body.scroll, body.tab_width)
+    } else {
+        Vec::new()
+    };
 
     // Each secondary caret's line is invariant across the frame: resolve it once
     // here (O(selections) rope lookups) instead of per visible row, which would
@@ -1720,6 +1740,17 @@ fn paint_body(frame: &mut Frame, area: Rect, snapshot: &ViewSnapshot, body: Body
             // selection's ground rather than being flattened to the selection's own
             // foreground (SPEC §5, later overlays win in `render_line`).
             let mut overlays: Vec<(std::ops::Range<usize>, Style)> = body.rulers.clone();
+            // Indent guides sit just above the rulers and below everything else, for
+            // the same reason: both are margin markers, and a selection or a match
+            // crossing one must not be the thing that gives way. The overlay carries
+            // only the guide's *color* - the glyph itself is substituted into the row's
+            // text below, since an overlay can restyle a cell but not rewrite it.
+            let columns: &[usize] = guides.get(row).map_or(&[], Vec::as_slice);
+            overlays.extend(
+                columns
+                    .iter()
+                    .map(|&col| (col..col + 1, body.theme.indent_guide)),
+            );
             overlays.extend(snapshot.selections.iter().filter_map(|s| {
                 layout::selection_columns(
                     raw,
@@ -1838,7 +1869,7 @@ fn paint_body(frame: &mut Frame, area: Rect, snapshot: &ViewSnapshot, body: Body
                 gutter_style,
             )];
             spans.extend(layout::render_line(
-                line.display(),
+                &layout::with_indent_guides(line.display(), columns),
                 body.h_scroll,
                 body.text_width,
                 base,
@@ -2535,6 +2566,7 @@ mod tests {
             tab_width: config::DEFAULT_TAB_WIDTH,
             line_numbers: config::LineNumbers::default(),
             rulers: &[],
+            indent_guides: false,
             search: NO_SEARCH.get_or_init(buffersearch::SearchState::default),
         }
     }
@@ -2707,6 +2739,151 @@ mod tests {
             row.iter().all(|&bg| bg != theme.ruler.bg.unwrap()),
             "no cell should carry the ruler ground: {row:?}"
         );
+    }
+
+    #[test]
+    fn indent_guides_paint_a_glyph_at_each_level_without_shifting_the_text() {
+        // The whole claim of a glyph over a tint: it stands in for the whitespace it
+        // covers, so the code lands in exactly the columns it would have anyway.
+        let snap = snapshot_after(&[Action::Insert("fn a() {\n    x();\n        y();\n}".into())]);
+        let guided = render_with(
+            &snap,
+            40,
+            8,
+            PaintInputs {
+                indent_guides: true,
+                ..paint_inputs(0)
+            },
+        );
+        let plain = render(&snap, 40, 8);
+        let gutter = layout::gutter_width(layout::display_line_count(&snap.text)) as u16;
+        assert_eq!(
+            row_text(&guided, 2).trim_end(),
+            format!("{}│   x();", &row_text(&plain, 2)[..gutter as usize]).trim_end(),
+            "one level in"
+        );
+        assert_eq!(
+            row_text(&guided, 3).trim_end(),
+            format!("{}│   │   y();", &row_text(&plain, 3)[..gutter as usize]).trim_end(),
+            "two levels in"
+        );
+        // Unindented rows are untouched - there is no enclosing block to mark.
+        assert_eq!(row_text(&guided, 1), row_text(&plain, 1));
+        assert_eq!(row_text(&guided, 4), row_text(&plain, 4));
+        // The guide wears its own (dim) color, not the text's.
+        let theme = config::Theme::default();
+        assert_eq!(
+            guided.cell((gutter, 2)).unwrap().fg,
+            theme.indent_guide.fg.unwrap()
+        );
+    }
+
+    #[test]
+    fn a_blank_line_inside_a_block_still_shows_its_guides() {
+        // The inherited case, end to end: the blank row between two statements has no
+        // whitespace of its own, so the cells its guides want have to be padded in.
+        // Row 3 is the blank *between* two statements; row 5 the blank that trails the
+        // block, just above the closing brace.
+        let snap = snapshot_after(&[Action::Insert("fn a() {\n    x();\n\n    y();\n\n}".into())]);
+        let buf = render_with(
+            &snap,
+            40,
+            8,
+            PaintInputs {
+                indent_guides: true,
+                ..paint_inputs(0)
+            },
+        );
+        let gutter = layout::gutter_width(layout::display_line_count(&snap.text)) as u16;
+        assert_eq!(
+            buf.cell((gutter, 3)).unwrap().symbol(),
+            "│",
+            "the blank row keeps the guide running"
+        );
+        // The trailing blank takes the shallower side, so the guide stops there rather
+        // than running past the closing brace.
+        assert_eq!(buf.cell((gutter, 5)).unwrap().symbol(), " ");
+    }
+
+    #[test]
+    fn indent_guides_are_off_unless_asked() {
+        // Off has to mean the row is exactly what it was: chrome that leaves a faint
+        // mark when disabled is worse than chrome that does not exist.
+        let snap = snapshot_after(&[Action::Insert("fn a() {\n        y();\n}".into())]);
+        let buf = render(&snap, 40, 8);
+        for row in 0..8 {
+            assert!(
+                !row_text(&buf, row).contains('│'),
+                "row {row} carries a guide: {:?}",
+                row_text(&buf, row)
+            );
+        }
+    }
+
+    #[test]
+    fn a_selection_over_an_indent_guide_keeps_both() {
+        // The guide is a glyph and the selection is a ground, so they compose rather
+        // than one erasing the other - a hole in a selection would read as a bug, and
+        // a guide the selection swallowed would break the column it is drawing.
+        let snap = snapshot_after(&[
+            Action::Insert("    x();".into()),
+            Action::MoveCursor {
+                motion: vortex_core::Motion::LineStart,
+                extend: false,
+            },
+            Action::MoveCursor {
+                motion: vortex_core::Motion::LineEnd,
+                extend: true,
+            },
+        ]);
+        let buf = render_with(
+            &snap,
+            40,
+            8,
+            PaintInputs {
+                indent_guides: true,
+                ..paint_inputs(0)
+            },
+        );
+        let gutter = layout::gutter_width(layout::display_line_count(&snap.text)) as u16;
+        let cell = buf.cell((gutter, 1)).unwrap();
+        assert_eq!(cell.symbol(), "│", "the glyph survives the wash");
+        assert_eq!(
+            cell.bg,
+            config::Theme::default().selection.bg.unwrap(),
+            "and sits on the selection's ground"
+        );
+    }
+
+    #[test]
+    fn toggling_indent_guides_flips_the_live_config_both_ways() {
+        // Frontend-local, like the line-number toggle: nothing reaches the handle, so
+        // the whole effect is the value the next frame reads.
+        let Core { handle, run: _ } = vortex_core::new(64);
+        let mut config = config::Config::default();
+        let mut overlays = Compositor::new();
+        let mut toasts = Toasts::new(config.theme.toast_info, config.theme.toast_error);
+        let mut search = buffersearch::SearchState::default();
+        let mut toggle = |config: &mut config::Config| {
+            let mut ui = Frontend {
+                overlays: &mut overlays,
+                config,
+                toasts: &mut toasts,
+                snapshot: None,
+                search: &mut search,
+            };
+            assert!(dispatch_command(
+                Command::ToggleIndentGuides,
+                &handle,
+                &mut ui
+            ));
+        };
+
+        assert!(!config.indent_guides, "off unless asked");
+        toggle(&mut config);
+        assert!(config.indent_guides);
+        toggle(&mut config);
+        assert!(!config.indent_guides, "and back");
     }
 
     #[test]
