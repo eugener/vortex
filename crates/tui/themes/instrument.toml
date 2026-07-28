@@ -19,6 +19,8 @@ selection        = { fg = "#eef2f4", bg = "#2f383e" }
 current_line     = { bg = "#1b1f22" }
 ruler            = { bg = "#23282b" }
 indent_guide     = { fg = "#31383d" }
+scrollbar_track  = { fg = "#31383d" }
+scrollbar_thumb  = { fg = "#69747b" }
 secondary_cursor = { fg = "#141719", bg = "#e04b3c" }
 toast_info       = { fg = "#c9ced2", bg = "#242a2e" }
 toast_error      = { fg = "#141719", bg = "#e04b3c", bold = true }

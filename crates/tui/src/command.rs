@@ -47,6 +47,11 @@ pub enum Command {
     /// Draw or stop drawing the indent guides (frontend-local), the same live-config
     /// switch [`Command::ToggleLineNumbers`] is.
     ToggleIndentGuides,
+    /// Show or hide the scrollbar (frontend-local). Unlike the other chrome toggles
+    /// this one changes the *layout* - the reserved column comes and goes with it -
+    /// but still only on this side of the seam: the core has no idea a viewport
+    /// exists, let alone a column standing for one.
+    ToggleScrollbar,
     /// Open the encoding picker overlay (frontend-local). A pick commits an
     /// [`Action::SetEncoding`], so the choice reaches the core the same way a
     /// bound key's would.

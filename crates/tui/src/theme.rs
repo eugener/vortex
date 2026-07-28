@@ -229,6 +229,8 @@ struct ThemeFile {
     current_line: Option<StyleSpec>,
     ruler: Option<StyleSpec>,
     indent_guide: Option<StyleSpec>,
+    scrollbar_track: Option<StyleSpec>,
+    scrollbar_thumb: Option<StyleSpec>,
     secondary_cursor: Option<StyleSpec>,
     search_match: Option<StyleSpec>,
     search_current: Option<StyleSpec>,
@@ -280,6 +282,16 @@ impl ThemeFile {
             current_line: slot("current_line", self.current_line, base.current_line)?,
             ruler: slot("ruler", self.ruler, base.ruler)?,
             indent_guide: slot("indent_guide", self.indent_guide, base.indent_guide)?,
+            scrollbar_track: slot(
+                "scrollbar_track",
+                self.scrollbar_track,
+                base.scrollbar_track,
+            )?,
+            scrollbar_thumb: slot(
+                "scrollbar_thumb",
+                self.scrollbar_thumb,
+                base.scrollbar_thumb,
+            )?,
             secondary_cursor: slot(
                 "secondary_cursor",
                 self.secondary_cursor,

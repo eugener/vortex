@@ -40,7 +40,7 @@ use ratatui::crossterm::{execute, queue};
 use ratatui::layout::{Constraint, Layout, Position, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::Paragraph;
+use ratatui::widgets::{Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState};
 use ratatui::{Frame, Terminal, TerminalOptions, Viewport};
 use unicode_width::UnicodeWidthStr;
 
@@ -613,6 +613,12 @@ fn event_loop(
     // Consecutive presses, so a double- or triple-click can be told from two
     // separate ones - the terminal reports presses and leaves the gesture to us.
     let mut clicks = click::Clicks::new();
+    // Whether the pointer is currently dragging the scrollbar. The one piece of drag
+    // state the editor keeps, and it is here for the same reason `clicks` is: the
+    // terminal reports positions, not gestures. Without it a drag that wandered one
+    // column off the bar would stop scrolling and start selecting text instead, which
+    // is not what a hand that has grabbed a scrollbar is asking for.
+    let mut dragging_scrollbar = false;
     // Transient file/edit notices (open/save results, failures) surface here as
     // top-right toasts that auto-fade, rather than hijacking the status bar (SPEC
     // §7.5). A failed save must be visible, not silent (SPEC §8).
@@ -793,6 +799,7 @@ fn event_loop(
                     line_numbers: config.line_numbers,
                     rulers: &config.rulers,
                     indent_guides: config.indent_guides,
+                    scrollbar: config.scrollbar,
                     search: &search,
                 },
                 &overlays,
@@ -999,6 +1006,39 @@ fn event_loop(
                             }
                             continue;
                         }
+                        // The scrollbar is a control, not just a readout: a press on
+                        // its column throws the view to that fraction of the buffer
+                        // and a drag tracks the pointer (SPEC §7.5). Checked before
+                        // the body, since the reserved column is not text.
+                        //
+                        // A press decides whether this gesture belongs to the bar; a
+                        // drag inherits that answer rather than re-asking, so pulling
+                        // a cell sideways off the bar keeps scrolling instead of
+                        // turning into a text selection halfway through the gesture.
+                        let screen = terminal.size()?;
+                        if is_press {
+                            dragging_scrollbar = on_scrollbar(
+                                Rect::new(0, 0, screen.width, screen.height),
+                                config.scrollbar,
+                                mouse.column,
+                                mouse.row,
+                            );
+                        }
+                        if dragging_scrollbar {
+                            let track = viewport.page_height;
+                            let max_scroll =
+                                layout::display_line_count(&snap.text).saturating_sub(track);
+                            // A drag can be pulled off the top or the bottom of the
+                            // body; clamping to the track keeps both ends reachable
+                            // rather than letting the gesture slide off one.
+                            let row = (mouse.row as usize).clamp(1, track.max(1)) - 1;
+                            viewport.scroll = layout::scroll_at_track_row(row, track, max_scroll);
+                            // The caret has not moved, so the view must be allowed to
+                            // leave it - the same rule the wheel follows.
+                            follow = false;
+                            needs_redraw = true;
+                            continue;
+                        }
                         // Only a plain press advances the click run (SPEC §2.2): a
                         // drag is one continuous gesture, and a modified click means
                         // something else entirely, so both end the run rather than
@@ -1031,6 +1071,9 @@ fn event_loop(
                         follow = false;
                         needs_redraw = true;
                     }
+                    // Releasing ends a scrollbar drag. The only reason this arm exists
+                    // - every other gesture here is decided by its press.
+                    MouseEventKind::Up(_) => dragging_scrollbar = false,
                     _ => {}
                 },
                 // While an overlay is open, swallow OS pastes too rather than
@@ -1181,6 +1224,7 @@ fn dispatch_command(command: Command, handle: &vortex_core::CoreHandle, ui: &mut
             };
         }
         Command::ToggleIndentGuides => ui.config.indent_guides = !ui.config.indent_guides,
+        Command::ToggleScrollbar => ui.config.scrollbar = !ui.config.scrollbar,
         // No I/O and no round trip: the rows come from the snapshot's buffer list.
         // Nothing to pick from before the first snapshot, so it simply does not open.
         Command::OpenBufferPicker => {
@@ -1425,6 +1469,9 @@ struct PaintInputs<'a> {
     /// Draw a vertical rule at each indent level (SPEC §7.5), carried per frame for
     /// the same reason as `tab_width` - the palette's toggle mutates the live config.
     indent_guides: bool,
+    /// Reserve the body's rightmost column for a scrollbar (SPEC §7.5), carried per
+    /// frame for the same reason as `tab_width`.
+    scrollbar: bool,
     /// The live search (SPEC §11), borrowed rather than copied so the highlights can
     /// never be a frame behind what the prompt is showing.
     ///
@@ -1451,6 +1498,7 @@ fn paint(frame: &mut Frame, snapshot: &ViewSnapshot, inputs: PaintInputs) -> Vie
         line_numbers,
         rulers,
         indent_guides,
+        scrollbar,
         search,
     } = inputs;
     let area = frame.area();
@@ -1491,7 +1539,11 @@ fn paint(frame: &mut Frame, snapshot: &ViewSnapshot, inputs: PaintInputs) -> Vie
     let text_height = body_area.height as usize;
     let display_lines = layout::display_line_count(&snapshot.text);
     let gutter_width = layout::gutter_width(display_lines);
-    let text_width = (body_area.width as usize).saturating_sub(gutter_width);
+    // The scrollbar's column is reserved whenever the setting is on, painted or not
+    // (SPEC §7.5): a bar that appeared only once the file outgrew the screen would
+    // slide every line one cell sideways at exactly that moment.
+    let text_width =
+        (body_area.width as usize).saturating_sub(gutter_width + usize::from(scrollbar));
     // `scroll_to_show` only scrolls *toward* the cursor, never capping the offset at
     // the content extent. A stale offset carried across a frame where the buffer (or
     // line) shrank would then paint blank rows/columns and hide content that fits, so
@@ -1547,6 +1599,33 @@ fn paint(frame: &mut Frame, snapshot: &ViewSnapshot, inputs: PaintInputs) -> Vie
             current: preview,
         },
     );
+    // The scrollbar over the column `paint_body` left it, and only when the buffer
+    // actually scrolls: a bar answers "where am I in something bigger than the
+    // screen", so with nothing bigger there is nothing for it to say, and a
+    // full-height thumb would be a loud way of saying nothing. The reserved column
+    // stays reserved either way, so this appearing and disappearing moves no text.
+    if scrollbar && max_scroll > 0 {
+        // `content_length` is the number of scroll *positions*, not of lines. That is
+        // what makes ratatui's thumb the right size: with `viewport_content_length`
+        // set to the visible rows, its geometry works out to a thumb covering exactly
+        // the fraction of the track that the screen covers of the buffer, sitting at
+        // exactly the fraction the offset has travelled.
+        let mut state = ScrollbarState::new(max_scroll + 1)
+            .position(scroll)
+            .viewport_content_length(text_height);
+        frame.render_stateful_widget(
+            Scrollbar::new(ScrollbarOrientation::VerticalRight)
+                // No arrow heads: they would eat two of the track's rows to offer a
+                // line-step this editor already binds to a key and a wheel, and on a
+                // short body there are not two rows to spare.
+                .begin_symbol(None)
+                .end_symbol(None)
+                .track_style(theme.scrollbar_track)
+                .thumb_style(theme.scrollbar_thumb),
+            body_area,
+            &mut state,
+        );
+    }
     paint_status_bar(
         frame,
         status_area,
@@ -1956,6 +2035,27 @@ fn status_target_at(
         width,
         column,
     )
+}
+
+/// Whether `column`/`row` fall on the scrollbar's reserved column (SPEC §7.5).
+///
+/// Hit-tested by recomputing where the bar *would* paint - the rightmost column of the
+/// body, which is the screen less the head row and the status row - rather than by
+/// remembering where it went. That is the rule every clickable surface here follows
+/// (`Picker::row_at`, `layout::right_placement`): what is clicked and what was drawn
+/// cannot then disagree.
+///
+/// The whole reserved column answers, painted or not. When the buffer fits on screen
+/// nothing is drawn there, but the column still belongs to the scrollbar - falling
+/// through to the text would put a caret in a column that holds no text.
+fn on_scrollbar(screen: Rect, scrollbar: bool, column: u16, row: u16) -> bool {
+    scrollbar
+        && screen.width > 0
+        && column == screen.width - 1
+        // Row 0 is the bufferline and the last row is the status bar; both are their
+        // own controls and answered before this one.
+        && row >= 1
+        && row + 1 < screen.height
 }
 
 /// What a press or drag in the editor body means, given how many clicks the run has
@@ -2567,6 +2667,7 @@ mod tests {
             line_numbers: config::LineNumbers::default(),
             rulers: &[],
             indent_guides: false,
+            scrollbar: false,
             search: NO_SEARCH.get_or_init(buffersearch::SearchState::default),
         }
     }
@@ -2853,6 +2954,156 @@ mod tests {
             config::Theme::default().selection.bg.unwrap(),
             "and sits on the selection's ground"
         );
+    }
+
+    /// A 30-line buffer, which overflows every viewport these tests use.
+    fn tall_snapshot() -> ViewSnapshot {
+        let text: String = (1..=30).map(|n| format!("line {n}\n")).collect();
+        snapshot_after(&[Action::Insert(text)])
+    }
+
+    #[test]
+    fn the_scrollbar_reserves_its_column_whether_or_not_it_paints() {
+        // The reason the column is reserved rather than claimed on demand: a bar that
+        // appeared once a file outgrew the screen would slide every line one cell
+        // sideways at exactly that moment. So a short buffer and a long one have to
+        // put their text in the same columns.
+        let short = snapshot_after(&[Action::Insert("abcdefghij".into())]);
+        let tall = tall_snapshot();
+        let with = |snap: &ViewSnapshot| {
+            let buf = render_with(
+                snap,
+                20,
+                8,
+                PaintInputs {
+                    scrollbar: true,
+                    ..paint_inputs(0)
+                },
+            );
+            row_text(&buf, 1)
+        };
+        // 10 glyphs of text + a 4-wide gutter fits 20 columns with room to spare, so
+        // any difference here is the reserved column, not the text being clipped.
+        assert!(with(&short).starts_with("  1 abcdefghij"));
+        // The short buffer scrolls nowhere, so its column is blank...
+        let short_bar = with(&short).chars().last().unwrap();
+        assert_eq!(short_bar, ' ', "nothing to say, so nothing is said");
+        // ...while the tall one carries the bar in that same column.
+        assert_ne!(with(&tall).chars().last().unwrap(), ' ');
+    }
+
+    #[test]
+    fn the_scrollbar_costs_the_text_exactly_one_column() {
+        // A long line clipped by the text width is where the reservation is visible:
+        // turning the bar on must take one cell of it, not zero and not two.
+        let snap = snapshot_after(&[Action::Insert("x".repeat(60))]);
+        let width = |scrollbar: bool| {
+            let buf = render_with(
+                &snap,
+                20,
+                6,
+                PaintInputs {
+                    scrollbar,
+                    ..paint_inputs(0)
+                },
+            );
+            row_text(&buf, 1).matches('x').count()
+        };
+        assert_eq!(width(false), width(true) + 1);
+    }
+
+    #[test]
+    fn the_thumb_follows_the_scroll_offset_down_the_track() {
+        // What the bar is *for*: the filled stretch has to move as the view does, and
+        // sit at the ends when the view is at the ends.
+        let snap = tall_snapshot();
+        let thumb_rows = |scroll: usize| {
+            let buf = render_with(
+                &snap,
+                20,
+                12,
+                PaintInputs {
+                    follow: false,
+                    viewport: ViewState {
+                        scroll,
+                        h_scroll: 0,
+                        page_height: 10,
+                    },
+                    scrollbar: true,
+                    ..paint_inputs(0)
+                },
+            );
+            let thumb = config::Theme::default().scrollbar_thumb.fg.unwrap();
+            (1..11)
+                .filter(|&r| buf.cell((19, r)).unwrap().fg == thumb)
+                .collect::<Vec<u16>>()
+        };
+        let top = thumb_rows(0);
+        let bottom = thumb_rows(21);
+        assert_eq!(top.first(), Some(&1), "at the top of the file, at the top");
+        assert_eq!(bottom.last(), Some(&10), "at the bottom, at the bottom");
+        assert!(
+            top.last() < bottom.first(),
+            "the thumb moved down: {top:?} then {bottom:?}"
+        );
+        // Proportional, not a single cell: 10 rows of a 31-line buffer is about a
+        // third of the track.
+        assert!((2..=5).contains(&top.len()), "thumb spans {}", top.len());
+    }
+
+    #[test]
+    fn the_scrollbar_is_off_unless_asked() {
+        // Off means the body is exactly what it was - including the column, which is
+        // the one piece of chrome here that would otherwise cost text.
+        let snap = tall_snapshot();
+        let buf = render(&snap, 20, 8);
+        for row in 1..7 {
+            let cell = buf.cell((19, row)).unwrap();
+            assert_eq!(cell.symbol(), " ", "row {row} carries a bar");
+        }
+    }
+
+    #[test]
+    fn the_scrollbar_column_is_hit_tested_where_it_paints() {
+        let screen = Rect::new(0, 0, 80, 24);
+        // The rightmost column, on a body row.
+        assert!(on_scrollbar(screen, true, 79, 1));
+        assert!(on_scrollbar(screen, true, 79, 22));
+        // Not the column to its left.
+        assert!(!on_scrollbar(screen, true, 78, 5));
+        // Row 0 is the bufferline and row 23 the status bar; both are their own
+        // controls, and each answers before this one.
+        assert!(!on_scrollbar(screen, true, 79, 0));
+        assert!(!on_scrollbar(screen, true, 79, 23));
+        // Off, the column is text like any other.
+        assert!(!on_scrollbar(screen, false, 79, 5));
+        // A screen with no width at all has no column to hit.
+        assert!(!on_scrollbar(Rect::new(0, 0, 0, 24), true, 0, 5));
+    }
+
+    #[test]
+    fn toggling_the_scrollbar_flips_the_live_config_both_ways() {
+        let Core { handle, run: _ } = vortex_core::new(64);
+        let mut config = config::Config::default();
+        let mut overlays = Compositor::new();
+        let mut toasts = Toasts::new(config.theme.toast_info, config.theme.toast_error);
+        let mut search = buffersearch::SearchState::default();
+        let mut toggle = |config: &mut config::Config| {
+            let mut ui = Frontend {
+                overlays: &mut overlays,
+                config,
+                toasts: &mut toasts,
+                snapshot: None,
+                search: &mut search,
+            };
+            assert!(dispatch_command(Command::ToggleScrollbar, &handle, &mut ui));
+        };
+
+        assert!(!config.scrollbar, "off unless asked");
+        toggle(&mut config);
+        assert!(config.scrollbar);
+        toggle(&mut config);
+        assert!(!config.scrollbar, "and back");
     }
 
     #[test]

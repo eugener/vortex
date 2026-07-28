@@ -79,6 +79,14 @@ pub struct Config {
     /// every piece of chrome that puts a mark on every row: the editor spends the
     /// screen on text unless asked otherwise.
     pub indent_guides: bool,
+    /// Reserve the body's rightmost column for a scrollbar (SPEC §7.5). Off by
+    /// default, and more emphatically than the other chrome: this one is the only
+    /// piece that costs a *column of text*, so it has to be asked for.
+    ///
+    /// When on, the column is reserved whether or not a bar is drawn in it. A
+    /// scrollbar that appeared only once a file outgrew the screen would slide every
+    /// line one cell sideways at the moment the file crossed that boundary.
+    pub scrollbar: bool,
     /// Append a trailing newline on save when the buffer lacks one (SPEC §10.1).
     /// Held here because this is where the user's file is read, and handed to the
     /// core, which is what acts on it.
@@ -95,6 +103,7 @@ impl Default for Config {
             line_numbers: LineNumbers::default(),
             rulers: Vec::new(),
             indent_guides: false,
+            scrollbar: false,
             final_newline: CoreOptions::default().final_newline,
         }
     }
@@ -127,6 +136,7 @@ struct ConfigFile {
     line_numbers: Option<LineNumbers>,
     rulers: Option<Vec<usize>>,
     indent_guides: Option<bool>,
+    scrollbar: Option<bool>,
     final_newline: Option<bool>,
     /// Chord → command name, merged over the built-in bindings rather than
     /// replacing them: a user who binds one key keeps the other fifty. Binding a
@@ -227,6 +237,9 @@ fn parse(text: &str) -> (Config, Option<String>) {
     if let Some(on) = file.indent_guides {
         config.indent_guides = on;
     }
+    if let Some(on) = file.scrollbar {
+        config.scrollbar = on;
+    }
     if let Some(final_newline) = file.final_newline {
         config.final_newline = final_newline;
     }
@@ -321,6 +334,12 @@ pub struct Theme {
     /// eye while scanning structure, and one loud enough to read directly would
     /// compete with the code for attention on every single row.
     pub indent_guide: Style,
+    /// The scrollbar's track (SPEC §7.5) - the part of the column the thumb is *not*
+    /// on. Quiet, since it is the background of a control rather than the control.
+    pub scrollbar_track: Style,
+    /// The scrollbar's thumb: the stretch of track standing for what is on screen.
+    /// This is the part that carries the answer, so it is the part with the contrast.
+    pub scrollbar_thumb: Style,
     /// The marker for a *secondary* (non-primary) caret in a multi-cursor set
     /// (SPEC §2.2). The terminal has a single real cursor, which the primary caret
     /// uses; the others are painted as a one-cell reversed block so they are visible.
@@ -459,6 +478,11 @@ impl Default for Theme {
             // text on screen: a guide repeats on every row of every indented block,
             // so it has to sit below the threshold at which the eye stops on it.
             indent_guide: Style::new().fg(Color::Rgb(0x2f, 0x36, 0x50)),
+            // The track sits at the gutter's weight and the thumb well above it: the
+            // pair has to be separable at a glance from the far edge of the screen,
+            // where nothing else is competing for the eye.
+            scrollbar_track: Style::new().fg(Color::Rgb(0x2b, 0x31, 0x49)),
+            scrollbar_thumb: Style::new().fg(Color::Rgb(0x5a, 0x64, 0x8c)),
             // A violet block: the terminal has one real cursor, which the primary
             // caret uses, so the others need a color of their own (SPEC §2.2).
             secondary_cursor: Style::new()
@@ -582,6 +606,21 @@ mod tests {
         let (config, problem) = parse("indent_guides = false");
         assert_eq!(problem, None);
         assert!(!config.indent_guides);
+    }
+
+    #[test]
+    fn the_scrollbar_is_off_unless_the_file_asks_for_it() {
+        // The strictest of the chrome defaults, since this is the one that costs a
+        // column of text rather than a mark on cells the text was not using.
+        assert!(!Config::default().scrollbar, "off unless asked");
+
+        let (config, problem) = parse("scrollbar = true");
+        assert_eq!(problem, None);
+        assert!(config.scrollbar);
+
+        let (config, problem) = parse("scrollbar = false");
+        assert_eq!(problem, None);
+        assert!(!config.scrollbar);
     }
 
     #[test]
