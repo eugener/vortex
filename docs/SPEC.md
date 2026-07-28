@@ -513,7 +513,7 @@ adopt a component framework.**
 | **Pickers** (file / theme / buffer / encoding / line-ending / global-search / symbol) | overlay | emits `Action` on pick | **file + theme + buffer + global-search + the two format pickers built (M7).** fuzzy list + optional preview pane (**built (M7)**, opt-in per picker, filled when the highlight *moves*; the file picker uses it, and it is dropped below 80 columns rather than halving a narrow screen into two unreadable ones); large lists stream in without blocking. Mouse-driven: a click on a row picks it, the wheel moves the highlight, a click outside dismisses |
 | **Theme picker** | overlay | **none** | **built (M7).** the one surface whose commit never crosses the seam at all - chrome is frontend-owned, so it also *previews* as the highlight moves (§10.5) |
 | **Global-search picker** | overlay | emits `Action` on pick | **built (M7).** the one picker whose rows are not a list it was handed: the query *is* the search, a worker thread walks the project, and results stream in through `Layer::tick`. A pick is two actions - `Open` then `PlaceCursorAt` - so it lands on the match, not the top of the file |
-| **Which-key popup** | overlay | none | after a prefix key, show the available continuations from the keymap (§10.5) - pure frontend introspection of the binding table |
+| **Which-key popup** | overlay | none | **deferred out of M7 (§11).** It is the one surface with a prerequisite it cannot supply itself: "the available continuations from the keymap" presupposes a keymap that *has* continuations, and this one is flat by design (§10.5). Revisit with chord sequences, not before |
 | **Completion popup** | overlay | emits `Action`, reads decorations | LSP completion menu; ghost-preview of the selected item as a `VirtualText` decoration |
 | **Hover / diagnostic popup** | overlay | reads decorations | LSP hover + full diagnostic text on demand |
 
@@ -796,6 +796,14 @@ early milestones is a deliberate scope choice, not an oversight:
   the built-in bindings through the same `Chord`/`Command` string format the defaults are
   written in. What remains is the richer *modal* design - chord sequences, per-mode maps,
   modal vs modeless - drafted alongside §12.2's `Action` vocabulary. Target: M1+.
+- **Chord sequences + the which-key popup.** *Cut from M7 (2026-07-27), together, because
+  they are one feature and not two:* the popup is a view of a pending prefix, and a flat
+  keymap has no such thing (§7.5, §10.5). The order is fixed - trie keymap, pending-prefix
+  state, config syntax, `shortcut_for` rendering, *then* the popup, which is the small part.
+  **Trigger: the first thing that genuinely wants a prefix** - modal editing, a leader key,
+  or a command surface that outgrows one chord each. Building it for the popup alone would
+  buy a worse command palette at the cost of changing the keymap's public contract, so the
+  editor stays modeless-with-a-palette until something asks otherwise.
 
 ### Known structural debt (identified 2026-07-21, with triggers)
 
@@ -1085,9 +1093,9 @@ Incremental build order so the risky assumptions are validated early, not at the
   intent becomes an `Action`. *Verify:* save-as via a prompt, an error toast from a failed
   save, and a stacked overlay that dismisses top-first - in a real terminal, with no core
   round-trip for navigation.
-- **M7 - Pickers + palette + which-key.** *(in progress: file picker, command palette, the
-  theme picker with live preview + TOML theme files (§10.5), and **multi-buffer** with its
-  bufferline and buffer picker have landed.)* `nucleo` fuzzy matching (§3 addition); file /
+- **M7 - Pickers + palette + search. DONE.** *(Named "+ which-key" while it was open; the
+  popup was cut at the end of the milestone rather than built - see the closing note below.)*
+  `nucleo` fuzzy matching (§3 addition); file /
   global-search / buffer pickers with a preview pane; a command palette over the §10.5
   command identifiers; a which-key popup driven by the keymap. Multi-buffer was the one core
   change in this arc, since buffer-switching needs it: `Session` owns many `Document`s,
@@ -1165,8 +1173,18 @@ Incremental build order so the risky assumptions are validated early, not at the
   a `y`/`n`/`y`/`q` walk edited exactly the matches agreed to, `a` replaced the rest with
   `$1`/`$2` capture expansion, and select-all-matches plus typing rewrote all five
   occurrences at once.
-  **Still open in M7:** which-key popup (and see §10.5's note on chord sequences, which it
-  needs first).
+  **The which-key popup is cut from M7** (2026-07-27), and the milestone closes without it.
+  The popup shows the continuations of a half-typed key sequence, so it presupposes a keymap
+  that *has* sequences; this one is flat by design (§10.5 - one chord, modifiers and all,
+  matched whole). Building it therefore meant building the sequence keymap first - a trie, a
+  pending-prefix state in the event loop, config syntax for sequences, and sequence rendering
+  in `shortcut_for` - with the popup as the last fifth of the work. That is a change to the
+  keymap's *public contract* (§10.5: command names and chord grammar are a contract once a
+  config file exists), and it should be paid for by wanting leader keys, not by wanting a
+  popup. Stripped of sequences the popup degenerates into "list every binding", which is the
+  question the command palette already answers - by name, with the shortcut beside each row.
+  Deferred to §11 with that trigger: **if modal editing or leader sequences land, which-key
+  arrives with them**; until then M7's answer to "what can I do here" is `Ctrl+P`.
   *Verify:* open a file via the picker, switch buffers, run a command via the palette -
   in-terminal.
 - **M8 - Chrome + polish.** Git diff signs (a git-diff task feeding `GutterMark`s; its git
