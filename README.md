@@ -166,6 +166,7 @@ gutter           = { fg = "#4e575e" }
 gutter_current   = { fg = "#eef2f4", bold = true }
 selection        = { fg = "#eef2f4", bg = "#2f383e" }
 current_line     = { bg = "#1b1f22" }
+ruler            = { bg = "#23282b" }
 secondary_cursor = { fg = "#141719", bg = "#e04b3c" }
 toast_info       = { fg = "#c9ced2", bg = "#242a2e" }
 toast_error      = { fg = "#141719", bg = "#e04b3c", bold = true }
@@ -194,6 +195,7 @@ optional, so the file can be one line; `--config PATH` reads a different one.
 theme         = "phosphor"   # any built-in or one of your own
 tab_width     = 4            # display width of a tab stop
 line_numbers  = "absolute"   # or "relative" - see below
+rulers        = [80, 100]    # tint these columns; [] (the default) draws none
 final_newline = true         # add a trailing newline on save if the file lacks one
 
 [keys]                       # layered over the built-in bindings, not replacing them
@@ -209,6 +211,12 @@ you would type before a motion - except the cursor's own row, which shows its ab
 number rather than a useless `0`. The gutter keeps the width the buffer needs in both
 modes, so switching never slides the text sideways. **Toggle Relative Line Numbers** in
 the palette flips it for the session; the config key is what you start in.
+
+`rulers` tints the given columns down the whole buffer, so a line that runs past your
+width limit is visible without counting. Columns are 0-based - `80` marks the first
+column *past* an 80-wide limit. The tint runs past the end of short lines too, since a
+ruler marks a limit those lines have not reached; anything else painted there (a
+selection, a search match) wins the cell.
 
 Like a theme file, **an unknown key is an error rather than a shrug** - but a config that
 does not load never stops the editor coming up. It starts on the defaults and says what

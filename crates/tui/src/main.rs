@@ -791,6 +791,7 @@ fn event_loop(
                     selected,
                     tab_width: config.tab_width,
                     line_numbers: config.line_numbers,
+                    rulers: &config.rulers,
                     search: &search,
                 },
                 &overlays,
@@ -1416,6 +1417,9 @@ struct PaintInputs<'a> {
     /// How the gutter numbers its rows (SPEC §7.5), carried per frame for the same
     /// reason as `tab_width`.
     line_numbers: config::LineNumbers,
+    /// Display columns to draw a ruler down (SPEC §7.5). Borrowed rather than owned
+    /// so [`PaintInputs`] stays `Copy`; it is read-only for the whole frame.
+    rulers: &'a [usize],
     /// The live search (SPEC §11), borrowed rather than copied so the highlights can
     /// never be a frame behind what the prompt is showing.
     ///
@@ -1440,6 +1444,7 @@ fn paint(frame: &mut Frame, snapshot: &ViewSnapshot, inputs: PaintInputs) -> Vie
         selected,
         tab_width,
         line_numbers,
+        rulers,
         search,
     } = inputs;
     let area = frame.area();
@@ -1522,6 +1527,10 @@ fn paint(frame: &mut Frame, snapshot: &ViewSnapshot, inputs: PaintInputs) -> Vie
             theme,
             tab_width,
             line_numbers,
+            rulers: rulers
+                .iter()
+                .map(|&col| (col..col + 1, theme.ruler))
+                .collect(),
             // Only the lines about to be painted are searched, which is the whole
             // reason `matches_in` takes a line range (SPEC §10.4).
             matches: search
@@ -1640,6 +1649,11 @@ struct Body {
     /// from [`Body::cursor_line`], which this already carries for the current-line
     /// tint.
     line_numbers: config::LineNumbers,
+    /// Ruler overlays (SPEC §7.5), already resolved to display-column ranges and a
+    /// style. Identical for every row, so they are built once per frame here rather
+    /// than per row - and they seed each row's overlay list, which is what puts them
+    /// *under* everything else that paints.
+    rulers: Vec<(std::ops::Range<usize>, Style)>,
 }
 
 /// Paint the text body with a line-number gutter. Each visible row is a gutter
@@ -1694,26 +1708,29 @@ fn paint_body(frame: &mut Frame, area: Rect, snapshot: &ViewSnapshot, body: Body
             // `visible_lines` already fetched this line; reuse its raw form for the
             // byte->column mapping rather than a second rope traversal per row.
             let raw = &line.raw;
-            // Selection washes first, so syntax highlights paint *over* them: a
+            // Rulers underneath everything (SPEC §7.5): a ruler marks a margin, so a
+            // selection or a match crossing it must not be the thing that gives way.
+            // They cover cells *past* the line's end too - `render_line` pads the
+            // window and styles the padding - which is the point, since a ruler marks
+            // a limit a short line has not reached rather than one it has.
+            //
+            // Then the selection washes, so syntax highlights paint over them: a
             // selection sets a background, and the highlight that follows patches
             // only the foreground, so selected code keeps its syntax colors on the
             // selection's ground rather than being flattened to the selection's own
             // foreground (SPEC §5, later overlays win in `render_line`).
-            let mut overlays: Vec<(std::ops::Range<usize>, Style)> = snapshot
-                .selections
-                .iter()
-                .filter_map(|s| {
-                    layout::selection_columns(
-                        raw,
-                        line_start,
-                        line_end_excl,
-                        body.tab_width,
-                        s.start(),
-                        s.end(),
-                    )
-                    .map(|range| (range, body.theme.selection))
-                })
-                .collect();
+            let mut overlays: Vec<(std::ops::Range<usize>, Style)> = body.rulers.clone();
+            overlays.extend(snapshot.selections.iter().filter_map(|s| {
+                layout::selection_columns(
+                    raw,
+                    line_start,
+                    line_end_excl,
+                    body.tab_width,
+                    s.start(),
+                    s.end(),
+                )
+                .map(|range| (range, body.theme.selection))
+            }));
             // Search matches (SPEC §11), pushed with the selection washes and so
             // *under* the syntax highlights: a match sets a ground, and the
             // highlight that follows patches only the foreground, so matched code
@@ -2517,6 +2534,7 @@ mod tests {
             selected,
             tab_width: config::DEFAULT_TAB_WIDTH,
             line_numbers: config::LineNumbers::default(),
+            rulers: &[],
             search: NO_SEARCH.get_or_init(buffersearch::SearchState::default),
         }
     }
@@ -2609,6 +2627,85 @@ mod tests {
         assert_eq!(
             gutters(config::LineNumbers::Relative),
             ["  4 ", "  3 ", "  2 ", "  1 ", "  5 "]
+        );
+    }
+
+    #[test]
+    fn a_ruler_tints_its_column_on_every_row_including_past_a_short_line() {
+        // Ruler at display column 6, gutter 4 wide, so it lands on screen column 10.
+        // The first line reaches past it, the second stops short - and the ruler has
+        // to be there either way, since it marks a limit rather than the text.
+        let snap = snapshot_after(&[Action::Insert("abcdefghij\nxy".into())]);
+        let buf = render_with(
+            &snap,
+            40,
+            8,
+            PaintInputs {
+                rulers: &[6],
+                ..paint_inputs(0)
+            },
+        );
+        let theme = config::Theme::default();
+        let ruler_bg = theme.ruler.bg.unwrap();
+        let col = layout::gutter_width(layout::display_line_count(&snap.text)) as u16 + 6;
+        // Row 1 has text under the ruler; row 2 has only padding there.
+        assert_eq!(buf.cell((col, 1)).unwrap().bg, ruler_bg, "over text");
+        assert_eq!(buf.cell((col, 2)).unwrap().bg, ruler_bg, "past line end");
+        // A row past the end of the buffer entirely is left to the body ground - the
+        // ruler marks columns of *lines*, and there is no line there to hold a limit.
+        assert_ne!(buf.cell((col, 6)).unwrap().bg, ruler_bg, "past the buffer");
+        // Its neighbours are untouched, or the "one column" claim means nothing.
+        assert_ne!(buf.cell((col - 1, 1)).unwrap().bg, ruler_bg);
+        assert_ne!(buf.cell((col + 1, 1)).unwrap().bg, ruler_bg);
+    }
+
+    #[test]
+    fn a_selection_crossing_a_ruler_paints_over_it() {
+        // Order matters: the ruler seeds the overlay list so everything else wins on
+        // a shared cell. A selection that gave way to a margin marker would read as
+        // a hole punched in the selection.
+        let snap = snapshot_after(&[
+            Action::Insert("abcdefghij".into()),
+            Action::MoveCursor {
+                motion: vortex_core::Motion::LineStart,
+                extend: false,
+            },
+            Action::MoveCursor {
+                motion: vortex_core::Motion::LineEnd,
+                extend: true,
+            },
+        ]);
+        let buf = render_with(
+            &snap,
+            40,
+            8,
+            PaintInputs {
+                rulers: &[6],
+                ..paint_inputs(0)
+            },
+        );
+        let theme = config::Theme::default();
+        let col = layout::gutter_width(layout::display_line_count(&snap.text)) as u16 + 6;
+        assert_eq!(
+            buf.cell((col, 1)).unwrap().bg,
+            theme.selection.bg.unwrap(),
+            "the selection owns the cell it shares with a ruler"
+        );
+    }
+
+    #[test]
+    fn no_rulers_configured_paints_none() {
+        // The default is off, and "off" has to mean the body ground is untouched -
+        // an always-on faint stripe would be worse than the feature not existing.
+        let snap = snapshot_after(&[Action::Insert("abcdefghij".into())]);
+        let buf = render(&snap, 40, 8);
+        let theme = config::Theme::default();
+        let row = (0..20)
+            .map(|c| buf.cell((c, 1)).unwrap().bg)
+            .collect::<Vec<_>>();
+        assert!(
+            row.iter().all(|&bg| bg != theme.ruler.bg.unwrap()),
+            "no cell should carry the ruler ground: {row:?}"
         );
     }
 
