@@ -3086,22 +3086,22 @@ mod tests {
                 .collect::<Vec<usize>>()
         };
 
-        for track in [6usize, 15] {
-            // Both of these stay under `track²` lines, where the thumb is still drawn
-            // proportionally and the pointer lands squarely inside it.
-            for lines in [track + 2, track * 4] {
-                let text: String = (1..lines).map(|n| format!("l{n}\n")).collect();
-                let snap = snapshot_after(&[Action::Insert(text)]);
-                let max_scroll = layout::display_line_count(&snap.text) - track;
-                for row in 0..track {
-                    let scroll = layout::scroll_at_track_row(row, track, max_scroll);
-                    let rows = painted_thumb(&snap, track, scroll);
-                    assert!(
-                        rows.contains(&row),
-                        "track {track}, {lines} lines, row {row}: \
-                         scroll {scroll} painted the thumb at {rows:?}"
-                    );
-                }
+        // Explicit pairs rather than a nested sweep, because the property only holds
+        // while the thumb is proportional - every one of these is under `track²` lines,
+        // and the floor case below is where the other side is pinned. `track = 2` is
+        // the degenerate linear map (a span of one), which is why it leads.
+        for (track, lines) in [(2usize, 4usize), (6, 8), (6, 24), (15, 17), (15, 60)] {
+            let text: String = (1..lines).map(|n| format!("l{n}\n")).collect();
+            let snap = snapshot_after(&[Action::Insert(text)]);
+            let max_scroll = layout::display_line_count(&snap.text) - track;
+            for row in 0..track {
+                let scroll = layout::scroll_at_track_row(row, track, max_scroll);
+                let rows = painted_thumb(&snap, track, scroll);
+                assert!(
+                    rows.contains(&row),
+                    "track {track}, {lines} lines, row {row}: \
+                     scroll {scroll} painted the thumb at {rows:?}"
+                );
             }
         }
 
