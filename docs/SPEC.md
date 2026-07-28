@@ -543,6 +543,15 @@ add noise, each on/off switch a key in the config file the M5 loader now reads:
   never from the numbers relative mode happens to print: a gutter that narrowed to fit
   them would resize every time the caret crossed a power of ten, sliding the whole text
   body sideways under the reader.
+  **The origin is the caret, including when the caret is off screen** - after a wheel
+  scroll, or while a search preview holds the viewport on a match the caret has not moved
+  to (§11). The gutter then reads as large distances with no absolute number anywhere on
+  screen, which is worse than absolute mode would be, and it is still right: the caret is
+  where an edit will land, and a count typed before a motion is counted from *there*, not
+  from whatever the viewport happens to be showing. Numbering from the top visible row
+  instead would make the gutter agree with the screen and disagree with the keyboard. The
+  current-line tint keys off the caret for the same reason and is likewise invisible while
+  a preview is scrolled away, so the two stay consistent.
 - **Cursor shape per mode** - bar/block/underline via the terminal cursor (the frontend
   already drives the real cursor).
 - **Rulers / colorcolumn** - vertical rule at configured columns.
