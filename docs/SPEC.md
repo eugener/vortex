@@ -554,7 +554,20 @@ add noise, each on/off switch a key in the config file the M5 loader now reads:
   a preview is scrolled away, so the two stay consistent.
 - **Cursor shape per mode** - bar/block/underline via the terminal cursor (the frontend
   already drives the real cursor).
-- **Rulers / colorcolumn** - vertical rule at configured columns.
+- **Rulers / colorcolumn** - *built (M8).* `rulers = [80, 100]` in the config file, a
+  list because the limits a file is held to come in pairs as often as not, and drawing
+  several costs what drawing one does. Columns are **0-based**, so `80` marks the first
+  column *past* an 80-column limit - where the limit is actually crossed, not the last
+  cell inside it. Painted as a **ground tint, not a glyph**: a character would have to
+  displace the text it sits under, and the cell it wants is exactly the one a long line
+  is using. The tint is a theme slot (`ruler`) held distinct from `current_line`, since
+  the two cross on the caret's row and a ruler that matched would disappear precisely
+  there. Rulers seed each row's overlay list, so **everything paints over them** - a
+  selection or a search match crossing a ruler must not be the thing that gives way -
+  and they extend past a line's end onto the padded cells, because a ruler marks a limit
+  a short line has *not* reached rather than one it has. They stop at the end of the
+  buffer: a ruler marks a column of a line, and past the last line there is no line to
+  hold one.
 - **Scrollbar** - ratatui `Scrollbar` on the right edge, from viewport + line count.
 - **Sticky context header** - pin the enclosing scope (function/class) at the viewport top;
   needs tree-sitter, so it pairs with M4.
@@ -1206,7 +1219,7 @@ Incremental build order so the risky assumptions are validated early, not at the
   arrives with them**; until then M7's answer to "what can I do here" is `Ctrl+P`.
   *Verify:* open a file via the picker, switch buffers, run a command via the palette -
   in-terminal.
-- **M8 - Chrome + polish.** *(in progress: relative line numbers have landed.)* Git diff
+- **M8 - Chrome + polish.** *(in progress: relative line numbers and rulers have landed.)* Git diff
   signs (a git-diff task feeding `GutterMark`s; its git source - `gix` / `git2` - is a §3
   stack addition to raise), indent guides, relative line numbers, scrollbar, sticky context
   (tree-sitter), cursor-shape-per-mode, rulers. Unlike the earlier milestones these are

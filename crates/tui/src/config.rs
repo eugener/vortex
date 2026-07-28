@@ -67,6 +67,14 @@ pub struct Config {
     /// How the gutter numbers its rows (SPEC §7.5). Frontend-owned for the same
     /// reason the gutter itself is: the core has no idea a margin exists.
     pub line_numbers: LineNumbers,
+    /// Display columns to draw a ruler down (SPEC §7.5), 0-based so a value of 80
+    /// marks the 81st column - the first one *past* an 80-column limit, which is
+    /// where a limit is actually crossed. Empty (the default) draws none.
+    ///
+    /// A list rather than one column because the limits a file is held to often
+    /// come in pairs (a soft width and a hard one), and because the cost of drawing
+    /// several is the same as drawing one.
+    pub rulers: Vec<usize>,
     /// Append a trailing newline on save when the buffer lacks one (SPEC §10.1).
     /// Held here because this is where the user's file is read, and handed to the
     /// core, which is what acts on it.
@@ -81,6 +89,7 @@ impl Default for Config {
             keymap: Keymap::default(),
             tab_width: DEFAULT_TAB_WIDTH,
             line_numbers: LineNumbers::default(),
+            rulers: Vec::new(),
             final_newline: CoreOptions::default().final_newline,
         }
     }
@@ -111,6 +120,7 @@ struct ConfigFile {
     theme: Option<String>,
     tab_width: Option<usize>,
     line_numbers: Option<LineNumbers>,
+    rulers: Option<Vec<usize>>,
     final_newline: Option<bool>,
     /// Chord → command name, merged over the built-in bindings rather than
     /// replacing them: a user who binds one key keeps the other fifty. Binding a
@@ -205,6 +215,9 @@ fn parse(text: &str) -> (Config, Option<String>) {
     if let Some(mode) = file.line_numbers {
         config.line_numbers = mode;
     }
+    if let Some(rulers) = file.rulers {
+        config.rulers = rulers;
+    }
     if let Some(final_newline) = file.final_newline {
         config.final_newline = final_newline;
     }
@@ -287,6 +300,12 @@ pub struct Theme {
     /// The cursor line's background - a subtle tint filling the whole row so the
     /// active line is easy to find without pulling the eye like a selection does.
     pub current_line: Style,
+    /// The ground of a ruler column (SPEC §7.5) - the vertical stripe at each
+    /// configured line-length guide. Quieter than [`Self::current_line`]: a ruler is
+    /// on screen for the whole session and every row at once, so it has to read as a
+    /// margin rather than as a highlight. Distinct from it too, since the two cross
+    /// on the caret's row and a ruler that matched would vanish exactly there.
+    pub ruler: Style,
     /// The marker for a *secondary* (non-primary) caret in a multi-cursor set
     /// (SPEC §2.2). The terminal has a single real cursor, which the primary caret
     /// uses; the others are painted as a one-cell reversed block so they are visible.
@@ -418,6 +437,9 @@ impl Default for Theme {
                 .fg(Color::Rgb(0xee, 0xf1, 0xfa))
                 .bg(Color::Rgb(0x2b, 0x35, 0x57)),
             current_line: Style::new().bg(Color::Rgb(0x1c, 0x20, 0x31)),
+            // A step lighter than the current-line tint, so where the two cross the
+            // ruler is still the thing you see (an overlay patches the row's base).
+            ruler: Style::new().bg(Color::Rgb(0x21, 0x26, 0x3a)),
             // A violet block: the terminal has one real cursor, which the primary
             // caret uses, so the others need a color of their own (SPEC §2.2).
             secondary_cursor: Style::new()
@@ -514,6 +536,20 @@ mod tests {
         assert_eq!(problem, None);
         assert_eq!(config.line_numbers, LineNumbers::Relative);
         assert_eq!(config.tab_width, DEFAULT_TAB_WIDTH);
+    }
+
+    #[test]
+    fn rulers_are_a_list_and_default_to_none() {
+        assert!(Config::default().rulers.is_empty(), "off unless asked");
+
+        let (config, problem) = parse("rulers = [80, 100]");
+        assert_eq!(problem, None);
+        assert_eq!(config.rulers, vec![80, 100]);
+
+        // An explicit empty list is a way to say "none", not a parse error.
+        let (config, problem) = parse("rulers = []");
+        assert_eq!(problem, None);
+        assert!(config.rulers.is_empty());
     }
 
     #[test]
