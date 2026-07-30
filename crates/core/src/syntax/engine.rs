@@ -7,11 +7,12 @@
 //! with a real grammar - it needs no coverage exemption.
 
 use async_channel::{Receiver, Sender};
-use tree_sitter::Language;
+use tree_sitter::{Language, Parser, Query};
 use tree_sitter_highlight::{HighlightConfiguration, Highlighter};
 
 use crate::editor::BoxFuture;
 use crate::syntax::highlight::{names, spans_from_events};
+use crate::syntax::scope::scopes_from_tree;
 use crate::syntax::{SyntaxEvent, SyntaxSync};
 
 /// Why the highlighter could not start. Typed so the frontend can degrade to "no
@@ -20,10 +21,16 @@ use crate::syntax::{SyntaxEvent, SyntaxSync};
 /// with it.
 #[derive(Debug, thiserror::Error)]
 pub enum SyntaxError {
-    /// The highlight/injection/locals query failed to compile against the grammar
-    /// (a malformed `.scm`, or one written for a different grammar version).
+    /// The highlight/injection/locals/context query failed to compile against the
+    /// grammar (a malformed `.scm`, or one written for a different grammar
+    /// version).
     #[error("invalid highlight query: {0}")]
     Query(String),
+    /// The grammar itself is unusable with this tree-sitter - an ABI version the
+    /// parser cannot drive. Distinct from [`Self::Query`] because the two point at
+    /// different files to fix: one at the `.scm`, one at the grammar library.
+    #[error("unusable grammar: {0}")]
+    Grammar(String),
 }
 
 /// Channels the editor uses to talk to a running highlighter - the syntax twin of
@@ -44,17 +51,20 @@ const EVENT_CAP: usize = 64;
 /// Start a highlighter for one grammar and return its channels plus its loop.
 ///
 /// `language` is the tree-sitter grammar (the frontend loads it, dynamically,
-/// from config) and the three query strings are its `.scm` sources; `name` is the
-/// grammar's own name, used only in tree-sitter error messages. The returned
-/// future runs until the editor drops [`SyntaxHandle::sync`] or a query fails to
-/// compile, and resolves to why it stopped. Nothing happens until the frontend
-/// polls it.
+/// from config) and the query strings are its `.scm` sources; `name` is the
+/// grammar's own name, used only in tree-sitter error messages. An empty
+/// `context_query` means the grammar describes no structural scopes, and the
+/// producer then does no scope work at all (SPEC §7.5, M8) - not even the second
+/// parse it would otherwise need. The returned future runs until the editor drops
+/// [`SyntaxHandle::sync`] or a query fails to compile, and resolves to why it
+/// stopped. Nothing happens until the frontend polls it.
 pub fn highlighter(
     language: Language,
     name: impl Into<String>,
     highlights_query: String,
     injections_query: String,
     locals_query: String,
+    context_query: String,
 ) -> (SyntaxHandle, BoxFuture<Result<(), SyntaxError>>) {
     let (sync_tx, sync_rx) = async_channel::bounded::<SyntaxSync>(SYNC_CAP);
     let (event_tx, event_rx) = async_channel::bounded::<SyntaxEvent>(EVENT_CAP);
@@ -67,34 +77,60 @@ pub fn highlighter(
         Box::pin(run(
             language,
             name,
-            highlights_query,
-            injections_query,
-            locals_query,
+            Queries {
+                highlights: highlights_query,
+                injections: injections_query,
+                locals: locals_query,
+                context: context_query,
+            },
             sync_rx,
             event_tx,
         )),
     )
 }
 
-#[allow(clippy::too_many_arguments)]
+/// The `.scm` sources a grammar is driven by, bundled so [`run`] takes one
+/// parameter for them rather than four positional strings that are all `String`
+/// and so all swappable by mistake.
+struct Queries {
+    highlights: String,
+    injections: String,
+    locals: String,
+    context: String,
+}
+
 async fn run(
     language: Language,
     name: String,
-    highlights_query: String,
-    injections_query: String,
-    locals_query: String,
+    queries: Queries,
     sync: Receiver<SyntaxSync>,
     events: Sender<SyntaxEvent>,
 ) -> Result<(), SyntaxError> {
+    // The context query and its parser, or `None` for a grammar that ships no
+    // `context.scm` - which is what keeps every language that has not opted into
+    // sticky context from paying for the second parse (M8). Compiled here with
+    // the highlight configuration, so a malformed context query is reported the
+    // same way and before any text is parsed.
+    let mut context = if queries.context.trim().is_empty() {
+        None
+    } else {
+        let query = Query::new(&language, &queries.context)
+            .map_err(|e| SyntaxError::Query(e.to_string()))?;
+        let mut parser = Parser::new();
+        parser
+            .set_language(&language)
+            .map_err(|e| SyntaxError::Grammar(e.to_string()))?;
+        Some((parser, query))
+    };
     // Build the configuration once: the grammar and queries are fixed for this
     // producer's lifetime, so compilation (the only fallible step) happens up
     // front and a bad query stops the loop before any text is parsed.
     let mut config = HighlightConfiguration::new(
         language,
         name,
-        &highlights_query,
-        &injections_query,
-        &locals_query,
+        &queries.highlights,
+        &queries.injections,
+        &queries.locals,
     )
     .map_err(|e| SyntaxError::Query(e.to_string()))?;
     config.configure(&names());
@@ -135,17 +171,44 @@ async fn run(
             Err(_) => continue,
         };
 
-        if events
-            .send(SyntaxEvent::Highlights {
+        // The structural scopes for the sticky context header (M8), from this
+        // producer's own parse of the same source - see the module doc for why the
+        // highlight pass cannot supply the tree. `None` for a grammar with no
+        // context query, and for a parse that failed: a failed parse costs this
+        // version its scopes, exactly as a failed highlight query costs it its
+        // colors, rather than killing the producer (SPEC §8).
+        let scopes = context
+            .as_mut()
+            .and_then(|(parser, query)| {
+                Some(scopes_from_tree(
+                    &parser.parse(source.as_bytes(), None)?,
+                    query,
+                    source.as_bytes(),
+                ))
+            })
+            .map(|spans| SyntaxEvent::Scopes {
                 buffer_id,
                 version,
                 spans,
-            })
-            .await
-            .is_err()
+            });
+
+        // Highlights first: the colors are what a first paint is waiting on, and
+        // the header can arrive a frame later without anything being wrong on
+        // screen (SPEC §5). Sent through one loop rather than two blocks so the
+        // producer has a single "the editor is gone" exit - the two sends are back
+        // to back with nothing between them that could make one fail and not the
+        // other, so a second copy of that check would be a branch no run can take.
+        for event in std::iter::once(SyntaxEvent::Highlights {
+            buffer_id,
+            version,
+            spans,
+        })
+        .chain(scopes)
         {
             // The editor dropped the event receiver: it has stopped.
-            return Ok(());
+            if events.send(event).await.is_err() {
+                return Ok(());
+            }
         }
     }
 }

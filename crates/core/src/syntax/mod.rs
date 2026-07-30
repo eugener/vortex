@@ -26,9 +26,23 @@
 //! path. Incremental parsing is an optimization to make against a benchmark, not
 //! a default to assume - deferred with the interval index the decoration channel
 //! also wants (SPEC §14).
+//!
+//! **Scopes cost a second parse, and that is the honest price** (M8). The sticky
+//! context header needs the parse *tree* - "which named nodes enclose this row" -
+//! but `tree_sitter_highlight::Highlighter::highlight` parses internally and hands
+//! back only an event stream, with no way to reach the tree or to supply one. The
+//! alternatives were to drop `tree_sitter_highlight` and re-implement highlighting
+//! over a raw `Query` (re-deriving its locals and injection machinery), or to run
+//! a second `tree_sitter::Parser` over the same source. This does the latter, and
+//! only for grammars that ship a `context.scm`: the extra parse is on the
+//! highlighter's own thread, off the keystroke path, and coalesced by the same
+//! drain-to-newest that already keeps fast typing from queueing parses. It
+//! collapses back to one parse if incremental reparse ever lands, since that
+//! change means owning the tree here anyway.
 
 pub(crate) mod engine;
 pub(crate) mod highlight;
+pub(crate) mod scope;
 
 use crate::buffer::{ByteRange, Text};
 use crate::decoration::HighlightKind;
@@ -86,5 +100,21 @@ pub enum SyntaxEvent {
         buffer_id: BufferId,
         version: u64,
         spans: Vec<HighlightSpan>,
+    },
+    /// The structural scopes of a version - the ranges the sticky context header
+    /// pins a first line from (SPEC §7.5, M8). A full replacement of the
+    /// [`Scope`](crate::decoration::DecorationSource::Scope) bucket, exactly as
+    /// [`Self::Highlights`] replaces the syntax one.
+    ///
+    /// A **separate event**, not a field on `Highlights`, so a grammar that ships
+    /// no `context.scm` simply never sends one - the highlighting path stays
+    /// untouched for every language that has not opted in, which is the same
+    /// additive-variant property that let M4 land on M2's channel.
+    Scopes {
+        buffer_id: BufferId,
+        version: u64,
+        /// Byte ranges of the enclosing nodes, outermost first among those
+        /// sharing a start (`syntax::scope`).
+        spans: Vec<ByteRange>,
     },
 }

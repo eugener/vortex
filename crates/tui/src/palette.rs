@@ -32,6 +32,7 @@ const PALETTE: &[(&str, Bindable)] = &[
     ("Toggle Relative Line Numbers", Bindable::ToggleLineNumbers),
     ("Toggle Indent Guides", Bindable::ToggleIndentGuides),
     ("Toggle Scrollbar", Bindable::ToggleScrollbar),
+    ("Toggle Sticky Context", Bindable::ToggleStickyContext),
     ("Set Encoding…", Bindable::OpenEncodingPicker),
     ("Set Line Endings…", Bindable::OpenLineEndingPicker),
     ("Save File", Bindable::Save),

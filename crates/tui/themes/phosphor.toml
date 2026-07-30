@@ -19,6 +19,8 @@ ruler            = { bg = "#2c210d" }
 indent_guide     = { fg = "#4a3100" }
 scrollbar_track  = { fg = "#4a3100" }
 scrollbar_thumb  = { fg = "#a06c00" }
+# Pinned rows one step up the intensity ladder from the current line.
+sticky_context   = { bg = "#332612" }
 secondary_cursor = { reversed = true }
 toast_info       = { fg = "#150f06", bg = "#c48700" }
 toast_error      = { fg = "#150f06", bg = "#ffd980", bold = true }

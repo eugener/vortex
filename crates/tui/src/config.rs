@@ -87,6 +87,11 @@ pub struct Config {
     /// scrollbar that appeared only once a file outgrew the screen would slide every
     /// line one cell sideways at the moment the file crossed that boundary.
     pub scrollbar: bool,
+    /// Pin the enclosing scopes of the viewport's top row at the top of the body
+    /// (SPEC §7.5). Off by default, and the only piece of chrome that costs *rows*
+    /// of text - as many as the code at the top of the screen is nested deep,
+    /// capped by [`STICKY_CONTEXT_MAX`] and by a third of the body.
+    pub sticky_context: bool,
     /// Append a trailing newline on save when the buffer lacks one (SPEC §10.1).
     /// Held here because this is where the user's file is read, and handed to the
     /// core, which is what acts on it.
@@ -104,6 +109,7 @@ impl Default for Config {
             rulers: Vec::new(),
             indent_guides: false,
             scrollbar: false,
+            sticky_context: false,
             final_newline: CoreOptions::default().final_newline,
         }
     }
@@ -137,6 +143,7 @@ struct ConfigFile {
     rulers: Option<Vec<usize>>,
     indent_guides: Option<bool>,
     scrollbar: Option<bool>,
+    sticky_context: Option<bool>,
     final_newline: Option<bool>,
     /// Chord → command name, merged over the built-in bindings rather than
     /// replacing them: a user who binds one key keeps the other fifty. Binding a
@@ -240,6 +247,9 @@ fn parse(text: &str) -> (Config, Option<String>) {
     if let Some(on) = file.scrollbar {
         config.scrollbar = on;
     }
+    if let Some(on) = file.sticky_context {
+        config.sticky_context = on;
+    }
     if let Some(final_newline) = file.final_newline {
         config.final_newline = final_newline;
     }
@@ -340,6 +350,13 @@ pub struct Theme {
     /// The scrollbar's thumb: the stretch of track standing for what is on screen.
     /// This is the part that carries the answer, so it is the part with the contrast.
     pub scrollbar_thumb: Style,
+    /// The sticky context header's ground (SPEC §7.5) - the rows pinned above the
+    /// text showing which scopes enclose it. A ground, unlike the indent guide's
+    /// bare foreground, because these rows are *not* buffer text at the position
+    /// they occupy: something has to say where the pinned lines stop and the file
+    /// resumes, and a tint says it without spending a row on a separator. The
+    /// syntax colors still paint over it, so a pinned line reads as the code it is.
+    pub sticky_context: Style,
     /// The marker for a *secondary* (non-primary) caret in a multi-cursor set
     /// (SPEC §2.2). The terminal has a single real cursor, which the primary caret
     /// uses; the others are painted as a one-cell reversed block so they are visible.
@@ -483,6 +500,11 @@ impl Default for Theme {
             // where nothing else is competing for the eye.
             scrollbar_track: Style::new().fg(Color::Rgb(0x2b, 0x31, 0x49)),
             scrollbar_thumb: Style::new().fg(Color::Rgb(0x5a, 0x64, 0x8c)),
+            // A shade above the current-line tint: the header has to read as a
+            // different *surface* from the text below it (it is the one place on
+            // screen where a row is not the line it appears to be), while staying
+            // far enough below the selection that pinned code is still code.
+            sticky_context: Style::new().bg(Color::Rgb(0x23, 0x28, 0x3d)),
             // A violet block: the terminal has one real cursor, which the primary
             // caret uses, so the others need a color of their own (SPEC §2.2).
             secondary_cursor: Style::new()
@@ -621,6 +643,21 @@ mod tests {
         let (config, problem) = parse("scrollbar = false");
         assert_eq!(problem, None);
         assert!(!config.scrollbar);
+    }
+
+    #[test]
+    fn sticky_context_is_off_unless_the_file_asks_for_it() {
+        // As strict as the scrollbar's default, and for the same kind of reason: this
+        // one costs *rows* of text rather than a mark on cells the text was not using.
+        assert!(!Config::default().sticky_context, "off unless asked");
+
+        let (config, problem) = parse("sticky_context = true");
+        assert_eq!(problem, None);
+        assert!(config.sticky_context);
+
+        let (config, problem) = parse("sticky_context = false");
+        assert_eq!(problem, None);
+        assert!(!config.sticky_context);
     }
 
     #[test]

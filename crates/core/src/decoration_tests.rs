@@ -355,3 +355,120 @@ fn a_highlight_rides_edits_with_the_shift_dont_grow_bias() {
         vec![(6..9, HighlightKind::Function)]
     );
 }
+
+fn scope_set(ranges: &[(usize, usize)]) -> DecorationSet {
+    let mut s = DecorationSet::new();
+    s.replace(
+        DecorationSource::Scope,
+        ranges
+            .iter()
+            .map(|&(start, end)| Decoration::Scope { range: start..end })
+            .collect(),
+    );
+    s
+}
+
+/// The one scope `set` reports at `offset`, or a failure naming what it found -
+/// spelled out rather than compared against a one-element `Vec`, which reads as a
+/// range someone meant to expand.
+fn only_scope_at(set: &DecorationSet, offset: usize) -> ByteRange {
+    let found: Vec<_> = set.scopes_at(offset).collect();
+    assert_eq!(found.len(), 1, "expected exactly one scope: {found:?}");
+    found[0].clone()
+}
+
+#[test]
+fn scopes_at_returns_the_enclosing_chain_outermost_first() {
+    // The header's own order: a scope containing another starts no later, and the
+    // bucket is sorted by start, so iteration reads module -> impl -> fn.
+    let s = scope_set(&[(10, 90), (0, 100), (20, 40)]);
+    assert_eq!(
+        s.scopes_at(30).collect::<Vec<_>>(),
+        vec![0..100, 10..90, 20..40]
+    );
+}
+
+#[test]
+fn a_scope_starting_at_the_queried_offset_does_not_enclose_it() {
+    // The frontend asks with the first byte of the top visible row: a scope
+    // starting there has its own first line on screen already, and pinning it
+    // would print that line twice.
+    let s = scope_set(&[(10, 90)]);
+    assert_eq!(s.scopes_at(10).count(), 0);
+    assert_eq!(only_scope_at(&s, 11), 10..90);
+}
+
+#[test]
+fn a_scope_ending_at_the_queried_offset_does_not_enclose_it() {
+    // Its last byte is on an earlier row, so it covers no cell of this one.
+    let s = scope_set(&[(10, 90)]);
+    assert_eq!(s.scopes_at(90).count(), 0);
+    assert_eq!(only_scope_at(&s, 89), 10..90);
+}
+
+#[test]
+fn scopes_at_ignores_every_other_producer() {
+    // Only the Scope bucket can hold one, which is what lets the lookup skip the
+    // file's thousands of highlights entirely.
+    let mut s = scope_set(&[(0, 100)]);
+    s.replace(
+        DecorationSource::Syntax,
+        vec![highlight(10..20, HighlightKind::Function)],
+    );
+    s.replace(
+        DecorationSource::Lsp,
+        vec![underline(10..20, Severity::Error)],
+    );
+    assert_eq!(only_scope_at(&s, 15), 0..100);
+}
+
+#[test]
+fn scopes_at_reads_the_kind_not_just_the_bucket() {
+    // The bucket says who published, the variant says what it is - and the lookup
+    // asks the variant. A producer that put something else in this bucket gets it
+    // ignored rather than misread as a scope.
+    let mut s = scope_set(&[(0, 100)]);
+    s.replace(
+        DecorationSource::Scope,
+        vec![
+            Decoration::Scope { range: 0..100 },
+            underline(10..20, Severity::Error),
+        ],
+    );
+    assert_eq!(only_scope_at(&s, 15), 0..100);
+}
+
+#[test]
+fn nested_scopes_do_not_disturb_the_highlight_search() {
+    // Why scopes get their own bucket: their ends are not monotonic, and
+    // `highlights_in` binary-searches a bucket assuming they are. In their own
+    // bucket the search finds nothing to misplace, whatever it lands on.
+    let mut s = scope_set(&[(0, 100), (10, 90), (20, 40)]);
+    s.replace(
+        DecorationSource::Syntax,
+        vec![
+            highlight(0..3, HighlightKind::Keyword),
+            highlight(30..33, HighlightKind::Type),
+        ],
+    );
+    assert_eq!(
+        s.highlights_in(30..34).collect::<Vec<_>>(),
+        vec![(30..33, HighlightKind::Type)]
+    );
+    assert_eq!(s.underlines_in(0..100).count(), 0);
+    assert_eq!(s.gutter_mark(&RopeBuffer::from("x").text(), 0), None);
+}
+
+#[test]
+fn a_scope_rides_edits_with_the_shift_dont_grow_bias() {
+    // Typing inside a function moves its end along, so the header keeps naming it
+    // between reparses; typing past its closing brace leaves the scope alone
+    // rather than stretching it over what follows.
+    let mut s = scope_set(&[(10, 90)]);
+    s.transform_through(&[edit(50, 50, 5)]); // 5 bytes inside the body
+    assert_eq!(only_scope_at(&s, 30), 10..95);
+    s.transform_through(&[edit(95, 95, 5)]); // 5 bytes just past the end
+    assert_eq!(only_scope_at(&s, 30), 10..95);
+    s.transform_through(&[edit(10, 10, 2)]); // 2 bytes just before the start
+    assert_eq!(only_scope_at(&s, 30), 12..97);
+}

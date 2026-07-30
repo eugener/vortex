@@ -28,8 +28,21 @@ pub fn grammar_target(path: &Path) -> Option<&'static str> {
 /// I/O left to do beyond loading the library itself.
 pub struct Resolved {
     pub lib_path: PathBuf,
+    pub queries: Queries,
+}
+
+/// A language's `.scm` sources. A struct rather than the tuple of same-typed
+/// `String`s this was, for the reason `vortex_core::syntax`'s own `Queries` is one:
+/// three positional strings are three things a caller can silently swap.
+#[derive(Debug, PartialEq, Eq)]
+pub struct Queries {
     pub highlights: String,
     pub injections: String,
+    /// The structural scopes the sticky context header pins from (SPEC §7.5, M8),
+    /// empty for a grammar shipping no `context.scm`. Empty is what tells the core
+    /// to skip the scope parse entirely, so a language that has not opted in pays
+    /// nothing for the feature.
+    pub context: String,
 }
 
 /// Resolve `lang`'s grammar library and queries from the environment, or `None` if
@@ -37,12 +50,8 @@ pub struct Resolved {
 /// directory discovery, library lookup, and query reading below.
 pub fn resolve(lang: &str) -> Option<Resolved> {
     let lib_path = find_grammar_lib(lang, &grammar_dirs())?;
-    let (highlights, injections) = read_queries(&runtime_dir()?, lang)?;
-    Some(Resolved {
-        lib_path,
-        highlights,
-        injections,
-    })
+    let queries = read_queries(&runtime_dir()?, lang)?;
+    Some(Resolved { lib_path, queries })
 }
 
 /// The platform library file name for a grammar. A grammar crate named
@@ -67,14 +76,17 @@ fn find_grammar_lib(lang: &str, dirs: &[PathBuf]) -> Option<PathBuf> {
         .find(|candidate| candidate.is_file())
 }
 
-/// The highlight queries for `lang` under a runtime directory: `highlights.scm`
-/// (required - `None` if absent) plus `injections.scm` (optional - empty if
-/// absent).
-fn read_queries(runtime: &Path, lang: &str) -> Option<(String, String)> {
+/// The queries for `lang` under a runtime directory: `highlights.scm` (required -
+/// `None` if absent) plus `injections.scm` and `context.scm` (optional - empty if
+/// absent). A missing optional query is a language that does not have that
+/// feature, never an error: the core reads an empty one as "nothing to do".
+fn read_queries(runtime: &Path, lang: &str) -> Option<Queries> {
     let dir = runtime.join("queries").join(lang);
-    let highlights = std::fs::read_to_string(dir.join("highlights.scm")).ok()?;
-    let injections = std::fs::read_to_string(dir.join("injections.scm")).unwrap_or_default();
-    Some((highlights, injections))
+    Some(Queries {
+        highlights: std::fs::read_to_string(dir.join("highlights.scm")).ok()?,
+        injections: std::fs::read_to_string(dir.join("injections.scm")).unwrap_or_default(),
+        context: std::fs::read_to_string(dir.join("context.scm")).unwrap_or_default(),
+    })
 }
 
 /// Directories to search for a grammar library, best first: an explicit

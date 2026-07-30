@@ -1281,6 +1281,118 @@ fn a_highlight_batch_for_a_stale_version_is_dropped() {
     });
 }
 
+/// The scope ranges the fake highlighter publishes below: one function spanning
+/// the whole fixture.
+fn scope_spans() -> Vec<crate::buffer::ByteRange> {
+    std::iter::once(0..17).collect()
+}
+
+#[test]
+fn a_scope_batch_lands_on_the_snapshot_decorations() {
+    // The sticky context header's input (M8) rides the same channel and guard as
+    // the highlights, into its own bucket.
+    drive(|h| async move {
+        let fake = attach_syntax(&h).await;
+        let snap = step(&h, Action::Insert("fn f() {\n    1;\n}".into())).await;
+        fake.events
+            .send(SyntaxEvent::Scopes {
+                buffer_id: BufferId(0),
+                version: snap.version,
+                spans: scope_spans(),
+            })
+            .await
+            .unwrap();
+        let snap = h.snapshots.recv().await.unwrap();
+        let pinned: Vec<_> = snap.decorations.scopes_at(10).collect();
+        assert_eq!(pinned, scope_spans());
+    });
+}
+
+#[test]
+fn a_scope_batch_for_a_stale_version_is_dropped() {
+    // Same reason as a stale highlight batch: the ranges are offsets into text the
+    // buffer has moved past, so pinning from them would name the wrong line rather
+    // than lag by a frame (SPEC §5).
+    drive(|h| async move {
+        let fake = attach_syntax(&h).await;
+        let snap = step(&h, Action::Insert("fn f() {\n    1;\n}".into())).await;
+        assert_eq!(snap.version, 1, "the first edit is version 1");
+        fake.events
+            .send(SyntaxEvent::Scopes {
+                buffer_id: BufferId(0),
+                version: 0,
+                spans: scope_spans(),
+            })
+            .await
+            .unwrap();
+        let after = step(&h, Action::RequestSnapshot).await;
+        assert!(
+            after.decorations.is_empty(),
+            "a stale-version batch must not install any scopes"
+        );
+    });
+}
+
+#[test]
+fn re_publishing_identical_scopes_changes_nothing() {
+    // A reparse that found the same scopes - the common case, since editing inside a
+    // function moves no scope's start - must cost no frame: `apply_scopes` returns
+    // false and the loop skips the publish, exactly as an unchanged highlight batch
+    // does. Exercised, then followed by a snapshot request to prove the editor kept
+    // running through the duplicate.
+    drive(|h| async move {
+        let fake = attach_syntax(&h).await;
+        let snap = step(&h, Action::Insert("fn f() {\n    1;\n}".into())).await;
+        let batch = || SyntaxEvent::Scopes {
+            buffer_id: BufferId(0),
+            version: snap.version,
+            spans: scope_spans(),
+        };
+        fake.events.send(batch()).await.unwrap();
+        let first = h.snapshots.recv().await.unwrap();
+        assert_eq!(first.decorations.scopes_at(10).count(), 1);
+        fake.events.send(batch()).await.unwrap();
+        let after = step(&h, Action::RequestSnapshot).await;
+        assert_eq!(after.decorations.scopes_at(10).count(), 1);
+    });
+}
+
+#[test]
+fn a_scope_batch_leaves_the_highlights_alone() {
+    // Two buckets from one producer: a reparse publishing scopes must not wipe the
+    // colors, which is the same independence the LSP and syntax buckets have.
+    drive(|h| async move {
+        let fake = attach_syntax(&h).await;
+        let snap = step(&h, Action::Insert("fn f() {\n    1;\n}".into())).await;
+        fake.events
+            .send(SyntaxEvent::Highlights {
+                buffer_id: BufferId(0),
+                version: snap.version,
+                spans: vec![HighlightSpan {
+                    range: 0..2,
+                    kind: HighlightKind::Keyword,
+                }],
+            })
+            .await
+            .unwrap();
+        h.snapshots.recv().await.unwrap();
+        fake.events
+            .send(SyntaxEvent::Scopes {
+                buffer_id: BufferId(0),
+                version: snap.version,
+                spans: scope_spans(),
+            })
+            .await
+            .unwrap();
+        let after = h.snapshots.recv().await.unwrap();
+        assert_eq!(
+            after.decorations.highlights_in(0..17).collect::<Vec<_>>(),
+            vec![(0..2, HighlightKind::Keyword)]
+        );
+        assert_eq!(after.decorations.scopes_at(10).count(), 1);
+    });
+}
+
 /// Every notification the core has emitted and not yet been read.
 fn drain_notifications(h: &CoreHandle) -> Vec<Notification> {
     std::iter::from_fn(|| h.notifications.try_recv().ok()).collect()

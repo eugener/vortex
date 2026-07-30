@@ -465,6 +465,108 @@ pub fn scroll_at_track_row(row: usize, track: usize, max_scroll: usize) -> Optio
     Some((row.min(span) * max_scroll + span / 2) / span)
 }
 
+/// Where a screen row falls in the editor's vertical split (SPEC §7.5).
+///
+/// The split is `paint`'s: the head bar owns row 0, the sticky context header the
+/// `header_height` rows under it, the text the rest of the body, and the status bar
+/// the last row. **Every hit test asks this rather than re-deriving it** - the four
+/// that once did (`on_scrollbar`, `pointer_offset`, the scrollbar drag, and the
+/// header's own press) agreed only by inspection, and the SPEC's structural-debt
+/// note named sticky context as exactly the change that would make them disagree
+/// with no compile error and no failing test.
+///
+/// The status bar is *not* distinguished here: it is a row the callers below never
+/// receive (the event loop answers it first), and telling it apart would mean
+/// carrying the screen height into a question none of them otherwise needs it for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Row {
+    /// Row 0 - the head bar / bufferline.
+    Head,
+    /// A pinned sticky context row, by index from the top of the header.
+    Header(usize),
+    /// A text row, by index from the top of the *text* area (not the body).
+    Text(usize),
+}
+
+/// Which part of the vertical split `screen_row` lands in, given the rows the
+/// sticky context header took on the frame being hit-tested.
+pub fn row_at(screen_row: u16, header_height: usize) -> Row {
+    // Saturating rather than `screen_row + 1` anywhere: the row arrives from a
+    // terminal, and a report of `u16::MAX` must be an answer rather than an
+    // overflow on an input path.
+    match (screen_row as usize).checked_sub(1) {
+        None => Row::Head,
+        Some(body) if body < header_height => Row::Header(body),
+        Some(body) => Row::Text(body - header_height),
+    }
+}
+
+/// The most rows the sticky context header will ever claim (SPEC §7.5, M8).
+///
+/// A cap is needed because nesting is a length the *file* chooses (§10.4) - a
+/// deeply nested match arm inside a closure inside a method would otherwise pin
+/// half the screen. Four is where the header stops answering "what am I inside"
+/// and starts being an outline: the innermost few scopes are the ones a reader
+/// has actually lost track of, and the module three levels out is not.
+pub const STICKY_CONTEXT_MAX: usize = 4;
+
+/// The header rows the sticky context feature would claim in a body of `height`
+/// rows: [`STICKY_CONTEXT_MAX`], but never more than a third of the body.
+///
+/// The fraction is what keeps the feature honest on a short terminal: pinning
+/// four rows of a twelve-row body spends a third of the file's own space on
+/// where you are rather than what you are reading, and on a six-row body it would
+/// leave two.
+pub fn sticky_budget(height: usize) -> usize {
+    STICKY_CONTEXT_MAX.min(height / 3)
+}
+
+/// The buffer lines to pin above the viewport: the first line of each scope
+/// enclosing `top_line`, outermost first, at most `budget` of them (SPEC §7.5).
+///
+/// Every line returned is strictly above `top_line`, because a scope that starts
+/// at or after the top row already has its own first line on screen
+/// (`DecorationSet::scopes_at` is what draws that boundary) - so the header never
+/// repeats a line the text below it is showing.
+///
+/// **When the chain is deeper than `budget`, the outermost rows are dropped, not
+/// the innermost.** The row a reader needs is the function they are inside; the
+/// module three levels out is the one they still know. Dropping from the other
+/// end would spend the whole budget answering the question nobody asked.
+///
+/// Two scopes opening on one line (`impl Foo { fn bar()` written flat) collapse to
+/// one row: the header is a list of *lines*, and a line pinned twice reads as a
+/// duplicate rather than as depth.
+pub fn sticky_lines(
+    text: &Text,
+    decorations: &vortex_core::DecorationSet,
+    top_line: usize,
+    budget: usize,
+) -> Vec<usize> {
+    if budget == 0 {
+        return Vec::new();
+    }
+    // The scopes are byte ranges, so the question is asked in bytes: the first
+    // byte of the top row. A line past the buffer's end encloses nothing.
+    let Some(top_byte) = text.byte_of_line(top_line) else {
+        return Vec::new();
+    };
+    let mut lines: Vec<usize> = Vec::new();
+    for scope in decorations.scopes_at(top_byte) {
+        let line = text.line_of_byte(scope.start);
+        // Ascending by construction (the bucket is sorted by start), so a repeat
+        // can only be the previous one.
+        if lines.last() != Some(&line) {
+            lines.push(line);
+        }
+    }
+    // Keep the innermost `budget`.
+    if lines.len() > budget {
+        lines.drain(..lines.len() - budget);
+    }
+    lines
+}
+
 /// Render the tab-expanded `line` into styled spans for the display-column window
 /// `[h_scroll, h_scroll + width)` - the frontend's one intra-line styling seam,
 /// shared by selection highlighting now and syntax highlighting (M4) later.
@@ -2436,5 +2538,126 @@ mod tests {
         let bar = fit_bar("日本", "", 3);
         assert_eq!(bar, "日 ");
         assert_eq!(bar.width(), 3);
+    }
+
+    /// A decoration set holding `ranges` as scopes, as the syntax producer publishes
+    /// them (M8).
+    fn scopes_of(ranges: &[(usize, usize)]) -> vortex_core::DecorationSet {
+        use vortex_core::{Decoration, DecorationSet, DecorationSource};
+        let mut set = DecorationSet::new();
+        set.replace(
+            DecorationSource::Scope,
+            ranges
+                .iter()
+                .map(|&(start, end)| Decoration::Scope { range: start..end })
+                .collect(),
+        );
+        set
+    }
+
+    #[test]
+    fn row_at_splits_the_screen_the_way_paint_does() {
+        // Head bar, then the pinned rows, then the text - the split every hit test
+        // now asks about instead of re-deriving.
+        assert_eq!(row_at(0, 0), Row::Head);
+        assert_eq!(row_at(1, 0), Row::Text(0));
+        assert_eq!(row_at(9, 0), Row::Text(8));
+
+        assert_eq!(row_at(0, 2), Row::Head);
+        assert_eq!(row_at(1, 2), Row::Header(0));
+        assert_eq!(row_at(2, 2), Row::Header(1));
+        // The text is indexed from the top of the *text* area, not of the body: the
+        // header's rows are chrome, and a caller mapping to a buffer line adds its
+        // own scroll offset to this.
+        assert_eq!(row_at(3, 2), Row::Text(0));
+    }
+
+    #[test]
+    fn row_at_answers_a_row_no_terminal_should_report() {
+        // It arrives from outside, so the answer is an answer rather than an
+        // overflow (CLAUDE.md: no panics on input paths).
+        assert_eq!(row_at(u16::MAX, 0), Row::Text(u16::MAX as usize - 1));
+        // A header taller than the screen leaves no text row at all, rather than
+        // wrapping into one.
+        assert_eq!(row_at(5, usize::MAX), Row::Header(4));
+    }
+
+    #[test]
+    fn sticky_budget_is_capped_by_the_body_as_well_as_the_constant() {
+        // A tall body gets the constant; a short one gets a third of itself, so the
+        // header can never take the screen the file is supposed to be on.
+        assert_eq!(sticky_budget(60), STICKY_CONTEXT_MAX);
+        assert_eq!(sticky_budget(12), 4);
+        assert_eq!(sticky_budget(9), 3);
+        assert_eq!(sticky_budget(5), 1);
+        assert_eq!(sticky_budget(2), 0);
+        assert_eq!(sticky_budget(0), 0);
+    }
+
+    #[test]
+    fn sticky_lines_pins_the_first_line_of_each_enclosing_scope() {
+        // Lines: 0 `mod m {`, 1 `  fn a() {`, 2 `    x;`, 3 `  }`, 4 `}`.
+        let src = "mod m {\n  fn a() {\n    x;\n  }\n}\n";
+        let t = text_of(src);
+        let set = scopes_of(&[
+            (0, src.len()),
+            (src.find("fn a").unwrap(), src.find("\n}").unwrap()),
+        ]);
+        // Viewing from line 2, both scopes enclose it, outermost first.
+        assert_eq!(sticky_lines(&t, &set, 2, 4), vec![0, 1]);
+    }
+
+    #[test]
+    fn a_scope_whose_own_first_line_is_on_screen_is_not_pinned() {
+        // Pinning it would print that line twice, once in the header and once as the
+        // top text row.
+        let src = "mod m {\n  fn a() {\n    x;\n  }\n}\n";
+        let t = text_of(src);
+        let set = scopes_of(&[(0, src.len())]);
+        assert!(sticky_lines(&t, &set, 0, 4).is_empty());
+        assert_eq!(sticky_lines(&t, &set, 1, 4), vec![0]);
+    }
+
+    #[test]
+    fn the_deepest_scopes_win_when_the_chain_is_over_budget() {
+        // The row a reader needs is the function they are in, not the module three
+        // levels out, so the budget is spent from the inside.
+        let src = "a\nb\nc\nd\ne\nf\n";
+        let t = text_of(src);
+        let set = scopes_of(&[(0, 11), (2, 11), (4, 11), (6, 11)]);
+        assert_eq!(sticky_lines(&t, &set, 5, 4), vec![0, 1, 2, 3]);
+        assert_eq!(sticky_lines(&t, &set, 5, 2), vec![2, 3]);
+        assert_eq!(sticky_lines(&t, &set, 5, 1), vec![3]);
+        assert!(sticky_lines(&t, &set, 5, 0).is_empty());
+    }
+
+    #[test]
+    fn two_scopes_opening_on_one_line_pin_one_row() {
+        // `impl Foo { fn bar() {` written flat: the header lists *lines*, and a line
+        // pinned twice reads as a duplicate rather than as depth.
+        let src = "impl Foo { fn bar() {\n    x;\n} }\n";
+        let t = text_of(src);
+        let set = scopes_of(&[(0, src.len()), (0, src.len() - 1)]);
+        assert_eq!(sticky_lines(&t, &set, 1, 4), vec![0]);
+    }
+
+    #[test]
+    fn sticky_lines_of_a_line_past_the_end_is_empty() {
+        // The offset is clamped elsewhere, but a viewport that outran the buffer must
+        // answer "nothing" rather than panic on the lookup (CLAUDE.md: no panics).
+        let t = text_of("a\nb\n");
+        let set = scopes_of(&[(0, 4)]);
+        assert!(sticky_lines(&t, &set, 99, 4).is_empty());
+    }
+
+    #[test]
+    fn nothing_is_pinned_without_scopes() {
+        // The overwhelming default: a buffer with no grammar, or a language shipping
+        // no context query, costs the frame one empty lookup.
+        let t = text_of("a\nb\nc\n");
+        assert_eq!(
+            sticky_lines(&t, &vortex_core::DecorationSet::new(), 2, 4),
+            Vec::<usize>::new()
+        );
     }
 }

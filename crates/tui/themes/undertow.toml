@@ -18,6 +18,9 @@ ruler            = { bg = "#21263a" }
 indent_guide     = { fg = "#2f3650" }
 scrollbar_track  = { fg = "#2b3149" }
 scrollbar_thumb  = { fg = "#5a648c" }
+# The pinned scope rows: one surface further forward than the current line, per
+# the depth-by-blue rule - they are a different surface, not a highlighted row.
+sticky_context   = { bg = "#23283d" }
 secondary_cursor = { fg = "#151823", bg = "#7d6ce0" }
 # Search (SPEC §11): amber, a hue nothing else here uses, so a match reads as
 # neither a selection nor a diagnostic. The dim ground marks the other matches and

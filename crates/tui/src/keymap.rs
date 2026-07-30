@@ -228,6 +228,9 @@ pub enum Command {
     /// Show or hide the scrollbar (frontend-local: the viewport is this side's, so
     /// what stands for it is too).
     ToggleScrollbar,
+    /// Show or hide the sticky context header (frontend-local: the viewport is this
+    /// side's, and so is the decision to spend rows of it on where you are).
+    ToggleStickyContext,
     /// Open the encoding picker (frontend-local until a pick, which commits an
     /// `Action::SetEncoding`).
     OpenEncodingPicker,
@@ -344,6 +347,7 @@ impl Command {
             "toggle_line_numbers" => Command::ToggleLineNumbers,
             "toggle_indent_guides" => Command::ToggleIndentGuides,
             "toggle_scrollbar" => Command::ToggleScrollbar,
+            "toggle_sticky_context" => Command::ToggleStickyContext,
             "open_encoding_picker" => Command::OpenEncodingPicker,
             "open_line_ending_picker" => Command::OpenLineEndingPicker,
             "next_buffer" => Command::NextBuffer,
@@ -371,6 +375,7 @@ impl Command {
             Command::ToggleLineNumbers => return FrontendCommand::ToggleLineNumbers,
             Command::ToggleIndentGuides => return FrontendCommand::ToggleIndentGuides,
             Command::ToggleScrollbar => return FrontendCommand::ToggleScrollbar,
+            Command::ToggleStickyContext => return FrontendCommand::ToggleStickyContext,
             Command::OpenEncodingPicker => return FrontendCommand::OpenEncodingPicker,
             Command::OpenLineEndingPicker => return FrontendCommand::OpenLineEndingPicker,
             Command::SaveAs => return FrontendCommand::OpenSavePrompt,
@@ -992,6 +997,24 @@ mod tests {
         assert_eq!(
             bound.shortcut_for(Command::ToggleLineNumbers).as_deref(),
             Some("Ctrl+L")
+        );
+    }
+
+    #[test]
+    fn the_sticky_context_toggle_is_nameable_but_unbound_by_default() {
+        // The same rule the other chrome switches follow: palette-reachable, config-
+        // bindable, and unbound until it earns a chord (SPEC §10.5).
+        assert_eq!(
+            Command::parse("toggle_sticky_context"),
+            Some(Command::ToggleStickyContext)
+        );
+        assert_eq!(
+            Command::ToggleStickyContext.resolve(PAGE),
+            FrontendCommand::ToggleStickyContext
+        );
+        assert_eq!(
+            Keymap::default().shortcut_for(Command::ToggleStickyContext),
+            None
         );
     }
 

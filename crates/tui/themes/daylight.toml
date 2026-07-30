@@ -18,6 +18,9 @@ ruler            = { bg = "#dcdfd8" }
 indent_guide     = { fg = "#c6ccc6" }
 scrollbar_track  = { fg = "#c6ccc6" }
 scrollbar_thumb  = { fg = "#8b938c" }
+# The pinned scope rows take the bars' paper, so the header reads as chrome
+# rather than as page.
+sticky_context   = { bg = "#dfe2dc" }
 secondary_cursor = { fg = "#eceee9", bg = "#8c3a2c" }
 toast_info       = { fg = "#eceee9", bg = "#4a544d" }
 toast_error      = { fg = "#f7efe9", bg = "#9c2f37", bold = true }
