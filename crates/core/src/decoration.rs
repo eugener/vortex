@@ -112,6 +112,20 @@ pub enum Decoration {
         range: ByteRange,
         kind: HighlightKind,
     },
+    /// A structural scope the text at this range sits inside - a function, an
+    /// `impl`, a class (tree-sitter, M8). The frontend pins the *first line* of
+    /// every scope enclosing the viewport's top row as a sticky context header
+    /// (SPEC §7.5), so what crosses the seam is the whole file's scope ranges,
+    /// once per parse, rather than an answer for one row: the row in question
+    /// changes on **scroll**, and scrolling is frontend-owned (SPEC §5) - asking
+    /// the core would put a round-trip on the scroll path.
+    ///
+    /// The one decoration that is not painted *at* its position. It is here
+    /// anyway because it is a position that must survive concurrent edits, which
+    /// is what this channel is (SPEC §5): typing inside a function has to move
+    /// the scope with the text, or the header names the wrong one until the next
+    /// reparse lands.
+    Scope { range: ByteRange },
 }
 
 /// Which subsystem produced a decoration. Each owns its own bucket so producers
@@ -128,6 +142,14 @@ pub enum DecorationSource {
     /// so a diagnostics republish cannot wipe highlights and a reparse cannot wipe
     /// squiggles - the independence that lets both producers run async (SPEC §5).
     Syntax,
+    /// The syntax highlighter again (M8): [`Decoration::Scope`] ranges for the
+    /// sticky context header. Same producer as [`Self::Syntax`] but a **separate
+    /// bucket**, and that separation is load-bearing rather than tidy: scopes are
+    /// *nested* by construction, so their ends are not monotonic, while
+    /// [`DecorationSet::highlights_in`] binary-searches a bucket on exactly the
+    /// sorted-and-non-overlapping invariant highlights have. Mixing the two would
+    /// misplace the highlight search rather than merely slow it.
+    Scope,
 }
 
 /// Every decoration currently attached to a buffer, bucketed by producer.
@@ -168,11 +190,19 @@ impl DecorationSet {
     /// frame. [`Self::transform_through`] preserves the order (edits are disjoint
     /// and monotonic), so it need not re-sort.
     ///
-    /// A test convenience: production splits this into [`Self::sorted_bucket`] +
+    /// The editor itself splits this into [`Self::sorted_bucket`] +
     /// [`Self::bucket_differs`] + [`Self::set_bucket`] so an unchanged reparse
-    /// clones nothing (see the editor's `apply_highlights`).
-    #[cfg(test)]
-    pub(crate) fn replace(&mut self, source: DecorationSource, mut decorations: Vec<Decoration>) {
+    /// clones nothing (see its `apply_bucket`); this is the same operation in one
+    /// step, for a caller *building* a set rather than maintaining one.
+    ///
+    /// **Test surface, not production API.** Nothing in the editor calls it - the
+    /// copy-on-write path above is the one producers take - and it is gated behind
+    /// `test-support` rather than made plain `pub` so that stays true: a frontend's
+    /// own tests can build a set to exercise resolution without standing up a core
+    /// and a producer, without the crate growing a public way to bulk-replace a
+    /// bucket around the discipline the rest of the mutation path is built on.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn replace(&mut self, source: DecorationSource, mut decorations: Vec<Decoration>) {
         if decorations.is_empty() {
             self.by_source.remove(&source);
         } else {
@@ -278,6 +308,37 @@ impl DecorationSet {
         })
     }
 
+    /// The scopes enclosing `offset`, outermost first (M8) - the chain the
+    /// frontend turns into sticky context header rows (SPEC §7.5).
+    ///
+    /// "Enclosing" is strict on the left and open on the right: a scope
+    /// *starting* at `offset` is not enclosing it, because the frontend passes
+    /// the first byte of the top visible row and a scope starting there already
+    /// has its own first line on screen - pinning it would print that line twice.
+    /// A scope merely *ending* at `offset` has no cell on that row and is out.
+    ///
+    /// Reads only the [`DecorationSource::Scope`] bucket rather than every
+    /// decoration: it is the one bucket that can hold a [`Decoration::Scope`],
+    /// and the file's syntax bucket beside it is three orders of magnitude
+    /// larger. The walk then **stops at the first scope starting at or past
+    /// `offset`** - the bucket is sorted by start, so nothing after that one can
+    /// enclose it either. That is the same sorted-bucket exploit
+    /// [`Self::highlights_in`] makes, minus the binary search: scopes are nested,
+    /// so their *ends* are not monotonic and there is no second bound to search
+    /// for. Cost is O(scopes above the offset), resolved once per frame rather
+    /// than per painted row.
+    pub fn scopes_at(&self, offset: usize) -> impl Iterator<Item = ByteRange> {
+        self.by_source
+            .get(&DecorationSource::Scope)
+            .into_iter()
+            .flatten()
+            .take_while(move |d| span_start(d) < offset)
+            .filter_map(move |d| match d {
+                Decoration::Scope { range } if range.end > offset => Some(range.clone()),
+                _ => None,
+            })
+    }
+
     /// The most severe gutter mark on `line`, or `None`. Several diagnostics
     /// commonly start on one line and the gutter has one cell, so the worst wins.
     pub fn gutter_mark(&self, text: &Text, line: usize) -> Option<GutterKind> {
@@ -318,7 +379,14 @@ impl DecorationSet {
                 // rather than swallowing the new (as-yet-unparsed) text, which the
                 // next reparse then colors correctly (SPEC §5, overlays trail by a
                 // frame). Sharing the arm keeps the two span kinds identical here.
-                Decoration::Underline { range, .. } | Decoration::Highlight { range, .. } => {
+                // A scope rides edits on the same bias, and it is the right one
+                // for the same reason read from the other end: typing just before
+                // a `fn` keyword must push the scope along rather than swallow the
+                // new text, and typing just after its closing brace must leave the
+                // scope where it is rather than stretch it over what follows.
+                Decoration::Underline { range, .. }
+                | Decoration::Highlight { range, .. }
+                | Decoration::Scope { range } => {
                     range.start = Anchor::after(range.start).transform_through(edits).offset();
                     range.end = Anchor::before(range.end).transform_through(edits).offset();
                     // A deletion spanning the whole range collapses the two ends
@@ -338,7 +406,9 @@ impl DecorationSet {
 /// start, or a gutter mark's line offset.
 fn span_start(d: &Decoration) -> usize {
     match d {
-        Decoration::Underline { range, .. } | Decoration::Highlight { range, .. } => range.start,
+        Decoration::Underline { range, .. }
+        | Decoration::Highlight { range, .. }
+        | Decoration::Scope { range } => range.start,
         Decoration::GutterMark { offset, .. } => *offset,
     }
 }
@@ -348,7 +418,9 @@ fn span_start(d: &Decoration) -> usize {
 /// sorted highlight spans.
 fn span_end(d: &Decoration) -> usize {
     match d {
-        Decoration::Underline { range, .. } | Decoration::Highlight { range, .. } => range.end,
+        Decoration::Underline { range, .. }
+        | Decoration::Highlight { range, .. }
+        | Decoration::Scope { range } => range.end,
         Decoration::GutterMark { offset, .. } => *offset,
     }
 }

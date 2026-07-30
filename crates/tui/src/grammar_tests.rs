@@ -99,7 +99,7 @@ fn find_grammar_lib_returns_the_first_directory_that_has_it() {
 }
 
 #[test]
-fn read_queries_requires_highlights_but_not_injections() {
+fn read_queries_requires_highlights_but_not_the_optional_ones() {
     let runtime = TempDir::new("rt");
     let qdir = runtime.0.join("queries").join("rust");
     std::fs::create_dir_all(&qdir).unwrap();
@@ -107,16 +107,20 @@ fn read_queries_requires_highlights_but_not_injections() {
     // Missing highlights.scm: no queries at all.
     assert_eq!(read_queries(&runtime.0, "rust"), None);
 
-    // highlights.scm alone: injections default to empty.
+    // highlights.scm alone: the optional queries default to empty, which is how a
+    // language says it has no injections and no sticky context.
     std::fs::write(qdir.join("highlights.scm"), "(identifier) @variable").unwrap();
-    let (highlights, injections) = read_queries(&runtime.0, "rust").unwrap();
-    assert_eq!(highlights, "(identifier) @variable");
-    assert_eq!(injections, "");
+    let queries = read_queries(&runtime.0, "rust").unwrap();
+    assert_eq!(queries.highlights, "(identifier) @variable");
+    assert_eq!(queries.injections, "");
+    assert_eq!(queries.context, "");
 
-    // Both present: both are read.
+    // All present: all are read.
     std::fs::write(qdir.join("injections.scm"), "; injections").unwrap();
-    let (_, injections) = read_queries(&runtime.0, "rust").unwrap();
-    assert_eq!(injections, "; injections");
+    std::fs::write(qdir.join("context.scm"), "(function_item) @context").unwrap();
+    let queries = read_queries(&runtime.0, "rust").unwrap();
+    assert_eq!(queries.injections, "; injections");
+    assert_eq!(queries.context, "(function_item) @context");
 }
 
 #[test]
@@ -135,8 +139,24 @@ fn resolve_finds_the_library_and_queries_under_the_runtime_env() {
         resolved.lib_path,
         rt.0.join("grammars").join(grammar_lib_name("rust"))
     );
-    assert_eq!(resolved.highlights, "(identifier) @variable");
-    assert_eq!(resolved.injections, "; inj");
+    assert_eq!(resolved.queries.highlights, "(identifier) @variable");
+    assert_eq!(resolved.queries.injections, "; inj");
+    // No context.scm in this runtime: the language simply has no sticky context,
+    // and the empty string is what tells the core not to parse for one.
+    assert_eq!(resolved.queries.context, "");
+}
+
+#[test]
+fn resolve_carries_a_context_query_when_the_language_ships_one() {
+    let rt = TempDir::new("resolve-context");
+    make_runtime(&rt.0, "rust", Some("(identifier) @variable"), Some("; inj"));
+    std::fs::write(
+        rt.0.join("queries").join("rust").join("context.scm"),
+        "(function_item) @context",
+    )
+    .unwrap();
+    let resolved = with_runtime(&rt.0, || resolve("rust")).expect("resolves");
+    assert_eq!(resolved.queries.context, "(function_item) @context");
 }
 
 #[test]

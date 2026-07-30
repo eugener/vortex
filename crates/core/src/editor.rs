@@ -29,8 +29,8 @@ use futures::future::Either;
 
 use crate::action::{Action, CoreOptions, Granularity as CoreGranularity};
 use crate::anchor::{Anchor, Edit};
-use crate::buffer::{Buffer, RopeBuffer};
-use crate::decoration::DecorationSet;
+use crate::buffer::{Buffer, ByteRange, RopeBuffer};
+use crate::decoration::{Decoration, DecorationSet, DecorationSource};
 use crate::file::FileFormat;
 use crate::history::{Change, History, Reverted};
 use crate::lsp::{Diagnostic, DocumentSync, LspEvent, LspHandle, convert};
@@ -695,8 +695,8 @@ impl Document {
     ///
     /// [`Syntax`]: crate::decoration::DecorationSource::Syntax
     fn apply_highlights(&mut self, spans: Vec<HighlightSpan>) -> bool {
-        use crate::decoration::{Decoration, DecorationSet, DecorationSource};
-        let candidate = DecorationSet::sorted_bucket(
+        self.apply_bucket(
+            DecorationSource::Syntax,
             spans
                 .into_iter()
                 .map(|s| Decoration::Highlight {
@@ -704,19 +704,24 @@ impl Document {
                     kind: s.kind,
                 })
                 .collect(),
-        );
-        // Compare only the syntax bucket, without cloning the set - a reparse that
-        // yields the identical spans (an edit that left tokens intact) allocates
-        // nothing. Only a real change takes the copy-on-write mutable borrow, which
-        // clones the set once, and only if a published snapshot still shares it.
-        if !self
-            .decorations
-            .bucket_differs(DecorationSource::Syntax, &candidate)
-        {
-            return false;
-        }
-        Arc::make_mut(&mut self.decorations).set_bucket(DecorationSource::Syntax, candidate);
-        true
+        )
+    }
+
+    /// Replace the structural scopes with `spans` (M8) - the sticky context
+    /// header's input (SPEC §7.5). The [`Scope`] twin of [`Self::apply_highlights`]
+    /// in every respect: a full replacement of one bucket, leaving the syntax and
+    /// LSP buckets alone, returning whether the screen would differ so a reparse
+    /// that moved no scope costs no frame.
+    ///
+    /// [`Scope`]: crate::decoration::DecorationSource::Scope
+    fn apply_scopes(&mut self, spans: Vec<ByteRange>) -> bool {
+        self.apply_bucket(
+            DecorationSource::Scope,
+            spans
+                .into_iter()
+                .map(|range| Decoration::Scope { range })
+                .collect(),
+        )
     }
 
     /// Replace the LSP's decorations with `diagnostics`, resolved against the
@@ -730,19 +735,29 @@ impl Document {
         if self.path.as_deref() != Some(path) {
             return false;
         }
-        use crate::decoration::{DecorationSet, DecorationSource};
-        let candidate = DecorationSet::sorted_bucket(convert::decorations_for(
-            &self.buffer.text(),
-            diagnostics,
-        ));
-        // Compare only the LSP bucket, no whole-set clone (see `apply_highlights`).
-        if !self
-            .decorations
-            .bucket_differs(DecorationSource::Lsp, &candidate)
-        {
+        self.apply_bucket(
+            DecorationSource::Lsp,
+            convert::decorations_for(&self.buffer.text(), diagnostics),
+        )
+    }
+
+    /// Install `decorations` as everything `source` contributes, reporting whether
+    /// that changed anything (SPEC §5's producer contract). The one body behind all
+    /// three producers' `apply_*`, which differ only in which bucket they own and how
+    /// they build their decorations.
+    ///
+    /// **Compares before it clones.** The bucket is compared against the candidate
+    /// without touching the set, so a producer republishing an identical result - a
+    /// reparse after an edit that altered no token, a server re-sending the same
+    /// diagnostics - allocates nothing. Only a real change takes the copy-on-write
+    /// mutable borrow, which clones the set once, and only while a published snapshot
+    /// still shares it.
+    fn apply_bucket(&mut self, source: DecorationSource, decorations: Vec<Decoration>) -> bool {
+        let candidate = DecorationSet::sorted_bucket(decorations);
+        if !self.decorations.bucket_differs(source, &candidate) {
             return false;
         }
-        Arc::make_mut(&mut self.decorations).set_bucket(DecorationSource::Lsp, candidate);
+        Arc::make_mut(&mut self.decorations).set_bucket(source, candidate);
         true
     }
 }
@@ -1461,11 +1476,18 @@ async fn run(
                 session.syntax_sync = None;
                 continue;
             }
-            Incoming::Syntax(SyntaxEvent::Highlights {
-                buffer_id,
-                version,
-                spans,
-            }) => {
+            Incoming::Syntax(event) => {
+                // Both of this producer's batches - the highlights and the sticky
+                // context scopes (M8) - are identified and guarded identically, and
+                // differ only in which bucket they replace, so they are applied here
+                // once rather than in two arms that would have to be kept in step.
+                let (SyntaxEvent::Highlights {
+                    buffer_id, version, ..
+                }
+                | SyntaxEvent::Scopes {
+                    buffer_id, version, ..
+                }) = &event;
+                let (buffer_id, version) = (*buffer_id, *version);
                 // Apply only a batch computed against the buffer and version it
                 // actually parsed. The spans are byte offsets in that text; if the
                 // buffer has advanced since (an edit landed while the parse was in
@@ -1492,11 +1514,12 @@ async fn run(
                 // Republish only when the set actually changed *and* it is on screen,
                 // so an identical reparse (an edit that left tokens intact) or one for
                 // a background buffer costs no frame.
-                if version == doc.version
-                    && doc.apply_highlights(spans)
-                    && index == active
-                    && !snapshots.publish(session.snapshot(None))
-                {
+                let changed = version == doc.version
+                    && match event {
+                        SyntaxEvent::Highlights { spans, .. } => doc.apply_highlights(spans),
+                        SyntaxEvent::Scopes { spans, .. } => doc.apply_scopes(spans),
+                    };
+                if changed && index == active && !snapshots.publish(session.snapshot(None)) {
                     break;
                 }
                 continue;

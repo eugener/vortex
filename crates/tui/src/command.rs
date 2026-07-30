@@ -52,6 +52,11 @@ pub enum Command {
     /// but still only on this side of the seam: the core has no idea a viewport
     /// exists, let alone a column standing for one.
     ToggleScrollbar,
+    /// Show or hide the sticky context header (frontend-local). Like the scrollbar
+    /// this one changes the *layout* - the pinned rows come and go with it - and the
+    /// data it pins is already on the snapshot, so nothing about it crosses the seam
+    /// either.
+    ToggleStickyContext,
     /// Open the encoding picker overlay (frontend-local). A pick commits an
     /// [`Action::SetEncoding`], so the choice reaches the core the same way a
     /// bound key's would.

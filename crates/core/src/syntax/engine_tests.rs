@@ -22,6 +22,16 @@ where
     F: FnOnce(Sender<SyntaxSync>, Receiver<SyntaxEvent>) -> Fut,
     Fut: Future<Output = T>,
 {
+    drive_rust_with(String::new(), f)
+}
+
+/// [`drive_rust`] with a context query, so the scope half of the producer (M8)
+/// runs too. An empty one is the no-sticky-context path every other test takes.
+fn drive_rust_with<F, Fut, T>(context: String, f: F) -> T
+where
+    F: FnOnce(Sender<SyntaxSync>, Receiver<SyntaxEvent>) -> Fut,
+    Fut: Future<Output = T>,
+{
     let ex = smol::Executor::new();
     let (handle, run) = highlighter(
         rust_language(),
@@ -29,12 +39,23 @@ where
         tree_sitter_rust::HIGHLIGHTS_QUERY.to_string(),
         tree_sitter_rust::INJECTIONS_QUERY.to_string(),
         String::new(),
+        context,
     );
     ex.spawn(async move {
         let _ = run.await;
     })
     .detach();
     smol::block_on(ex.run(f(handle.sync, handle.events)))
+}
+
+/// The version and spans of a highlight batch. A function rather than an
+/// irrefutable `let`, because the producer has two event variants now (M8) and a
+/// test that asked for highlights must fail loudly if it is handed scopes.
+fn highlights(event: SyntaxEvent) -> (u64, Vec<HighlightSpan>) {
+    match event {
+        SyntaxEvent::Highlights { version, spans, .. } => (version, spans),
+        other => panic!("expected a highlight batch, got {other:?}"),
+    }
 }
 
 /// Each span paired with the source text it covers, for offset-independent
@@ -57,7 +78,7 @@ fn parses_text_and_emits_highlights_for_its_version() {
         })
         .await
         .unwrap();
-        let SyntaxEvent::Highlights { version, spans, .. } = events.recv().await.unwrap();
+        let (version, spans) = highlights(events.recv().await.unwrap());
         (spans, version)
     });
     // The batch is tagged with the version it parsed, so the editor can reason
@@ -93,7 +114,7 @@ fn coalesces_to_the_newest_queued_text() {
             text: "fn new() {}".into(),
         })
         .unwrap();
-        let SyntaxEvent::Highlights { version, .. } = events.recv().await.unwrap();
+        let (version, _) = highlights(events.recv().await.unwrap());
         version
     });
     assert_eq!(
@@ -112,7 +133,7 @@ fn an_empty_buffer_highlights_nothing() {
         })
         .await
         .unwrap();
-        let SyntaxEvent::Highlights { spans, .. } = events.recv().await.unwrap();
+        let (_, spans) = highlights(events.recv().await.unwrap());
         spans
     });
     assert!(spans.is_empty());
@@ -132,7 +153,7 @@ fn successive_edits_each_produce_a_fresh_batch() {
             })
             .await
             .unwrap();
-            let SyntaxEvent::Highlights { version, .. } = events.recv().await.unwrap();
+            let (version, _) = highlights(events.recv().await.unwrap());
             seen.push(version);
         }
         seen
@@ -150,6 +171,7 @@ fn dropping_the_editor_stops_the_loop_cleanly() {
         tree_sitter_rust::HIGHLIGHTS_QUERY.to_string(),
         tree_sitter_rust::INJECTIONS_QUERY.to_string(),
         String::new(),
+        String::new(),
     );
     drop(handle);
     assert!(smol::block_on(run).is_ok());
@@ -165,6 +187,7 @@ fn the_editor_dropping_the_event_channel_stops_the_loop() {
         "rust",
         tree_sitter_rust::HIGHLIGHTS_QUERY.to_string(),
         tree_sitter_rust::INJECTIONS_QUERY.to_string(),
+        String::new(),
         String::new(),
     );
     let task = ex.spawn(run);
@@ -203,6 +226,83 @@ fn a_malformed_query_stops_the_loop_with_an_error() {
         "(this is not a valid query".to_string(),
         String::new(),
         String::new(),
+        String::new(),
+    );
+    drop(handle);
+    assert!(matches!(smol::block_on(run), Err(SyntaxError::Query(_))));
+}
+
+/// A context query for the scope tests below: the two Rust items a header would
+/// ever pin in this fixture.
+const CONTEXT: &str = "(impl_item) @context (function_item) @context";
+
+#[test]
+fn a_context_query_emits_scopes_for_the_version_it_parsed() {
+    let source = "impl Foo {\n    fn bar(&self) {\n        let x = 1;\n    }\n}\n";
+    let (version, spans) = drive_rust_with(CONTEXT.to_string(), |sync, events| async move {
+        sync.send(SyntaxSync {
+            buffer_id: BufferId(0),
+            version: 4,
+            text: source.into(),
+        })
+        .await
+        .unwrap();
+        // Highlights come first, scopes second - the order the loop sends them,
+        // because the colors are what a first paint waits on (M8).
+        highlights(events.recv().await.unwrap());
+        match events.recv().await.unwrap() {
+            SyntaxEvent::Scopes { version, spans, .. } => (version, spans),
+            other => panic!("expected a scope batch, got {other:?}"),
+        }
+    });
+    assert_eq!(version, 4, "a scope batch is tagged like a highlight batch");
+    let covered: Vec<&str> = spans.iter().map(|r| &source[r.clone()]).collect();
+    assert_eq!(
+        covered.len(),
+        2,
+        "impl and fn, outermost first: {covered:?}"
+    );
+    assert!(covered[0].starts_with("impl Foo"), "got {covered:?}");
+    assert!(covered[1].starts_with("fn bar"), "got {covered:?}");
+}
+
+#[test]
+fn without_a_context_query_the_producer_sends_only_highlights() {
+    // The no-opt-in path: a grammar shipping no `context.scm` must not pay the
+    // second parse, and the way that is observable from outside is that nothing
+    // but highlights ever arrives.
+    let versions = drive_rust(|sync, events| async move {
+        let mut seen = Vec::new();
+        for v in [1u64, 2] {
+            sync.send(SyntaxSync {
+                buffer_id: BufferId(0),
+                version: v,
+                text: "impl Foo {\n    fn bar() {}\n}\n".into(),
+            })
+            .await
+            .unwrap();
+            seen.push(highlights(events.recv().await.unwrap()).0);
+        }
+        seen
+    });
+    assert_eq!(
+        versions,
+        vec![1, 2],
+        "a Scopes event would have been seen here"
+    );
+}
+
+#[test]
+fn a_malformed_context_query_stops_the_loop_with_an_error() {
+    // Same contract as a broken highlight query (SPEC §8): typed, so the frontend
+    // degrades to no sticky context rather than losing the editor.
+    let (handle, run) = highlighter(
+        rust_language(),
+        "rust",
+        tree_sitter_rust::HIGHLIGHTS_QUERY.to_string(),
+        String::new(),
+        String::new(),
+        "(this is not a valid query".to_string(),
     );
     drop(handle);
     assert!(matches!(smol::block_on(run), Err(SyntaxError::Query(_))));

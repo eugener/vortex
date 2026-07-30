@@ -21,7 +21,7 @@ cargo clippy --all-targets --all-features -- -D warnings   # 2. lint (warnings a
 cargo build --workspace        # 3. compile
 cargo test --workspace         # 4. tests
 # 5. coverage gates - EVERY file must stay above its crate's floor (SPEC §13).
-#    Ratchet: no regress. Current: core 99.4% lines, tui 92.2%.
+#    Ratchet: no regress. Current: core 99.4% lines, tui 92.4%.
 cargo llvm-cov --package vortex-core --fail-under-file-lines 90 \
   --ignore-filename-regex 'lsp/client\.rs' --summary-only
 cargo llvm-cov --package vortex-tui  --fail-under-file-lines 60 --summary-only
@@ -55,9 +55,12 @@ routing is tested against a stand-in, leaving only the backend constructor untes
 brought the tui total back to 89.9%. M7's in-buffer search lifted it to 91.9%: the find
 prompt and the query-replace walk are pure logic with no I/O at all, so `buffersearch.rs`
 lands at 100% and pulls the total up rather than diluting it. M8's chrome holds it at
-92.2%, and for the reason the milestone is shaped that way: each piece is display-column
+92.4%, and for the reason the milestone is shaped that way: each piece is display-column
 math in `layout.rs` (99.5%) plus a config key, so the only untestable part is the
 scrollbar's drag state, which lives in the event loop with the rest of the I/O shell.
+Sticky context is the exception that proves it - the header's *height* is settled inside
+`paint`, so it is asserted through a `TestBackend` render rather than a pure function,
+which is why `paint` now hands back the view state it settled on.
 Requires `cargo-llvm-cov` >=0.8.6 (the release that added `--fail-under-file-lines`) +
 `rustup component add llvm-tools-preview`. Install/upgrade with `cargo install cargo-llvm-cov`.
 

@@ -57,6 +57,9 @@ unicode-width = "0.2.2"
 vortex-core = { path = "../core" }
 
 [dev-dependencies]
+# The same core, with its test-only builders switched on: the layout tests build a
+# `DecorationSet` directly to exercise resolution (see `vortex-core`'s `replace`).
+vortex-core = { path = "../core", features = ["test-support"] }
 # Microbenchmarks for the display-column paint hot paths (`benches/layout.rs`).
 # Slim, matching vortex-core: no plotters/html/rayon, `cargo_bench_support` kept
 # for `--save-baseline` and the loop's `--test` smoke mode. Reachable only because

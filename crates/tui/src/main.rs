@@ -69,6 +69,15 @@ struct ViewState {
     /// Text rows the last frame showed - the basis for the PageUp/PageDown step.
     /// 0 before the first paint.
     page_height: usize,
+    /// Rows the last frame gave to the sticky context header (SPEC §7.5), above
+    /// the text and below the head bar. 0 unless the feature is on and the top
+    /// line is inside something.
+    ///
+    /// Carried for the same reason `page_height` is: every screen→buffer mapping
+    /// in the event loop (the pointer, the scrollbar drag) has to subtract the rows
+    /// the text does not start at, and re-deriving the height there would mean
+    /// re-running the header's own settling against a snapshot that may have moved.
+    header_height: usize,
 }
 
 impl ViewState {
@@ -96,6 +105,14 @@ const HIGHLIGHT_WAIT: Duration = Duration::from_millis(150);
 /// the common terminal feel; scrolling is a pure frontend viewport move (SPEC §5),
 /// so it never round-trips to the core.
 const SCROLL_STEP: usize = 3;
+
+/// How many times a frame will re-derive the scroll offset and the sticky context
+/// header's height from each other before painting whatever it last held (SPEC
+/// §7.5). Each depends on the other, so a frame settles them rather than letting them
+/// chase each other across repaints; one pass answers every frame that did not scroll
+/// into or out of a scope, and the rest exist so a pair that would oscillate stops at
+/// a row that is merely one off rather than spinning.
+const STICKY_SETTLE_PASSES: usize = 3;
 
 fn main() -> io::Result<()> {
     // Parse argv before touching the terminal: `--help`/`--version` and bad flags
@@ -385,9 +402,13 @@ impl GrammarManager {
                 let (syntax_handle, syntax_loop) = vortex_core::highlighter(
                     language,
                     lang,
-                    resolved.highlights,
-                    resolved.injections,
+                    resolved.queries.highlights,
+                    resolved.queries.injections,
                     String::new(),
+                    // Empty unless this language ships a `context.scm`, which is
+                    // what keeps the sticky context header's second parse (M8) off
+                    // every grammar that has not opted into it.
+                    resolved.queries.context,
                 );
                 // A closed channel means the core has stopped; nothing to attach to.
                 // Otherwise run the highlighter loop here until the core drops it.
@@ -800,6 +821,7 @@ fn event_loop(
                     rulers: &config.rulers,
                     indent_guides: config.indent_guides,
                     scrollbar: config.scrollbar,
+                    sticky_context: config.sticky_context,
                     search: &search,
                 },
                 &overlays,
@@ -1024,6 +1046,7 @@ fn event_loop(
                                 let screen = terminal.size()?;
                                 on_scrollbar(
                                     Rect::new(0, 0, screen.width, screen.height),
+                                    viewport.header_height,
                                     mouse.column,
                                     mouse.row,
                                 )
@@ -1037,15 +1060,19 @@ fn event_loop(
                             let track = viewport.page_height;
                             let max_scroll =
                                 layout::display_line_count(&snap.text).saturating_sub(track);
-                            // Screen row to track row is one subtraction - the head bar
-                            // owns row 0. A drag pulled past either end of the body
-                            // still means that end: `saturating_sub` holds the top and
-                            // `scroll_at_track_row` already clamps the bottom, so
-                            // repeating that clamp here would be a second copy of a
-                            // bound that has one owner. A track too short to tell its
-                            // offsets apart answers `None`, and then the press moves
-                            // nothing rather than throwing the reader to line 1.
-                            let row = (mouse.row as usize).saturating_sub(1);
+                            // The track starts below the head bar and the pinned rows
+                            // (`layout::row_at` owns that split). A drag pulled past
+                            // either end of the body still means that end: a row above
+                            // the text is track row 0 and `scroll_at_track_row` already
+                            // clamps the bottom, so repeating that clamp here would be a
+                            // second copy of a bound that has one owner. A track too
+                            // short to tell its offsets apart answers `None`, and then
+                            // the press moves nothing rather than throwing the reader to
+                            // line 1.
+                            let row = match layout::row_at(mouse.row, viewport.header_height) {
+                                layout::Row::Head | layout::Row::Header(_) => 0,
+                                layout::Row::Text(row) => row,
+                            };
                             if let Some(scroll) =
                                 layout::scroll_at_track_row(row, track, max_scroll)
                             {
@@ -1243,6 +1270,7 @@ fn dispatch_command(command: Command, handle: &vortex_core::CoreHandle, ui: &mut
         }
         Command::ToggleIndentGuides => ui.config.indent_guides = !ui.config.indent_guides,
         Command::ToggleScrollbar => ui.config.scrollbar = !ui.config.scrollbar,
+        Command::ToggleStickyContext => ui.config.sticky_context = !ui.config.sticky_context,
         // No I/O and no round trip: the rows come from the snapshot's buffer list.
         // Nothing to pick from before the first snapshot, so it simply does not open.
         Command::OpenBufferPicker => {
@@ -1401,9 +1429,10 @@ fn dispatch_command(command: Command, handle: &vortex_core::CoreHandle, ui: &mut
 
 /// Resolve an absolute pointer cell to a buffer byte offset, using the last painted
 /// viewport (gutter width, scroll on both axes) so the lookup needs no core
-/// round-trip (SPEC §5). The head bar occupies screen row 0, so the body row is
-/// `row - 1`, clamped into the painted text rows: a click on the head bar maps to
-/// the top visible line and a drag below the body to the last one. Column and
+/// round-trip (SPEC §5). The head bar occupies screen row 0 and the sticky context
+/// header the rows under it (SPEC §7.5), so the text row is `row - 1 - header`,
+/// clamped into the painted text rows: a click on the head bar or on a pinned row
+/// maps to the top visible line and a drag below the body to the last one. Column and
 /// end-of-line clamping are handled by [`layout::offset_at_cell`].
 fn pointer_offset(
     snapshot: &ViewSnapshot,
@@ -1413,8 +1442,12 @@ fn pointer_offset(
     row: u16,
 ) -> usize {
     let gutter_width = layout::gutter_width(layout::display_line_count(&snapshot.text));
-    let last_body_row = viewport.page_height.saturating_sub(1);
-    let body_row = (row.saturating_sub(1) as usize).min(last_body_row);
+    // A row above the text - the head bar, or a pinned scope - resolves to the top
+    // visible line, and a drag below the body to the last one.
+    let body_row = match layout::row_at(row, viewport.header_height) {
+        layout::Row::Head | layout::Row::Header(_) => 0,
+        layout::Row::Text(row) => row.min(viewport.page_height.saturating_sub(1)),
+    };
     layout::offset_at_cell(
         &snapshot.text,
         viewport.scroll,
@@ -1490,6 +1523,9 @@ struct PaintInputs<'a> {
     /// Reserve the body's rightmost column for a scrollbar (SPEC §7.5), carried per
     /// frame for the same reason as `tab_width`.
     scrollbar: bool,
+    /// Pin the enclosing scopes above the text (SPEC §7.5), carried per frame for the
+    /// same reason as `tab_width`.
+    sticky_context: bool,
     /// The live search (SPEC §11), borrowed rather than copied so the highlights can
     /// never be a frame behind what the prompt is showing.
     ///
@@ -1517,6 +1553,7 @@ fn paint(frame: &mut Frame, snapshot: &ViewSnapshot, inputs: PaintInputs) -> Vie
         rulers,
         indent_guides,
         scrollbar,
+        sticky_context,
         search,
     } = inputs;
     let area = frame.area();
@@ -1554,7 +1591,7 @@ fn paint(frame: &mut Frame, snapshot: &ViewSnapshot, inputs: PaintInputs) -> Vie
     // Gutter width is fixed for the frame; the text column budget is what's left of
     // the body after it. Both scroll axes follow the cursor minimally (SPEC §5):
     // vertical by line, horizontal by display column within the text area.
-    let text_height = body_area.height as usize;
+    let body_height = body_area.height as usize;
     let display_lines = layout::display_line_count(&snapshot.text);
     let gutter_width = layout::gutter_width(display_lines);
     // The scrollbar's column is reserved whenever the setting is on, painted or not
@@ -1562,26 +1599,73 @@ fn paint(frame: &mut Frame, snapshot: &ViewSnapshot, inputs: PaintInputs) -> Vie
     // slide every line one cell sideways at exactly that moment.
     let text_width =
         (body_area.width as usize).saturating_sub(gutter_width + usize::from(scrollbar));
-    // `scroll_to_show` only scrolls *toward* the cursor, never capping the offset at
-    // the content extent. A stale offset carried across a frame where the buffer (or
-    // line) shrank would then paint blank rows/columns and hide content that fits, so
-    // clamp each axis to its max useful offset. The `+ 1` on the horizontal extent
-    // leaves a cell for the caret sitting just past the line's last glyph.
+    // Sticky context (SPEC §7.5) and the vertical scroll are **each other's input**:
+    // the header pins the scopes enclosing the top visible line, and the top visible
+    // line is what the header's own rows push down to. They are settled together
+    // here, in the frame, rather than left to converge over several - each pass takes
+    // the offset the previous height produced and re-derives the header for it.
+    //
+    // It stops as soon as the *offset* repeats, not when the height does, and that is
+    // what keeps the steady state to a single `sticky_lines` call: the header is a
+    // pure function of the top line, so an offset that did not move cannot produce a
+    // different header, and every ordinary frame - anything that did not scroll into
+    // or out of a scope - lands there on the first pass. The pass count is a bound,
+    // not a target: a pair that would oscillate settles a row off rather than
+    // spinning.
+    //
+    // The offset itself: `scroll_to_show` only scrolls *toward* the cursor, never
+    // capping at the content extent, and a stale offset carried across a frame where
+    // the buffer shrank would paint blank rows below the last line - so it is clamped
+    // to the max useful offset for the window the header leaves.
+    let budget = if sticky_context {
+        layout::sticky_budget(body_height)
+    } else {
+        0
+    };
+    // When following the caret (keys, clicks, edits) the view scrolls the minimum to
+    // keep it visible; a wheel scroll turns follow off and paints the viewport's own
+    // offset instead, so the view can move away from the caret. A live preview
+    // overrides the wheel's "stay put": the user is asking to be shown the match,
+    // which is the one case where the view must move without the caret.
+    //
+    // The header takes its rows from the body and the *text window shrinks by exactly
+    // that much*, so no line is ever behind a pinned row - which is why this follows
+    // the caret in the shortened window and nothing else. (Shifting the followed line
+    // up by the header's height as well, to "clear" it, pushes the caret off the
+    // bottom by that many rows: the rows it would be clearing are ones the text no
+    // longer occupies.)
+    let offset_for = |header_height: usize| {
+        let text_height = body_height.saturating_sub(header_height);
+        if follow || preview.is_some() {
+            layout::scroll_to_show(follow_line, viewport.scroll, text_height)
+        } else {
+            viewport.scroll
+        }
+        .min(display_lines.saturating_sub(text_height))
+    };
+    let mut scroll = offset_for(0);
+    let mut header = layout::sticky_lines(&snapshot.text, &snapshot.decorations, scroll, budget);
+    for _ in 1..STICKY_SETTLE_PASSES {
+        let next = offset_for(header.len());
+        if next == scroll {
+            break;
+        }
+        scroll = next;
+        header = layout::sticky_lines(&snapshot.text, &snapshot.decorations, scroll, budget);
+    }
+    let header_height = header.len();
+    let text_height = body_height.saturating_sub(header_height);
+    // Re-clamp against the height actually painted. A no-op whenever the loop above
+    // settled - it exits with the offset and the header agreeing - and the guard for
+    // when it ran out of passes instead: the offset would then have been capped for a
+    // header a row taller or shorter than this one, and an offset past the content
+    // paints blank rows below the last line.
     let max_scroll = display_lines.saturating_sub(text_height);
+    let scroll = scroll.min(max_scroll);
+    // The `+ 1` on the horizontal extent leaves a cell for the caret sitting just
+    // past the line's last glyph.
     let line_width = layout::display_column(&line_text, line_text.len(), tab_width);
     let max_h_scroll = (line_width + 1).saturating_sub(text_width);
-    // When following the caret (keys, clicks, edits) each axis scrolls the minimum
-    // to keep it visible; a wheel scroll turns follow off and paints the viewport's
-    // own offset instead, so the view can move away from the caret. Both are clamped
-    // to the content extent so a stale offset never paints blank rows/columns.
-    // A live preview overrides the wheel's "stay put": the user is asking to be shown
-    // the match, which is the one case where the view must move without the caret.
-    let scroll = if follow || preview.is_some() {
-        layout::scroll_to_show(follow_line, viewport.scroll, text_height)
-    } else {
-        viewport.scroll
-    }
-    .min(max_scroll);
     let h_scroll = if follow {
         layout::scroll_to_show(cursor_display_col, viewport.h_scroll, text_width)
     } else {
@@ -1589,40 +1673,47 @@ fn paint(frame: &mut Frame, snapshot: &ViewSnapshot, inputs: PaintInputs) -> Vie
     }
     .min(max_h_scroll);
 
+    // The header takes its rows off the top of the body, so the text starts below
+    // it. `Min(0)` lets the text area vanish on a terminal too short to hold both.
+    let [context_area, text_area] =
+        Layout::vertical([Constraint::Length(header_height as u16), Constraint::Min(0)])
+            .areas(body_area);
+
+    let body = Body {
+        scroll,
+        h_scroll,
+        gutter_width,
+        text_width,
+        cursor_line,
+        theme,
+        tab_width,
+        line_numbers,
+        rulers: rulers
+            .iter()
+            .map(|&col| (col..col + 1, theme.ruler))
+            .collect(),
+        reserved: usize::from(scrollbar),
+        indent_guides,
+        // Only the lines about to be painted are searched, which is the whole
+        // reason `matches_in` takes a line range (SPEC §10.4).
+        matches: search
+            .query()
+            .map(|q| q.matches_in(&snapshot.text, scroll..scroll + text_height))
+            .unwrap_or_default(),
+        current: preview,
+    };
     paint_head_bar(frame, head_area, snapshot, &theme);
-    paint_body(
-        frame,
-        body_area,
-        snapshot,
-        Body {
-            scroll,
-            h_scroll,
-            gutter_width,
-            text_width,
-            cursor_line,
-            theme,
-            tab_width,
-            line_numbers,
-            rulers: rulers
-                .iter()
-                .map(|&col| (col..col + 1, theme.ruler))
-                .collect(),
-            reserved: usize::from(scrollbar),
-            indent_guides,
-            // Only the lines about to be painted are searched, which is the whole
-            // reason `matches_in` takes a line range (SPEC §10.4).
-            matches: search
-                .query()
-                .map(|q| q.matches_in(&snapshot.text, scroll..scroll + text_height))
-                .unwrap_or_default(),
-            current: preview,
-        },
-    );
+    paint_body(frame, text_area, snapshot, &body);
+    paint_sticky_context(frame, context_area, snapshot, &body, &header);
     // The scrollbar over the column `paint_body` left it, and only when the buffer
     // actually scrolls: a bar answers "where am I in something bigger than the
     // screen", so with nothing bigger there is nothing for it to say, and a
     // full-height thumb would be a loud way of saying nothing. The reserved column
     // stays reserved either way, so this appearing and disappearing moves no text.
+    //
+    // Over the *text* area, not the whole body: the track stands for what scrolls,
+    // and the header's rows do not - a bar running up behind pinned lines would
+    // offer positions its own top rows cannot show.
     if scrollbar && max_scroll > 0 {
         // `content_length` is the number of scroll *positions*, not of lines. That is
         // what makes ratatui's thumb the right size: with `viewport_content_length`
@@ -1641,7 +1732,7 @@ fn paint(frame: &mut Frame, snapshot: &ViewSnapshot, inputs: PaintInputs) -> Vie
                 .end_symbol(None)
                 .track_style(theme.scrollbar_track)
                 .thumb_style(theme.scrollbar_thumb),
-            body_area,
+            text_area,
             &mut state,
         );
     }
@@ -1666,8 +1757,8 @@ fn paint(frame: &mut Frame, snapshot: &ViewSnapshot, inputs: PaintInputs) -> Vie
         && (scroll..scroll + text_height).contains(&cursor_line)
         && (h_scroll..h_scroll + text_width).contains(&cursor_display_col);
     if cursor_visible {
-        let row = body_area.y + (cursor_line - scroll) as u16;
-        let col = body_area.x + (gutter_width + cursor_display_col - h_scroll) as u16;
+        let row = text_area.y + (cursor_line - scroll) as u16;
+        let col = text_area.x + (gutter_width + cursor_display_col - h_scroll) as u16;
         frame.set_cursor_position(Position::new(col, row));
     }
 
@@ -1675,6 +1766,7 @@ fn paint(frame: &mut Frame, snapshot: &ViewSnapshot, inputs: PaintInputs) -> Vie
         scroll,
         h_scroll,
         page_height: text_height,
+        header_height,
     }
 }
 
@@ -1780,7 +1872,7 @@ struct Body {
 /// gets a one-cell [`Body::secondary_cursor`] block so a multi-cursor set is visible
 /// (SPEC §2.2 - the primary caret renders as the terminal's own cursor, so its
 /// zero-width selection shows nothing here).
-fn paint_body(frame: &mut Frame, area: Rect, snapshot: &ViewSnapshot, body: Body) {
+fn paint_body(frame: &mut Frame, area: Rect, snapshot: &ViewSnapshot, body: &Body) {
     let text = &snapshot.text;
     let height = area.height as usize;
     let lines = layout::visible_lines(text, body.scroll, height, body.tab_width);
@@ -1906,27 +1998,14 @@ fn paint_body(frame: &mut Frame, area: Rect, snapshot: &ViewSnapshot, body: Body
             // Syntax highlights (M4): each span clipped to this line's byte range,
             // mapped to display columns, painted as a foreground color over the
             // selection ground and under the diagnostic underline and carets.
-            if !snapshot.decorations.is_empty() {
-                // Highlights arrive sorted and non-overlapping, so one walker
-                // resolves every span on this line in a single left-to-right pass
-                // (O(line + spans)) instead of rescanning from byte 0 per span.
-                let mut walker = layout::ColumnWalker::new(raw, body.tab_width);
-                for (span, kind) in snapshot
-                    .decorations
-                    .highlights_in(line_start..line_end_excl)
-                {
-                    if let Some(range) = layout::span_columns(
-                        &mut walker,
-                        raw.len(),
-                        line_start,
-                        line_end_excl,
-                        span.start,
-                        span.end,
-                    ) {
-                        overlays.push((range, body.theme.highlight(kind)));
-                    }
-                }
-            }
+            push_highlights(
+                &mut overlays,
+                snapshot,
+                &body.theme,
+                raw,
+                line_start..line_end_excl,
+                body.tab_width,
+            );
             // Diagnostic underlines (SPEC §5): the decoration channel resolved for
             // just this line's byte span, each clipped to its columns and painted
             // as an underlined foreground. Pushed before the caret blocks so a
@@ -2010,6 +2089,128 @@ fn paint_body(frame: &mut Frame, area: Rect, snapshot: &ViewSnapshot, body: Body
     // the rows past the end of the buffer too and a light theme is legible in a dark
     // terminal. Per-row styles (current line, selection) patch on top of it.
     frame.render_widget(Paragraph::new(rows).style(body.theme.text), area);
+}
+
+/// Append the syntax colors for one line to its overlay list (M4): each span
+/// clipped to `bytes` (the line's own byte range), mapped to display columns.
+///
+/// Shared by the body's rows and the sticky context header's, which resolve the
+/// same question about the same kind of line - the header is not a caption, it is a
+/// line of the file that happens to be pinned, so it has to be colored by the same
+/// code rather than by a copy of it.
+///
+/// Highlights arrive sorted and non-overlapping, so one [`layout::ColumnWalker`]
+/// resolves every span on the line in a single left-to-right pass (O(line + spans))
+/// instead of rescanning from byte 0 per span.
+fn push_highlights(
+    overlays: &mut Vec<(std::ops::Range<usize>, Style)>,
+    snapshot: &ViewSnapshot,
+    theme: &config::Theme,
+    raw: &str,
+    bytes: std::ops::Range<usize>,
+    tab_width: usize,
+) {
+    if snapshot.decorations.is_empty() {
+        return;
+    }
+    let mut walker = layout::ColumnWalker::new(raw, tab_width);
+    for (span, kind) in snapshot.decorations.highlights_in(bytes.clone()) {
+        if let Some(range) = layout::span_columns(
+            &mut walker,
+            raw.len(),
+            bytes.start,
+            bytes.end,
+            span.start,
+            span.end,
+        ) {
+            overlays.push((range, theme.highlight(kind)));
+        }
+    }
+}
+
+/// Paint the sticky context header: one row per pinned scope, in `lines` order
+/// (outermost first), above the text (SPEC §7.5, M8).
+///
+/// Each row is laid out exactly as a body row - the same gutter width, the same
+/// horizontal window, the same syntax colors - because a pinned line *is* a line of
+/// the file, and one that did not line up with the code below it would read as a
+/// caption rather than as the code it is. What separates the two is the
+/// [`Theme::sticky_context`] ground the rows sit on, which is the only thing saying
+/// that these rows are not the lines the text below them continues from.
+///
+/// The gutter carries each pinned line's own number, which is what makes the header
+/// a set of jump targets rather than a label: it names where the scope opened, and a
+/// click on the row goes there (`press_action`).
+///
+/// Deliberately not carried over from the body: search-match highlighting (its
+/// matches are resolved for the *text* window, and rescanning a header row per frame
+/// would be a second scan answering a question the body already answers) and indent
+/// guides (they are computed for a contiguous window, and a header row's neighbours
+/// are not its neighbours in the file).
+fn paint_sticky_context(
+    frame: &mut Frame,
+    area: Rect,
+    snapshot: &ViewSnapshot,
+    body: &Body,
+    lines: &[usize],
+) {
+    if lines.is_empty() || area.height == 0 {
+        return;
+    }
+    let text = &snapshot.text;
+    let rows: Vec<Line> = lines
+        .iter()
+        .map(|&line_index| {
+            let raw = text.line(line_index).unwrap_or_default();
+            let line_start = text.byte_of_line(line_index).unwrap_or(0);
+            let line_end_excl = text
+                .byte_of_line(line_index + 1)
+                .unwrap_or_else(|| text.byte_len());
+            // Rulers first, as in the body: a margin marker crossing the header
+            // marks the same column it marks everywhere else. Then the same syntax
+            // colors the body paints, so a pinned line reads as the code it is.
+            let mut overlays: Vec<(std::ops::Range<usize>, Style)> = body.rulers.clone();
+            push_highlights(
+                &mut overlays,
+                snapshot,
+                &body.theme,
+                &raw,
+                line_start..line_end_excl,
+                body.tab_width,
+            );
+            let mut spans = vec![Span::styled(
+                layout::gutter_label(
+                    line_index,
+                    body.cursor_line,
+                    body.gutter_width,
+                    body.line_numbers,
+                ),
+                body.theme.gutter.patch(body.theme.sticky_context),
+            )];
+            spans.extend(layout::render_line(
+                &layout::expand_tabs(&raw, body.tab_width),
+                body.h_scroll,
+                body.text_width,
+                body.theme.sticky_context,
+                &overlays,
+            ));
+            // The header's ground crosses the scrollbar's reserved column for the
+            // same reason a body row's does: the column is outside the text width,
+            // so without this the header would stop one cell short of the body's
+            // edge and show a notch where the bar is not painted.
+            if body.reserved > 0 {
+                spans.push(Span::styled(
+                    " ".repeat(body.reserved),
+                    body.theme.sticky_context,
+                ));
+            }
+            Line::from(spans)
+        })
+        .collect();
+    frame.render_widget(
+        Paragraph::new(rows).style(body.theme.text.patch(body.theme.sticky_context)),
+        area,
+    );
 }
 
 /// Paint the bottom status bar: cursor position (left) and buffer metrics (right).
@@ -2098,14 +2299,14 @@ fn status_target_at(
 /// through to the text would put a caret in a column that holds no text.
 /// Whether the setting is on is the caller's question, not this one's - it gates the
 /// terminal-size query that produces `screen`.
-fn on_scrollbar(screen: Rect, column: u16, row: u16) -> bool {
+fn on_scrollbar(screen: Rect, header: usize, column: u16, row: u16) -> bool {
     screen.width > 0
         && column == screen.width - 1
-        // Row 0 is the bufferline and the last row is the status bar; both are their
-        // own controls and answered before this one. Saturating rather than `row + 1`,
-        // because `row` arrives from a terminal and a report of `u16::MAX` must not be
-        // an overflow on an input path.
-        && row >= 1
+        // Row 0 is the bufferline, the next `header` rows are the sticky context
+        // header, and the last row is the status bar; each is its own control and
+        // answered before this one. The bar is painted over the text rows alone, so
+        // the pinned rows are not track even though they share its column.
+        && matches!(layout::row_at(row, header), layout::Row::Text(_))
         && row < screen.height.saturating_sub(1)
 }
 
@@ -2143,6 +2344,31 @@ fn press_action(
 
     if is_press && mouse.modifiers.contains(KeyModifiers::ALT) {
         return Action::AddCursorAt { offset };
+    }
+    // A pinned scope row is a jump target, not text (SPEC §7.5): pressing it goes to
+    // the line that opened the scope. The rows are re-derived from the same snapshot
+    // and offset the frame painted them from, which is the rule every clickable
+    // surface here follows (`on_scrollbar`, `Picker::row_at`) - what was clicked and
+    // what was drawn cannot then disagree. Presses only: a drag crossing the header
+    // is a selection sweep that ran off the top, and it already clamps to the first
+    // text row.
+    if is_press
+        && let layout::Row::Header(pinned_row) = layout::row_at(mouse.row, viewport.header_height)
+    {
+        let header = layout::sticky_lines(
+            &snapshot.text,
+            &snapshot.decorations,
+            viewport.scroll,
+            viewport.header_height,
+        );
+        if let Some(&pinned) = header.get(pinned_row)
+            && let Some(start) = snapshot.text.byte_of_line(pinned)
+        {
+            return Action::PlaceCursor {
+                offset: start,
+                extend: false,
+            };
+        }
     }
     if is_press && (mouse.column as usize) < gutter {
         return line;
@@ -2719,6 +2945,7 @@ mod tests {
             rulers: &[],
             indent_guides: false,
             scrollbar: false,
+            sticky_context: false,
             search: NO_SEARCH.get_or_init(buffersearch::SearchState::default),
         }
     }
@@ -2738,14 +2965,27 @@ mod tests {
         h: u16,
         inputs: PaintInputs,
     ) -> ratatui::buffer::Buffer {
+        render_state(snapshot, w, h, inputs).0
+    }
+
+    /// [`render_with`], also handing back the view state the frame settled on - the
+    /// scroll offset it chose and the rows it gave the sticky context header, which
+    /// is what the event loop carries into the next frame's pointer math.
+    fn render_state(
+        snapshot: &ViewSnapshot,
+        w: u16,
+        h: u16,
+        inputs: PaintInputs,
+    ) -> (ratatui::buffer::Buffer, ViewState) {
         let mut terminal = Terminal::new(TestBackend::new(w, h)).unwrap();
         let selected = layout::selected_grapheme_count(&snapshot.text, &snapshot.selections);
+        let mut state = ViewState::default();
         terminal
             .draw(|frame| {
-                paint(frame, snapshot, PaintInputs { selected, ..inputs });
+                state = paint(frame, snapshot, PaintInputs { selected, ..inputs });
             })
             .unwrap();
-        terminal.backend().buffer().clone()
+        (terminal.backend().buffer().clone(), state)
     }
 
     #[test]
@@ -3049,6 +3289,7 @@ mod tests {
                         scroll: 0,
                         h_scroll,
                         page_height: 4,
+                        header_height: 0,
                     },
                     ..paint_inputs(0)
                 },
@@ -3076,6 +3317,296 @@ mod tests {
                 row_text(&buf, row)
             );
         }
+    }
+
+    /// A snapshot for the sticky context tests: run `script` against the real core,
+    /// then publish `spans` as scopes over the syntax seam, exactly as the
+    /// highlighter's second parse does (M8). Hand-building a `DecorationSet` here
+    /// would test the painter against a set no producer can actually deliver.
+    fn snapshot_with_scopes(script: &[Action], spans: Vec<std::ops::Range<usize>>) -> ViewSnapshot {
+        let ex = smol::Executor::new();
+        let Core { handle, run } = vortex_core::new(64);
+        ex.spawn(run).detach();
+        smol::block_on(ex.run(async move {
+            let (sync_tx, sync_rx) = async_channel::bounded(16);
+            let (event_tx, event_rx) = async_channel::bounded(16);
+            handle
+                .syntax
+                .send(vortex_core::SyntaxHandle {
+                    sync: sync_tx,
+                    events: event_rx,
+                })
+                .await
+                .unwrap();
+            let mut snap = None;
+            for action in script {
+                handle.actions.send(action.clone()).await.unwrap();
+                while handle.deltas.try_recv().is_ok() {}
+                snap = Some(handle.snapshots.recv().await.unwrap());
+            }
+            let snap: ViewSnapshot = snap.expect("script must contain at least one action");
+            event_tx
+                .send(vortex_core::SyntaxEvent::Scopes {
+                    buffer_id: snap.buffer_id,
+                    version: snap.version,
+                    spans,
+                })
+                .await
+                .unwrap();
+            let published = handle.snapshots.recv().await.unwrap();
+            // The core keeps re-sending the buffer for a parse while a highlighter is
+            // attached; holding the receiver until here keeps that channel open.
+            drop(sync_rx);
+            published
+        }))
+    }
+
+    /// The nested fixture the sticky context tests share: a `mod` around a `fn`
+    /// around a run of statements, with the scope ranges those two items span. Long
+    /// enough that a test terminal can scroll into the middle of it without the
+    /// offset being clamped by the end of the file.
+    fn nested_scopes() -> ViewSnapshot {
+        let src = "mod m {\n  fn a() {\n    x1;\n    x2;\n    x3;\n    x4;\n    x5;\n    x6;\n    x7;\n    x8;\n  }\n}\n";
+        let outer = 0..src.len();
+        let inner = src.find("fn a").unwrap()..src.rfind("  }").unwrap() + 3;
+        snapshot_with_scopes(&[Action::Insert(src.into())], vec![outer, inner])
+    }
+
+    #[test]
+    fn sticky_context_pins_the_enclosing_scopes_above_the_text() {
+        // Scrolled to line 4 (`x2;`), which is inside both scopes: the two rows that
+        // opened them are pinned, in outermost-first order, and the text starts below.
+        let snap = nested_scopes();
+        let (buf, state) = render_state(
+            &snap,
+            40,
+            9,
+            PaintInputs {
+                sticky_context: true,
+                follow: false,
+                viewport: ViewState {
+                    scroll: 3,
+                    ..ViewState::default()
+                },
+                ..paint_inputs(0)
+            },
+        );
+        assert_eq!(state.header_height, 2);
+        assert!(
+            row_text(&buf, 1).contains("mod m {"),
+            "{:?}",
+            row_text(&buf, 1)
+        );
+        assert!(
+            row_text(&buf, 2).contains("fn a() {"),
+            "{:?}",
+            row_text(&buf, 2)
+        );
+        // Each pinned row keeps its own line number, which is what makes it a jump
+        // target rather than a caption.
+        assert!(row_text(&buf, 1).trim_start().starts_with('1'));
+        assert!(row_text(&buf, 2).trim_start().starts_with('2'));
+        // The text picks up at the scrolled-to line, not two lines later: the header
+        // took rows from the viewport, it did not consume buffer lines.
+        assert!(row_text(&buf, 3).contains("x2;"), "{:?}", row_text(&buf, 3));
+    }
+
+    #[test]
+    fn the_pinned_rows_wear_the_header_ground() {
+        // The one thing saying these rows are not the lines the text continues from.
+        let snap = nested_scopes();
+        let buf = render_with(
+            &snap,
+            40,
+            9,
+            PaintInputs {
+                sticky_context: true,
+                follow: false,
+                viewport: ViewState {
+                    scroll: 3,
+                    ..ViewState::default()
+                },
+                ..paint_inputs(0)
+            },
+        );
+        let theme = config::Theme::default();
+        for col in 0..40 {
+            assert_eq!(
+                buf.cell((col, 1)).unwrap().bg,
+                theme.sticky_context.bg.unwrap(),
+                "column {col} of the header is not on the header's ground"
+            );
+        }
+        // And the row below it is not: the ground is what draws the boundary.
+        assert_ne!(
+            buf.cell((20, 3)).unwrap().bg,
+            theme.sticky_context.bg.unwrap()
+        );
+    }
+
+    #[test]
+    fn sticky_context_is_off_unless_asked() {
+        // Off means the top row is the text's own, with no row spent on chrome.
+        let snap = nested_scopes();
+        let (buf, state) = render_state(
+            &snap,
+            40,
+            9,
+            PaintInputs {
+                follow: false,
+                viewport: ViewState {
+                    scroll: 3,
+                    ..ViewState::default()
+                },
+                ..paint_inputs(0)
+            },
+        );
+        assert_eq!(state.header_height, 0);
+        assert!(row_text(&buf, 1).contains("x2;"), "{:?}", row_text(&buf, 1));
+    }
+
+    #[test]
+    fn the_caret_stays_in_the_window_the_header_left() {
+        // The regression a real terminal caught: following the caret has to aim at
+        // the *shortened* window. Shifting the followed line up by the header's
+        // height as well - to "clear" rows the text no longer occupies - leaves the
+        // caret that many rows below the last painted one, which reads as the view
+        // refusing to reach the end of the file.
+        let snap = nested_scopes();
+        let (_, state) = render_state(
+            &snap,
+            40,
+            8,
+            PaintInputs {
+                sticky_context: true,
+                // The caret is at the end of the inserted text - the last line, and
+                // the one a too-clever follow leaves off screen.
+                viewport: ViewState::default(),
+                ..paint_inputs(0)
+            },
+        );
+        let caret_line = snap.text.line_of_byte(snap.selections[snap.primary].head);
+        assert!(state.header_height > 0, "the fixture must pin something");
+        assert!(
+            (state.scroll..state.scroll + state.page_height).contains(&caret_line),
+            "caret on line {caret_line} is outside the {} rows painted from {}",
+            state.page_height,
+            state.scroll
+        );
+    }
+
+    #[test]
+    fn the_last_line_is_still_reachable_under_a_header() {
+        // The header shortens the window, so the scroll has to be allowed that much
+        // further - otherwise the final rows of a file could not be brought on screen.
+        let snap = nested_scopes();
+        let (buf, state) = render_state(
+            &snap,
+            40,
+            6,
+            PaintInputs {
+                sticky_context: true,
+                follow: false,
+                viewport: ViewState {
+                    scroll: 99,
+                    ..ViewState::default()
+                },
+                ..paint_inputs(0)
+            },
+        );
+        let last = layout::display_line_count(&snap.text) - 1;
+        assert!(
+            state.scroll + state.page_height > last,
+            "last line {last} is off screen: scroll {} + {} rows",
+            state.scroll,
+            state.page_height
+        );
+        // And nothing is painted past it: the offset is still clamped to the content.
+        assert!(
+            row_text(&buf, 4).trim().is_empty() || state.scroll + state.page_height == last + 1
+        );
+    }
+
+    #[test]
+    fn pressing_a_pinned_row_goes_to_the_line_that_opened_the_scope() {
+        // The header is a set of jump targets, and the rows are re-derived from the
+        // same snapshot and offset the frame painted them from, so what was clicked
+        // and what was drawn cannot disagree.
+        let snap = nested_scopes();
+        let viewport = ViewState {
+            scroll: 3,
+            page_height: 6,
+            header_height: 2,
+            h_scroll: 0,
+        };
+        let press = |row: u16| {
+            press_action(
+                &snap,
+                viewport,
+                config::DEFAULT_TAB_WIDTH,
+                MouseEvent {
+                    kind: MouseEventKind::Down(ratatui::crossterm::event::MouseButton::Left),
+                    column: 10,
+                    row,
+                    modifiers: KeyModifiers::NONE,
+                },
+                1,
+            )
+        };
+        // Row 1 is the outer scope's row, row 2 the inner one's.
+        assert_eq!(
+            press(1),
+            Action::PlaceCursor {
+                offset: 0,
+                extend: false
+            }
+        );
+        let inner_start = snap.text.byte_of_line(1).unwrap();
+        assert_eq!(
+            press(2),
+            Action::PlaceCursor {
+                offset: inner_start,
+                extend: false
+            }
+        );
+        // A press on the first *text* row is a caret placement in that line, not a
+        // jump: the header's rows end where the text begins.
+        let text_row = snap.text.byte_of_line(3).unwrap();
+        assert!(matches!(
+            press(3),
+            Action::PlaceCursor { offset, .. } if offset >= text_row
+        ));
+    }
+
+    #[test]
+    fn toggling_sticky_context_flips_the_live_config_both_ways() {
+        let Core { handle, run: _ } = vortex_core::new(64);
+        let mut config = config::Config::default();
+        let mut overlays = Compositor::new();
+        let mut toasts = Toasts::new(config.theme.toast_info, config.theme.toast_error);
+        let mut search = buffersearch::SearchState::default();
+        let mut toggle = |config: &mut config::Config| {
+            let mut ui = Frontend {
+                overlays: &mut overlays,
+                toasts: &mut toasts,
+                config,
+                snapshot: None,
+                search: &mut search,
+            };
+            assert!(dispatch_command(
+                Command::ToggleStickyContext,
+                &handle,
+                &mut ui
+            ));
+        };
+        assert!(!config.sticky_context, "off unless the file asks");
+        toggle(&mut config);
+        assert!(
+            config.sticky_context,
+            "the toggle turns it on for the session"
+        );
+        toggle(&mut config);
+        assert!(!config.sticky_context, "and off again");
     }
 
     #[test]
@@ -3224,6 +3755,7 @@ mod tests {
                         scroll,
                         h_scroll: 0,
                         page_height: 10,
+                        header_height: 0,
                     },
                     scrollbar: true,
                     ..paint_inputs(0)
@@ -3269,6 +3801,7 @@ mod tests {
                         scroll,
                         h_scroll: 0,
                         page_height: track,
+                        header_height: 0,
                     },
                     scrollbar: true,
                     ..paint_inputs(0)
@@ -3335,20 +3868,33 @@ mod tests {
     fn the_scrollbar_column_is_hit_tested_where_it_paints() {
         let screen = Rect::new(0, 0, 80, 24);
         // The rightmost column, on a body row.
-        assert!(on_scrollbar(screen, 79, 1));
-        assert!(on_scrollbar(screen, 79, 22));
+        assert!(on_scrollbar(screen, 0, 79, 1));
+        assert!(on_scrollbar(screen, 0, 79, 22));
         // Not the column to its left.
-        assert!(!on_scrollbar(screen, 78, 5));
+        assert!(!on_scrollbar(screen, 0, 78, 5));
         // Row 0 is the bufferline and row 23 the status bar; both are their own
         // controls, and each answers before this one.
-        assert!(!on_scrollbar(screen, 79, 0));
-        assert!(!on_scrollbar(screen, 79, 23));
+        assert!(!on_scrollbar(screen, 0, 79, 0));
+        assert!(!on_scrollbar(screen, 0, 79, 23));
         // A screen with no width at all has no column to hit.
-        assert!(!on_scrollbar(Rect::new(0, 0, 0, 24), 0, 5));
+        assert!(!on_scrollbar(Rect::new(0, 0, 0, 24), 0, 0, 5));
         // A row a terminal should never report still has to be an answer rather than
         // an overflow - this arrives from outside (CLAUDE.md: no panics on input paths).
-        assert!(!on_scrollbar(screen, 79, u16::MAX));
-        assert!(!on_scrollbar(Rect::new(0, 0, 80, 0), 79, u16::MAX));
+        assert!(!on_scrollbar(screen, 0, 79, u16::MAX));
+        assert!(!on_scrollbar(Rect::new(0, 0, 80, 0), 0, 79, u16::MAX));
+    }
+
+    #[test]
+    fn the_sticky_header_rows_are_not_the_scrollbar_track() {
+        // The bar paints over the text rows only, so its column above them belongs to
+        // the header - a press there must not throw the view to the top of the file.
+        let screen = Rect::new(0, 0, 80, 24);
+        assert!(!on_scrollbar(screen, 2, 79, 1));
+        assert!(!on_scrollbar(screen, 2, 79, 2));
+        assert!(on_scrollbar(screen, 2, 79, 3));
+        // A header claiming more rows than the screen has leaves no track at all,
+        // rather than wrapping into one.
+        assert!(!on_scrollbar(screen, usize::MAX, 79, 5));
     }
 
     #[test]
@@ -4420,6 +4966,7 @@ mod tests {
             scroll: 50,
             h_scroll: 0,
             page_height: 4,
+            header_height: 0,
         };
         terminal
             .draw(|frame| {
@@ -4454,6 +5001,7 @@ mod tests {
             scroll: 0,
             h_scroll: 40,
             page_height: 2,
+            header_height: 0,
         };
         terminal
             .draw(|frame| {
@@ -4493,6 +5041,7 @@ mod tests {
             scroll: 2,
             h_scroll: 0,
             page_height: 4,
+            header_height: 0,
         };
         let mut settled = ViewState::default();
         let mut terminal = Terminal::new(TestBackend::new(20, 6)).unwrap();
@@ -4526,6 +5075,7 @@ mod tests {
             scroll: 0,
             h_scroll: 0,
             page_height: 8,
+            header_height: 0,
         };
         // Screen row 2 is body row 1 = line "cdef" (starts at byte 3); the gutter
         // edge (column 4) maps to its first character.

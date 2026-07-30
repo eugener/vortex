@@ -231,6 +231,7 @@ struct ThemeFile {
     indent_guide: Option<StyleSpec>,
     scrollbar_track: Option<StyleSpec>,
     scrollbar_thumb: Option<StyleSpec>,
+    sticky_context: Option<StyleSpec>,
     secondary_cursor: Option<StyleSpec>,
     search_match: Option<StyleSpec>,
     search_current: Option<StyleSpec>,
@@ -292,6 +293,7 @@ impl ThemeFile {
                 self.scrollbar_thumb,
                 base.scrollbar_thumb,
             )?,
+            sticky_context: slot("sticky_context", self.sticky_context, base.sticky_context)?,
             secondary_cursor: slot(
                 "secondary_cursor",
                 self.secondary_cursor,

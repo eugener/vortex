@@ -673,8 +673,57 @@ add noise, each on/off switch a key in the config file the M5 loader now reads:
   and the gutter already takes the tint, so the row would be washed at both ends and
   broken at one. The bar paints over it afterwards and its styles set a foreground only,
   so the track and thumb land on the row's ground rather than punching the hole back in.
-- **Sticky context header** - pin the enclosing scope (function/class) at the viewport top;
-  needs tree-sitter, so it pairs with M4.
+- **Sticky context header** - *built (M8).* `sticky_context = true` in the config file,
+  plus `toggle_sticky_context`. The first line of every scope enclosing the viewport's
+  top row, pinned above the text, outermost first, each row carrying its own line
+  number - which is what makes the header a set of jump targets rather than a caption:
+  a press on one goes to the line that opened that scope.
+  **It needs the parse tree, which the highlighter cannot hand over**, so the producer
+  parses the source a second time (`syntax::scope`, driven by a per-language
+  `context.scm`). `tree_sitter_highlight::Highlighter::highlight` takes source bytes and
+  returns an event stream; there is no way to reach the tree it built or to give it one.
+  The alternatives were re-implementing highlighting over a raw `Query` - re-deriving
+  the locals and injection machinery M4 already has working - or a second parse. The
+  second parse is off the keystroke path, coalesced by the same drain-to-newest that
+  keeps fast typing from queueing parses, and **paid only by grammars that ship a
+  `context.scm`**: an empty context query means the producer does no scope work at all.
+  It collapses back to one parse if incremental reparse (§14, deferred in M4) lands,
+  since that change means owning the tree here anyway.
+  **The whole file's scope ranges cross the seam, not the answer for one row**, because
+  the row in question changes on *scroll* and scrolling is frontend-owned (§5) - asking
+  the core would put a round-trip on the scroll path, the same reason the search preview
+  stays frontend-side. They ride the decoration channel as `Decoration::Scope`, so
+  anchors carry them across edits and the header keeps naming the right function while
+  you type. It is the one decoration not painted *at* its position; it is on this channel
+  because it is a position that must survive concurrent edits, which is what the channel
+  is for. Its own **bucket** (`DecorationSource::Scope`), separate from the highlights
+  the same producer publishes, and that separation is load-bearing rather than tidy:
+  scopes are *nested* by construction, so their ends are not monotonic, while
+  `highlights_in` binary-searches a bucket on exactly the sorted-non-overlapping
+  invariant highlights have. Mixing them would misplace the highlight search, not merely
+  slow it.
+  **The header's height and the scroll offset are each other's input** - the header pins
+  what encloses the top line, and the top line is what the header's rows push down to -
+  so a frame settles them together (`STICKY_SETTLE_PASSES`) rather than letting them
+  chase each other across repaints. Two passes is the fixed point whenever the view is at
+  rest; the third is a bound, so a pair that would oscillate stops a row off instead of
+  spinning. The height is **dynamic**, capped at `STICKY_CONTEXT_MAX` rows and at a third
+  of the body: reserving a fixed block would spend rows on blank chrome at the top of a
+  file, and a file's nesting depth is a length the *file* chooses (§10.4). Over budget,
+  the **outermost** rows are dropped - the row a reader needs is the function they are
+  inside, not the module three levels out.
+  The text window shrinks by exactly the header's height, so **no line is ever behind a
+  pinned row**, and following the caret is therefore just `scroll_to_show` in the shorter
+  window. The tempting extra step - shifting the followed line up by the header's height
+  to "clear" it - pushes the caret that many rows off the *bottom*, since the rows it
+  clears are ones the text no longer occupies. That shipped in a first draft, passed a
+  test asserting the wrong invariant, and was caught by driving the editor in a pty.
+  Scope ranges confined to one line never cross the seam: once such a line is above the
+  viewport, so is all of it, and nothing about it encloses what is on screen.
+  The scrollbar, when both are on, is painted over the **text** area rather than the whole
+  body - the track stands for what scrolls, and the pinned rows do not - which is also
+  what keeps a press on the bar's column above the text from throwing the view to the top
+  of the file.
 - **Current-line tint, selection wash, multi-cursor carets** - already built (M1-M3); listed
   so the catalog is complete.
 
@@ -947,18 +996,19 @@ Cleanups that were identified, judged real, and deliberately not taken yet. Each
 the condition that should pull it forward, so they are scheduled rather than forgotten.
 None is a correctness bug today.
 
-- **The head-bar / body / status split is written out in four places.** `paint` owns the
-  real one (`Layout::vertical([Length(1), Min(0), Length(1)])`), and three hit tests
-  re-derive it independently: `on_scrollbar` as `row >= 1 && row < height - 1`,
-  `pointer_offset` and the scrollbar's drag handler each as `row.saturating_sub(1)`. Every
-  copy agrees today. **Deferred because** collapsing them means a shared
-  `body_rect(area) -> Rect` threaded through hit tests that currently take a
-  `page_height`, which is a refactor of tested code reaching well past whatever change
-  prompts it. **Trigger: the head bar growing a second row** - sticky context is on M8's
-  own list, and it is exactly the change that would make the copies disagree with no
-  compile error and no failing test: the bar would paint one row lower while the hit tests
-  answered for the old geometry, so presses land a row off and the track's top row goes
-  dead.
+- ~~**The head-bar / body / status split is written out in four places.**~~ **Paid off
+  (2026-07-30), by its own trigger.** The note predicted that sticky context - "on M8's own
+  list" - would be the change that made the copies disagree with no compile error and no
+  failing test, and it was: the header pushes the text down, so `on_scrollbar`,
+  `pointer_offset`, the scrollbar's drag handler and the new pinned-row hit test would each
+  have had to subtract the same two numbers by hand, and a fourth copy was being added at
+  the same time. They now all ask `layout::row_at(screen_row, header_height) -> Row`
+  (`Head` / `Header(i)` / `Text(i)`), which is a pure function with its own tests rather
+  than the `body_rect(area) -> Rect` this note proposed - the callers want *which row is
+  this*, not a rectangle, and answering that directly kept `page_height` out of it. The
+  status bar stays outside the split deliberately: it is a row the event loop answers
+  before any of these, so distinguishing it would mean carrying a screen height into a
+  question none of them otherwise needs it for.
 - **A guide is a glyph substitution outside `render_line` plus a style overlay inside it.**
   Every other marker (ruler, selection, search, syntax, diagnostic, secondary caret) is one
   `(Range<usize>, Style)` in the overlay list; the indent guide alone needs a second
@@ -1357,9 +1407,9 @@ Incremental build order so the risky assumptions are validated early, not at the
   *Verify:* open a file via the picker, switch buffers, run a command via the palette -
   in-terminal.
 - **M8 - Chrome + polish.** *(in progress.)* **Landed:** relative line numbers, rulers,
-  indent guides, the scrollbar. **Left:** git diff signs (a git-diff task feeding
-  `GutterMark`s; its git source - `gix` / `git2` - is a §3 stack addition to raise),
-  sticky context (tree-sitter), cursor-shape-per-mode. Unlike the earlier milestones these are
+  indent guides, the scrollbar, sticky context. **Left:** git diff signs (a git-diff task
+  feeding `GutterMark`s; its git source - `gix` / `git2` - is a §3 stack addition to
+  raise), cursor-shape-per-mode. Unlike the earlier milestones these are
   **independent items sharing one shape** rather than an arc: each reads data the snapshot
   or decoration channel already carries, each is a config key over a theme slot (§7.5), and
   none needs a seam change - so they land one at a time and in any order, and the milestone
@@ -1383,7 +1433,14 @@ Incremental build order so the risky assumptions are validated early, not at the
   drags each landing on the offset the linear map predicts to the line, the second of
   those drags twenty columns *off* the bar and still scrolling rather than selecting
   text, and `Ln 1, Col 1` unmoved in the status bar throughout - the view goes where it
-  is thrown and the caret stays where it was.
+  is thrown and the caret stays where it was. Sticky context driven in a pty over a
+  27-line nested Rust file in an 18-row body: two page-downs pinning `fn describe` /
+  `for` / `if` / `} else {` - the innermost four of the six scopes enclosing the top row -
+  with the text below them contiguous and the caret's own line still on screen, and a
+  press on the second pinned row jumping to the line that opened it (`Ln 10`) and the
+  header re-resolving to `mod` / `impl` / `fn` for the new top line. That run is what
+  caught the follow bug the §7.5 entry records; the unit test that was supposed to cover
+  it had asserted the wrong invariant and passed.
 
 Extensibility (§12.1) sits after the M0-M8 build order and is gated on that decision.
 
