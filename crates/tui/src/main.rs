@@ -1653,15 +1653,32 @@ fn paint(frame: &mut Frame, snapshot: &ViewSnapshot, inputs: PaintInputs) -> Vie
         scroll = next;
         header = layout::sticky_lines(&snapshot.text, &snapshot.decorations, scroll, budget);
     }
+    // Re-clamp against the height actually painted: had the loop run out of passes,
+    // the offset would have been capped for a header a row taller or shorter than
+    // this one, and an offset past the content paints blank rows below the last line.
+    //
+    // **And re-derive the header when that moves the top line**, because the pinned
+    // rows have to describe the line they sit above. Clamping alone would leave the
+    // frame holding a header computed for a line it is no longer showing - which
+    // paints the wrong depth, and, since `press_action` re-derives a click's target
+    // from the same `(scroll, header_height)` pair, sends a press on a pinned row to
+    // a different line than the one it is labelled with. A no-op whenever the loop
+    // reached its fixed point, which is every ordinary frame: the clamp is then the
+    // one `offset_for` already applied.
+    let clamped =
+        scroll.min(display_lines.saturating_sub(body_height.saturating_sub(header.len())));
+    if clamped != scroll {
+        scroll = clamped;
+        header = layout::sticky_lines(&snapshot.text, &snapshot.decorations, scroll, budget);
+    }
+    let (scroll, header) = (scroll, header);
     let header_height = header.len();
     let text_height = body_height.saturating_sub(header_height);
-    // Re-clamp against the height actually painted. A no-op whenever the loop above
-    // settled - it exits with the offset and the header agreeing - and the guard for
-    // when it ran out of passes instead: the offset would then have been capped for a
-    // header a row taller or shorter than this one, and an offset past the content
-    // paints blank rows below the last line.
+    // What the offset could have been for *this* header. The pair above is settled on
+    // the header's terms rather than the offset's, so a non-convergent frame can sit
+    // up to `budget` rows past this - a few blank rows at the very bottom of a file,
+    // which is the better failure than a header naming a scope the text is not in.
     let max_scroll = display_lines.saturating_sub(text_height);
-    let scroll = scroll.min(max_scroll);
     // The `+ 1` on the horizontal extent leaves a cell for the caret sitting just
     // past the line's last glyph.
     let line_width = layout::display_column(&line_text, line_text.len(), tab_width);
@@ -3370,6 +3387,92 @@ mod tests {
         let outer = 0..src.len();
         let inner = src.find("fn a").unwrap()..src.rfind("  }").unwrap() + 3;
         snapshot_with_scopes(&[Action::Insert(src.into())], vec![outer, inner])
+    }
+
+    /// Buffers whose scope depth is *not* monotonic in the top line - a deep run, a
+    /// shallow gap, then another deep run, which is the shape a `match`'s arms or a
+    /// sequence of nested blocks produces. This is what makes the header's height and
+    /// the scroll offset disagree if the frame settles them carelessly.
+    fn irregular_scope_layouts(lines: usize) -> (String, Vec<Vec<std::ops::Range<usize>>>) {
+        let src: String = (0..lines).map(|i| format!("l{i}\n")).collect();
+        let off = |line: usize| src.find(&format!("l{line}\n")).unwrap();
+        let layouts = vec![
+            vec![
+                off(0)..src.len(),
+                off(1)..off(6),
+                off(2)..off(5),
+                off(8)..src.len(),
+            ],
+            vec![
+                off(0)..off(4),
+                off(1)..off(3),
+                off(5)..src.len(),
+                off(6)..off(9),
+                off(7)..off(8),
+            ],
+            vec![
+                off(0)..src.len(),
+                off(1)..src.len(),
+                off(2)..src.len(),
+                off(3)..off(9),
+                off(4)..off(8),
+            ],
+        ];
+        (src, layouts)
+    }
+
+    #[test]
+    fn the_painted_header_always_describes_the_painted_top_line() {
+        // The invariant the whole feature rests on: the pinned rows name the scopes
+        // enclosing the line the text starts at. It is not automatic, because the
+        // frame settles two mutually dependent values and then clamps the offset to
+        // the content - and a clamp that moved the top line without re-deriving the
+        // header left the frame painting one depth while sitting at another. A press
+        // on a pinned row then went to a different line than its own label, since
+        // `press_action` re-derives the click's target from this same pair.
+        for lines in [14usize, 20, 26] {
+            let (src, layouts) = irregular_scope_layouts(lines);
+            for spans in layouts {
+                let snap = snapshot_with_scopes(&[Action::Insert(src.clone())], spans);
+                for height in [8u16, 12, 16, 19] {
+                    for start in [0usize, 3, 7, 11, 99] {
+                        for follow in [true, false] {
+                            let (_, state) = render_state(
+                                &snap,
+                                40,
+                                height,
+                                PaintInputs {
+                                    sticky_context: true,
+                                    follow,
+                                    viewport: ViewState {
+                                        scroll: start,
+                                        ..ViewState::default()
+                                    },
+                                    ..paint_inputs(0)
+                                },
+                            );
+                            let body = height as usize - 2;
+                            let truth = layout::sticky_lines(
+                                &snap.text,
+                                &snap.decorations,
+                                state.scroll,
+                                layout::sticky_budget(body),
+                            );
+                            assert_eq!(
+                                state.header_height,
+                                truth.len(),
+                                "{lines}-line buffer, {height}-row terminal, from {start} \
+                                 (follow={follow}): painted {} pinned rows at offset {}, \
+                                 where {} scopes enclose the top line",
+                                state.header_height,
+                                state.scroll,
+                                truth.len()
+                            );
+                        }
+                    }
+                }
+            }
+        }
     }
 
     #[test]
