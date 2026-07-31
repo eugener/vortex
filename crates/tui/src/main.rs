@@ -789,6 +789,11 @@ fn event_loop(
     // postpone the next one (see [`COALESCE`]). Starts now rather than at the epoch so
     // the first frame is not treated as already overdue.
     let mut last_drawn = Instant::now();
+    // Whether the last iteration had a search preview holding the viewport. A preview
+    // is the one thing besides the caret that the view follows, and it is *frontend*
+    // state - cancelling it moves no caret and bumps no version, so nothing else marks
+    // the moment it lets go.
+    let mut was_previewing = false;
 
     loop {
         // Take the newest snapshot if the core published one (latest-wins cell).
@@ -882,6 +887,14 @@ fn event_loop(
             // core's own event rather than inferred from the list shrinking.
             if let vortex_core::Notification::BufferClosed { buffer_id } = &note {
                 viewports.remove(buffer_id);
+                // ...and it must not be parked again on the way out. `painted` is the
+                // id the swap below stores the outgoing viewport under, so leaving it
+                // pointing at a closed buffer re-inserted the entry moments after this
+                // dropped it - and since ids are never reused, every buffer ever
+                // closed left a dead `ViewState` behind for the session.
+                if painted == Some(*buffer_id) {
+                    painted = None;
+                }
             }
             // A copy/cut asks us to mirror the register to the OS clipboard. We push
             // it over OSC 52 (clipboard-over-terminal), which works locally and over
@@ -956,6 +969,20 @@ fn event_loop(
             viewport = viewports.get(&snap.buffer_id).copied().unwrap_or_default();
             painted = Some(snap.buffer_id);
         }
+
+        // A search preview owns the viewport while it exists - `paint` follows the
+        // *match* rather than the caret - so the frames it drives record a caret they
+        // were not showing. When it lets go, the reason the view sits away from the
+        // caret goes with it, and the view must come back: Esc on a find prompt would
+        // otherwise leave the reader parked on a match they just rejected, with the
+        // caret off screen until the next keystroke snapped it back. Voided rather
+        // than followed directly, the same way a resize says "what the last frame
+        // showed is no longer the question".
+        let previewing = search.preview().is_some();
+        if was_previewing && !previewing {
+            viewport.shown = None;
+        }
+        was_previewing = previewing;
 
         // Chase the caret only when the caret (or the text under it) has actually moved
         // since the frame that last showed it - see [`ViewState::shown`]. Derived per
@@ -1118,6 +1145,13 @@ fn event_loop(
                         if result == EventResult::Consumed {
                             continue;
                         }
+                        // Falling through means the click belongs to the editor, and
+                        // the overlay that declined it must not stay painted over what
+                        // the click is about to do - the same conclusion the key path
+                        // reaches when a binding fires over an open overlay. Without
+                        // this the two input routes would disagree about what "fell
+                        // through" means the first time a layer uses the escape hatch.
+                        overlays.dismiss();
                     }
 
                     // A toast sits over the editor, so a click on one is a click on it
@@ -1157,7 +1191,7 @@ fn event_loop(
                                     &snap.buffers,
                                     snap.buffer_id,
                                     count_width,
-                                    terminal.size()?.width as usize,
+                                    screen.width as usize,
                                 );
                                 // A click on an overflow marker, the padding, or the line
                                 // count selects nothing and is simply swallowed.
@@ -1178,12 +1212,12 @@ fn event_loop(
                             // (SPEC §7.5). Checked before the body, since the bar is not
                             // text - and only on the bottom row, so a drag that ends
                             // there still belongs to the selection it was sweeping.
-                            let bottom = terminal.size()?.height.saturating_sub(1);
+                            let bottom = screen.height.saturating_sub(1);
                             if is_press && mouse.row == bottom {
                                 if let Some(target) = status_target_at(
                                     snap,
                                     selected,
-                                    terminal.size()?.width as usize,
+                                    screen.width as usize,
                                     mouse.column as usize,
                                 ) {
                                     let command = match target {
@@ -1225,15 +1259,13 @@ fn event_loop(
                             // off - it no longer skips the common case, now that the bar is
                             // on by default, so the `is_press` guard is what does the work.
                             if is_press {
-                                dragging_scrollbar = config.scrollbar && {
-                                    let screen = terminal.size()?;
-                                    on_scrollbar(
-                                        Rect::new(0, 0, screen.width, screen.height),
+                                dragging_scrollbar = config.scrollbar
+                                    && on_scrollbar(
+                                        screen,
                                         viewport.header_height,
                                         mouse.column,
                                         mouse.row,
-                                    )
-                                };
+                                    );
                             }
                             // The column can be taken away mid-gesture - the palette's
                             // toggle is reachable with the button still down - and a drag
@@ -1296,10 +1328,19 @@ fn event_loop(
                         // Clamped as it goes - see `scroll_down_by_wheel` for why the
                         // paint's own clamp is not enough.
                         MouseEventKind::ScrollDown => {
-                            let Some(snap) = &latest else { continue };
+                            // No snapshot yet means nothing is known to bound against,
+                            // not that the notch is refused - bailing here while the
+                            // arm below still scrolled would make the two directions
+                            // disagree before the first frame. `page_height` is 0 until
+                            // something paints, so the bound is briefly "every line in
+                            // the file" rather than "the last screenful"; the first
+                            // frame narrows it.
+                            let display_lines = latest
+                                .as_ref()
+                                .map_or(usize::MAX, |snap| layout::display_line_count(&snap.text));
                             viewport.scroll = scroll_down_by_wheel(
                                 viewport.scroll,
-                                layout::display_line_count(&snap.text),
+                                display_lines,
                                 viewport.page_height,
                             );
                             needs_redraw = true;
@@ -1338,7 +1379,16 @@ fn event_loop(
                 // that should pull back to the caret without it having moved.
                 Event::Resize(_, _) => {
                     needs_redraw = true;
+                    // Every buffer's, not just the live one's. A parked viewport keeps
+                    // what its buffer's last frame showed, and a switch back to it
+                    // restores that - so voiding only the active one left the others
+                    // believing a window height that no longer exists, and a buffer
+                    // returned to after a shrink kept a scroll with its caret below the
+                    // last visible row.
                     viewport.shown = None;
+                    for parked in viewports.values_mut() {
+                        parked.shown = None;
+                    }
                 }
                 _ => {}
             }
@@ -4194,6 +4244,52 @@ mod tests {
         for note in [&conflict, &rejected, &removed] {
             assert!(toast::toast_for(note).is_some());
         }
+    }
+
+    #[test]
+    fn a_preview_letting_go_of_the_viewport_sends_it_back_to_the_caret() {
+        // Esc on a find prompt clears frontend state only: no caret moves and no
+        // version is bumped, so nothing marks the moment the preview stops owning the
+        // view. Without voiding, the reader was left parked on a match they had just
+        // rejected, caret off screen, until the next keystroke snapped it back. This is
+        // the rule the loop applies; `a_preview_holds_the_view_until_it_is_cancelled`
+        // in the pty log is the end-to-end half.
+        let shown = Some((7, 100));
+        // While the preview holds it, nothing has moved, so nothing would follow.
+        assert!(!should_follow(shown, 7, 100));
+        // Voiding is what the loop does when the preview lets go, and it is enough.
+        assert!(should_follow(None, 7, 100));
+    }
+
+    #[test]
+    fn closing_a_buffer_does_not_park_the_viewport_it_just_dropped() {
+        // `BufferClosed` removes the entry and the swap re-inserts it a moment later
+        // under `painted`, so every buffer ever closed left a dead ViewState behind -
+        // ids are never reused, so nothing ever reclaimed them. Clearing `painted` is
+        // what stops the park; this pins the shape the loop relies on.
+        let mut viewports: HashMap<BufferId, ViewState> = HashMap::new();
+        let closed = BufferId(1);
+        let mut painted = Some(closed);
+        viewports.insert(closed, ViewState::default());
+
+        // The BufferClosed arm.
+        viewports.remove(&closed);
+        if painted == Some(closed) {
+            painted = None;
+        }
+        // The swap arm, for the buffer that replaced it.
+        let live = BufferId(2);
+        if painted != Some(live) {
+            if let Some(previous) = painted {
+                viewports.insert(previous, ViewState::default());
+            }
+            painted = Some(live);
+        }
+        assert!(
+            viewports.is_empty(),
+            "the closed buffer was parked again after being dropped"
+        );
+        assert_eq!(painted, Some(live));
     }
 
     #[test]

@@ -81,17 +81,21 @@ impl WatchSet {
     /// Stop watching `file`. Returns the directory the caller must release, or
     /// `None` while other watched files still live in it.
     ///
-    /// Falls back to finding the entry by *file name* when the path no longer
-    /// resolves. A directory removed while its file was open (`rm -rf` on a checkout)
-    /// makes `resolve_key` fail, and returning early there leaked both the entry and
-    /// the `notify` watch under it for the rest of the session - the accumulation this
-    /// whole request exists to prevent, in exactly the case that produces it.
+    /// Falls back to the key this exact path resolved to *when it was watched* (see
+    /// [`Self::requested`]) whenever resolving it now does not name something watched.
+    /// Two ways that happens, and both leaked the entry and the `notify` watch under it
+    /// for the rest of the session - the accumulation this request exists to prevent,
+    /// in the cases that produce it:
+    ///
+    /// - The directory was removed while the file was open (`rm -rf` on a checkout), so
+    ///   `resolve_key` fails outright.
+    /// - The file is a symlink whose *target* was removed, so `resolve_key` **succeeds**
+    ///   and hands back the link's own location rather than the target the watch is
+    ///   keyed under. Testing only for failure would miss this one entirely.
     pub fn unwatch(&mut self, file: &Path) -> Option<PathBuf> {
         let key = match resolve_key(file) {
-            Some(key) => key,
-            // The directory is gone, so ask what this path resolved to when it was
-            // still there rather than giving up and leaking the watch.
-            None => self.requested.get(file).cloned()?,
+            Some(key) if self.files.contains(&key) => key,
+            _ => self.requested.get(file).cloned()?,
         };
         self.requested.remove(file);
         let dir = key.parent()?.to_path_buf();

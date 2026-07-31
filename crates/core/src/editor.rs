@@ -1200,6 +1200,14 @@ async fn recv_attach<H>(attach: &Receiver<H>) -> H {
 /// way. Resolving the directory also handles a symlinked one (`/tmp` → `/private/tmp`),
 /// where the raw spellings differ even though neither is wrong.
 ///
+/// **A broken symlink is followed one hop** before that is done, because the two sides
+/// are otherwise fed different files. `vortex ~/.vimrc` stores the *link*, while the
+/// watcher canonicalizes and so reports events against the *target* - and the moment
+/// the target is deleted, the link stops canonicalizing and the same algorithm applied
+/// to each gives two different answers. Reading the link restores the agreement. One
+/// hop, not a chain: a link to a link to a deleted file is rare enough not to pay for,
+/// and each extra hop is another `readlink`.
+///
 /// Only a path whose *directory* is also unresolvable falls back to itself: two
 /// spellings of a file in a directory that does not exist can still duplicate, which
 /// self-corrects the moment either is saved.
@@ -1207,6 +1215,24 @@ fn file_identity(path: &Path) -> PathBuf {
     if let Ok(real) = path.canonicalize() {
         return real;
     }
+    // A symlink whose target is gone: resolve what it pointed at instead of the link,
+    // since that is the path every other producer of this identity will be using. A
+    // relative target is relative to the link's own directory.
+    if let Ok(target) = path.read_link() {
+        let resolved = if target.is_absolute() {
+            target
+        } else {
+            path.parent().unwrap_or(Path::new(".")).join(target)
+        };
+        return resolve_through_parent(&resolved);
+    }
+    resolve_through_parent(path)
+}
+
+/// `path`'s directory canonicalized, plus its file name - the reduction that survives
+/// the file itself having been deleted. Falls back to `path` when even the directory
+/// is unresolvable.
+fn resolve_through_parent(path: &Path) -> PathBuf {
     let Some(name) = path.file_name() else {
         return path.to_path_buf();
     };
@@ -2323,6 +2349,9 @@ async fn reload(
     // `std::fs::read` until some writer appeared, on the single actor thread, hanging
     // the whole editor with no way out - which is exactly what the guard on the open
     // path exists to prevent, and `is_writable` already assumes has happened.
+    // Every failure below names the document being *reloaded*, which a watcher event
+    // can aim at any open buffer - not whichever one happens to be focused.
+    let reloading = session.docs[index].id;
     let metadata = match std::fs::metadata(&path) {
         Ok(metadata) if !metadata.is_file() => {
             let kind = if metadata.is_dir() {
@@ -2330,7 +2359,14 @@ async fn reload(
             } else {
                 "not a regular file"
             };
-            return report_file_error(session, Some(path), kind, snapshots, notifications);
+            return report_file_error_for(
+                session,
+                reloading,
+                Some(path),
+                kind,
+                snapshots,
+                notifications,
+            );
         }
         Ok(metadata) => Some(metadata),
         // Gone between the event and this stat. The read below reports it.
@@ -2338,8 +2374,9 @@ async fn reload(
     };
     let bytes = match std::fs::read(&path) {
         Ok(bytes) if crate::file::is_binary(&bytes) => {
-            return report_file_error(
+            return report_file_error_for(
                 session,
+                reloading,
                 Some(path),
                 "binary file (contains NUL bytes)",
                 snapshots,
@@ -2348,8 +2385,9 @@ async fn reload(
         }
         Ok(bytes) => bytes,
         Err(err) => {
-            return report_file_error(
+            return report_file_error_for(
                 session,
+                reloading,
                 Some(path),
                 &err.to_string(),
                 snapshots,
@@ -2399,7 +2437,14 @@ async fn reload(
     // conflict that had already been settled. Stamped from the stat taken before the
     // read, in the same direction `open_file` argues for - an older stamp than the
     // bytes costs a redundant reload, a newer one misses a change entirely.
-    doc.disk = metadata.as_ref().and_then(DiskStamp::of);
+    doc.disk = match &metadata {
+        Some(metadata) => DiskStamp::of(metadata),
+        // The stat lost a race the read then won - an external `rm` followed by a
+        // `cp`, with the event landing between them. Storing `None` would tell the
+        // next save the file is gone and earn an overwrite prompt for a conflict that
+        // does not exist, which is the defect this whole block exists to remove.
+        None => DiskStamp::read(&path),
+    };
     doc.conflict = false;
 
     let id = doc.id;
@@ -2757,8 +2802,27 @@ fn report_file_error(
     snapshots: &SnapshotSink,
     notifications: &Sender<Notification>,
 ) -> bool {
+    let id = session.active().id;
+    report_file_error_for(session, id, path, message, snapshots, notifications)
+}
+
+/// [`report_file_error`] for a document that is **not** necessarily the active one.
+///
+/// Almost every file operation is something the user asked of the buffer in front of
+/// them, so the active id is right. A *reload* is not: it is driven by a watcher event,
+/// which can name any open buffer, and reporting its failure against whatever happens
+/// to be focused marks the wrong tab as broken and leaves the file that actually
+/// changed looking fine.
+fn report_file_error_for(
+    session: &mut Session,
+    buffer_id: BufferId,
+    path: Option<PathBuf>,
+    message: &str,
+    snapshots: &SnapshotSink,
+    notifications: &Sender<Notification>,
+) -> bool {
     let _ = notifications.try_send(Notification::FileError {
-        buffer_id: session.active().id,
+        buffer_id,
         path,
         message: message.to_string(),
     });

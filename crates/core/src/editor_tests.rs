@@ -1005,8 +1005,9 @@ fn reloading_a_fifo_is_refused_rather_than_blocking_the_actor() {
     );
 }
 
+#[cfg(unix)]
 #[test]
-fn a_deletion_reaches_a_buffer_opened_by_a_relative_path() {
+fn a_deletion_reaches_a_buffer_opened_by_an_unresolved_path() {
     // `vortex notes.txt` stores the spelling the user typed; the watcher reports the
     // absolute path it derived from the directory it watches. Both canonicalize to
     // nothing once the file is gone, so the raw spellings were compared and never
@@ -1016,14 +1017,20 @@ fn a_deletion_reaches_a_buffer_opened_by_a_relative_path() {
     let path = dir.file("notes.txt");
     std::fs::write(&path, "precious\n").unwrap();
 
-    // Open by a relative path, as argv would hand it over.
-    let previous = std::env::current_dir().unwrap();
-    std::env::set_current_dir(&dir.path).unwrap();
+    // A directory reached through a symlink stands in for the relative path argv
+    // hands over: both are spellings the watcher will not use, because it
+    // canonicalizes. **Deliberately not `set_current_dir`** - these tests run as
+    // threads in one process, so moving the process's working directory would move it
+    // under every test running beside this one, and a panic before the restore would
+    // leave the rest of the binary in a directory that is about to be deleted.
+    let link = dir.path.join("via-link");
+    std::os::unix::fs::symlink(&dir.path, &link).unwrap();
+
     let h = Harness::new();
     let mut e = Session::new();
     assert!(smol::block_on(open_file(
         &mut e,
-        std::path::PathBuf::from("notes.txt"),
+        link.join("notes.txt"),
         &h.delta_tx,
         &h.snapshots,
         &h.note_tx,
@@ -1031,22 +1038,19 @@ fn a_deletion_reaches_a_buffer_opened_by_a_relative_path() {
     let _ = drain_notes(&h);
     std::fs::remove_file(&path).unwrap();
 
-    // The watcher always reports the resolved absolute path.
-    let reported = path.canonicalize().unwrap_or_else(|_| {
-        dir.path
-            .canonicalize()
-            .unwrap_or_else(|_| dir.path.clone())
-            .join("notes.txt")
-    });
-    let alive = smol::block_on(external_change(
+    // The watcher always reports the resolved path, never the spelling it was given.
+    let reported = dir
+        .path
+        .canonicalize()
+        .unwrap_or_else(|_| dir.path.clone())
+        .join("notes.txt");
+    assert!(smol::block_on(external_change(
         &mut e,
         &reported,
         &h.delta_tx,
         &h.snapshots,
         &h.note_tx,
-    ));
-    std::env::set_current_dir(previous).unwrap();
-    assert!(alive);
+    )));
 
     let notes = drain_notes(&h);
     assert!(
