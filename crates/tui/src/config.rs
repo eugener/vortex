@@ -79,13 +79,17 @@ pub struct Config {
     /// every piece of chrome that puts a mark on every row: the editor spends the
     /// screen on text unless asked otherwise.
     pub indent_guides: bool,
-    /// Reserve the body's rightmost column for a scrollbar (SPEC §7.5). Off by
-    /// default, and more emphatically than the other chrome: this one is the only
-    /// piece that costs a *column of text*, so it has to be asked for.
+    /// Reserve the body's rightmost column for a scrollbar (SPEC §7.5). **On by
+    /// default**, unlike the rest of the chrome here, which stays off because it marks
+    /// every row. This one marks no row: it answers "where am I in something bigger
+    /// than the screen", which is a question every editor's reader has and which
+    /// nothing else on screen answers - the status bar's line number tells you where
+    /// the *caret* is, not where the window is. One column is what that costs, and
+    /// `scrollbar = false` still buys it back.
     ///
-    /// When on, the column is reserved whether or not a bar is drawn in it. A
-    /// scrollbar that appeared only once a file outgrew the screen would slide every
-    /// line one cell sideways at the moment the file crossed that boundary.
+    /// The column is reserved whether or not a bar is drawn in it. A scrollbar that
+    /// appeared only once a file outgrew the screen would slide every line one cell
+    /// sideways at the moment the file crossed that boundary.
     pub scrollbar: bool,
     /// Pin the enclosing scopes of the viewport's top row at the top of the body
     /// (SPEC §7.5). Off by default, and the only piece of chrome that costs *rows*
@@ -108,7 +112,7 @@ impl Default for Config {
             line_numbers: LineNumbers::default(),
             rulers: Vec::new(),
             indent_guides: false,
-            scrollbar: false,
+            scrollbar: true,
             sticky_context: false,
             final_newline: CoreOptions::default().final_newline,
         }
@@ -631,18 +635,19 @@ mod tests {
     }
 
     #[test]
-    fn the_scrollbar_is_off_unless_the_file_asks_for_it() {
-        // The strictest of the chrome defaults, since this is the one that costs a
-        // column of text rather than a mark on cells the text was not using.
-        assert!(!Config::default().scrollbar, "off unless asked");
+    fn the_scrollbar_is_on_until_the_file_declines_it() {
+        // The one piece of chrome that is on by default: it marks no row, and it
+        // answers a question nothing else on screen does - where the *window* sits in
+        // the file, as against where the caret sits, which is the status bar's job.
+        assert!(Config::default().scrollbar, "on unless declined");
+
+        let (config, problem) = parse("scrollbar = false");
+        assert_eq!(problem, None);
+        assert!(!config.scrollbar, "and the column is buyable back");
 
         let (config, problem) = parse("scrollbar = true");
         assert_eq!(problem, None);
         assert!(config.scrollbar);
-
-        let (config, problem) = parse("scrollbar = false");
-        assert_eq!(problem, None);
-        assert!(!config.scrollbar);
     }
 
     #[test]

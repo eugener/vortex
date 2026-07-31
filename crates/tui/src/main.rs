@@ -3956,9 +3956,11 @@ mod tests {
     }
 
     #[test]
-    fn the_scrollbar_is_off_unless_asked() {
-        // Off means the body is exactly what it was - including the column, which is
-        // the one piece of chrome here that would otherwise cost text.
+    fn declining_the_scrollbar_gives_the_column_back() {
+        // The bar is on by default now, so this is the setting doing its remaining job:
+        // off means the body is exactly what it was, column included - which is the one
+        // piece of chrome here that costs text rather than marking cells it was not
+        // using, and so the one worth being able to decline.
         let snap = tall_snapshot();
         let buf = render(&snap, 20, 8);
         for row in 1..7 {
@@ -4018,11 +4020,11 @@ mod tests {
             assert!(dispatch_command(Command::ToggleScrollbar, &handle, &mut ui));
         };
 
-        assert!(!config.scrollbar, "off unless asked");
+        assert!(config.scrollbar, "on by default");
         toggle(&mut config);
-        assert!(config.scrollbar);
+        assert!(!config.scrollbar);
         toggle(&mut config);
-        assert!(!config.scrollbar, "and back");
+        assert!(config.scrollbar, "and back");
     }
 
     #[test]
