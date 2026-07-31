@@ -78,6 +78,23 @@ struct ViewState {
     /// the text does not start at, and re-deriving the height there would mean
     /// re-running the header's own settling against a snapshot that may have moved.
     header_height: usize,
+    /// What the last frame was looking at: the buffer version it painted and the byte
+    /// the primary caret sat on. `None` before the first frame, and whenever something
+    /// has invalidated the answer (a resize).
+    ///
+    /// **This is what decides whether the next frame chases the caret.** The viewport
+    /// follows the caret when - and only when - one of these has moved since the frame
+    /// that last showed it, which is the difference between "the text or the cursor
+    /// went somewhere" and "the screen is being repainted for some other reason". A
+    /// wheel scroll, a scrollbar drag, a toast expiring, decorations arriving and a
+    /// buffer switched away and back all leave both unchanged, and so leave the view
+    /// where the reader put it.
+    ///
+    /// Carried per buffer with the rest of the view state, which is what makes a switch
+    /// away and back land where you left: the incoming buffer's own last-shown pair is
+    /// restored with its scroll, so the comparison asks "did *this* buffer move while I
+    /// was away" rather than comparing against whatever the other buffer was doing.
+    shown: Option<(u64, usize)>,
 }
 
 impl ViewState {
@@ -121,6 +138,39 @@ const COALESCE: Duration = Duration::from_millis(16);
 /// which only shows itself when input never stops arriving.
 fn coalescing(needs_redraw: bool, held_for: Duration, input_waiting: bool) -> bool {
     needs_redraw && input_waiting && held_for < COALESCE
+}
+
+/// Whether the next frame should pull the viewport to keep the caret visible, given
+/// what the last frame was showing ([`ViewState::shown`]) and where the caret is now.
+///
+/// The view chases the caret when the caret moved **or** the text changed under it, and
+/// otherwise stays where the reader put it. Both halves are load-bearing: the caret
+/// catches motions, and the version catches an edit that leaves the caret where it was
+/// (deleting forward, say) - typing must bring you back to what you are typing even
+/// when the caret byte does not move. `None` means the last frame's answer is unknown
+/// or void - the very first frame, or a resize that may have left the caret off the
+/// bottom - and then the caret wins.
+///
+/// Split out of the loop because the loop is terminal I/O no test can drive (SPEC §13),
+/// and because this is the rule that decides whether a scroll survives: a version of it
+/// that reset itself after every frame meant a wheel scroll lasted only until the next
+/// repaint, whatever caused that repaint.
+fn should_follow(shown: Option<(u64, usize)>, version: u64, head: usize) -> bool {
+    shown != Some((version, head))
+}
+
+/// The byte the primary caret sits on (SPEC §2.2) - the primary selection, never a
+/// positional guess at `selections[0]`, which diverges under multi-cursor.
+///
+/// Shared by [`paint`], which puts the caret there, and the event loop, which asks
+/// whether it has moved since the last frame ([`ViewState::shown`]) - the two must be
+/// the same byte or the view would chase a caret the paint is not drawing.
+fn primary_head(snapshot: &ViewSnapshot) -> usize {
+    snapshot
+        .selections
+        .get(snapshot.primary)
+        .map(|s| s.head)
+        .unwrap_or(0)
 }
 
 /// Where a wheel notch downward takes the viewport: [`SCROLL_STEP`] further into the
@@ -705,11 +755,6 @@ fn event_loop(
     // first frame. Redrawing every idle poll tick is wasted work (ratatui
     // cell-diffs, so it emits nothing, but it still rebuilds the frame ~60x/sec).
     let mut needs_redraw = true;
-    // Whether the next paint pulls the viewport to keep the caret visible. True for
-    // every paint except one driven by a wheel scroll, which moves the view *away*
-    // from the caret on purpose (SPEC §5, frontend-owned viewport); it resets to
-    // true after each frame so a later edit/motion re-centers the caret.
-    let mut follow = true;
     // The overlay UI stack (SPEC §7.5): empty while editing, holding a prompt/
     // palette/picker when one is open. Overlays get first refusal on keys and paint
     // over the base editor; an empty stack is a no-op on the hot path.
@@ -888,6 +933,15 @@ fn event_loop(
             painted = Some(snap.buffer_id);
         }
 
+        // Chase the caret only when the caret (or the text under it) has actually moved
+        // since the frame that last showed it - see [`ViewState::shown`]. Derived per
+        // frame rather than carried as a flag the paint resets: a flag meaning "this
+        // one frame" made every *later* repaint pull the view back, so scrolling away
+        // survived only until the next toast expired or the next snapshot landed.
+        let follow = latest
+            .as_ref()
+            .is_some_and(|snap| should_follow(viewport.shown, snap.version, primary_head(snap)));
+
         if let Some(snap) = &latest
             && needs_redraw
             && !hold_for_highlight
@@ -915,9 +969,6 @@ fn event_loop(
             needs_redraw = false;
             last_drawn = Instant::now();
             awaiting_highlight = None;
-            // Default back to caret-follow; only a wheel scroll opts out, and only
-            // for the single frame it triggered.
-            follow = true;
         }
 
         // Wait for input, but no longer than POLL so a snapshot arriving without a
@@ -1166,9 +1217,11 @@ fn event_loop(
                                 layout::scroll_at_track_row(row, track, max_scroll)
                             {
                                 viewport.scroll = scroll;
-                                // The caret has not moved, so the view must be allowed
-                                // to leave it - the same rule the wheel follows.
-                                follow = false;
+                                // Nothing to say about caret-follow: the caret has not
+                                // moved, so the next frame will not chase it (see
+                                // `ViewState::shown`) and the view stays where the drag
+                                // put it - including across every repaint after this
+                                // one, until something actually moves the caret.
                                 needs_redraw = true;
                             }
                             continue;
@@ -1193,9 +1246,11 @@ fn event_loop(
                             return Ok(());
                         }
                     }
-                    // Wheel scrolls the viewport without moving the caret (follow off
-                    // for this frame), clamped as it goes - see `scroll_down_by_wheel`
-                    // for why the paint's own clamp is not enough.
+                    // Wheel moves the view without moving the caret, so nothing here
+                    // says anything about caret-follow: the next frame sees an
+                    // unmoved caret and leaves the view alone (`ViewState::shown`).
+                    // Clamped as it goes - see `scroll_down_by_wheel` for why the
+                    // paint's own clamp is not enough.
                     MouseEventKind::ScrollDown => {
                         let Some(snap) = &latest else { continue };
                         viewport.scroll = scroll_down_by_wheel(
@@ -1203,14 +1258,12 @@ fn event_loop(
                             layout::display_line_count(&snap.text),
                             viewport.page_height,
                         );
-                        follow = false;
                         needs_redraw = true;
                     }
                     // No clamp needed going up: `saturating_sub` already stops at the
                     // top, which is the only bound this direction has.
                     MouseEventKind::ScrollUp => {
                         viewport.scroll = viewport.scroll.saturating_sub(SCROLL_STEP);
-                        follow = false;
                         needs_redraw = true;
                     }
                     // Releasing ends a scrollbar drag. The only reason this arm exists
@@ -1233,7 +1286,15 @@ fn event_loop(
                     }
                 }
                 // Repaint against the new terminal size.
-                Event::Resize(_, _) => needs_redraw = true,
+                // A resize also forgets what the last frame was showing, which asks the
+                // next one to chase the caret again (`ViewState::shown`). A window that
+                // shrank can leave the caret below the last visible row, and unlike a
+                // scroll the reader did not ask for that - so this is the one repaint
+                // that should pull back to the caret without it having moved.
+                Event::Resize(_, _) => {
+                    needs_redraw = true;
+                    viewport.shown = None;
+                }
                 _ => {}
             }
         }
@@ -1665,11 +1726,7 @@ fn paint(frame: &mut Frame, snapshot: &ViewSnapshot, inputs: PaintInputs) -> Vie
 
     // Primary cursor position in line/grapheme-column space (SPEC §2.2): follow
     // the primary selection, not a positional guess.
-    let head = snapshot
-        .selections
-        .get(snapshot.primary)
-        .map(|s| s.head)
-        .unwrap_or(0);
+    let head = primary_head(snapshot);
     let (cursor_line, cursor_byte_col, line_text) = layout::cursor_line_col(&snapshot.text, head);
     let cursor_display_col = layout::display_column(&line_text, cursor_byte_col, tab_width);
 
@@ -1869,6 +1926,8 @@ fn paint(frame: &mut Frame, snapshot: &ViewSnapshot, inputs: PaintInputs) -> Vie
         h_scroll,
         page_height: text_height,
         header_height,
+        // What this frame showed, for the next one to compare against (see the field).
+        shown: Some((snapshot.version, head)),
     }
 }
 
@@ -3392,6 +3451,7 @@ mod tests {
                         h_scroll,
                         page_height: 4,
                         header_height: 0,
+                        shown: None,
                     },
                     ..paint_inputs(0)
                 },
@@ -3726,6 +3786,7 @@ mod tests {
             page_height: 6,
             header_height: 2,
             h_scroll: 0,
+            shown: None,
         };
         let press = |row: u16| {
             press_action(
@@ -3944,6 +4005,7 @@ mod tests {
                         h_scroll: 0,
                         page_height: 10,
                         header_height: 0,
+                        shown: None,
                     },
                     scrollbar: true,
                     ..paint_inputs(0)
@@ -3990,6 +4052,7 @@ mod tests {
                         h_scroll: 0,
                         page_height: track,
                         header_height: 0,
+                        shown: None,
                     },
                     scrollbar: true,
                     ..paint_inputs(0)
@@ -4052,6 +4115,63 @@ mod tests {
             let cell = buf.cell((19, row)).unwrap();
             assert_eq!(cell.symbol(), " ", "row {row} carries a bar");
         }
+    }
+
+    #[test]
+    fn a_repaint_that_moved_nothing_leaves_the_view_where_it_was() {
+        // The bug this replaced: `follow` was reset to true after every frame, so a
+        // wheel scroll or a scrollbar drag survived only until the next repaint - a
+        // toast expiring, decorations landing - and then snapped back to the caret.
+        // Nothing moved, so nothing is chased.
+        assert!(!should_follow(Some((7, 100)), 7, 100));
+    }
+
+    #[test]
+    fn the_view_chases_the_caret_when_it_moves_or_the_text_does() {
+        // A motion: same version, different byte.
+        assert!(should_follow(Some((7, 100)), 7, 140));
+        // An edit that leaves the caret byte alone - deleting forward, say. Without the
+        // version half you could type at a caret you had scrolled off screen and never
+        // be shown what you were typing.
+        assert!(should_follow(Some((7, 100)), 8, 100));
+        // Nothing known about the last frame: the first one, and a resize, which voids
+        // the answer because a window that shrank can leave the caret below the last
+        // row without the reader having asked for that.
+        assert!(should_follow(None, 7, 100));
+    }
+
+    #[test]
+    fn the_caret_followed_is_the_primary_one() {
+        // Under multi-cursor the primary is not `selections[0]`, and the byte the loop
+        // compares has to be the byte `paint` puts the caret on, or the view would
+        // chase a cursor that is not being drawn.
+        let snap = snapshot_after(&[
+            Action::Insert("alpha\nbeta\ngamma".into()),
+            Action::AddCursorAbove,
+        ]);
+        assert!(snap.selections.len() > 1, "needs a second cursor");
+        assert_eq!(primary_head(&snap), snap.selections[snap.primary].head);
+    }
+
+    #[test]
+    fn a_frame_records_the_version_and_caret_it_painted() {
+        // The other half of the mechanism: what `paint` hands back is what the next
+        // frame compares against, so a frame that painted version V at byte B must say
+        // so - otherwise every frame would look like a change and follow would never
+        // switch off.
+        let snap = snapshot_after(&[Action::Insert("one\ntwo\nthree".into())]);
+        let mut terminal = Terminal::new(TestBackend::new(20, 8)).unwrap();
+        let mut settled = ViewState::default();
+        terminal
+            .draw(|frame| settled = paint(frame, &snap, paint_inputs(0)))
+            .unwrap();
+        assert_eq!(settled.shown, Some((snap.version, primary_head(&snap))));
+        // And so a repaint of that same state does not chase the caret.
+        assert!(!should_follow(
+            settled.shown,
+            snap.version,
+            primary_head(&snap)
+        ));
     }
 
     #[test]
@@ -5217,6 +5337,7 @@ mod tests {
             h_scroll: 0,
             page_height: 4,
             header_height: 0,
+            shown: None,
         };
         terminal
             .draw(|frame| {
@@ -5252,6 +5373,7 @@ mod tests {
             h_scroll: 40,
             page_height: 2,
             header_height: 0,
+            shown: None,
         };
         terminal
             .draw(|frame| {
@@ -5292,6 +5414,7 @@ mod tests {
             h_scroll: 0,
             page_height: 4,
             header_height: 0,
+            shown: None,
         };
         let mut settled = ViewState::default();
         let mut terminal = Terminal::new(TestBackend::new(20, 6)).unwrap();
@@ -5326,6 +5449,7 @@ mod tests {
             h_scroll: 0,
             page_height: 8,
             header_height: 0,
+            shown: None,
         };
         // Screen row 2 is body row 1 = line "cdef" (starts at byte 3); the gutter
         // edge (column 4) maps to its first character.

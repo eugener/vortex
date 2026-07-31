@@ -390,6 +390,42 @@ Frontend coalesces rapid input: it may receive many snapshots/inputs but paints 
 once per frame budget (target ~8-16ms). This is *when* it calls the loop it already owns
 (§7), not a custom renderer.
 
+*Built (M8).* A dirtied frame yields while input is **already buffered**, bounded at
+16ms so a stream that never lets up still repaints rather than freezing the screen. The
+loop reads one event per iteration, so without this a mouse drag - which a terminal
+reports once per cell crossed - paid for a full frame rebuild per report, every one of
+them showing a state the next queued event was about to replace. Measured on a 200-line
+file: 300 drag reports cost 303 frames and 617KB of terminal output, against 4 frames and
+7KB after. The paints were also what let the queue grow, so the gesture ran on past the
+button coming up and the keystroke behind it waited for all of it.
+
+Two things had been leaning on the old paint-per-event rhythm, and both moved to where
+they belong once it went away. **The wheel's offset is clamped in the handler**, not left
+to the next paint: notches that accumulate between paints run the offset past the end of
+the file, and the flick back is then spent burning off an overshoot the screen never
+showed. **The per-buffer viewport swap happens outside the paint**, because it is which
+buffer's view state is *live* rather than which was last drawn - an event handled before
+the deferred frame would otherwise read the outgoing buffer's scroll.
+
+### Caret-follow
+
+The viewport chases the caret when the caret has moved **or** the text changed under it,
+and otherwise stays where the reader put it. Both halves matter: the caret catches
+motions, and the version catches an edit that leaves the caret byte alone (deleting
+forward), because typing must show you what you are typing even when the byte does not
+move. Each buffer carries the version and caret byte its last frame showed, so the test
+asks "did *this* buffer move while I was away" - which is what makes a switch away and
+back land where you left.
+
+*This replaced a flag that meant "this one frame".* It was set false by a wheel scroll
+and reset to true after every paint, so scrolling away survived only until the next
+repaint - a toast expiring, decorations landing, a buffer switched back - and then
+snapped to the caret. The per-buffer scroll restore was effectively dead for the same
+reason: the offset was restored correctly and then immediately overridden. A resize is
+the one repaint that still pulls back without the caret moving, expressed by *voiding*
+the record rather than by a second flag: a window that shrank can leave the caret below
+the last row, and unlike a scroll the reader did not ask for that.
+
 ---
 
 ## 6. Channels and back-pressure
@@ -609,8 +645,9 @@ add noise, each on/off switch a key in the config file the M5 loader now reads:
   them would resize every time the caret crossed a power of ten, sliding the whole text
   body sideways under the reader.
   **The origin is the caret, including when the caret is off screen** - after a wheel
-  scroll, or while a search preview holds the viewport on a match the caret has not moved
-  to (§11). The gutter then reads as large distances with no absolute number anywhere on
+  scroll or a scrollbar drag, which the view now *stays* at (see "Caret-follow" below),
+  or while a search preview holds the viewport on a match the caret has not moved to
+  (§11). The gutter then reads as large distances with no absolute number anywhere on
   screen, which is worse than absolute mode would be, and it is still right: the caret is
   where an edit will land, and a count typed before a motion is counted from *there*, not
   from whatever the viewport happens to be showing. Numbering from the top visible row
