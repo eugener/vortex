@@ -123,6 +123,25 @@ fn coalescing(needs_redraw: bool, held_for: Duration, input_waiting: bool) -> bo
     needs_redraw && input_waiting && held_for < COALESCE
 }
 
+/// Where a wheel notch downward takes the viewport: [`SCROLL_STEP`] further into the
+/// content, but never past the last screenful of it.
+///
+/// **The clamp belongs here rather than at paint time**, where it also happens, because
+/// a paint is not guaranteed to follow each notch - a burst of them is exactly what
+/// [`COALESCE`] collapses, and only a paint hands back a corrected offset. Left
+/// unclamped the offset keeps growing across the whole burst, and the flick back up is
+/// then spent burning off an overshoot the screen never showed: scroll to the bottom of
+/// a file, reverse, and nothing moves. Scrolling *up* needs no equivalent, since
+/// `saturating_sub` already stops at the top.
+///
+/// Split out of the loop for the same reason [`coalescing`] is: the decision is
+/// testable, and the terminal I/O around it is not (SPEC §13).
+fn scroll_down_by_wheel(scroll: usize, display_lines: usize, page_height: usize) -> usize {
+    scroll
+        .saturating_add(SCROLL_STEP)
+        .min(display_lines.saturating_sub(page_height))
+}
+
 /// How long the first paint of a freshly-opened highlightable buffer waits for its
 /// syntax highlights, so the file appears already colored instead of flashing plain
 /// text for a frame first (M4). Highlights normally arrive within a frame or two of
@@ -847,22 +866,33 @@ fn event_loop(
             needs_redraw && event::poll(Duration::ZERO)?,
         );
 
+        // A switch swaps the viewport: park the outgoing buffer's scroll and restore
+        // the incoming one's, so coming back lands where you left rather than snapping
+        // to the top. A buffer never seen before starts at the default, which is the
+        // top.
+        //
+        // **Outside the paint below, not inside it.** This is which buffer's view state
+        // is *live*, not which one was last drawn, and every event handled before the
+        // next frame reads that state: a wheel event would otherwise park its scroll
+        // under the outgoing buffer's id, and a press would resolve its row against the
+        // outgoing buffer's offset and land the caret on the wrong line. A paint is not
+        // guaranteed to come between the switch and that event - it can be deferred by
+        // a coalesced burst or by the highlight hold.
+        if let Some(snap) = &latest
+            && painted != Some(snap.buffer_id)
+        {
+            if let Some(previous) = painted {
+                viewports.insert(previous, viewport);
+            }
+            viewport = viewports.get(&snap.buffer_id).copied().unwrap_or_default();
+            painted = Some(snap.buffer_id);
+        }
+
         if let Some(snap) = &latest
             && needs_redraw
             && !hold_for_highlight
             && !coalescing
         {
-            // A switch swaps the viewport: park the outgoing buffer's scroll and
-            // restore the incoming one's, so coming back lands where you left rather
-            // than snapping to the top. A buffer never painted before starts at the
-            // default, which is the top.
-            if painted != Some(snap.buffer_id) {
-                if let Some(previous) = painted {
-                    viewports.insert(previous, viewport);
-                }
-                viewport = viewports.get(&snap.buffer_id).copied().unwrap_or_default();
-                painted = Some(snap.buffer_id);
-            }
             viewport = draw(
                 terminal,
                 snap,
@@ -1093,10 +1123,13 @@ fn event_loop(
                         // drag inherits that answer rather than re-asking, so pulling
                         // a cell sideways off the bar keeps scrolling instead of
                         // turning into a text selection halfway through the gesture.
-                        // Asked only on a press, and only when the column is there at
-                        // all: mouse mode reports a drag per cell crossed, so querying
-                        // the terminal's size here unconditionally would charge every
-                        // selection sweep an ioctl per column with the bar switched off.
+                        // Asked only on a press: mouse mode reports a drag per cell
+                        // crossed, so querying the terminal's size on every one of them
+                        // would charge each selection sweep an ioctl per column. The
+                        // `config.scrollbar` test in front of it is the cheap half of
+                        // the pair and short-circuits for a reader who turned the bar
+                        // off - it no longer skips the common case, now that the bar is
+                        // on by default, so the `is_press` guard is what does the work.
                         if is_press {
                             dragging_scrollbar = config.scrollbar && {
                                 let screen = terminal.size()?;
@@ -1160,13 +1193,21 @@ fn event_loop(
                             return Ok(());
                         }
                     }
-                    // Wheel scrolls the viewport without moving the caret (follow
-                    // off for this frame); clamping to content happens in `paint`.
+                    // Wheel scrolls the viewport without moving the caret (follow off
+                    // for this frame), clamped as it goes - see `scroll_down_by_wheel`
+                    // for why the paint's own clamp is not enough.
                     MouseEventKind::ScrollDown => {
-                        viewport.scroll = viewport.scroll.saturating_add(SCROLL_STEP);
+                        let Some(snap) = &latest else { continue };
+                        viewport.scroll = scroll_down_by_wheel(
+                            viewport.scroll,
+                            layout::display_line_count(&snap.text),
+                            viewport.page_height,
+                        );
                         follow = false;
                         needs_redraw = true;
                     }
+                    // No clamp needed going up: `saturating_sub` already stops at the
+                    // top, which is the only bound this direction has.
                     MouseEventKind::ScrollUp => {
                         viewport.scroll = viewport.scroll.saturating_sub(SCROLL_STEP);
                         follow = false;
@@ -4029,6 +4070,37 @@ mod tests {
             !coalescing(false, fresh, true),
             "a clean frame has nothing to postpone"
         );
+    }
+
+    #[test]
+    fn a_wheel_burst_cannot_overshoot_the_end_of_the_file() {
+        // The offset used to be clamped only by the paint that followed each notch.
+        // Once a burst could collapse into one frame, the notches accumulated between
+        // paints: 20 down-notches on a 42-line file in an 18-row window ran the offset
+        // to 60 against a bound of 24, so the three up-notches after it - the ordinary
+        // "flick to the bottom, flick back" - moved the view not at all.
+        let (display, page) = (42, 18);
+        let max = display - page;
+        let mut scroll = 0;
+        for _ in 0..20 {
+            scroll = scroll_down_by_wheel(scroll, display, page);
+        }
+        assert_eq!(scroll, max, "parked at the last screenful, not past it");
+        // And the flick back moves immediately, rather than paying off an overshoot.
+        scroll = scroll.saturating_sub(SCROLL_STEP * 3);
+        assert_eq!(scroll, max - SCROLL_STEP * 3);
+    }
+
+    #[test]
+    fn a_wheel_notch_stops_where_there_is_nothing_left_to_show() {
+        // A file that fits the window has no offset to move to, and a window taller
+        // than its content must not wrap the subtraction round.
+        assert_eq!(scroll_down_by_wheel(0, 10, 30), 0);
+        assert_eq!(scroll_down_by_wheel(0, 0, 0), 0);
+        // An offset already past the bound (a window that just grew) is pulled back to
+        // it rather than nudged further out.
+        assert_eq!(scroll_down_by_wheel(900, 42, 18), 24);
+        assert_eq!(scroll_down_by_wheel(usize::MAX, 42, 18), 24);
     }
 
     #[test]
