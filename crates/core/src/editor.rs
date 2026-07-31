@@ -1185,12 +1185,39 @@ async fn recv_attach<H>(attach: &Receiver<H>) -> H {
 /// same file from the picker yields two buffers over one file, each with its own
 /// history, and whichever is saved last silently discards the other's edits.
 ///
-/// A path that does not exist yet has nothing to resolve against, so it falls back to
-/// itself: two different spellings of the same *not-yet-created* file can still
-/// duplicate. That is the residue of doing this without touching the filesystem for
-/// files that are not on it, and it self-corrects at the first save.
+/// A path whose *file* does not exist is resolved through its **directory** instead,
+/// which is the case that matters most: a file the watcher reports as deleted cannot
+/// be canonicalized by definition, and falling back to the raw spelling made it
+/// unmatchable. `vortex notes.txt` stores `notes.txt`, while the watcher reports the
+/// absolute path it derived from the directory it watches - so the deletion of a file
+/// opened by a relative path was never delivered to the buffer holding it, and
+/// `ExternalChange { removed: true }` could not fire at all for the ordinary
+/// command-line invocation.
+///
+/// **Deliberately the same algorithm the watcher's own key resolution uses.** The two
+/// sides of this comparison are computed in different crates from differently-spelled
+/// inputs, and the only thing that makes them meet is that they reduce a path the same
+/// way. Resolving the directory also handles a symlinked one (`/tmp` → `/private/tmp`),
+/// where the raw spellings differ even though neither is wrong.
+///
+/// Only a path whose *directory* is also unresolvable falls back to itself: two
+/// spellings of a file in a directory that does not exist can still duplicate, which
+/// self-corrects the moment either is saved.
 fn file_identity(path: &Path) -> PathBuf {
-    path.canonicalize().unwrap_or_else(|_| path.to_path_buf())
+    if let Ok(real) = path.canonicalize() {
+        return real;
+    }
+    let Some(name) = path.file_name() else {
+        return path.to_path_buf();
+    };
+    let parent = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    parent
+        .canonicalize()
+        .map(|dir| dir.join(name))
+        .unwrap_or_else(|_| path.to_path_buf())
 }
 
 /// The LSP `languageId` for a path (the protocol's own identifiers, which are
@@ -2289,6 +2316,26 @@ async fn reload(
     snapshots: &SnapshotSink,
     notifications: &Sender<Notification>,
 ) -> bool {
+    // Stat before reading, for both of the reasons `open_file` does it (SPEC §10.2,
+    // §10.3). **The regular-file guard is the load-bearing half here**: this path is
+    // reached from a *watcher event*, so the thing at the end of it is whatever an
+    // external process just put there. A file replaced by a FIFO would block
+    // `std::fs::read` until some writer appeared, on the single actor thread, hanging
+    // the whole editor with no way out - which is exactly what the guard on the open
+    // path exists to prevent, and `is_writable` already assumes has happened.
+    let metadata = match std::fs::metadata(&path) {
+        Ok(metadata) if !metadata.is_file() => {
+            let kind = if metadata.is_dir() {
+                "is a directory"
+            } else {
+                "not a regular file"
+            };
+            return report_file_error(session, Some(path), kind, snapshots, notifications);
+        }
+        Ok(metadata) => Some(metadata),
+        // Gone between the event and this stat. The read below reports it.
+        Err(_) => None,
+    };
     let bytes = match std::fs::read(&path) {
         Ok(bytes) if crate::file::is_binary(&bytes) => {
             return report_file_error(
@@ -2345,9 +2392,23 @@ async fn reload(
     // The buffer now *is* the file, whether or not anything moved: a reload of a
     // buffer that had been edited back to matching disk is still clean afterwards.
     doc.history = History::new();
+    // ...and so the buffer and the file no longer disagree about anything. Both of
+    // these are what `save_file` tests before it writes, and leaving either behind
+    // made the *next* save refuse a buffer that is byte-identical to disk: answering
+    // "yes, reload" and then typing one character earned an overwrite prompt about a
+    // conflict that had already been settled. Stamped from the stat taken before the
+    // read, in the same direction `open_file` argues for - an older stamp than the
+    // bytes costs a redundant reload, a newer one misses a change entirely.
+    doc.disk = metadata.as_ref().and_then(DiskStamp::of);
+    doc.conflict = false;
 
     let id = doc.id;
-    let dirty = changed.then(|| 0..doc.buffer.byte_len());
+    // Only when this document is the one the snapshot will describe. `Session::snapshot`
+    // publishes the *active* buffer, and a background buffer reloading (a watcher event
+    // for a file behind another tab) would otherwise attach its byte range to text that
+    // never had those bytes - a repaint hint pointing past the end of what it describes.
+    let dirty =
+        (changed && index == session.active).then(|| 0..session.docs[index].buffer.byte_len());
     let _ = notifications.try_send(Notification::FileReloaded {
         buffer_id: id,
         path,

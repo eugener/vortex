@@ -903,6 +903,208 @@ fn a_removed_file_keeps_the_buffer_that_is_now_its_only_copy() {
 }
 
 #[test]
+fn answering_a_conflict_with_a_reload_leaves_nothing_for_the_next_save_to_refuse() {
+    // The user says "yes, take the disk copy", types one character, and saves. That
+    // save used to be refused: `reload` left `conflict` set and `disk` stamped at the
+    // version it had just replaced, and `save_file` tests both. The prompt it raised
+    // was about a conflict that had already been answered.
+    let dir = TempDir::new();
+    let path = dir.file("notes.txt");
+    std::fs::write(&path, "before\n").unwrap();
+
+    let h = Harness::new();
+    let (mut e, _watch) = watching(&path, &h);
+    mark_dirty(&mut e); // unsaved edits, so the change becomes a conflict
+    std::fs::write(&path, "theirs\n").unwrap();
+    assert!(smol::block_on(external_change(
+        &mut e,
+        &path,
+        &h.delta_tx,
+        &h.snapshots,
+        &h.note_tx,
+    )));
+    assert!(e.active().conflict, "the conflict was raised");
+    let _ = drain_notes(&h);
+
+    // "y" on the prompt: a forced reload.
+    let id = e.active().id;
+    assert!(smol::block_on(reload_buffer(
+        &mut e,
+        id,
+        true,
+        &h.delta_tx,
+        &h.snapshots,
+        &h.note_tx,
+    )));
+    assert!(!e.active().conflict, "the reload answered the conflict");
+    let _ = drain_notes(&h);
+
+    mark_dirty(&mut e);
+    assert!(smol::block_on(save_file(
+        &mut e,
+        false,
+        &h.snapshots,
+        &h.note_tx
+    )));
+    let notes = drain_notes(&h);
+    assert!(
+        !notes
+            .iter()
+            .any(|n| matches!(n, Notification::SaveRejected { .. })),
+        "the save was refused after the reload settled it: {notes:?}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn reloading_a_fifo_is_refused_rather_than_blocking_the_actor() {
+    // The reload path is reached from a *watcher event*, so whatever sits at the end
+    // of it is whatever an external process just put there - including, after an
+    // `rm` and an `mkfifo`, something that is not a file at all. Reading a FIFO
+    // blocks until a writer appears, which on the actor thread is the whole editor
+    // hung with no way out. The open path has guarded this since M5; the reload path
+    // did not. Same bargain as `opening_a_fifo_is_refused_rather_than_blocking_the_actor`:
+    // **if this test ever hangs, the guard is gone.**
+    let dir = TempDir::new();
+    let path = dir.file("notes.txt");
+    std::fs::write(&path, "before\n").unwrap();
+
+    let h = Harness::new();
+    let (mut e, _watch) = watching(&path, &h);
+    let _ = drain_notes(&h);
+
+    // Exactly what an external process doing `rm notes.txt && mkfifo notes.txt` leaves.
+    std::fs::remove_file(&path).unwrap();
+    let status = std::process::Command::new("mkfifo")
+        .arg(&path)
+        .status()
+        .expect("mkfifo");
+    assert!(status.success());
+
+    let id = e.active().id;
+    assert!(smol::block_on(reload_buffer(
+        &mut e,
+        id,
+        true,
+        &h.delta_tx,
+        &h.snapshots,
+        &h.note_tx,
+    )));
+    assert_eq!(
+        e.active().buffer.text().to_string(),
+        "before\n",
+        "the buffer kept what it had"
+    );
+    let notes = drain_notes(&h);
+    assert!(
+        notes.iter().any(|n| matches!(
+            n,
+            Notification::FileError { message, .. } if message.contains("regular file")
+        )),
+        "expected a refusal naming the reason, got {notes:?}"
+    );
+}
+
+#[test]
+fn a_deletion_reaches_a_buffer_opened_by_a_relative_path() {
+    // `vortex notes.txt` stores the spelling the user typed; the watcher reports the
+    // absolute path it derived from the directory it watches. Both canonicalize to
+    // nothing once the file is gone, so the raw spellings were compared and never
+    // matched - which made `ExternalChange { removed: true }` unreachable for the
+    // ordinary command-line invocation.
+    let dir = TempDir::new();
+    let path = dir.file("notes.txt");
+    std::fs::write(&path, "precious\n").unwrap();
+
+    // Open by a relative path, as argv would hand it over.
+    let previous = std::env::current_dir().unwrap();
+    std::env::set_current_dir(&dir.path).unwrap();
+    let h = Harness::new();
+    let mut e = Session::new();
+    assert!(smol::block_on(open_file(
+        &mut e,
+        std::path::PathBuf::from("notes.txt"),
+        &h.delta_tx,
+        &h.snapshots,
+        &h.note_tx,
+    )));
+    let _ = drain_notes(&h);
+    std::fs::remove_file(&path).unwrap();
+
+    // The watcher always reports the resolved absolute path.
+    let reported = path.canonicalize().unwrap_or_else(|_| {
+        dir.path
+            .canonicalize()
+            .unwrap_or_else(|_| dir.path.clone())
+            .join("notes.txt")
+    });
+    let alive = smol::block_on(external_change(
+        &mut e,
+        &reported,
+        &h.delta_tx,
+        &h.snapshots,
+        &h.note_tx,
+    ));
+    std::env::set_current_dir(previous).unwrap();
+    assert!(alive);
+
+    let notes = drain_notes(&h);
+    assert!(
+        notes
+            .iter()
+            .any(|n| matches!(n, Notification::ExternalChange { removed: true, .. })),
+        "the removal never reached the buffer holding the file: {notes:?}"
+    );
+}
+
+#[test]
+fn a_background_reload_does_not_describe_the_active_buffers_text_with_its_own_range() {
+    // `Session::snapshot` always publishes the *active* document, so a reload of some
+    // other buffer must not attach its byte range to it: the frontend would get a
+    // repaint hint reaching past the end of the text it came with. The TUI ignores
+    // `dirty` today, which is the only reason this was invisible - `view.rs` states
+    // the range describes the text it travels with.
+    let dir = TempDir::new();
+    let background = dir.file("background.txt");
+    std::fs::write(&background, "short\n").unwrap();
+    let active = dir.file("active.txt");
+    std::fs::write(&active, "ab\n").unwrap();
+
+    let h = Harness::new();
+    let (mut e, _watch) = watching(&background, &h);
+    // Open the second file; it becomes active and the first falls to the background.
+    assert!(smol::block_on(open_file(
+        &mut e,
+        active.clone(),
+        &h.delta_tx,
+        &h.snapshots,
+        &h.note_tx,
+    )));
+    let _ = drain_notes(&h);
+    while h.delta_rx.try_recv().is_ok() {}
+
+    // The background file grows well past the active buffer's length.
+    std::fs::write(&background, "x".repeat(5000)).unwrap();
+    assert!(smol::block_on(external_change(
+        &mut e,
+        &background,
+        &h.delta_tx,
+        &h.snapshots,
+        &h.note_tx,
+    )));
+
+    let snap = h.snapshot();
+    assert_eq!(snap.text.byte_len(), 3, "the active buffer is the one sent");
+    if let Some(range) = &snap.dirty {
+        assert!(
+            range.end <= snap.text.byte_len(),
+            "dirty {range:?} runs past the {} bytes it describes",
+            snap.text.byte_len()
+        );
+    }
+}
+
+#[test]
 fn an_event_for_a_file_no_buffer_holds_is_ignored() {
     // Directories are watched, not files, so events about the neighbours arrive as
     // a matter of course.
