@@ -673,6 +673,25 @@ add noise, each on/off switch a key in the config file the M5 loader now reads:
   and the gutter already takes the tint, so the row would be washed at both ends and
   broken at one. The bar paints over it afterwards and its styles set a foreground only,
   so the track and thumb land on the row's ground rather than punching the hole back in.
+  **The picker overlay carries the same bar**, on the same terms: a column reserved at
+  the right of its list whether or not a bar is drawn in it (a list overflows and stops
+  overflowing *as you type*, so a column that came and went would re-clip every label on
+  the keystroke that changed the match count), painted over the list rows only and not
+  the query line, and taking the pointer the same way. The widget and its state are built
+  in one place (`layout::scrollbar`) for both, because the `max_scroll + 1` /
+  `viewport_content_length` pairing above is the exact geometry `scroll_at_track_row`
+  inverts on the way back - split across two files, the map and its inverse could drift
+  with no compile error and leave the thumb somewhere other than under the hand pulling
+  it. Two things differ. The overlay's bar is **not** gated on `scrollbar = true`: that
+  key buys a permanent column off the text, which is the thing worth declining, while a
+  box that is on screen for a keystroke or two costs nothing to leave; a second key for
+  it would be a setting nobody wants to hold an opinion about. And its drag moves the
+  **highlight**, because a picker's offset is derived from the selection (one source of
+  truth, so a click cannot land on a row other than what is drawn) - which puts the
+  highlight on the window's last row, exactly where the wheel already leaves it. Preview
+  work is held until the button comes up: a drag reports an event per cell crossed, and
+  a preview reloads a theme while a pane reads and decodes a file (a megabyte of one for
+  the project-search picker), so the gesture buys one read rather than one per report.
 - **Sticky context header** - *built (M8).* `sticky_context = true` in the config file,
   plus `toggle_sticky_context`. The first line of every scope enclosing the viewport's
   top row, pinned above the text, outermost first, each row carrying its own line
@@ -1022,14 +1041,21 @@ None is a correctness bug today.
   a single caller is the premature abstraction CLAUDE.md rules out. **Trigger: a second
   marker that replaces a cell it did not widen** - whitespace visualization (`·` for
   spaces, `→` for tabs) is the obvious candidate, and it would want exactly this seam.
-- **The scrollbar's drag state is a bare `bool` in the event loop.** Press sets it from
-  the hit test, a drag inherits it, a release and a `scrollbar = false` clear it - a small
-  state machine living in `event_loop`, which no test drives, so it is covered only by the
-  pty run recorded in §14. `click::Clicks` is the precedent for lifting exactly this kind
-  of pointer state into a tested module. **Deferred because** `Clicks` earned its module
-  by needing a clock injected; this has no logic a struct would make clearer, only a
-  boundary a test could reach. **Trigger: a third stateful gesture** (a fold drag, a split
-  resize) - at two, the coordination between them is still readable in one screen.
+- **The scrollbar's drag state is a bare `bool`, now in two places.** The body's lives in
+  `event_loop`: press sets it from the hit test, a drag inherits it, a release and a
+  `scrollbar = false` clear it - which no test drives, so it is covered only by the pty
+  run recorded in §14. The picker's bar repeats the shape as a `dragging` field on the
+  layer, and *that* one is tested, because the layer owns its own geometry and takes
+  synthetic events. The two are not merged and should not be: `Layer::handle_mouse`
+  defaults to `Consumed` and the overlay arm returns before the body's hit tests run, so
+  an open picker already holds the pointer exclusively and the event loop's latch is
+  unreachable while one is up. What the latch answers - "did this gesture start on *my*
+  bar" - is only answerable by whoever owns the geometry, which under the trait's
+  no-stored-geometry contract is the layer. **Deferred because** `click::Clicks` earned
+  its module by needing a clock injected; a `bool` set on press and cleared on release
+  has no logic a struct would make clearer. **Trigger: a third stateful gesture** (a fold
+  drag, a split resize) - at two, the coordination between them is still readable in one
+  screen.
 - **Quit is detected by sniffing the `Action` value in the frontend.** `dispatch_command`
   compares against `Action::Quit` and exits the loop immediately after sending it, while
   the core's own `Notification::ShuttingDown` (which exists for exactly this) is drained

@@ -16,6 +16,7 @@ use std::path::Path;
 
 use ratatui::style::Style;
 use ratatui::text::Span;
+use ratatui::widgets::{Scrollbar, ScrollbarOrientation, ScrollbarState};
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 use vortex_core::{BufferId, BufferInfo, FileFormat, Selection, Text};
@@ -463,6 +464,40 @@ pub fn scroll_at_track_row(row: usize, track: usize, max_scroll: usize) -> Optio
     // Rounded rather than truncated, so the row nearest an offset selects it instead
     // of the whole track drifting one line toward the top.
     Some((row.min(span) * max_scroll + span / 2) / span)
+}
+
+/// The editor's vertical scrollbar and the state that places its thumb (SPEC §7.5):
+/// a track over content with `max_scroll` offsets, `viewport` rows of it on screen,
+/// currently at `scroll`.
+///
+/// **Both halves come from here because they are one decision.** `content_length`
+/// counts scroll *positions* rather than lines, and pairing that with
+/// `viewport_content_length` is what works the thumb out to the fraction of the track
+/// the window covers of the content, sitting at the fraction the offset has travelled.
+/// That is exactly the geometry [`scroll_at_track_row`] inverts when a press comes back
+/// the other way, and its promise that the pointer sits inside the thumb it is dragging
+/// rests on it. Split across the two places that draw a bar - the body and the picker
+/// overlay - the mapping and its inverse could drift with no compile error and no
+/// failing test, leaving the thumb somewhere other than under the hand pulling it.
+pub fn scrollbar(
+    scroll: usize,
+    max_scroll: usize,
+    viewport: usize,
+    track: Style,
+    thumb: Style,
+) -> (Scrollbar<'static>, ScrollbarState) {
+    let state = ScrollbarState::new(max_scroll + 1)
+        .position(scroll)
+        .viewport_content_length(viewport);
+    let bar = Scrollbar::new(ScrollbarOrientation::VerticalRight)
+        // No arrow heads: they would eat two of the track's rows to offer a line-step
+        // this editor already binds to a key and a wheel, and neither a short body nor
+        // an eighteen-row picker has two rows to spare.
+        .begin_symbol(None)
+        .end_symbol(None)
+        .track_style(track)
+        .thumb_style(thumb);
+    (bar, state)
 }
 
 /// Where a screen row falls in the editor's vertical split (SPEC §7.5).
@@ -1965,6 +2000,39 @@ mod tests {
         // A drag pulled below the body still means "the bottom", not an offset past
         // the end that the paint would silently clamp back.
         assert_eq!(scroll_at_track_row(99, 10, 90), Some(90));
+    }
+
+    #[test]
+    fn the_thumb_lands_where_the_track_row_that_selects_it_would() {
+        // The two halves of one mapping, checked against each other: paint the bar for
+        // the offset `scroll_at_track_row` hands back for a row, and the thumb has to
+        // cover that row. This is the invariant that lets a drag read as dragging the
+        // thumb rather than throwing it, and the reason both halves live in this file.
+        use ratatui::buffer::Buffer;
+        use ratatui::layout::Rect;
+        use ratatui::widgets::StatefulWidget;
+
+        let (track, viewport, max_scroll) = (10, 20, 90);
+        let area = Rect::new(0, 0, 1, track as u16);
+        for row in 0..track {
+            let scroll = scroll_at_track_row(row, track, max_scroll).unwrap();
+            let (bar, mut state) = scrollbar(
+                scroll,
+                max_scroll,
+                viewport,
+                Style::default(),
+                Style::default(),
+            );
+            let mut buf = Buffer::empty(area);
+            StatefulWidget::render(bar, area, &mut buf, &mut state);
+            let painted: Vec<String> = (0..track)
+                .map(|y| buf.cell((0, y as u16)).unwrap().symbol().to_string())
+                .collect();
+            assert_eq!(
+                painted[row], "█",
+                "row {row} selects offset {scroll}, whose thumb is at {painted:?}"
+            );
+        }
     }
 
     #[test]

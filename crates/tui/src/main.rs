@@ -40,7 +40,7 @@ use ratatui::crossterm::{execute, queue};
 use ratatui::layout::{Constraint, Layout, Position, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState};
+use ratatui::widgets::Paragraph;
 use ratatui::{Frame, Terminal, TerminalOptions, Viewport};
 use unicode_width::UnicodeWidthStr;
 
@@ -1744,26 +1744,14 @@ fn paint(frame: &mut Frame, snapshot: &ViewSnapshot, inputs: PaintInputs) -> Vie
     // and the header's rows do not - a bar running up behind pinned lines would
     // offer positions its own top rows cannot show.
     if scrollbar && max_scroll > 0 {
-        // `content_length` is the number of scroll *positions*, not of lines. That is
-        // what makes ratatui's thumb the right size: with `viewport_content_length`
-        // set to the visible rows, its geometry works out to a thumb covering exactly
-        // the fraction of the track that the screen covers of the buffer, sitting at
-        // exactly the fraction the offset has travelled.
-        let mut state = ScrollbarState::new(max_scroll + 1)
-            .position(scroll)
-            .viewport_content_length(text_height);
-        frame.render_stateful_widget(
-            Scrollbar::new(ScrollbarOrientation::VerticalRight)
-                // No arrow heads: they would eat two of the track's rows to offer a
-                // line-step this editor already binds to a key and a wheel, and on a
-                // short body there are not two rows to spare.
-                .begin_symbol(None)
-                .end_symbol(None)
-                .track_style(theme.scrollbar_track)
-                .thumb_style(theme.scrollbar_thumb),
-            text_area,
-            &mut state,
+        let (bar, mut state) = layout::scrollbar(
+            scroll,
+            max_scroll,
+            text_height,
+            theme.scrollbar_track,
+            theme.scrollbar_thumb,
         );
+        frame.render_stateful_widget(bar, text_area, &mut state);
     }
     paint_status_bar(
         frame,

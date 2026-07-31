@@ -43,15 +43,9 @@ pub fn open(theme: &Theme, current: &str) -> Box<dyn Layer> {
     // rather than leaving the preview silently applied.
     let selected = entries.iter().position(|e| e.name == current).unwrap_or(0);
     Box::new(
-        Picker::new(
-            "Themes",
-            registry(entries),
-            false,
-            theme.palette,
-            theme.palette_selected,
-        )
-        .with_selected(selected)
-        .previewing(Command::SetTheme(current.to_string())),
+        Picker::new("Themes", registry(entries), false, theme)
+            .with_selected(selected)
+            .previewing(Command::SetTheme(current.to_string())),
     )
 }
 

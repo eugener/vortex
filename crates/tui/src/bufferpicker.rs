@@ -52,8 +52,7 @@ pub fn open(theme: &Theme, buffers: &[BufferInfo], active: BufferId) -> Box<dyn 
         "Switch Buffer",
         items(buffers, active),
         true, // path-aware fuzzy matching: the labels are paths
-        theme.palette,
-        theme.palette_selected,
+        theme,
     ))
 }
 
