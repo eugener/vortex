@@ -46,6 +46,14 @@ pub struct WatchSet {
     /// what stops the watch. Two files open from one directory is the common case,
     /// not a corner one.
     dirs: HashMap<PathBuf, usize>,
+    /// The spelling each watch was *requested* with, mapped to the key it resolved
+    /// to. Resolution needs the directory to exist, and a directory can be removed
+    /// while its file is open (`rm -rf` on a checkout) - after which the close that
+    /// follows could no longer name what it was releasing, and the entry and the
+    /// `notify` watch under it leaked for the rest of the session. The core asks to
+    /// unwatch with the same path it asked to watch, so remembering that spelling
+    /// answers it without the filesystem.
+    requested: HashMap<PathBuf, PathBuf>,
 }
 
 impl WatchSet {
@@ -59,6 +67,9 @@ impl WatchSet {
     pub fn watch(&mut self, file: &Path) -> Option<PathBuf> {
         let key = resolve_key(file)?;
         let dir = key.parent()?.to_path_buf();
+        // Recorded before the dedup check, so a second spelling of an already-watched
+        // file can still name it later.
+        self.requested.insert(file.to_path_buf(), key.clone());
         if !self.files.insert(key) {
             return None; // already watched; the directory already is too
         }
@@ -69,8 +80,20 @@ impl WatchSet {
 
     /// Stop watching `file`. Returns the directory the caller must release, or
     /// `None` while other watched files still live in it.
+    ///
+    /// Falls back to finding the entry by *file name* when the path no longer
+    /// resolves. A directory removed while its file was open (`rm -rf` on a checkout)
+    /// makes `resolve_key` fail, and returning early there leaked both the entry and
+    /// the `notify` watch under it for the rest of the session - the accumulation this
+    /// whole request exists to prevent, in exactly the case that produces it.
     pub fn unwatch(&mut self, file: &Path) -> Option<PathBuf> {
-        let key = resolve_key(file)?;
+        let key = match resolve_key(file) {
+            Some(key) => key,
+            // The directory is gone, so ask what this path resolved to when it was
+            // still there rather than giving up and leaking the watch.
+            None => self.requested.get(file).cloned()?,
+        };
+        self.requested.remove(file);
         let dir = key.parent()?.to_path_buf();
         if !self.files.remove(&key) {
             return None;

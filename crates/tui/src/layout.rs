@@ -1263,7 +1263,14 @@ fn right_placement(left: &str, right: &str, width: usize) -> Option<usize> {
     if width == 0 {
         return None;
     }
-    let left_cells = truncate_to_cells(left, width).1;
+    fits_beside(truncate_to_cells(left, width).1, right, width)
+}
+
+/// [`right_placement`] for a caller that has already measured the left segment - the
+/// paint, which needs the truncated text anyway. The rule stays in one place while
+/// `fit_bar` stops walking the left segment a second time on every frame, only to
+/// recompute a cell count it is already holding.
+fn fits_beside(left_cells: usize, right: &str, width: usize) -> Option<usize> {
     let right_cells = right.width();
     (left_cells + 1 + right_cells <= width).then(|| width - right_cells)
 }
@@ -1275,7 +1282,7 @@ pub fn fit_bar(left: &str, right: &str, width: usize) -> String {
     let (left_text, left_cells) = truncate_to_cells(left, width);
     let right_cells = right.width();
     // Room for both plus at least one separating space?
-    if right_placement(left, right, width).is_some() {
+    if fits_beside(left_cells, right, width).is_some() {
         let gap = width - left_cells - right_cells;
         let mut out = String::with_capacity(left_text.len() + gap + right.len());
         out.push_str(&left_text);

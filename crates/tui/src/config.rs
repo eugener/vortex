@@ -195,11 +195,23 @@ fn config_path(
 /// not an error at all - it is the normal state of a fresh install. A file that
 /// exists but does not parse, or that names a theme that will not load, degrades to
 /// the defaults *for the parts that failed* and reports why.
-pub fn load(path: &Path) -> (Config, Option<String>) {
+/// `asked_for` distinguishes the two callers, and only matters when the file is not
+/// there. A missing config in the default location is the normal state of a fresh
+/// install and says nothing; a missing one named by `--config` is a typo, and starting
+/// silently on the defaults leaves the user looking at an editor with none of their
+/// settings and nothing anywhere saying why.
+pub fn load(path: &Path, asked_for: bool) -> (Config, Option<String>) {
     let text = match std::fs::read_to_string(path) {
         Ok(text) => text,
-        // No config file is the overwhelmingly common case, not a problem.
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return (Config::default(), None),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            let problem = asked_for.then(|| {
+                format!(
+                    "{}: no such config file",
+                    crate::theme::one_line(&path.display().to_string())
+                )
+            });
+            return (Config::default(), problem);
+        }
         Err(err) => {
             return (
                 Config::default(),
@@ -229,12 +241,16 @@ fn parse(text: &str) -> (Config, Option<String>) {
     };
 
     let mut config = Config::default();
-    let mut problem = None;
+    // Every complaint, not the last one. The settings here fail independently - a bad
+    // tab width says nothing about the theme, which says nothing about the bindings -
+    // so overwriting meant a file with three typos took three restarts to fix, each
+    // one revealing the next. Joined into the single line the toast has room for.
+    let mut problems: Vec<String> = Vec::new();
     if let Some(width) = file.tab_width {
         // Zero would divide the display-column math by nothing and collapse every
         // tab onto the previous glyph; there is no sane reading of it.
         if width == 0 {
-            problem = Some("tab_width must be at least 1".to_string());
+            problems.push("tab_width must be at least 1".to_string());
         } else {
             config.tab_width = width;
         }
@@ -265,7 +281,7 @@ fn parse(text: &str) -> (Config, Option<String>) {
                 config.theme = theme;
                 config.theme_name = name;
             }
-            Err(err) => problem = Some(crate::theme::one_line(&err)),
+            Err(err) => problems.push(crate::theme::one_line(&err)),
         }
     }
     if !file.keys.is_empty() {
@@ -274,13 +290,19 @@ fn parse(text: &str) -> (Config, Option<String>) {
             .iter()
             .map(|(chord, command)| (chord.as_str(), command.as_str()))
             .collect();
-        match config.keymap.extend_from_pairs(&pairs) {
-            Ok(()) => {}
-            // The bindings before the bad one stay applied, so a typo on one line
-            // does not cost the user every key they rebound above it.
-            Err(err) => problem = Some(crate::theme::one_line(&err.to_string())),
-        }
+        // Every binding that parses is applied, whatever else in the table did not,
+        // so one typo costs exactly the one key it is on.
+        problems.extend(
+            config
+                .keymap
+                .extend_from_pairs(&pairs)
+                .iter()
+                .map(|err| crate::theme::one_line(&err.to_string())),
+        );
     }
+    // Re-bounded after joining: each part was trimmed to fit a row on its own, and
+    // three of them end up three rows long otherwise.
+    let problem = (!problems.is_empty()).then(|| crate::theme::one_line(&problems.join("; ")));
     (config, problem)
 }
 
@@ -582,9 +604,17 @@ mod tests {
         assert!(config.final_newline);
         assert_eq!(problem, None);
 
-        let (config, problem) = load(std::path::Path::new("/nonexistent/vortex/config.toml"));
+        let missing = std::path::Path::new("/nonexistent/vortex/config.toml");
+        let (config, problem) = load(missing, false);
         assert_eq!(config.theme_name, crate::theme::DEFAULT);
         assert_eq!(problem, None);
+
+        // ...but one named with `--config` is a typo, and starting silently on the
+        // defaults leaves the user with none of their settings and no reason given.
+        let (config, problem) = load(missing, true);
+        assert_eq!(config.theme_name, crate::theme::DEFAULT, "still starts");
+        let problem = problem.expect("an explicit path that is not there is reported");
+        assert!(problem.contains("no such config file"), "{problem}");
     }
 
     #[test]
@@ -755,6 +785,57 @@ mod tests {
         assert_eq!(
             command_for_key(&config.keymap, ctrl_s, 10),
             Some(Command::Editor(vortex_core::Action::Quit))
+        );
+    }
+
+    #[test]
+    fn every_independent_complaint_is_reported_at_once() {
+        // These fail independently, so overwriting meant three typos took three
+        // restarts to find - each fix revealing the next one.
+        let (config, problem) = parse(
+            "tab_width = 0\ntheme = \"no-such-theme\"\n[keys]\n\"ctrl+e\" = \"frobnicate\"\n",
+        );
+        let problem = problem.expect("three things were wrong");
+        assert!(problem.contains("tab_width"), "{problem}");
+        assert!(problem.contains("no-such-theme"), "{problem}");
+        assert!(problem.contains("frobnicate"), "{problem}");
+        // ...and each part still degraded to its own default.
+        assert_eq!(config.tab_width, DEFAULT_TAB_WIDTH);
+        assert_eq!(config.theme_name, crate::theme::DEFAULT);
+    }
+
+    #[test]
+    fn a_typo_in_one_binding_costs_only_that_binding() {
+        use crate::command::Command;
+        use crate::keymap::command_for_key;
+        use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+        // `keys` arrives as a sorted table, so "ctrl+a" is applied before "ctrl+z"
+        // whatever order they were written in. Stopping at the first bad one
+        // therefore discarded a good binding written *above* the typo - the opposite
+        // of what the doc promised. Every binding that parses is now applied.
+        let (config, problem) = parse(
+            "[keys]\n\"ctrl+z\" = \"quit\"\n\"ctrl+a\" = \"frobnicate\"\n\"ctrl+e\" = \"save\"\n",
+        );
+        let problem = problem.expect("the typo is still reported");
+        assert!(problem.contains("frobnicate"), "{problem}");
+
+        let bound = |c: char| {
+            command_for_key(
+                &config.keymap,
+                KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL),
+                10,
+            )
+        };
+        assert_eq!(
+            bound('z'),
+            Some(Command::Editor(vortex_core::Action::Quit)),
+            "sorts after the typo, and survived it"
+        );
+        assert_eq!(
+            bound('e'),
+            Some(Command::Editor(vortex_core::Action::Save { force: false })),
+            "sorts after the typo, and survived it"
         );
     }
 
