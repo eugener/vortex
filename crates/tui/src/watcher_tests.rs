@@ -38,6 +38,27 @@ fn watching_the_same_file_twice_is_not_two_files() {
 }
 
 #[test]
+fn closing_a_file_whose_directory_is_gone_still_releases_the_watch() {
+    // `rm -rf` on a checkout, then close the buffer. `resolve_key` canonicalizes the
+    // parent, which no longer exists, so the unwatch used to return before touching
+    // anything - leaving the entry and the OS watch under it for the session. That is
+    // the accumulation the Unwatch request exists to prevent, in the one case that
+    // reliably produces it.
+    let dir = TempDir::new();
+    let a = dir.path.join("a.txt");
+    let mut set = WatchSet::new();
+    let watched = set.watch(&a).expect("the first file starts a watch");
+
+    std::fs::remove_dir_all(&dir.path).unwrap();
+    assert_eq!(
+        set.unwatch(&a),
+        Some(watched),
+        "the directory must still be released"
+    );
+    assert!(set.is_empty(), "and nothing may be left behind");
+}
+
+#[test]
 fn unwatching_something_never_watched_releases_nothing() {
     let dir = TempDir::new();
     let mut set = WatchSet::new();

@@ -587,18 +587,30 @@ impl Keymap {
     /// so a user who rebinds one key does not lose the other fifty.
     ///
     /// # Errors
-    /// Returns a message naming the first unparseable chord or command. The
-    /// bindings applied before it stay applied: a typo on line 9 must not silently
-    /// undo lines 1 to 8, and the message says which line to fix.
-    pub fn extend_from_pairs(&mut self, pairs: &[(&str, &str)]) -> Result<(), KeymapError> {
+    /// Returns one error per unparseable chord or command, in the order given, and
+    /// applies **every** binding that did parse.
+    ///
+    /// Deliberately not "stop at the first bad one". That version's promise - a typo
+    /// on line 9 leaves lines 1 to 8 applied - was never true, because the pairs
+    /// arrive from a `toml` table and so in *alphabetical* order rather than file
+    /// order: a bad `ctrl+a` discarded a good `ctrl+z` written above it. Applying
+    /// what parses makes the outcome independent of the order entirely, which is the
+    /// only version of the promise that survives not controlling that order, and it
+    /// is what the user wants anyway - one typo should cost one binding.
+    pub fn extend_from_pairs(&mut self, pairs: &[(&str, &str)]) -> Vec<KeymapError> {
+        let mut rejected = Vec::new();
         for (chord, command) in pairs {
-            let chord_key =
-                Chord::parse(chord).ok_or_else(|| KeymapError::UnknownChord(chord.to_string()))?;
-            let command = Command::parse(command)
-                .ok_or_else(|| KeymapError::UnknownCommand(command.to_string()))?;
+            let Some(chord_key) = Chord::parse(chord) else {
+                rejected.push(KeymapError::UnknownChord(chord.to_string()));
+                continue;
+            };
+            let Some(command) = Command::parse(command) else {
+                rejected.push(KeymapError::UnknownCommand(command.to_string()));
+                continue;
+            };
             self.bindings.insert(chord_key, command);
         }
-        Ok(())
+        rejected
     }
 
     /// The shortcut bound to `command`, formatted for display (e.g. `"Ctrl+S"`), or

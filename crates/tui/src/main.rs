@@ -129,6 +129,22 @@ const POLL: Duration = Duration::from_millis(16);
 /// until it ends.
 const COALESCE: Duration = Duration::from_millis(16);
 
+/// Whether `note` has already been put to the user as a modal question, in which case
+/// the toast carrying the same sentence is withheld.
+///
+/// A toast is what remains once something has been *dealt with*; a prompt is the
+/// dealing with it. Raising both in one frame asks and answers at the same time, in
+/// two different places on screen. The twins that get no prompt - a file removed (there
+/// is nothing to reload from) and a clean buffer the core already reloaded for you -
+/// keep their toast, which is what makes this a rule rather than a special case.
+fn raises_a_prompt(note: &vortex_core::Notification) -> bool {
+    matches!(
+        note,
+        vortex_core::Notification::ExternalChange { removed: false, .. }
+            | vortex_core::Notification::SaveRejected { .. }
+    )
+}
+
 /// Whether a dirtied frame should yield to input that is already buffered (see
 /// [`COALESCE`]): there is something to paint, more input is waiting, and the frame has
 /// not yet been held for as long as it may be.
@@ -298,8 +314,9 @@ fn main() -> io::Result<()> {
     // paints (SPEC §10.5). A file that will not parse degrades to the defaults and
     // reports itself as a toast below, once there is a screen to show it on: the
     // editor starting is not negotiable (SPEC §8).
+    let asked_for_config = config_path.is_some();
     let (config, config_problem) = match config_path.or_else(config::user_path) {
-        Some(path) => config::load(&path),
+        Some(path) => config::load(&path, asked_for_config),
         // No home directory to look in: built-in defaults, and nothing to report.
         None => (config::Config::default(), None),
     };
@@ -873,7 +890,14 @@ fn event_loop(
             if let vortex_core::Notification::SetClipboard { text } = &note {
                 let _ = osc52::copy(text);
             }
-            if let Some((text, level)) = toast::toast_for(&note) {
+            // ...but not for a notification that just raised a question. A conflict
+            // put a modal prompt on screen above; adding a red toast saying the same
+            // thing means the editor asks and answers in the same frame. The toast is
+            // what remains once something has been dealt with, which is why the two
+            // cases with no prompt - a removed file, a clean buffer reloaded for you -
+            // still get one.
+            if let Some((text, level)) = toast::toast_for(&note).filter(|_| !raises_a_prompt(&note))
+            {
                 toasts.push(text, level, Instant::now());
                 needs_redraw = true;
             }
@@ -1059,218 +1083,239 @@ fn event_loop(
                 // cost anything. The moment something does hover, this is where it
                 // starts.
                 Event::Mouse(mouse) if mouse.kind == MouseEventKind::Moved => {}
-                Event::Mouse(mouse) if !overlays.is_empty() => {
-                    let screen = terminal.size()?;
-                    let (result, commands) =
-                        overlays.handle_mouse(mouse, Rect::new(0, 0, screen.width, screen.height));
-                    for command in commands {
-                        let mut ui = Frontend {
-                            overlays: &mut overlays,
-                            config: &mut config,
-                            toasts: &mut toasts,
-                            snapshot: latest.as_ref(),
-                            search: &mut search,
-                        };
-                        if !dispatch_command(command, handle, &mut ui) {
-                            return Ok(());
-                        }
-                    }
-                    needs_redraw = true;
-                    if result == EventResult::Consumed {
-                        continue;
-                    }
-                }
-                // A toast sits over the editor, so a click on one is a click on it
-                // rather than on the text underneath - dismissing it early instead of
-                // waiting out the fade. Checked before the editor's own handling and
-                // only for a press, so a drag that happens to pass under a toast
-                // keeps sweeping out its selection.
-                Event::Mouse(mouse)
-                    if mouse.kind == MouseEventKind::Down(MouseButton::Left)
-                        && toasts.dismiss_at(
-                            Rect::new(0, 0, terminal.size()?.width, terminal.size()?.height),
-                            mouse.column,
-                            mouse.row,
-                        ) =>
-                {
-                    needs_redraw = true;
-                }
-                Event::Mouse(mouse) => match mouse.kind {
-                    // Left press or drag places/extends the caret at the pointer.
-                    // A press is a plain click unless Shift is held (extend from the
-                    // current anchor); a drag always extends, so a press-then-drag
-                    // sweeps out a selection.
-                    MouseEventKind::Down(MouseButton::Left)
-                    | MouseEventKind::Drag(MouseButton::Left) => {
-                        let Some(snap) = &latest else { continue };
-                        let is_press = matches!(mouse.kind, MouseEventKind::Down(_));
-                        // A press on the bufferline selects that tab's buffer rather
-                        // than placing a caret: row 0 is chrome, not text. Resolved
-                        // against the same fitted strip that was painted, so the tab
-                        // under the pointer is the one that gets picked. A drag is
-                        // ignored here - dragging across tabs is not a gesture.
-                        if is_press && mouse.row == 0 {
-                            let count_width =
-                                layout::line_count_label(layout::display_line_count(&snap.text))
-                                    .width();
-                            let tabs = layout::head_bar_tabs(
-                                &snap.buffers,
-                                snap.buffer_id,
-                                count_width,
-                                terminal.size()?.width as usize,
-                            );
-                            // A click on an overflow marker, the padding, or the line
-                            // count selects nothing and is simply swallowed.
-                            if let Some(id) = layout::tab_at_column(&tabs, mouse.column as usize)
-                                && id != snap.buffer_id
-                                && handle
-                                    .actions
-                                    .send_blocking(Action::SwitchBuffer { id })
-                                    .is_err()
-                            {
+                // **One arm, with the stages inside it**, the shape the key path above
+                // already has. As separate match arms this could not work: Rust arms do
+                // not fall through, so an overlay that returned `Ignored` had its click
+                // silently dropped instead of delivered to the editor beneath - the
+                // exact escape hatch `Compositor::handle_mouse` and the `Layer` trait
+                // both advertise. Nothing exercises it today (every layer consumes), so
+                // it was a trap set for the next layer that wants it rather than a live
+                // fault.
+                //
+                // The screen is measured once here rather than per stage: mouse mode
+                // reports a drag per cell crossed, and this used to cost three or more
+                // ioctls on each one.
+                Event::Mouse(mouse) => {
+                    let size = terminal.size()?;
+                    let screen = Rect::new(0, 0, size.width, size.height);
+                    let is_left_press = mouse.kind == MouseEventKind::Down(MouseButton::Left);
+
+                    if !overlays.is_empty() {
+                        let (result, commands) = overlays.handle_mouse(mouse, screen);
+                        for command in commands {
+                            let mut ui = Frontend {
+                                overlays: &mut overlays,
+                                config: &mut config,
+                                toasts: &mut toasts,
+                                snapshot: latest.as_ref(),
+                                search: &mut search,
+                            };
+                            if !dispatch_command(command, handle, &mut ui) {
                                 return Ok(());
                             }
+                        }
+                        needs_redraw = true;
+                        if result == EventResult::Consumed {
                             continue;
                         }
-                        // The status bar is a readout *and* a control: its encoding
-                        // and line-ending words open a picker for what they show
-                        // (SPEC §7.5). Checked before the body, since the bar is not
-                        // text - and only on the bottom row, so a drag that ends
-                        // there still belongs to the selection it was sweeping.
-                        let bottom = terminal.size()?.height.saturating_sub(1);
-                        if is_press && mouse.row == bottom {
-                            if let Some(target) = status_target_at(
-                                snap,
-                                selected,
-                                terminal.size()?.width as usize,
-                                mouse.column as usize,
-                            ) {
-                                let command = match target {
-                                    layout::StatusTarget::Encoding => Command::OpenEncodingPicker,
-                                    layout::StatusTarget::LineEnding => {
-                                        Command::OpenLineEndingPicker
-                                    }
-                                };
-                                let mut ui = Frontend {
-                                    overlays: &mut overlays,
-                                    config: &mut config,
-                                    toasts: &mut toasts,
-                                    snapshot: latest.as_ref(),
-                                    search: &mut search,
-                                };
-                                if !dispatch_command(command, handle, &mut ui) {
+                    }
+
+                    // A toast sits over the editor, so a click on one is a click on it
+                    // rather than on the text underneath - dismissing it early instead
+                    // of waiting out the fade. Before the editor's own handling and
+                    // only for a press, so a drag that happens to pass under a toast
+                    // keeps sweeping out its selection.
+                    //
+                    // A statement, not a match guard. `dismiss_at` mutates, and a guard
+                    // that removes a toast as a side effect of *deciding* which arm
+                    // runs is a trap for anyone who later reorders or duplicates arms.
+                    if is_left_press && toasts.dismiss_at(screen, mouse.column, mouse.row) {
+                        needs_redraw = true;
+                        continue;
+                    }
+
+                    match mouse.kind {
+                        // Left press or drag places/extends the caret at the pointer.
+                        // A press is a plain click unless Shift is held (extend from the
+                        // current anchor); a drag always extends, so a press-then-drag
+                        // sweeps out a selection.
+                        MouseEventKind::Down(MouseButton::Left)
+                        | MouseEventKind::Drag(MouseButton::Left) => {
+                            let Some(snap) = &latest else { continue };
+                            let is_press = matches!(mouse.kind, MouseEventKind::Down(_));
+                            // A press on the bufferline selects that tab's buffer rather
+                            // than placing a caret: row 0 is chrome, not text. Resolved
+                            // against the same fitted strip that was painted, so the tab
+                            // under the pointer is the one that gets picked. A drag is
+                            // ignored here - dragging across tabs is not a gesture.
+                            if is_press && mouse.row == 0 {
+                                let count_width = layout::line_count_label(
+                                    layout::display_line_count(&snap.text),
+                                )
+                                .width();
+                                let tabs = layout::head_bar_tabs(
+                                    &snap.buffers,
+                                    snap.buffer_id,
+                                    count_width,
+                                    terminal.size()?.width as usize,
+                                );
+                                // A click on an overflow marker, the padding, or the line
+                                // count selects nothing and is simply swallowed.
+                                if let Some(id) =
+                                    layout::tab_at_column(&tabs, mouse.column as usize)
+                                    && id != snap.buffer_id
+                                    && handle
+                                        .actions
+                                        .send_blocking(Action::SwitchBuffer { id })
+                                        .is_err()
+                                {
                                     return Ok(());
                                 }
-                                needs_redraw = true;
+                                continue;
                             }
-                            continue;
-                        }
-                        // The scrollbar is a control, not just a readout: a press on
-                        // its column throws the view to that fraction of the buffer
-                        // and a drag tracks the pointer (SPEC §7.5). Checked before
-                        // the body, since the reserved column is not text.
-                        //
-                        // A press decides whether this gesture belongs to the bar; a
-                        // drag inherits that answer rather than re-asking, so pulling
-                        // a cell sideways off the bar keeps scrolling instead of
-                        // turning into a text selection halfway through the gesture.
-                        // Asked only on a press: mouse mode reports a drag per cell
-                        // crossed, so querying the terminal's size on every one of them
-                        // would charge each selection sweep an ioctl per column. The
-                        // `config.scrollbar` test in front of it is the cheap half of
-                        // the pair and short-circuits for a reader who turned the bar
-                        // off - it no longer skips the common case, now that the bar is
-                        // on by default, so the `is_press` guard is what does the work.
-                        if is_press {
-                            dragging_scrollbar = config.scrollbar && {
-                                let screen = terminal.size()?;
-                                on_scrollbar(
-                                    Rect::new(0, 0, screen.width, screen.height),
-                                    viewport.header_height,
-                                    mouse.column,
-                                    mouse.row,
-                                )
-                            };
-                        }
-                        // The column can be taken away mid-gesture - the palette's
-                        // toggle is reachable with the button still down - and a drag
-                        // must not keep scrolling over what has become text.
-                        dragging_scrollbar &= config.scrollbar;
-                        if dragging_scrollbar {
-                            let track = viewport.page_height;
-                            let max_scroll =
-                                layout::display_line_count(&snap.text).saturating_sub(track);
-                            // The track starts below the head bar and the pinned rows
-                            // (`layout::row_at` owns that split). A drag pulled past
-                            // either end of the body still means that end: a row above
-                            // the text is track row 0 and `scroll_at_track_row` already
-                            // clamps the bottom, so repeating that clamp here would be a
-                            // second copy of a bound that has one owner. A track too
-                            // short to tell its offsets apart answers `None`, and then
-                            // the press moves nothing rather than throwing the reader to
-                            // line 1.
-                            let row = match layout::row_at(mouse.row, viewport.header_height) {
-                                layout::Row::Head | layout::Row::Header(_) => 0,
-                                layout::Row::Text(row) => row,
-                            };
-                            if let Some(scroll) =
-                                layout::scroll_at_track_row(row, track, max_scroll)
+                            // The status bar is a readout *and* a control: its encoding
+                            // and line-ending words open a picker for what they show
+                            // (SPEC §7.5). Checked before the body, since the bar is not
+                            // text - and only on the bottom row, so a drag that ends
+                            // there still belongs to the selection it was sweeping.
+                            let bottom = terminal.size()?.height.saturating_sub(1);
+                            if is_press && mouse.row == bottom {
+                                if let Some(target) = status_target_at(
+                                    snap,
+                                    selected,
+                                    terminal.size()?.width as usize,
+                                    mouse.column as usize,
+                                ) {
+                                    let command = match target {
+                                        layout::StatusTarget::Encoding => {
+                                            Command::OpenEncodingPicker
+                                        }
+                                        layout::StatusTarget::LineEnding => {
+                                            Command::OpenLineEndingPicker
+                                        }
+                                    };
+                                    let mut ui = Frontend {
+                                        overlays: &mut overlays,
+                                        config: &mut config,
+                                        toasts: &mut toasts,
+                                        snapshot: latest.as_ref(),
+                                        search: &mut search,
+                                    };
+                                    if !dispatch_command(command, handle, &mut ui) {
+                                        return Ok(());
+                                    }
+                                    needs_redraw = true;
+                                }
+                                continue;
+                            }
+                            // The scrollbar is a control, not just a readout: a press on
+                            // its column throws the view to that fraction of the buffer
+                            // and a drag tracks the pointer (SPEC §7.5). Checked before
+                            // the body, since the reserved column is not text.
+                            //
+                            // A press decides whether this gesture belongs to the bar; a
+                            // drag inherits that answer rather than re-asking, so pulling
+                            // a cell sideways off the bar keeps scrolling instead of
+                            // turning into a text selection halfway through the gesture.
+                            // Asked only on a press: mouse mode reports a drag per cell
+                            // crossed, so querying the terminal's size on every one of them
+                            // would charge each selection sweep an ioctl per column. The
+                            // `config.scrollbar` test in front of it is the cheap half of
+                            // the pair and short-circuits for a reader who turned the bar
+                            // off - it no longer skips the common case, now that the bar is
+                            // on by default, so the `is_press` guard is what does the work.
+                            if is_press {
+                                dragging_scrollbar = config.scrollbar && {
+                                    let screen = terminal.size()?;
+                                    on_scrollbar(
+                                        Rect::new(0, 0, screen.width, screen.height),
+                                        viewport.header_height,
+                                        mouse.column,
+                                        mouse.row,
+                                    )
+                                };
+                            }
+                            // The column can be taken away mid-gesture - the palette's
+                            // toggle is reachable with the button still down - and a drag
+                            // must not keep scrolling over what has become text.
+                            dragging_scrollbar &= config.scrollbar;
+                            if dragging_scrollbar {
+                                let track = viewport.page_height;
+                                let max_scroll =
+                                    layout::display_line_count(&snap.text).saturating_sub(track);
+                                // The track starts below the head bar and the pinned rows
+                                // (`layout::row_at` owns that split). A drag pulled past
+                                // either end of the body still means that end: a row above
+                                // the text is track row 0 and `scroll_at_track_row` already
+                                // clamps the bottom, so repeating that clamp here would be a
+                                // second copy of a bound that has one owner. A track too
+                                // short to tell its offsets apart answers `None`, and then
+                                // the press moves nothing rather than throwing the reader to
+                                // line 1.
+                                let row = match layout::row_at(mouse.row, viewport.header_height) {
+                                    layout::Row::Head | layout::Row::Header(_) => 0,
+                                    layout::Row::Text(row) => row,
+                                };
+                                if let Some(scroll) =
+                                    layout::scroll_at_track_row(row, track, max_scroll)
+                                {
+                                    viewport.scroll = scroll;
+                                    // Nothing to say about caret-follow: the caret has not
+                                    // moved, so the next frame will not chase it (see
+                                    // `ViewState::shown`) and the view stays where the drag
+                                    // put it - including across every repaint after this
+                                    // one, until something actually moves the caret.
+                                    needs_redraw = true;
+                                }
+                                continue;
+                            }
+                            // Only a plain press advances the click run (SPEC §2.2): a
+                            // drag is one continuous gesture, and a modified click means
+                            // something else entirely, so both end the run rather than
+                            // extending it. Counted here because it is the one part of
+                            // the decision that needs a clock.
+                            let count = if is_press
+                                && !mouse
+                                    .modifiers
+                                    .intersects(KeyModifiers::ALT | KeyModifiers::SHIFT)
                             {
-                                viewport.scroll = scroll;
-                                // Nothing to say about caret-follow: the caret has not
-                                // moved, so the next frame will not chase it (see
-                                // `ViewState::shown`) and the view stays where the drag
-                                // put it - including across every repaint after this
-                                // one, until something actually moves the caret.
-                                needs_redraw = true;
+                                clicks.press(mouse.column, mouse.row, Instant::now())
+                            } else {
+                                clicks.reset();
+                                1
+                            };
+                            let action =
+                                press_action(snap, viewport, config.tab_width, mouse, count);
+                            if handle.actions.send_blocking(action).is_err() {
+                                return Ok(());
                             }
-                            continue;
                         }
-                        // Only a plain press advances the click run (SPEC §2.2): a
-                        // drag is one continuous gesture, and a modified click means
-                        // something else entirely, so both end the run rather than
-                        // extending it. Counted here because it is the one part of
-                        // the decision that needs a clock.
-                        let count = if is_press
-                            && !mouse
-                                .modifiers
-                                .intersects(KeyModifiers::ALT | KeyModifiers::SHIFT)
-                        {
-                            clicks.press(mouse.column, mouse.row, Instant::now())
-                        } else {
-                            clicks.reset();
-                            1
-                        };
-                        let action = press_action(snap, viewport, config.tab_width, mouse, count);
-                        if handle.actions.send_blocking(action).is_err() {
-                            return Ok(());
+                        // Wheel moves the view without moving the caret, so nothing here
+                        // says anything about caret-follow: the next frame sees an
+                        // unmoved caret and leaves the view alone (`ViewState::shown`).
+                        // Clamped as it goes - see `scroll_down_by_wheel` for why the
+                        // paint's own clamp is not enough.
+                        MouseEventKind::ScrollDown => {
+                            let Some(snap) = &latest else { continue };
+                            viewport.scroll = scroll_down_by_wheel(
+                                viewport.scroll,
+                                layout::display_line_count(&snap.text),
+                                viewport.page_height,
+                            );
+                            needs_redraw = true;
                         }
+                        // No clamp needed going up: `saturating_sub` already stops at the
+                        // top, which is the only bound this direction has.
+                        MouseEventKind::ScrollUp => {
+                            viewport.scroll = viewport.scroll.saturating_sub(SCROLL_STEP);
+                            needs_redraw = true;
+                        }
+                        // Releasing ends a scrollbar drag. The only reason this arm exists
+                        // - every other gesture here is decided by its press.
+                        MouseEventKind::Up(_) => dragging_scrollbar = false,
+                        _ => {}
                     }
-                    // Wheel moves the view without moving the caret, so nothing here
-                    // says anything about caret-follow: the next frame sees an
-                    // unmoved caret and leaves the view alone (`ViewState::shown`).
-                    // Clamped as it goes - see `scroll_down_by_wheel` for why the
-                    // paint's own clamp is not enough.
-                    MouseEventKind::ScrollDown => {
-                        let Some(snap) = &latest else { continue };
-                        viewport.scroll = scroll_down_by_wheel(
-                            viewport.scroll,
-                            layout::display_line_count(&snap.text),
-                            viewport.page_height,
-                        );
-                        needs_redraw = true;
-                    }
-                    // No clamp needed going up: `saturating_sub` already stops at the
-                    // top, which is the only bound this direction has.
-                    MouseEventKind::ScrollUp => {
-                        viewport.scroll = viewport.scroll.saturating_sub(SCROLL_STEP);
-                        needs_redraw = true;
-                    }
-                    // Releasing ends a scrollbar drag. The only reason this arm exists
-                    // - every other gesture here is decided by its press.
-                    MouseEventKind::Up(_) => dragging_scrollbar = false,
-                    _ => {}
-                },
+                }
                 // While an overlay is open, swallow OS pastes too rather than
                 // splatting the text into the buffer underneath (SPEC §7.5 modal).
                 // Pasting *into* the prompt is an M7 refinement.
@@ -4114,6 +4159,40 @@ mod tests {
         for row in 1..7 {
             let cell = buf.cell((19, row)).unwrap();
             assert_eq!(cell.symbol(), " ", "row {row} carries a bar");
+        }
+    }
+
+    #[test]
+    fn a_notification_that_raises_a_prompt_does_not_also_raise_a_toast() {
+        // A conflict puts a modal question on screen. Saying the same thing in red
+        // beside it means the editor asks and answers in one frame. The two cases
+        // that get no prompt still get a toast, which is the whole rule: a toast is
+        // what remains once something has been dealt with.
+        let id = vortex_core::BufferId(1);
+        let path = std::path::PathBuf::from("notes.txt");
+        let conflict = vortex_core::Notification::ExternalChange {
+            buffer_id: id,
+            path: path.clone(),
+            removed: false,
+        };
+        let rejected = vortex_core::Notification::SaveRejected {
+            buffer_id: id,
+            path: path.clone(),
+            removed: false,
+        };
+        // The twin that gets no prompt: nothing to reload from, so it only toasts.
+        let removed = vortex_core::Notification::ExternalChange {
+            buffer_id: id,
+            path,
+            removed: true,
+        };
+
+        assert!(raises_a_prompt(&conflict));
+        assert!(raises_a_prompt(&rejected));
+        assert!(!raises_a_prompt(&removed));
+        // Each still *has* a toast; the loop is what withholds the two that asked.
+        for note in [&conflict, &rejected, &removed] {
+            assert!(toast::toast_for(note).is_some());
         }
     }
 
