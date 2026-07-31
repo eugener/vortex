@@ -261,7 +261,17 @@ pub enum Action {
     /// [`Action::SaveAs`] instead. The write is atomic (temp file + rename, SPEC §8)
     /// so a failed write never corrupts the existing file, and the buffer stays
     /// dirty on failure so no work is lost.
-    Save,
+    ///
+    /// **Refused when the file changed underneath**, with a
+    /// `Notification::SaveRejected`, unless `force` - the twin of
+    /// [`Action::Reload`]'s flag and for the same reason (SPEC §8, §10.2). Writing
+    /// over someone else's change is exactly as destructive as reloading over your
+    /// own, so it takes the user saying so, and the *core* is where that cannot be
+    /// skipped by a frontend that forgot to ask. The watcher normally raises the
+    /// conflict first; this catches the cases it cannot see - a dropped event, a
+    /// platform whose backend missed the write, a file reached through a symlink
+    /// whose target moved, or no watcher running at all.
+    Save { force: bool },
     /// Write the buffer to `path` and adopt it as the buffer's file, so subsequent
     /// `Save`s target it (the "save-as" the frontend's prompt commits, SPEC §7.5).
     /// The write is atomic like `Save`; on failure the old path binding and dirty

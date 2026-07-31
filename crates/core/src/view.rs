@@ -206,6 +206,25 @@ pub enum Notification {
     /// [`Notification::CloseRejected`] and for the same reason: discarding work
     /// takes the user saying so, and the *core* is where that cannot be skipped.
     ReloadRejected { buffer_id: BufferId, path: PathBuf },
+    /// A save was refused because the file changed underneath the buffer since it
+    /// was last read or written (SPEC §8, §10.2). The third of the same family:
+    /// writing over someone else's change destroys work exactly as reloading or
+    /// closing over your own does, so it takes the user saying so.
+    ///
+    /// Normally the watcher has already raised
+    /// [`Notification::ExternalChange`] and the user has answered it. This fires
+    /// when it did not - a dropped event, a backend that missed the write, a
+    /// frontend running no watcher - which is why the check is at the write and not
+    /// only on the notification path. The frontend confirms and re-sends
+    /// `Action::Save { force: true }`.
+    SaveRejected {
+        buffer_id: BufferId,
+        path: PathBuf,
+        /// The file is *gone* rather than modified. Saving recreates it, which is
+        /// usually what the user wants - but it is still their call, since the file
+        /// may have been deleted deliberately.
+        removed: bool,
+    },
     /// A close was refused because the buffer has unsaved edits (SPEC §8: never
     /// silently lose work). The frontend confirms with the user and, if they accept,
     /// re-sends the close with `force`. Carries the path so the prompt can name the

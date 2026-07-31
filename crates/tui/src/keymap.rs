@@ -395,7 +395,7 @@ impl Command {
             Command::FindPrevious => return FrontendCommand::FindPrevious,
             Command::SelectAllMatches => return FrontendCommand::SelectAllMatches,
             Command::Quit => Action::Quit,
-            Command::Save => Action::Save,
+            Command::Save => Action::Save { force: false },
             Command::Undo => Action::Undo,
             Command::Redo => Action::Redo,
             Command::DeleteBackward => Action::DeleteBackward,
@@ -1029,7 +1029,7 @@ mod tests {
                 with_mods(KeyCode::Char('s'), KeyModifiers::CONTROL),
                 PAGE
             ),
-            Some(FrontendCommand::Editor(Action::Save))
+            Some(FrontendCommand::Editor(Action::Save { force: false }))
         );
         assert_eq!(
             command_for_key(&km, press(KeyCode::Char('a')), PAGE),
@@ -1201,7 +1201,7 @@ mod tests {
                 with_mods(KeyCode::Char('s'), KeyModifiers::CONTROL),
                 PAGE
             ),
-            Some(FrontendCommand::Editor(Action::Save))
+            Some(FrontendCommand::Editor(Action::Save { force: false }))
         );
         // A misspelled overlay command is reported like any other, not dropped.
         assert_eq!(
@@ -1272,7 +1272,7 @@ mod tests {
     fn ctrl_s_saves() {
         assert_eq!(
             act(with_mods(KeyCode::Char('s'), KeyModifiers::CONTROL)),
-            Some(Action::Save)
+            Some(Action::Save { force: false })
         );
     }
 

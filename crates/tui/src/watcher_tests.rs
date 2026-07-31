@@ -309,3 +309,46 @@ fn a_real_watcher_starts() {
     let (handle, _loop) = watcher().expect("a backend is available");
     drop(handle);
 }
+
+#[test]
+fn a_symlink_is_watched_where_its_target_lives() {
+    // The dotfiles shape: `~/.vimrc -> ~/dotfiles/vimrc`, where the link and the
+    // file it points at are in different directories. A save resolves the link
+    // before it writes - so does every other editor - which means the write lands
+    // in the *target's* directory. Watching the link's own directory therefore
+    // watched a place nothing ever writes, and an external change to a symlinked
+    // file was silently never reported.
+    let dir = TempDir::new();
+    let real_dir = dir.path.join("dotfiles");
+    std::fs::create_dir(&real_dir).unwrap();
+    let target = real_dir.join("vimrc");
+    std::fs::write(&target, "set nocompatible").unwrap();
+    let link = dir.path.join(".vimrc");
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(&target, &link).unwrap();
+    #[cfg(not(unix))]
+    return;
+
+    let mut set = WatchSet::new();
+    let watched_dir = set.watch(&link).expect("watch starts");
+    assert_eq!(
+        watched_dir,
+        real_dir.canonicalize().unwrap(),
+        "the target's directory is the one writes land in"
+    );
+
+    // An event for the real file resolves to the watched file. The core matches it
+    // to the buffer by canonicalized identity, so the link it was opened under and
+    // the target it resolves to are the same document.
+    let canonical = target.canonicalize().unwrap();
+    assert_eq!(set.resolve(&canonical), Some(canonical.clone()));
+    // And so does one spelled with the link, since both canonicalize alike.
+    assert_eq!(set.resolve(&link), Some(canonical));
+
+    // Releasing it releases the target's directory, not the link's.
+    assert_eq!(
+        set.unwatch(&link),
+        Some(real_dir.canonicalize().unwrap()),
+        "the last file leaving stops the watch it started"
+    );
+}

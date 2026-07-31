@@ -288,6 +288,39 @@ pub fn confirm_reload(
     ))
 }
 
+/// Ask whether to write over a file that changed underneath the buffer, after the
+/// core refused the save (SPEC §8, §10.2).
+///
+/// The third of the family, and the one whose stakes point outward: closing or
+/// reloading discards *your* work, while this discards someone else's. Declining
+/// leaves both copies intact - the buffer keeps its edits and the file keeps its
+/// own - so "no" is the default here as well.
+///
+/// A `removed` file is a different sentence. There is nothing to overwrite, and
+/// saving is how the buffer gets written back, so the question is whether to
+/// recreate it - which is usually yes, but is still the user's call, since the file
+/// may have been deleted on purpose.
+pub fn confirm_overwrite(
+    theme: &Theme,
+    path: Option<&std::path::Path>,
+    removed: bool,
+) -> Box<dyn Layer> {
+    let name = path.map_or_else(
+        || "this buffer".to_string(),
+        |p| crate::layout::buffer_display_name(Some(p), false),
+    );
+    let question = if removed {
+        format!("{name} was deleted. Save it back? (y/N) ")
+    } else {
+        format!("{name} changed on disk. Overwrite it with your version? (y/N) ")
+    };
+    Box::new(Confirm::new(
+        question,
+        vec![Command::Editor(Action::Save { force: true })],
+        theme.palette,
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -566,6 +599,61 @@ mod tests {
                 force: true,
             })]
         );
+    }
+
+    /// The bottom row a confirmation paints - the question itself.
+    fn question_row(layer: Box<dyn Layer>) -> String {
+        let mut terminal = Terminal::new(TestBackend::new(70, 3)).unwrap();
+        terminal
+            .draw(|frame| layer.render(frame.area(), frame.buffer_mut()))
+            .unwrap();
+        crate::testutil::row_text(&terminal.backend().buffer().clone(), 2)
+    }
+
+    #[test]
+    fn confirming_an_overwrite_commits_a_forced_save() {
+        // The core refused the unforced save precisely so this question gets asked -
+        // and this is the one whose "yes" discards someone else's work rather than
+        // the user's own.
+        let mut layer = confirm_overwrite(
+            &Theme::default(),
+            Some(std::path::Path::new("dir/shared.txt")),
+            false,
+        );
+        assert_eq!(layer.handle_key(key('y')), EventResult::Consumed);
+        assert!(layer.is_finished());
+        assert_eq!(
+            layer.take_commands(),
+            vec![Command::Editor(Action::Save { force: true })]
+        );
+    }
+
+    #[test]
+    fn declining_an_overwrite_writes_nothing() {
+        // Both copies survive a "no": the buffer keeps its edits and the file keeps
+        // its own, which is why "no" is the default.
+        let mut layer = confirm_overwrite(&Theme::default(), None, false);
+        layer.handle_key(press(KeyCode::Esc));
+        assert!(layer.is_finished());
+        assert!(layer.take_commands().is_empty());
+    }
+
+    #[test]
+    fn a_deleted_file_is_asked_about_differently() {
+        // Nothing to overwrite, so the question is whether to put it back - which is
+        // usually yes, but is still the user's call.
+        let deleted = confirm_overwrite(
+            &Theme::default(),
+            Some(std::path::Path::new("gone.txt")),
+            true,
+        );
+        let changed = confirm_overwrite(
+            &Theme::default(),
+            Some(std::path::Path::new("gone.txt")),
+            false,
+        );
+        assert!(question_row(deleted).contains("was deleted"));
+        assert!(question_row(changed).contains("changed on disk"));
     }
 
     #[test]

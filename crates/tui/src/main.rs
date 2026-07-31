@@ -752,6 +752,18 @@ fn event_loop(
                 ));
                 needs_redraw = true;
             }
+            // The core refused to write over a file that changed underneath the
+            // buffer (SPEC §8). Same shape as the two above, and the one whose
+            // stakes point outward: what a forced save discards is someone else's
+            // work, not the user's own.
+            if let vortex_core::Notification::SaveRejected { path, removed, .. } = &note {
+                overlays.push(prompt::confirm_overwrite(
+                    &config.theme,
+                    Some(path.as_path()),
+                    *removed,
+                ));
+                needs_redraw = true;
+            }
             // The buffer is gone, so its parked scroll position is too. Keyed off the
             // core's own event rather than inferred from the list shrinking.
             if let vortex_core::Notification::BufferClosed { buffer_id } = &note {

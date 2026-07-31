@@ -650,7 +650,7 @@ fn a_read_only_buffer_refuses_edits_and_saves_but_still_yields_to_save_as() {
     let (snap, notes) = run_seam(&[
         Action::Open(path.clone()),
         Action::Insert("nope".into()),
-        Action::Save,
+        Action::Save { force: false },
         Action::SaveAs(target.clone()),
         Action::Insert("yes".into()),
     ]);
@@ -819,7 +819,12 @@ fn the_editors_own_save_is_not_an_external_change() {
         &h.snapshots,
         &h.note_tx,
     ));
-    assert!(smol::block_on(save_file(&mut e, &h.snapshots, &h.note_tx)));
+    assert!(smol::block_on(save_file(
+        &mut e,
+        false,
+        &h.snapshots,
+        &h.note_tx
+    )));
     let _ = drain_notes(&h);
 
     assert!(smol::block_on(external_change(
@@ -1348,7 +1353,7 @@ fn every_step_declares_whether_it_edits_the_buffer() {
     assert!(Step::Redo.edits_buffer());
     // Save is not listed: it writes the file, not the buffer, and `save_file` holds
     // that guard so the refusal can be a `FileError` instead of an `EditRejected`.
-    assert!(!Step::Save.edits_buffer());
+    assert!(!Step::Save { force: false }.edits_buffer());
     assert!(!Step::SaveAs(PathBuf::from("x")).edits_buffer());
     assert!(!Step::Republish.edits_buffer());
     assert!(!Step::Open(PathBuf::from("x")).edits_buffer());
@@ -1443,7 +1448,12 @@ fn open_non_utf8_text_file_loads_and_saves_back_unchanged() {
     assert_eq!(snap.format.eol, crate::file::LineEnding::Crlf);
     assert!(!snap.text.to_string().contains('\r')); // the buffer is always LF
 
-    assert!(smol::block_on(save_file(&mut e, &h.snapshots, &h.note_tx)));
+    assert!(smol::block_on(save_file(
+        &mut e,
+        false,
+        &h.snapshots,
+        &h.note_tx
+    )));
     assert_eq!(std::fs::read(&path).unwrap(), original);
 }
 
@@ -1476,7 +1486,12 @@ fn saving_a_character_the_files_encoding_cannot_hold_is_refused() {
         &h.note_tx,
     ));
 
-    assert!(smol::block_on(save_file(&mut e, &h.snapshots, &h.note_tx)));
+    assert!(smol::block_on(save_file(
+        &mut e,
+        false,
+        &h.snapshots,
+        &h.note_tx
+    )));
     assert!(e.active().modified()); // still dirty: nothing was saved
     assert_eq!(std::fs::read(&path).unwrap(), original); // file untouched
     let notes: Vec<_> = std::iter::from_fn(|| h.note_rx.try_recv().ok()).collect();
@@ -1499,7 +1514,7 @@ fn save_writes_buffer_to_bound_file_and_clears_modified() {
     mark_dirty(&mut e);
 
     let h = Harness::new();
-    let alive = smol::block_on(save_file(&mut e, &h.snapshots, &h.note_tx));
+    let alive = smol::block_on(save_file(&mut e, false, &h.snapshots, &h.note_tx));
 
     assert!(alive);
     // The trailing newline is the POSIX final-newline policy (SPEC §10.1), applied
@@ -1534,7 +1549,7 @@ fn save_without_path_errors_and_keeps_buffer_dirty() {
     mark_dirty(&mut e);
 
     let h = Harness::new();
-    let alive = smol::block_on(save_file(&mut e, &h.snapshots, &h.note_tx));
+    let alive = smol::block_on(save_file(&mut e, false, &h.snapshots, &h.note_tx));
 
     assert!(alive);
     assert!(e.active().modified()); // still dirty
@@ -1558,10 +1573,14 @@ fn save_failure_keeps_buffer_dirty_and_does_not_corrupt_original() {
 
     let mut e = session_with("new work", SelectionSet::at_origin());
     e.active_mut().path = Some(path.clone());
+    // Account for what is there, so this exercises the *write* failing rather than
+    // the conflict guard in front of it - a buffer whose path holds something it
+    // never read is a conflict, and refusing that is a different test.
+    e.active_mut().disk = DiskStamp::read(&path);
     mark_dirty(&mut e);
 
     let h = Harness::new();
-    let alive = smol::block_on(save_file(&mut e, &h.snapshots, &h.note_tx));
+    let alive = smol::block_on(save_file(&mut e, false, &h.snapshots, &h.note_tx));
 
     assert!(alive);
     assert!(e.active().modified()); // failed save keeps the buffer dirty
@@ -1603,7 +1622,7 @@ fn open_then_edit_then_save_round_trips_through_disk() {
         &h.note_tx,
     ));
     assert!(e.active().modified());
-    smol::block_on(save_file(&mut e, &h.snapshots, &h.note_tx));
+    smol::block_on(save_file(&mut e, false, &h.snapshots, &h.note_tx));
 
     assert!(!e.active().modified());
     assert_eq!(std::fs::read_to_string(&path).unwrap(), "abcd\n");
@@ -1646,7 +1665,7 @@ fn save_as_writes_to_target_adopts_it_and_clears_modified() {
         &h.snapshots,
         &h.note_tx,
     ));
-    smol::block_on(save_file(&mut e, &h.snapshots, &h.note_tx));
+    smol::block_on(save_file(&mut e, false, &h.snapshots, &h.note_tx));
     assert_eq!(std::fs::read_to_string(&target).unwrap(), "save-as body!\n");
     assert!(!has_temp_file(&dir.path), "leftover .vortex-tmp file");
 }
@@ -1803,7 +1822,7 @@ fn save_writes_to_a_new_file_that_did_not_exist() {
         &h.snapshots,
         &h.note_tx,
     ));
-    smol::block_on(save_file(&mut e, &h.snapshots, &h.note_tx));
+    smol::block_on(save_file(&mut e, false, &h.snapshots, &h.note_tx));
 
     assert!(path.exists());
     assert_eq!(std::fs::read_to_string(&path).unwrap(), "brand new\n");
@@ -1856,7 +1875,7 @@ fn save_into_missing_directory_errors_and_keeps_buffer_dirty() {
     mark_dirty(&mut e);
 
     let h = Harness::new();
-    let alive = smol::block_on(save_file(&mut e, &h.snapshots, &h.note_tx));
+    let alive = smol::block_on(save_file(&mut e, false, &h.snapshots, &h.note_tx));
 
     assert!(alive);
     assert!(e.active().modified());
@@ -2140,7 +2159,7 @@ fn open_then_save_through_the_actor_loop() {
     let (snap, notes) = run_seam(&[
         Action::Open(path.clone()),
         Action::Insert("Z".into()),
-        Action::Save,
+        Action::Save { force: false },
     ]);
 
     assert_eq!(snap.path, Some(path.clone()));
@@ -2466,9 +2485,9 @@ fn undo_back_to_the_saved_state_clears_modified_through_the_loop() {
     let (snap, _notes) = run_seam(&[
         Action::Open(path.clone()),
         Action::Insert("x".into()),
-        Action::Save,               // saved state = "x"
-        Action::Insert("y".into()), // dirty: "xy"
-        Action::Undo,               // back to the saved node
+        Action::Save { force: false }, // saved state = "x"
+        Action::Insert("y".into()),    // dirty: "xy"
+        Action::Undo,                  // back to the saved node
     ]);
     assert_eq!(snap.text.to_string(), "x");
     assert!(
