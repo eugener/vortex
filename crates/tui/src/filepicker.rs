@@ -191,8 +191,7 @@ pub fn open(theme: &Theme, root: &Path) -> Box<dyn Layer> {
             "Open File",
             items(root),
             true, // path-aware fuzzy matching
-            theme.palette,
-            theme.palette_selected,
+            theme,
         )
         .with_preview_pane(preview_source()),
     )

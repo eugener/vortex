@@ -30,7 +30,7 @@ use std::path::Path;
 
 use ratatui::layout::{Position, Rect};
 use ratatui::style::Style;
-use ratatui::widgets::{Block, Clear, Widget};
+use ratatui::widgets::{Block, Clear, StatefulWidget, Widget};
 use unicode_width::UnicodeWidthStr;
 
 use crate::command::Command;
@@ -156,6 +156,10 @@ pub struct Picker {
     matcher: Matcher,
     style: Style,
     selected_style: Style,
+    /// The scrollbar's two halves, same slots the body's bar reads (SPEC §7.5) - a
+    /// second pair for overlays would be two ways to say the same thing in a theme.
+    track_style: Style,
+    thumb_style: Style,
     finished: bool,
     /// Commands the picker has committed, drained by [`Layer::take_commands`].
     /// A list, not a single slot, because a previewing picker emits as you move.
@@ -175,17 +179,26 @@ pub struct Picker {
     /// The source's status as of the last tick, so a change in it can ask for a
     /// repaint. A source may change what it says without producing a row.
     status: Option<String>,
+    /// Whether the pointer is dragging the scrollbar. The press decides whether the
+    /// gesture belongs to the bar and every drag after it inherits that answer, so
+    /// pulling a cell sideways off the one-column track keeps scrolling instead of
+    /// dying halfway through the gesture - the same bargain the body's bar makes
+    /// (SPEC §12), kept in the layer because the picker's geometry is the layer's.
+    dragging: bool,
 }
 
 impl Picker {
     /// A picker titled `title` over `items`. `match_paths` tunes the matcher for
     /// path-shaped haystacks (a file picker) versus plain labels (a command palette).
+    ///
+    /// Takes the whole theme rather than the handful of styles it reads, as
+    /// [`Layer::restyle`] already does: the picker draws from four slots now, and a
+    /// positional list of them is a swap waiting to happen.
     pub fn new(
         title: impl Into<String>,
         items: Vec<Item>,
         match_paths: bool,
-        style: Style,
-        selected_style: Style,
+        theme: &Theme,
     ) -> Self {
         let config = if match_paths {
             Config::DEFAULT.match_paths()
@@ -200,8 +213,10 @@ impl Picker {
             filtered,
             selected: 0,
             matcher: Matcher::new(config),
-            style,
-            selected_style,
+            style: theme.palette,
+            selected_style: theme.palette_selected,
+            track_style: theme.scrollbar_track,
+            thumb_style: theme.scrollbar_thumb,
             finished: false,
             outbox: Vec::new(),
             cancel: None,
@@ -209,6 +224,7 @@ impl Picker {
             pane: None,
             source: None,
             status: None,
+            dragging: false,
         }
     }
 
@@ -356,23 +372,89 @@ impl Picker {
         self.selected.saturating_sub(list_h.saturating_sub(1))
     }
 
+    /// The list column split into the rows the items paint on and the one-cell column
+    /// reserved to their right for the scrollbar. `None` when the column has no room
+    /// for both (a box one cell wide, or with no row under its query line).
+    ///
+    /// **The column is reserved whether or not a bar is drawn in it**, the bargain the
+    /// body's scrollbar already makes (SPEC §7.5): the list overflows and stops
+    /// overflowing as you type, and a column that came and went with it would re-clip
+    /// every label and re-place every shortcut on the keystroke that changed the match
+    /// count. One cell of a sixty-column row is a cheaper price than a list that
+    /// twitches while you filter it.
+    ///
+    /// Shared by [`Layer::render`] and [`Self::row_at`], for the same reason
+    /// [`Self::columns`] is: a click must land on the row the user is looking at, and
+    /// must not pick one at all when it landed on the bar.
+    fn list_split(list: Rect) -> Option<(Rect, Rect)> {
+        // A query row plus a row to list under it, and a column for the bar beside
+        // them: under either, there is no list left to split.
+        if list.height < 2 || list.width < 2 {
+            return None;
+        }
+        // The query row sits at `list.y`; the rows start beneath it.
+        let (width, height) = (list.width - 1, list.height - 1);
+        Some((
+            Rect::new(list.x, list.y + 1, width, height),
+            Rect::new(list.right() - 1, list.y + 1, 1, height),
+        ))
+    }
+
+    /// The scrollbar's track, when there is a bar to grab - which is when the list
+    /// outruns the box, the one condition [`Layer::render`] also paints under. `None`
+    /// leaves the reserved column inert, which is what it is with nothing drawn in it:
+    /// a press there must not scroll a list that has nowhere to scroll to.
+    ///
+    /// The track is as tall as the rows it stands for, so its `height` is also the
+    /// window size the rest of the scroll math needs - no second copy to keep in step.
+    fn bar(&self, screen: Rect) -> Option<Rect> {
+        let (inner, _) = self.columns(screen)?;
+        let (rows, bar) = Self::list_split(inner)?;
+        (self.filtered.len() > rows.height as usize).then_some(bar)
+    }
+
+    /// Scroll to what a pointer on screen `row` of the track asks for.
+    ///
+    /// The bar has no offset of its own to write - the list's is
+    /// [derived](Self::list_scroll) from the selection - so it moves the *highlight*,
+    /// which is what the wheel over this picker already does. The highlight lands on
+    /// the last row of the window the pointer chose, which is where it sits whenever
+    /// the list is scrolled at all, since that is the only thing that scrolls it.
+    ///
+    /// Shares [`crate::layout::scroll_at_track_row`] with the body's bar so both read
+    /// the track the same way: its ends are the list's ends, and the pointer stays
+    /// inside the thumb it is dragging. A row above the track (a drag pulled up past
+    /// the query line) means the top, as it does there.
+    fn scroll_to_track(&mut self, screen: Rect, row: u16) {
+        let Some(bar) = self.bar(screen) else {
+            return;
+        };
+        let track = bar.height as usize;
+        let max_scroll = self.filtered.len() - track;
+        let offset = row.saturating_sub(bar.y) as usize;
+        let Some(scroll) = crate::layout::scroll_at_track_row(offset, track, max_scroll) else {
+            return;
+        };
+        self.selected = (scroll + track - 1).min(self.filtered.len() - 1);
+    }
+
     /// The row of [`Self::filtered`] under the pointer, or `None` if the pointer is
-    /// on the border, the query row, the preview pane, or off the box entirely.
+    /// on the border, the query row, the scrollbar, the preview pane, or off the box
+    /// entirely.
     fn row_at(&self, screen: Rect, column: u16, row: u16) -> Option<usize> {
         let (inner, _) = self.columns(screen)?;
-        if column < inner.x || column >= inner.right() {
+        let (rows, _) = Self::list_split(inner)?;
+        // The bar's column is excluded rather than treated as part of the row it sits
+        // on: it is the track's, and a press there scrolls ([`Self::scroll_to_track`])
+        // rather than running whatever the user was reaching past.
+        if column < rows.x || column >= rows.right() {
             return None;
         }
-        let list_h = inner.height.saturating_sub(1) as usize;
-        if list_h == 0 {
+        let offset = row.checked_sub(rows.y)? as usize;
+        if offset >= rows.height as usize {
             return None;
         }
-        // The query row sits at `inner.y`; the list starts beneath it.
-        let offset = row.checked_sub(inner.y + 1)? as usize;
-        if offset >= list_h {
-            return None;
-        }
-        let index = self.list_scroll(list_h) + offset;
+        let index = self.list_scroll(rows.height as usize) + offset;
         // Past the last match: the rows are painted, but there is nothing on them.
         (index < self.filtered.len()).then_some(index)
     }
@@ -468,11 +550,12 @@ impl Layer for Picker {
         if let (Some(area), Some(state)) = (pane, self.pane.as_ref()) {
             self.render_pane(state, area, buf);
         }
-        // The list fills the rows beneath it, scrolled to keep the highlight visible.
-        let list_h = inner.height.saturating_sub(1) as usize;
-        if list_h == 0 {
+        // The list fills the rows beneath it, scrolled to keep the highlight visible,
+        // with the last column of each row left to the scrollbar.
+        let Some((rows, _)) = Self::list_split(inner) else {
             return;
-        }
+        };
+        let list_h = rows.height as usize;
         // Nothing to list yet: say why, if the source knows. An empty box under a
         // typed query is the one state a picker cannot explain by itself - a bad
         // pattern and a genuine no-match look identical.
@@ -480,29 +563,33 @@ impl Layer for Picker {
             && let Some(status) = self.source.as_ref().and_then(|s| s.status())
         {
             buf.set_stringn(
-                inner.x,
-                inner.y + 1,
+                rows.x,
+                rows.y,
                 format!("  {status}"),
-                inner.width as usize,
+                rows.width as usize,
                 self.style,
             );
         }
         let scroll = self.list_scroll(list_h);
         for (row, &idx) in self.filtered.iter().enumerate().skip(scroll).take(list_h) {
-            let y = inner.y + 1 + (row - scroll) as u16;
+            let y = rows.y + (row - scroll) as u16;
             let style = if row == self.selected {
                 self.selected_style
             } else {
                 self.style
             };
             let item = &self.items[idx];
+            // The highlight's ground crosses the bar's column - the same carry the
+            // body's current-line wash makes - so the selected row reads as one band
+            // rather than one notched a cell short of the border. The bar paints after
+            // this and sets only a foreground, so its glyphs survive the wash.
             let rect = Rect::new(inner.x, y, inner.width, 1);
             buf.set_style(rect, style);
             buf.set_stringn(
-                inner.x,
+                rows.x,
                 y,
                 format!("  {}", item.label),
-                inner.width as usize,
+                rows.width as usize,
                 style,
             );
             // The shortcut (if any) is drawn right-aligned, one cell in from the
@@ -510,10 +597,25 @@ impl Layer for Picker {
             if let Some(shortcut) = &item.shortcut {
                 let text = format!("{shortcut} ");
                 let w = text.width() as u16;
-                if w < inner.width {
-                    buf.set_stringn(inner.x + inner.width - w, y, &text, w as usize, style);
+                if w < rows.width {
+                    buf.set_stringn(rows.x + rows.width - w, y, &text, w as usize, style);
                 }
             }
+        }
+        // The bar, asked for from [`Self::bar`] rather than re-tested here, so what is
+        // painted and what can be grabbed are the same question asked once: a track
+        // with no thumb to pull would be a control over a list with nowhere to go.
+        // Over the rows and not the query line, for the reason the body's runs over the
+        // text and not the sticky header - the track stands for what scrolls.
+        if let Some(bar) = self.bar(screen) {
+            let (widget, mut state) = crate::layout::scrollbar(
+                scroll,
+                self.filtered.len() - list_h,
+                list_h,
+                self.track_style,
+                self.thumb_style,
+            );
+            StatefulWidget::render(widget, bar, buf, &mut state);
         }
     }
 
@@ -562,7 +664,19 @@ impl Layer for Picker {
     fn handle_mouse(&mut self, mouse: MouseEvent, screen: Rect) -> EventResult {
         match mouse.kind {
             MouseEventKind::Down(MouseButton::Left) => {
-                if let Some(row) = self.row_at(screen, mouse.column, mouse.row) {
+                // The press decides whose gesture this is, and *always* answers: a
+                // press that missed the bar ends any latch a lost release left behind,
+                // rather than leaving one armed for the next drag to inherit.
+                self.dragging = self
+                    .bar(screen)
+                    .is_some_and(|bar| bar.contains(Position::new(mouse.column, mouse.row)));
+                if self.dragging {
+                    // The bar is a control, not just a readout: a press anywhere on
+                    // the track goes to that fraction of the list and holding drags
+                    // it, which is the gesture a scrollbar owes the hand that grabs
+                    // it. Checked before the rows, since the column is not one.
+                    self.scroll_to_track(screen, mouse.row);
+                } else if let Some(row) = self.row_at(screen, mouse.column, mouse.row) {
                     // One click picks. A picker exists to choose something, and the
                     // row under the pointer is unambiguous in a way a caret position
                     // is not - so there is nothing for a second click to confirm.
@@ -578,6 +692,15 @@ impl Layer for Picker {
                 // Anywhere else in the box - border, query row, empty rows below the
                 // last match - is a click on the picker's own furniture. Swallowed.
             }
+            // A drag only means the bar if the press that started it did. Anywhere
+            // else it is a pointer moving over a modal box, which has nothing to
+            // sweep: rows are chosen by the click that lands on them.
+            MouseEventKind::Drag(MouseButton::Left) if self.dragging => {
+                self.scroll_to_track(screen, mouse.row);
+            }
+            // Releasing ends the drag, the one thing this arm is here for. Also on a
+            // release *outside* the box, which is where a fast drag ends up.
+            MouseEventKind::Up(_) => self.dragging = false,
             // The wheel moves the highlight, which is what scrolls the list: the view
             // offset is derived from the selection, so there is no way to scroll the
             // list away from it and then click on a row that is not what it says.
@@ -589,7 +712,16 @@ impl Layer for Picker {
             }
             _ => {}
         }
-        if !self.finished {
+        // Held off while a drag is live, unlike every other way the highlight moves.
+        // Both of these are I/O - a preview reloads a theme, a pane reads (and decodes)
+        // a file, up to a megabyte of one for the project-search picker - and a drag
+        // reports an event per cell the pointer crosses, so a hand wobbling on the bar
+        // would queue one read per report. [`PreviewSource`] is documented as bounded
+        // work per *move*, and a drag is one move however many cells it reports; the
+        // release below clears the latch first, so the pane still lands on the row the
+        // gesture finished on. The list itself scrolls throughout: `list_scroll` is
+        // derived, so the rows and the thumb repaint on every event regardless.
+        if !self.finished && !self.dragging {
             self.preview();
             self.fill_pane();
         }
@@ -603,6 +735,8 @@ impl Layer for Picker {
     fn restyle(&mut self, theme: &Theme) {
         self.style = theme.palette;
         self.selected_style = theme.palette_selected;
+        self.track_style = theme.scrollbar_track;
+        self.thumb_style = theme.scrollbar_thumb;
     }
 
     fn tick(&mut self) -> bool {
@@ -676,7 +810,7 @@ mod tests {
     }
 
     fn picker() -> Picker {
-        Picker::new("Test", items(), false, Style::default(), Style::default())
+        Picker::new("Test", items(), false, &Theme::default())
     }
 
     fn key(c: char) -> KeyEvent {
@@ -834,14 +968,7 @@ mod tests {
     fn a_click_lands_on_the_row_the_user_sees_after_the_list_has_scrolled() {
         // The list scrolls by following the highlight, so a long list is offset -
         // and a hit test that ignored that would run the wrong item entirely.
-        let many: Vec<Item> = (0..40)
-            .map(|n| Item {
-                label: format!("item-{n:02}"),
-                shortcut: None,
-                command: Command::Editor(Action::Insert(format!("{n}"))),
-            })
-            .collect();
-        let mut p = Picker::new("Many", many, false, Style::default(), Style::default());
+        let mut p = long();
         for _ in 0..30 {
             p.handle_key(press(KeyCode::Down));
         }
@@ -987,11 +1114,17 @@ mod tests {
         let theme = Theme {
             palette: Style::new().bg(ratatui::style::Color::Rgb(1, 2, 3)),
             palette_selected: Style::new().bg(ratatui::style::Color::Rgb(4, 5, 6)),
+            scrollbar_track: Style::new().fg(ratatui::style::Color::Rgb(7, 8, 9)),
+            scrollbar_thumb: Style::new().fg(ratatui::style::Color::Rgb(10, 11, 12)),
             ..Theme::default()
         };
         p.restyle(&theme);
         assert_eq!(p.style, theme.palette);
         assert_eq!(p.selected_style, theme.palette_selected);
+        // The bar too, or a picker open across a theme swap keeps a track in the
+        // colours of the theme that is no longer on screen.
+        assert_eq!(p.track_style, theme.scrollbar_track);
+        assert_eq!(p.thumb_style, theme.scrollbar_thumb);
     }
 
     #[test]
@@ -1276,14 +1409,8 @@ mod tests {
             pending: Rc::clone(&pending),
             status: Status::default(),
         };
-        let p = Picker::new(
-            "Search",
-            Vec::new(),
-            false,
-            Style::default(),
-            Style::default(),
-        )
-        .with_item_source(Box::new(source));
+        let p = Picker::new("Search", Vec::new(), false, &Theme::default())
+            .with_item_source(Box::new(source));
         (p, asked, pending)
     }
 
@@ -1358,14 +1485,8 @@ mod tests {
             status: Rc::new(RefCell::new(Some("searching…".to_string()))),
             ..Fake::default()
         };
-        let p = Picker::new(
-            "Search",
-            Vec::new(),
-            false,
-            Style::default(),
-            Style::default(),
-        )
-        .with_item_source(Box::new(source));
+        let p = Picker::new("Search", Vec::new(), false, &Theme::default())
+            .with_item_source(Box::new(source));
         let buf = painted(&p, SCREEN);
         let (list, _) = p.columns(SCREEN).unwrap();
         let row: String = (list.x..list.right())
@@ -1397,14 +1518,8 @@ mod tests {
             status: Rc::clone(&status),
             ..Fake::default()
         };
-        let mut p = Picker::new(
-            "Search",
-            Vec::new(),
-            false,
-            Style::default(),
-            Style::default(),
-        )
-        .with_item_source(Box::new(source));
+        let mut p = Picker::new("Search", Vec::new(), false, &Theme::default())
+            .with_item_source(Box::new(source));
         assert!(!p.tick(), "nothing arrived and nothing was restated");
         *status.borrow_mut() = Some("searching…".to_string());
         assert!(p.tick(), "the line under the query changed");
@@ -1433,6 +1548,277 @@ mod tests {
         // And with no working directory to be relative to (deleted, or unreadable),
         // every row stays absolute rather than the picker losing its labels.
         assert_eq!(display_path(Path::new("/etc/hosts"), None), "/etc/hosts");
+    }
+
+    /// A picker over forty rows labelled `item-NN` - longer than any box this crate
+    /// draws, so the list always overflows and the bar always has somewhere to go.
+    fn long() -> Picker {
+        let items = (0..40)
+            .map(|k| Item {
+                label: format!("item-{k:02}"),
+                shortcut: None,
+                command: Command::Editor(Action::Insert(format!("{k}"))),
+            })
+            .collect();
+        Picker::new("Many", items, false, &Theme::default())
+    }
+
+    /// The rows and the bar's column, as [`Layer::render`] would place them.
+    fn split(p: &Picker, screen: Rect) -> (Rect, Rect) {
+        Picker::list_split(p.columns(screen).unwrap().0).unwrap()
+    }
+
+    /// What is painted down the bar's column, one symbol per row, top to bottom.
+    fn bar_column(p: &Picker, screen: Rect) -> String {
+        let buf = painted(p, screen);
+        let (_, bar) = split(p, screen);
+        (bar.y..bar.bottom())
+            .map(|y| buf.cell((bar.x, y)).unwrap().symbol().to_string())
+            .collect()
+    }
+
+    #[test]
+    fn a_list_that_fits_its_box_gets_no_bar() {
+        // A bar answers "where am I in something bigger than the box"; with nothing
+        // bigger there is nothing for it to say, and a full-height thumb would be a
+        // loud way of saying it.
+        let column = bar_column(&picker(), SCREEN);
+        assert!(column.trim().is_empty(), "{column:?}");
+    }
+
+    #[test]
+    fn a_list_longer_than_its_box_gets_a_bar() {
+        let column = bar_column(&long(), SCREEN);
+        assert!(column.contains('█'), "a thumb: {column:?}");
+        assert!(column.contains('║'), "with track around it: {column:?}");
+    }
+
+    #[test]
+    fn the_thumb_travels_as_the_highlight_scrolls_the_list() {
+        // The bar is a readout of the derived offset, so it has to move with it -
+        // a thumb pinned at the top under a list scrolled to its end is worse than
+        // no bar at all.
+        let mut p = long();
+        let top = bar_column(&p, SCREEN);
+        assert_eq!(top.chars().next(), Some('█'), "starts at the top: {top:?}");
+        for _ in 0..40 {
+            p.handle_key(press(KeyCode::Down));
+        }
+        let bottom = bar_column(&p, SCREEN);
+        assert_eq!(
+            bottom.chars().last(),
+            Some('█'),
+            "and reaches the end: {bottom:?}"
+        );
+    }
+
+    /// A left drag to a screen cell, and the release that ends it.
+    fn drag(column: u16, row: u16) -> MouseEvent {
+        MouseEvent {
+            kind: MouseEventKind::Drag(MouseButton::Left),
+            column,
+            row,
+            modifiers: KeyModifiers::NONE,
+        }
+    }
+
+    fn release(column: u16, row: u16) -> MouseEvent {
+        MouseEvent {
+            kind: MouseEventKind::Up(MouseButton::Left),
+            column,
+            row,
+            modifiers: KeyModifiers::NONE,
+        }
+    }
+
+    #[test]
+    fn a_press_on_the_bar_scrolls_there_instead_of_picking() {
+        // The track's ends are the list's ends: a press at the bottom of it shows the
+        // end of the list, and never runs the row it happened to land beside.
+        let mut p = long();
+        let (_, bar) = split(&p, SCREEN);
+        assert_eq!(
+            p.handle_mouse(click(bar.x, bar.bottom() - 1), SCREEN),
+            EventResult::Consumed
+        );
+        assert!(!p.is_finished(), "a press on the bar is not a pick");
+        assert!(p.take_commands().is_empty());
+        assert_eq!(selected_label(&p), "item-39", "scrolled to the end");
+
+        p.handle_mouse(click(bar.x, bar.y), SCREEN);
+        let (rows, _) = split(&p, SCREEN);
+        assert_eq!(
+            p.list_scroll(rows.height as usize),
+            0,
+            "and back to the start"
+        );
+    }
+
+    #[test]
+    fn dragging_the_bar_tracks_the_pointer_down_the_track() {
+        let mut p = long();
+        let (rows, bar) = split(&p, SCREEN);
+        p.handle_mouse(click(bar.x, bar.y), SCREEN);
+        let mut seen = Vec::new();
+        for y in bar.y..bar.bottom() {
+            p.handle_mouse(drag(bar.x, y), SCREEN);
+            seen.push(p.list_scroll(rows.height as usize));
+        }
+        assert!(
+            seen.windows(2).all(|w| w[0] <= w[1]),
+            "the offset only ever moved down: {seen:?}"
+        );
+        assert_eq!(seen.first(), Some(&0), "from the top");
+        assert_eq!(
+            seen.last(),
+            Some(&(p.filtered.len() - rows.height as usize)),
+            "to the end"
+        );
+    }
+
+    #[test]
+    fn a_drag_that_strays_off_the_track_keeps_scrolling() {
+        // Mouse mode reports a drag per cell crossed, and a hand pulling a one-column
+        // track will leave it. The press decides whose gesture this is; the drags
+        // after it inherit that rather than dying a cell to the left.
+        let mut p = long();
+        let (rows, bar) = split(&p, SCREEN);
+        p.handle_mouse(click(bar.x, bar.y), SCREEN);
+        p.handle_mouse(drag(0, bar.bottom() - 1), SCREEN);
+        assert_eq!(
+            p.list_scroll(rows.height as usize),
+            p.filtered.len() - rows.height as usize
+        );
+        assert!(!p.is_finished(), "straying off is not a click-away cancel");
+    }
+
+    #[test]
+    fn a_drag_that_did_not_start_on_the_bar_scrolls_nothing() {
+        // Otherwise a pointer wandering across an open picker with the button down
+        // would throw the list about.
+        let mut p = long();
+        let (rows, bar) = split(&p, SCREEN);
+        p.handle_mouse(drag(bar.x, bar.bottom() - 1), SCREEN);
+        assert_eq!(p.list_scroll(rows.height as usize), 0, "nothing moved");
+    }
+
+    #[test]
+    fn releasing_ends_the_drag() {
+        let mut p = long();
+        let (rows, bar) = split(&p, SCREEN);
+        p.handle_mouse(click(bar.x, bar.y), SCREEN);
+        p.handle_mouse(release(bar.x, bar.y), SCREEN);
+        p.handle_mouse(drag(bar.x, bar.bottom() - 1), SCREEN);
+        assert_eq!(
+            p.list_scroll(rows.height as usize),
+            0,
+            "the drag was over when the button came up"
+        );
+    }
+
+    #[test]
+    fn a_bar_gesture_previews_once_when_it_is_let_go() {
+        // Preview is I/O - the theme picker reloads a theme file per emitted command -
+        // and a drag reports an event per cell crossed. So the gesture previews what it
+        // *landed* on, once, rather than every theme it swept past on the way.
+        let mut p = long().previewing(Command::OpenPalette);
+        let (_, bar) = split(&p, SCREEN);
+        p.handle_mouse(click(bar.x, bar.y), SCREEN);
+        p.handle_mouse(drag(bar.x, bar.bottom() - 1), SCREEN);
+        assert!(
+            p.take_commands().is_empty(),
+            "silent while the button is down"
+        );
+        p.handle_mouse(release(bar.x, bar.bottom() - 1), SCREEN);
+        assert_eq!(
+            p.take_commands(),
+            vec![Command::Editor(Action::Insert("39".to_string()))],
+            "and previews the row it finished on"
+        );
+    }
+
+    #[test]
+    fn a_drag_does_not_refill_the_preview_pane_until_it_ends() {
+        // The pane's source reads (and decodes) a file - up to a megabyte of one for
+        // the project-search picker - so one read per reported cell is what a hand
+        // resting on the bar would otherwise cost.
+        let asked = Rc::new(RefCell::new(Vec::new()));
+        let log = Rc::clone(&asked);
+        let mut p = long().with_preview_pane(Box::new(move |item, _| {
+            log.borrow_mut().push(item.label.clone());
+            Vec::new()
+        }));
+        let (_, bar) = split(&p, SCREEN);
+        asked.borrow_mut().clear(); // the fill on open
+        p.handle_mouse(click(bar.x, bar.y), SCREEN);
+        for y in bar.y..bar.bottom() {
+            p.handle_mouse(drag(bar.x, y), SCREEN);
+        }
+        assert!(asked.borrow().is_empty(), "read a file mid-drag");
+        p.handle_mouse(release(bar.x, bar.bottom() - 1), SCREEN);
+        assert_eq!(
+            *asked.borrow(),
+            vec!["item-39"],
+            "exactly one read, for the row the drag finished on"
+        );
+    }
+
+    #[test]
+    fn a_press_that_misses_the_bar_disarms_a_stranded_drag() {
+        // A release can go missing - a terminal that drops the report, a button let go
+        // off-window. The next press answers the question again rather than inheriting
+        // a latch, so the picker cannot be left permanently in a drag.
+        let mut p = long();
+        let (rows, bar) = split(&p, SCREEN);
+        p.handle_mouse(click(bar.x, bar.y), SCREEN); // arms it
+        let scrolled = p.list_scroll(rows.height as usize);
+        // A press on the query row: furniture, so the picker stays open, but it is not
+        // the bar - and no release ever arrives.
+        p.handle_mouse(click(rows.x, rows.y - 1), SCREEN);
+        assert!(!p.dragging, "the latch did not survive a press that missed");
+        p.handle_mouse(drag(bar.x, bar.bottom() - 1), SCREEN);
+        assert_eq!(
+            p.list_scroll(rows.height as usize),
+            scrolled,
+            "the stranded drag moved nothing"
+        );
+    }
+
+    #[test]
+    fn the_bars_column_is_reserved_whether_or_not_it_paints() {
+        // A list overflows and stops overflowing as you type. A column that came and
+        // went with it would re-clip every label and re-place every shortcut on the
+        // keystroke that changed the match count.
+        let (fits, _) = split(&picker(), SCREEN);
+        let (overflows, bar) = split(&long(), SCREEN);
+        assert_eq!(fits, overflows, "the rows do not move when a bar appears");
+        // And the column is the bar's in both: a click there is furniture, not the
+        // row it abuts, even with nothing drawn in it.
+        let mut p = picker();
+        assert_eq!(p.row_at(SCREEN, bar.x, bar.y), None);
+        p.handle_mouse(click(bar.x, bar.y), SCREEN);
+        assert!(!p.is_finished());
+        assert!(p.take_commands().is_empty());
+    }
+
+    #[test]
+    fn a_row_too_long_for_its_width_stops_short_of_the_bar() {
+        // Clipped to the rows rather than to the list column: a label running under
+        // the track would be half-overwritten by it, which reads as a corrupt row
+        // rather than as a long one.
+        let items = (0..40)
+            .map(|k| Item {
+                label: "x".repeat(200),
+                shortcut: Some("y".repeat(200)),
+                command: Command::Editor(Action::Insert(format!("{k}"))),
+            })
+            .collect();
+        let p = Picker::new("Wide", items, false, &Theme::default());
+        let column = bar_column(&p, SCREEN);
+        assert!(
+            column.chars().all(|c| c == '█' || c == '║'),
+            "the label reached the bar's column: {column:?}"
+        );
     }
 
     #[test]

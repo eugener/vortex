@@ -32,13 +32,7 @@ pub fn encoding(theme: &Theme, current: &str) -> Box<dyn Layer> {
         })
         .collect();
     let selected = OFFERED_ENCODINGS.iter().position(|&n| n == current);
-    let picker = Picker::new(
-        "Encoding",
-        items,
-        false,
-        theme.palette,
-        theme.palette_selected,
-    );
+    let picker = Picker::new("Encoding", items, false, theme);
     Box::new(match selected {
         Some(index) => picker.with_selected(index),
         // An encoding the list does not offer - nothing stops a file being loaded
@@ -59,16 +53,7 @@ pub fn line_ending(theme: &Theme, current: LineEnding) -> Box<dyn Layer> {
         })
         .collect();
     let selected = choices.iter().position(|&eol| eol == current).unwrap_or(0);
-    Box::new(
-        Picker::new(
-            "Line endings",
-            items,
-            false,
-            theme.palette,
-            theme.palette_selected,
-        )
-        .with_selected(selected),
-    )
+    Box::new(Picker::new("Line endings", items, false, theme).with_selected(selected))
 }
 
 /// What a terminator is called outside a status bar, so the row means something to

@@ -216,8 +216,7 @@ pub fn open(theme: &Theme, root: &Path) -> Box<dyn Layer> {
             "Search Project",
             Vec::new(), // every row arrives from the source
             false,      // the query is a regex, not a fuzzy pattern - no path tuning
-            theme.palette,
-            theme.palette_selected,
+            theme,
         )
         .with_item_source(Box::new(matches))
         .with_preview_pane(preview_source()),

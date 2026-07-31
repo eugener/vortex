@@ -71,13 +71,7 @@ fn registry(keymap: &Keymap) -> Vec<Item> {
 
 /// Open the command palette, styled from the theme, with shortcuts from the keymap.
 pub fn open(theme: &Theme, keymap: &Keymap) -> Box<dyn Layer> {
-    Box::new(Picker::new(
-        "Commands",
-        registry(keymap),
-        false,
-        theme.palette,
-        theme.palette_selected,
-    ))
+    Box::new(Picker::new("Commands", registry(keymap), false, theme))
 }
 
 #[cfg(test)]
