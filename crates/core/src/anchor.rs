@@ -136,6 +136,66 @@ impl Anchor {
     }
 }
 
+/// Transforms a **non-decreasing** sequence of [`Bias::After`] offsets through one
+/// sorted, disjoint edit batch in a single pass, instead of walking the whole batch
+/// per offset.
+///
+/// This is what keeps one keystroke over N cursors from costing O(N²)
+/// ([`Anchor::transform_through`] is O(edits), and the caller has one offset per
+/// edit). The queries are monotonic because the caller's selections are sorted and
+/// disjoint - a selection's head lies within its own span, and each span starts at
+/// or after the previous one ends - so the batch can be consumed left to right and
+/// never revisited. The same trick `ColumnWalker` plays for syntax spans, for the
+/// same reason: the question sequence is ordered, so the answer sequence can be too.
+///
+/// Feeding it a *decreasing* offset does not panic; it simply answers as though the
+/// edits already consumed were not there, which is why every caller must be one with
+/// an ordered sequence to ask about.
+pub(crate) struct AfterWalk<'a> {
+    edits: &'a [Edit],
+    /// The first edit not yet passed - all earlier ones are folded into `shift`.
+    next: usize,
+    /// Net length change of every edit before `next`.
+    shift: isize,
+}
+
+impl<'a> AfterWalk<'a> {
+    pub(crate) fn new(edits: &'a [Edit]) -> Self {
+        Self {
+            edits,
+            next: 0,
+            shift: 0,
+        }
+    }
+
+    /// Where `offset` lands after the batch, for an anchor biased
+    /// [`Bias::After`](Bias::After).
+    pub(crate) fn offset(&mut self, offset: usize) -> usize {
+        // Edits ending strictly before this offset only shift it; fold them in and
+        // never look at them again. Comparing in *base* coordinates is sound because
+        // the anchor and the edits carry the same accumulated shift, so it cancels.
+        while let Some(e) = self.edits.get(self.next) {
+            if e.old_end >= offset {
+                break;
+            }
+            self.shift += e.insert_len as isize - (e.old_end - e.start) as isize;
+            self.next += 1;
+        }
+        match self.edits.get(self.next) {
+            // Inside the edit that replaced it: `Bias::After` puts it just past the
+            // inserted text, which is what makes a caret ride to the right of what
+            // was typed. The edit is *not* consumed - a later, larger offset may sit
+            // past it and need its shift.
+            Some(e) if e.start <= offset => {
+                (e.start as isize + self.shift).max(0) as usize + e.insert_len
+            }
+            // Before every remaining edit: only the shift applies. `max(0)` is the
+            // same defensive cast `transform_through` makes.
+            _ => (offset as isize + self.shift).max(0) as usize,
+        }
+    }
+}
+
 #[cfg(test)]
 #[path = "anchor_tests.rs"]
 mod tests;

@@ -80,9 +80,11 @@ frontend's logic lives in a **library target** (`crates/tui/src/lib.rs`): a `[[b
 only link a lib, so the pure paint math had to move out of the binary. `main.rs` is now the
 thin I/O shell it always claimed to be and depends on the lib; `testutil.rs` backs both a
 `pub mod` in the lib and a `#[cfg(test)] mod` in the binary, since a dependency's
-`cfg(test)` items are invisible to the crate depending on it. Still not benched: the edit
-path's O(N²) selection remap, which needs an actor-driven bench (noted in the core bench's
-header).
+`cfg(test)` items are invisible to the crate depending on it. The edit path's O(N²)
+selection remap is now benched (`multicursor_edit`) *and* fixed - it walks the edit batch
+once for the whole selection set - which a code review made urgent: select-all-matches had
+been merging adjacent matches into one cursor, and un-merging them put thousands of carets
+on the ordinary path.
 
 Then, for any change with a runtime surface, **actually exercise it** - do not infer
 success from a green test suite:

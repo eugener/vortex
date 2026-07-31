@@ -12,11 +12,13 @@
 //!   the per-cursor cost (and any super-linear surprise) is visible as multi-cursor
 //!   grows the count.
 //! - **`multicursor_edit`** - an edit applied over a growing cursor set, driven
-//!   through the actor. This is the one path where the O(N²) selection remap
-//!   (`selections_after_edits` × `Anchor::transform_through`, both `pub(crate)`)
-//!   actually bites: N selections each transformed through N edits. Motion scales
-//!   linearly (`cursor_motion_scaling`); this is where to watch for the quadratic
-//!   as multi-cursor (M3) makes high cursor counts reachable.
+//!   through the actor. This was the one path where the selection remap was
+//!   quadratic - N selections each walked through all N edits - which
+//!   select-all-matches made reachable in ordinary use once adjacent matches stopped
+//!   being merged into one. `selections_after_edits` now walks the batch **once** for
+//!   the whole set (`anchor::AfterWalk`), since the heads are non-decreasing: 8 000
+//!   carets went from 68 ms to 0.19 ms. This series is what keeps it that way -
+//!   watch for the curve bending back toward quadratic.
 //!
 //! ## Running
 //!
