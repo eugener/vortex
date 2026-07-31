@@ -366,6 +366,50 @@ fn disjoint_cursors_do_not_merge() {
 }
 
 #[test]
+fn touching_spans_stay_separate() {
+    // The rule select-all-matches depends on: `abc` picked out as `a|b|c` is three
+    // regions, not one. They share no byte, so nothing downstream needs them fused -
+    // and fusing them turned "a cursor per occurrence" into "a cursor per run".
+    let t = text("abcdef");
+    let mut set = SelectionSet::single(Selection::cursor(0));
+    set.select_matches(&[0..1, 1..2, 2..3], 0);
+    assert_eq!(
+        set.all(),
+        &[
+            Selection::new(0, 1),
+            Selection::new(1, 2),
+            Selection::new(2, 3)
+        ]
+    );
+    // And they survive the next normalize, which is what a motion or an edit runs
+    // over the whole set - fixing only the moment they are built would let the very
+    // next keystroke fuse them again.
+    set.add_cursor(&t, 5);
+    assert_eq!(set.len(), 4, "{:?}", set.all());
+    set.move_all(&t, Motion::LineStart, false);
+    assert_eq!(set.len(), 1, "collapsed onto one caret at the line start");
+}
+
+#[test]
+fn a_cursor_at_a_selections_edge_is_absorbed() {
+    // The other half of the rule: a bare caret coincident with a span, or sitting
+    // exactly at its edge, has nothing of its own to carry - which is what dedupes
+    // an add-cursor onto a caret that is already there.
+    let t = text("abcdef");
+    let mut set = SelectionSet {
+        selections: vec![Selection::new(0, 2)].into(),
+        primary: 0,
+    };
+    set.add_cursor(&t, 2); // at the selection's end
+    assert_eq!(set.len(), 1, "{:?}", set.all());
+    set.add_cursor(&t, 0); // at its start
+    assert_eq!(set.len(), 1, "{:?}", set.all());
+    // But a caret past the edge is its own cursor.
+    set.add_cursor(&t, 3);
+    assert_eq!(set.len(), 2, "{:?}", set.all());
+}
+
+#[test]
 fn coincident_cursors_merge_to_one() {
     let t = text("abcdef");
     let mut set = SelectionSet {
