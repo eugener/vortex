@@ -94,6 +94,35 @@ impl ViewState {
 /// still gets painted promptly.
 const POLL: Duration = Duration::from_millis(16);
 
+/// How long a dirtied frame may wait for input that is *already buffered* before it
+/// paints anyway (SPEC §7).
+///
+/// A terminal reports a mouse drag once per cell the pointer crosses, and key
+/// auto-repeat arrives just as fast. The loop reads one event per iteration, so
+/// without this each report pays for a full frame rebuild - and every one of those
+/// frames shows a state the event already sitting in the input buffer is about to
+/// replace. Worse, the paints are what let the buffer keep growing: input queues behind
+/// work done for pixels nobody will see, so a drag runs on long after the button is up
+/// and the keystroke behind it waits its turn.
+///
+/// So a frame with input still pending yields, and the events collapse into the one
+/// paint that shows where the pointer actually ended up. **Bounded**, or a stream that
+/// never lets up would hold the screen indefinitely: past this the frame paints
+/// regardless, so a sustained drag repaints at roughly this rate rather than freezing
+/// until it ends.
+const COALESCE: Duration = Duration::from_millis(16);
+
+/// Whether a dirtied frame should yield to input that is already buffered (see
+/// [`COALESCE`]): there is something to paint, more input is waiting, and the frame has
+/// not yet been held for as long as it may be.
+///
+/// Split out of the loop because it is the *decision*, and the loop around it is
+/// terminal I/O that no test can reach (SPEC §13) - in particular the starvation bound,
+/// which only shows itself when input never stops arriving.
+fn coalescing(needs_redraw: bool, held_for: Duration, input_waiting: bool) -> bool {
+    needs_redraw && input_waiting && held_for < COALESCE
+}
+
 /// How long the first paint of a freshly-opened highlightable buffer waits for its
 /// syntax highlights, so the file appears already colored instead of flashing plain
 /// text for a frame first (M4). Highlights normally arrive within a frame or two of
@@ -675,6 +704,10 @@ fn event_loop(
     // file never flashes plain-then-colored. Any input cancels the hold - a keystroke
     // must never wait on highlighting.
     let mut awaiting_highlight: Option<Instant> = None;
+    // When the last frame went out, which is what bounds how long a burst of input may
+    // postpone the next one (see [`COALESCE`]). Starts now rather than at the epoch so
+    // the first frame is not treated as already overdue.
+    let mut last_drawn = Instant::now();
 
     loop {
         // Take the newest snapshot if the core published one (latest-wins cell).
@@ -805,9 +838,19 @@ fn event_loop(
                 && since.elapsed() < HIGHLIGHT_WAIT
         });
 
+        // Let a burst collapse into one frame rather than painting every event in it
+        // (see [`COALESCE`]). Asked only of a frame that would otherwise paint, so an
+        // idle loop pays no extra poll.
+        let coalescing = coalescing(
+            needs_redraw,
+            last_drawn.elapsed(),
+            needs_redraw && event::poll(Duration::ZERO)?,
+        );
+
         if let Some(snap) = &latest
             && needs_redraw
             && !hold_for_highlight
+            && !coalescing
         {
             // A switch swaps the viewport: park the outgoing buffer's scroll and
             // restore the incoming one's, so coming back lands where you left rather
@@ -840,6 +883,7 @@ fn event_loop(
                 &toasts,
             )?;
             needs_redraw = false;
+            last_drawn = Instant::now();
             awaiting_highlight = None;
             // Default back to caret-follow; only a wheel scroll opts out, and only
             // for the single frame it triggered.
@@ -3967,6 +4011,35 @@ mod tests {
             let cell = buf.cell((19, row)).unwrap();
             assert_eq!(cell.symbol(), " ", "row {row} carries a bar");
         }
+    }
+
+    #[test]
+    fn a_burst_of_input_collapses_into_one_frame() {
+        // A terminal reports a drag once per cell crossed. Painting each report rebuilt
+        // a frame the next report replaced, and the paints were what let the queue
+        // grow: 300 drag reports cost 303 full frames, with the keystroke behind them
+        // waiting for every one. A frame with input already buffered yields instead.
+        let fresh = Duration::from_millis(1);
+        assert!(coalescing(true, fresh, true), "more is already waiting");
+        assert!(
+            !coalescing(true, fresh, false),
+            "nothing waiting - paint it now, or the editor lags a whole event behind"
+        );
+        assert!(
+            !coalescing(false, fresh, true),
+            "a clean frame has nothing to postpone"
+        );
+    }
+
+    #[test]
+    fn input_that_never_lets_up_cannot_hold_the_screen() {
+        // The bound that makes yielding safe: without it, a drag held down (or key
+        // auto-repeat) would keep the frame perpetually postponed and freeze the
+        // display until the gesture ended.
+        assert!(!coalescing(true, COALESCE, true), "held its full budget");
+        assert!(!coalescing(true, COALESCE * 10, true), "and well past it");
+        // Just inside the budget it still yields, which is what does the collapsing.
+        assert!(coalescing(true, COALESCE - Duration::from_millis(1), true));
     }
 
     #[test]
