@@ -58,6 +58,35 @@ fn closing_a_file_whose_directory_is_gone_still_releases_the_watch() {
     assert!(set.is_empty(), "and nothing may be left behind");
 }
 
+#[cfg(unix)]
+#[test]
+fn closing_a_symlink_whose_target_is_gone_still_releases_the_watch() {
+    // The nastier half of the same leak. Here `resolve_key` *succeeds* - a broken link
+    // resolves through its own directory - and hands back a path that was never
+    // watched, so a fallback that only fires on failure never runs and the entry is
+    // stranded. What matters is whether the resolved key names something watched, not
+    // whether it resolved.
+    let dir = TempDir::new();
+    let target_dir = dir.path.join("dotfiles");
+    std::fs::create_dir(&target_dir).unwrap();
+    let target = target_dir.join("vimrc");
+    std::fs::write(&target, "set nocompatible\n").unwrap();
+    let link = dir.path.join(".vimrc");
+    std::os::unix::fs::symlink(&target, &link).unwrap();
+
+    let mut set = WatchSet::new();
+    let watched = set.watch(&link).expect("the link's target starts a watch");
+    assert_eq!(watched, target_dir.canonicalize().unwrap());
+
+    std::fs::remove_file(&target).unwrap();
+    assert_eq!(
+        set.unwatch(&link),
+        Some(watched),
+        "a broken link must still release the directory it was watching"
+    );
+    assert!(set.is_empty(), "and nothing may be left behind");
+}
+
 #[test]
 fn unwatching_something_never_watched_releases_nothing() {
     let dir = TempDir::new();

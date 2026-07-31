@@ -162,7 +162,7 @@ pub fn parse(text: &str) -> Result<Theme, String> {
 /// echoes the offending line, and a bad color echoes the value - so a theme file
 /// that is not really a theme (a binary, a minified blob) would otherwise carry a
 /// megabyte-long line into a surface that can show one row of it.
-const MAX_ERROR: usize = 200;
+pub(crate) const MAX_ERROR: usize = 200;
 
 /// Flatten an error onto one line and cap its length.
 ///
@@ -171,6 +171,13 @@ const MAX_ERROR: usize = 200;
 /// diagram rows are noise once the newlines are gone, and the source row would echo
 /// the file's own contents onto the screen, so only the prose rows are kept.
 pub(crate) fn one_line(error: &str) -> String {
+    one_line_within(error, MAX_ERROR)
+}
+
+/// [`one_line`] against a caller-chosen budget, for when several messages have to
+/// share one row: bounding each part to its share keeps every complaint visible, where
+/// bounding the joined result drops whichever ones happened to be written last.
+pub(crate) fn one_line_within(error: &str, max: usize) -> String {
     let mut out = error
         .lines()
         .map(str::trim)
@@ -178,9 +185,9 @@ pub(crate) fn one_line(error: &str) -> String {
         .filter(|line| !line.starts_with('|') && !line.contains(" | "))
         .collect::<Vec<_>>()
         .join(": ");
-    if out.len() > MAX_ERROR {
+    if out.len() > max {
         // Truncate on a character boundary, never mid-UTF-8.
-        let end = (0..=MAX_ERROR)
+        let end = (0..=max)
             .rev()
             .find(|&n| out.is_char_boundary(n))
             .unwrap_or(0);

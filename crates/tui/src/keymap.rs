@@ -597,6 +597,11 @@ impl Keymap {
     /// what parses makes the outcome independent of the order entirely, which is the
     /// only version of the promise that survives not controlling that order, and it
     /// is what the user wants anyway - one typo should cost one binding.
+    ///
+    /// `#[must_use]` by hand: this returned a `Result` before, which carries it for
+    /// free, and dropping to a plain `Vec` would otherwise let a caller discard every
+    /// binding error and leave a user's typo silently unbound (SPEC §8).
+    #[must_use]
     pub fn extend_from_pairs(&mut self, pairs: &[(&str, &str)]) -> Vec<KeymapError> {
         let mut rejected = Vec::new();
         for (chord, command) in pairs {

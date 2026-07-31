@@ -281,7 +281,7 @@ fn parse(text: &str) -> (Config, Option<String>) {
                 config.theme = theme;
                 config.theme_name = name;
             }
-            Err(err) => problems.push(crate::theme::one_line(&err)),
+            Err(err) => problems.push(err),
         }
     }
     if !file.keys.is_empty() {
@@ -297,12 +297,23 @@ fn parse(text: &str) -> (Config, Option<String>) {
                 .keymap
                 .extend_from_pairs(&pairs)
                 .iter()
-                .map(|err| crate::theme::one_line(&err.to_string())),
+                .map(|err| err.to_string()),
         );
     }
-    // Re-bounded after joining: each part was trimmed to fit a row on its own, and
-    // three of them end up three rows long otherwise.
-    let problem = (!problems.is_empty()).then(|| crate::theme::one_line(&problems.join("; ")));
+    // Each part gets a share of the row rather than the join being cut to fit it. The
+    // obvious version - bound each to a full row, join, bound the join - reads the same
+    // and silently drops whichever complaints came last, which is the "three typos,
+    // three restarts" problem again in a narrower window: one long theme error would
+    // eat the binding error behind it. A floor keeps a share readable when there are
+    // many, at the cost of a row that can run slightly long.
+    let problem = (!problems.is_empty()).then(|| {
+        let share = (crate::theme::MAX_ERROR / problems.len()).max(40);
+        problems
+            .iter()
+            .map(|p| crate::theme::one_line_within(p, share))
+            .collect::<Vec<_>>()
+            .join("; ")
+    });
     (config, problem)
 }
 
@@ -836,6 +847,23 @@ mod tests {
             bound('e'),
             Some(Command::Editor(vortex_core::Action::Save { force: false })),
             "sorts after the typo, and survived it"
+        );
+    }
+
+    #[test]
+    fn a_long_complaint_does_not_swallow_the_ones_after_it() {
+        // Bounding the *joined* string instead of each part reads the same and loses
+        // whichever complaints came last - the "three typos, three restarts" problem
+        // again, in a narrower window. A theme name long enough to fill a row on its
+        // own must still leave the binding error visible behind it.
+        let long_name = "z".repeat(400);
+        let (_, problem) = parse(&format!(
+            "theme = \"{long_name}\"\n[keys]\n\"ctrl+e\" = \"frobnicate\"\n"
+        ));
+        let problem = problem.expect("both were wrong");
+        assert!(
+            problem.contains("frobnicate"),
+            "the second complaint was cut off: {problem}"
         );
     }
 
