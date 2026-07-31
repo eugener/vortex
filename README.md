@@ -200,7 +200,7 @@ tab_width     = 4            # display width of a tab stop
 line_numbers  = "absolute"   # or "relative" - see below
 rulers        = [80, 100]    # tint these columns; [] (the default) draws none
 indent_guides = true         # a rule down each indent level; off by default
-scrollbar     = true         # reserve the right column for one; off by default
+scrollbar     = false        # give the right column back to text; on by default
 final_newline = true         # add a trailing newline on save if the file lacks one
 
 [keys]                       # layered over the built-in bindings, not replacing them

@@ -633,10 +633,16 @@ add noise, each on/off switch a key in the config file the M5 loader now reads:
   a short line has *not* reached rather than one it has. They stop at the end of the
   buffer: a ruler marks a column of a line, and past the last line there is no line to
   hold one.
-- **Scrollbar** - *built (M8).* `scrollbar = true` in the config file, plus
-  `toggle_scrollbar`. ratatui's `Scrollbar` on the body's right edge, as this section
-  said - the one place a shipped widget was the whole answer, since the layer stack we
-  build is job 2 and a bar in a column is job 1's business.
+- **Scrollbar** - *built (M8).* `scrollbar = false` in the config file to decline it,
+  plus `toggle_scrollbar`. ratatui's `Scrollbar` on the body's right edge, as this
+  section said - the one place a shipped widget was the whole answer, since the layer
+  stack we build is job 2 and a bar in a column is job 1's business.
+  **It is the one piece of chrome here that defaults to on**, having shipped off. The
+  rest of this section's chrome marks cells the text was already using, so it stays off
+  until asked; this marks none, and it answers a question nothing else on screen does -
+  where the *window* sits in the file, as against the status bar's line number, which
+  says where the caret sits. Those are different questions, and only one of them was
+  being answered. A column is the price, and the setting still buys it back.
   **The column is reserved whenever the setting is on, painted or not.** This is the
   decision the feature turns on: the tempting version claims the column only once a file
   outgrows the viewport, and that version slides every line one cell sideways at exactly
