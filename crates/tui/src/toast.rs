@@ -86,6 +86,19 @@ pub fn toast_for(note: &Notification) -> Option<(String, Level)> {
             ),
             Level::Error,
         )),
+        // The refusal that stands between a save and someone else's work. The
+        // prompt (`main.rs`) is the answer to it; the toast is what stays on screen
+        // once that is dismissed, because a buffer whose file has moved out from
+        // under it is not a calm state to leave a user in (SPEC §8).
+        Notification::SaveRejected { path, removed, .. } => {
+            let name = buffer_display_name(Some(path), false);
+            let text = if *removed {
+                format!("{name} was deleted; not saved")
+            } else {
+                format!("{name} changed on disk; not saved")
+            };
+            Some((text, Level::Error))
+        }
         // A search that found nothing (SPEC §11). Info, not error: a pattern that
         // does not appear in this file is an ordinary answer, and it is the *only*
         // answer the user gets - a find that changes nothing on screen is otherwise

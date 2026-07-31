@@ -2095,7 +2095,7 @@ fn the_final_newline_policy_is_what_the_frontend_configured() {
         async move {
             step(&h, Action::Open(path.clone())).await;
             step(&h, Action::Insert("no trailing newline".into())).await;
-            step(&h, Action::Save).await;
+            step(&h, Action::Save { force: false }).await;
             await_note(&h, |n| matches!(n, Notification::FileSaved { .. })).await;
             assert_eq!(
                 std::fs::read_to_string(&path).unwrap(),
@@ -2112,12 +2112,160 @@ fn the_final_newline_policy_is_what_the_frontend_configured() {
         step(&h, Action::Configure(options)).await;
         step(&h, Action::Open(bare.clone())).await;
         step(&h, Action::Insert("no trailing newline".into())).await;
-        step(&h, Action::Save).await;
+        step(&h, Action::Save { force: false }).await;
         await_note(&h, |n| matches!(n, Notification::FileSaved { .. })).await;
         assert_eq!(
             std::fs::read_to_string(&bare).unwrap(),
             "no trailing newline"
         );
+    });
+}
+
+#[test]
+fn a_save_over_someone_elses_write_is_refused_until_forced() {
+    // The guarantee the watcher cannot make on its own: an event can be dropped, a
+    // backend can miss a write, a frontend can run no watcher at all. Nothing here
+    // is watching, which is exactly the point - the core stats the file before it
+    // writes, so the other write survives until the user says otherwise (SPEC §8).
+    drive(|h| async move {
+        let dir = TempDir::new();
+        let path = dir.0.join("shared.txt");
+        std::fs::write(&path, "theirs\n").unwrap();
+
+        step(&h, Action::Open(path.clone())).await;
+        step(&h, Action::Insert("mine ".into())).await;
+
+        // Someone else writes the file while the buffer is dirty. The mtime has to
+        // move for the stamp to differ - on a fast machine the write can land in the
+        // same clock tick as the open - so the length changes too, which it would in
+        // any real conflict.
+        std::fs::write(&path, "theirs, edited elsewhere\n").unwrap();
+
+        // `step` awaits the snapshot the refusal publishes, so by the time it
+        // returns the notification is already queued - drained rather than awaited,
+        // so a regression fails here instead of hanging on a note that never comes.
+        step(&h, Action::Save { force: false }).await;
+        let notes = drain_notifications(&h);
+        assert!(
+            notes
+                .iter()
+                .any(|n| matches!(n, Notification::SaveRejected { removed: false, .. })),
+            "expected the save to be refused, got {notes:?}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "theirs, edited elsewhere\n",
+            "the refused save must not have written anything"
+        );
+
+        // Forced, it goes through - the user has been asked and answered.
+        let saved = step(&h, Action::Save { force: true }).await;
+        await_note(&h, |n| matches!(n, Notification::FileSaved { .. })).await;
+        assert!(!saved.modified, "a forced save still cleans the buffer");
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "mine theirs\n",
+            "the buffer's own text is what landed"
+        );
+    });
+}
+
+#[test]
+fn a_reported_conflict_still_blocks_a_save_until_it_is_answered() {
+    // Found by driving the editor in a terminal, and the reason the guard needs two
+    // signals. Reporting a conflict advances the buffer's disk stamp on purpose -
+    // one write must raise one prompt, not one per event the platform sends - which
+    // meant that by the time the user pressed Ctrl+S with the question still on
+    // screen, the stamp matched and the save looked perfectly ordinary. It wrote,
+    // and the other version was gone.
+    drive(|h| async move {
+        let dir = TempDir::new();
+        let path = dir.0.join("shared.txt");
+        std::fs::write(&path, "theirs\n").unwrap();
+        let watcher = attach_watcher(&h).await;
+        step(&h, Action::Open(path.clone())).await;
+        step(&h, Action::Insert("mine ".into())).await;
+
+        // The watcher reports the external write, exactly as the frontend's would.
+        std::fs::write(&path, "theirs, edited elsewhere\n").unwrap();
+        watcher
+            .events
+            .send(crate::watch::FileEvent::Changed(path.clone()))
+            .await
+            .unwrap();
+        await_note(&h, |n| matches!(n, Notification::ExternalChange { .. })).await;
+        // Reporting the conflict published a snapshot of its own. Take it, or the
+        // next `step` is answered by *that* and returns before the save it sent has
+        // even been processed.
+        h.snapshots.recv().await.unwrap();
+
+        // The user has not answered. A save must not slip past the open question.
+        step(&h, Action::Save { force: false }).await;
+        let notes = drain_notifications(&h);
+        assert!(
+            notes
+                .iter()
+                .any(|n| matches!(n, Notification::SaveRejected { .. })),
+            "expected the save to be refused, got {notes:?}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "theirs, edited elsewhere\n",
+            "the unanswered conflict must have stopped the write"
+        );
+
+        // Answering it - here by overwriting - is what lets the save through.
+        step(&h, Action::Save { force: true }).await;
+        await_note(&h, |n| matches!(n, Notification::FileSaved { .. })).await;
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "mine theirs\n");
+    });
+}
+
+#[test]
+fn a_save_of_a_file_deleted_underneath_is_refused_until_forced() {
+    // Recreating it is usually what the user wants, but it is still their call: the
+    // file may have been deleted deliberately.
+    drive(|h| async move {
+        let dir = TempDir::new();
+        let path = dir.0.join("gone.txt");
+        std::fs::write(&path, "here\n").unwrap();
+        step(&h, Action::Open(path.clone())).await;
+        step(&h, Action::Insert("edited ".into())).await;
+        std::fs::remove_file(&path).unwrap();
+
+        step(&h, Action::Save { force: false }).await;
+        let rejected = await_note(&h, |n| matches!(n, Notification::SaveRejected { .. })).await;
+        assert!(
+            matches!(rejected, Notification::SaveRejected { removed: true, .. }),
+            "got {rejected:?}"
+        );
+        assert!(
+            !path.exists(),
+            "the refused save must not have recreated it"
+        );
+
+        step(&h, Action::Save { force: true }).await;
+        await_note(&h, |n| matches!(n, Notification::FileSaved { .. })).await;
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "edited here\n");
+    });
+}
+
+#[test]
+fn an_ordinary_save_is_not_mistaken_for_a_conflict() {
+    // The guard must be invisible in the common case: open, edit, save, edit, save.
+    // A save that re-stamps the file it just wrote has to leave the next one alone,
+    // or every second keystroke-to-disk would raise a false conflict.
+    drive(|h| async move {
+        let dir = TempDir::new();
+        let path = dir.0.join("mine.txt");
+        std::fs::write(&path, "one\n").unwrap();
+        step(&h, Action::Open(path.clone())).await;
+        for text in ["two ", "three "] {
+            step(&h, Action::Insert(text.into())).await;
+            step(&h, Action::Save { force: false }).await;
+            await_note(&h, |n| matches!(n, Notification::FileSaved { .. })).await;
+        }
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "two three one\n");
     });
 }
 
@@ -2176,7 +2324,7 @@ fn setting_the_encoding_changes_what_the_next_save_writes() {
         assert!(snap.modified, "the edit is still unsaved");
 
         step(&h, Action::SetLineEnding(crate::file::LineEnding::Crlf)).await;
-        step(&h, Action::Save).await;
+        step(&h, Action::Save { force: false }).await;
         await_note(&h, |n| matches!(n, Notification::FileSaved { .. })).await;
         // latin-1 'é' is one byte, and the final newline is the policy's, in CRLF.
         assert_eq!(std::fs::read(&path).unwrap(), b"caf\xE9\r\n");

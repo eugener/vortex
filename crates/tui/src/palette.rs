@@ -94,7 +94,7 @@ mod tests {
         // their shortcuts are populated from the keymap.
         let save = items
             .iter()
-            .find(|i| matches!(i.command, Command::Editor(Action::Save)))
+            .find(|i| matches!(i.command, Command::Editor(Action::Save { .. })))
             .expect("Save File listed");
         assert_eq!(save.shortcut.as_deref(), Some("Ctrl+S"));
         let find = items
@@ -153,7 +153,7 @@ mod tests {
         let items = registry(&rebound);
         let save = items
             .iter()
-            .find(|i| matches!(i.command, Command::Editor(Action::Save)))
+            .find(|i| matches!(i.command, Command::Editor(Action::Save { .. })))
             .expect("Save File listed");
         assert_eq!(save.shortcut.as_deref(), Some("Ctrl+W"));
         // A command the config left unbound simply shows no shortcut.

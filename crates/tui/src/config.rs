@@ -734,7 +734,7 @@ mod tests {
         let ctrl_s = KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL);
         assert_eq!(
             command_for_key(&config.keymap, ctrl_s, 10),
-            Some(Command::Editor(vortex_core::Action::Save))
+            Some(Command::Editor(vortex_core::Action::Save { force: false }))
         );
     }
 
@@ -842,7 +842,7 @@ mod tests {
         let ctrl_s = KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL);
         assert_eq!(
             command_for_key(&config.keymap, ctrl_s, 10),
-            Some(Command::Editor(Action::Save))
+            Some(Command::Editor(Action::Save { force: false }))
         );
         // Overlay triggers ride the same table, so the resolved config carries them
         // too - the property that breaks if they are ever built outside `from_pairs`.

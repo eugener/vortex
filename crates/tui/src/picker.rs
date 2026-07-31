@@ -657,7 +657,11 @@ mod tests {
 
     fn items() -> Vec<Item> {
         [
-            ("Save File", Some("Ctrl+S"), Command::Editor(Action::Save)),
+            (
+                "Save File",
+                Some("Ctrl+S"),
+                Command::Editor(Action::Save { force: false }),
+            ),
             ("Open Palette", None, Command::OpenPalette),
             ("Quit", Some("Ctrl+Q"), Command::Editor(Action::Quit)),
             ("Copy", None, Command::Editor(Action::Copy)),
@@ -955,7 +959,10 @@ mod tests {
         // A key that leaves the highlight where it is must not re-emit, or a held
         // Up at the top would fire the same preview over and over.
         p.handle_key(press(KeyCode::Up));
-        assert_eq!(p.take_commands(), vec![Command::Editor(Action::Save)]);
+        assert_eq!(
+            p.take_commands(),
+            vec![Command::Editor(Action::Save { force: false })]
+        );
         p.handle_key(press(KeyCode::Up));
         assert!(p.take_commands().is_empty(), "re-emitted without moving");
 

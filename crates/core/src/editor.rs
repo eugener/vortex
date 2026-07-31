@@ -150,6 +150,20 @@ struct Document {
     /// also updated when a conflict is *reported*, so one external write raises one
     /// prompt however many events the platform decides to send for it.
     disk: Option<DiskStamp>,
+    /// A reported external change the user has not answered yet (SPEC §10.2).
+    ///
+    /// Separate from [`Self::disk`] because that stamp answers "what is on disk",
+    /// and this answers "does the user know". Reporting a conflict advances the
+    /// stamp - one write must not raise a second prompt - which would otherwise
+    /// leave a save looking perfectly ordinary the moment the prompt appeared:
+    /// stamp matches, write proceeds, the other version is gone. The two together
+    /// are what the save guard needs, since they fail in different directions: the
+    /// stamp catches a change nobody reported, and this catches one that was
+    /// reported and left hanging.
+    ///
+    /// Cleared by whatever settles the question - a reload, or a save that goes
+    /// through - and by opening a different file into the buffer.
+    conflict: bool,
     /// The undo tree (SPEC §2.4). Owns the reversible change history and the
     /// coalescing state; reset on a file open (undo does not cross a load).
     history: History,
@@ -446,6 +460,7 @@ impl Document {
             format: FileFormat::default(),
             read_only: None,
             disk: None,
+            conflict: false,
             history: History::new(),
             decorations: Arc::new(DecorationSet::new()),
             lsp_dirty: false,
@@ -938,7 +953,9 @@ enum Step {
     Redo,
     Republish,
     Open(PathBuf),
-    Save,
+    Save {
+        force: bool,
+    },
     SaveAs(PathBuf),
     Switch(BufferId),
     Close {
@@ -1004,7 +1021,7 @@ impl Step {
             | Step::SearchFailed { .. }
             | Step::Republish
             | Step::Open(_)
-            | Step::Save
+            | Step::Save { .. }
             | Step::SaveAs(_)
             | Step::Switch(_)
             | Step::Close { .. } => false,
@@ -1678,7 +1695,7 @@ async fn run(
             Action::Redo => Step::Redo,
             Action::RequestSnapshot => Step::Republish,
             Action::Open(path) => Step::Open(path),
-            Action::Save => Step::Save,
+            Action::Save { force } => Step::Save { force },
             Action::SaveAs(path) => Step::SaveAs(path),
             Action::SwitchBuffer { id } => Step::Switch(id),
             Action::CloseBuffer { id, force } => Step::Close { id, force },
@@ -1743,7 +1760,9 @@ async fn run(
             Step::Open(path) => {
                 open_file(&mut session, path, &deltas, &snapshots, &notifications).await
             }
-            Step::Save => save_file(&mut session, &snapshots, &notifications).await,
+            Step::Save { force } => {
+                save_file(&mut session, force, &snapshots, &notifications).await
+            }
             Step::SaveAs(path) => {
                 save_as_file(&mut session, path, &snapshots, &notifications).await
             }
@@ -2103,6 +2122,8 @@ async fn open_file(
     // which costs a redundant reload. The other order would leave a newer stamp
     // than the bytes and miss the change entirely (SPEC §10.2).
     doc.disk = metadata.as_ref().and_then(DiskStamp::of);
+    // Whatever the buffer and the file disagreed about, this read is the answer.
+    doc.conflict = false;
     doc.history = History::new();
     // Decorations describe the *previous* file's text; keeping them would paint
     // squiggles at meaningless offsets until a producer refreshes.
@@ -2176,6 +2197,11 @@ async fn external_change(
         // The file is gone. There is nothing to reload from and the buffer is now
         // the only copy - so hold onto it and say so, rather than helpfully
         // emptying the buffer to match (SPEC §8).
+        //
+        // Left as an open conflict: advancing the stamp above is what keeps one
+        // write to one prompt, and without this a save would then look ordinary -
+        // the stamp it compares against is already the *other* side's.
+        doc.conflict = true;
         let _ = notifications.try_send(Notification::ExternalChange {
             buffer_id: id,
             path: path.to_path_buf(),
@@ -2185,6 +2211,7 @@ async fn external_change(
     }
 
     if doc.modified() {
+        doc.conflict = true;
         let _ = notifications.try_send(Notification::ExternalChange {
             buffer_id: id,
             path: path.to_path_buf(),
@@ -2474,6 +2501,7 @@ fn close_buffer(
 /// `false` if the frontend has hung up.
 async fn save_file(
     session: &mut Session,
+    force: bool,
     snapshots: &SnapshotSink,
     notifications: &Sender<Notification>,
 ) -> bool {
@@ -2501,6 +2529,34 @@ async fn save_file(
         );
     }
 
+    // The file must still be the one this buffer last accounted for. The watcher
+    // normally raises a conflict long before a save gets here (SPEC §10.2), but it is
+    // a *notification* path, not a guarantee: an event can be dropped, a backend can
+    // miss a write, and a frontend need not run a watcher at all. Stat-before-write
+    // is the guarantee, and it belongs here because "never silently overwrite work"
+    // is a core promise (SPEC §8), not a frontend courtesy - the same reason the
+    // close and reload guards live in the core.
+    //
+    // Deliberately the same comparison `external_change` makes against the same
+    // stamp: whatever the watcher would have called a change, this calls a conflict.
+    if !force {
+        let stamp = DiskStamp::read(&path);
+        let doc = session.active();
+        // Two ways to be out of date, and they fail in opposite directions. The
+        // stamp catches a change nobody reported - the watcher missed it, dropped
+        // it, or is not running. `conflict` catches one that *was* reported and left
+        // unanswered, which the stamp cannot see precisely because reporting it
+        // advanced the stamp (one write, one prompt).
+        if stamp != doc.disk || doc.conflict {
+            let _ = notifications.try_send(Notification::SaveRejected {
+                buffer_id: doc.id,
+                path: path.clone(),
+                removed: stamp.is_none(),
+            });
+            return snapshots.publish(session.snapshot(None));
+        }
+    }
+
     let bytes = match session.active().encode_for_save(&session.options) {
         Ok(bytes) => bytes,
         Err(message) => {
@@ -2514,8 +2570,10 @@ async fn save_file(
     let doc = session.active_mut();
     // The file is now exactly what we just wrote. Recording that here is what
     // stops the watcher's report of *this* write from being read as someone
-    // else's change (SPEC §10.2).
+    // else's change (SPEC §10.2) - and it settles any conflict, including the one
+    // a forced save has just answered by overwriting.
     doc.disk = DiskStamp::read(&path);
+    doc.conflict = false;
     // Mark the current history node as the on-disk state, so undoing back to it
     // later clears the modified marker (SPEC §2.4, §8).
     doc.history.mark_saved();
@@ -2597,6 +2655,9 @@ async fn save_as_file(
     let dropped = renamed.then(|| doc.path.clone()).flatten();
     let id = doc.id;
     doc.disk = DiskStamp::read(&path);
+    // The buffer now matches this file exactly, whether or not it is the one the
+    // conflict was about.
+    doc.conflict = false;
     if renamed {
         doc.lsp_dirty = true;
         // This is the way out of a read-only buffer (SPEC §10.3): the write just

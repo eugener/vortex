@@ -98,10 +98,27 @@ impl WatchSet {
     }
 }
 
-/// A file's key: its directory resolved to a canonical path, plus its own name.
-/// `None` when it has no file name, or its directory does not exist - both of
-/// which mean there is nothing here to watch.
+/// A file's key: the path with **symlinks followed**, so a watch lands on the file
+/// whose bytes actually change. `None` when it has no file name, or its directory
+/// does not exist - both of which mean there is nothing here to watch.
+///
+/// **Following the link is the whole point.** A save resolves symlinks before it
+/// writes (`write_atomic`, so a link stays a link), and so does every other editor
+/// and dotfile manager - which means the write lands in the *target's* directory.
+/// Watching the link's own directory instead, as resolving only the parent did,
+/// left `~/.vimrc -> ~/dotfiles/vimrc` watching `~/` while every writer touched
+/// `~/dotfiles/`, so an external change to a symlinked file was never reported.
+///
+/// The core matches an event to a buffer by `file_identity`, which canonicalizes
+/// too, so reporting the resolved path still finds the document that was opened
+/// under the link. A file that does not exist yet cannot be canonicalized (and
+/// cannot be a symlink to anywhere useful), so it falls back to resolving the
+/// parent - a watch has to outlive the moment a rename replaces the file, which is
+/// the entire reason directories are what get watched.
 fn resolve_key(file: &Path) -> Option<PathBuf> {
+    if let Ok(real) = file.canonicalize() {
+        return Some(real);
+    }
     let name = file.file_name()?;
     let parent = file
         .parent()
