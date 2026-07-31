@@ -1099,13 +1099,13 @@ fn a_background_reload_does_not_describe_the_active_buffers_text_with_its_own_ra
 
     let snap = h.snapshot();
     assert_eq!(snap.text.byte_len(), 3, "the active buffer is the one sent");
-    if let Some(range) = &snap.dirty {
-        assert!(
-            range.end <= snap.text.byte_len(),
-            "dirty {range:?} runs past the {} bytes it describes",
-            snap.text.byte_len()
-        );
-    }
+    // Nothing, rather than "something that happens to fit": the active buffer did not
+    // change, so there is no range to hint with. Asserted directly, because a bounds
+    // check inside `if let Some` is a test that passes by never running.
+    assert_eq!(
+        snap.dirty, None,
+        "a background reload described the active text"
+    );
 }
 
 #[test]

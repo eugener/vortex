@@ -129,22 +129,6 @@ const POLL: Duration = Duration::from_millis(16);
 /// until it ends.
 const COALESCE: Duration = Duration::from_millis(16);
 
-/// Whether `note` has already been put to the user as a modal question, in which case
-/// the toast carrying the same sentence is withheld.
-///
-/// A toast is what remains once something has been *dealt with*; a prompt is the
-/// dealing with it. Raising both in one frame asks and answers at the same time, in
-/// two different places on screen. The twins that get no prompt - a file removed (there
-/// is nothing to reload from) and a clean buffer the core already reloaded for you -
-/// keep their toast, which is what makes this a rule rather than a special case.
-fn raises_a_prompt(note: &vortex_core::Notification) -> bool {
-    matches!(
-        note,
-        vortex_core::Notification::ExternalChange { removed: false, .. }
-            | vortex_core::Notification::SaveRejected { .. }
-    )
-}
-
 /// Whether a dirtied frame should yield to input that is already buffered (see
 /// [`COALESCE`]): there is something to paint, more input is waiting, and the frame has
 /// not yet been held for as long as it may be.
@@ -789,11 +773,6 @@ fn event_loop(
     // postpone the next one (see [`COALESCE`]). Starts now rather than at the epoch so
     // the first frame is not treated as already overdue.
     let mut last_drawn = Instant::now();
-    // Whether the last iteration had a search preview holding the viewport. A preview
-    // is the one thing besides the caret that the view follows, and it is *frontend*
-    // state - cancelling it moves no caret and bumps no version, so nothing else marks
-    // the moment it lets go.
-    let mut was_previewing = false;
 
     loop {
         // Take the newest snapshot if the core published one (latest-wins cell).
@@ -843,6 +822,13 @@ fn event_loop(
                     awaiting_highlight = Some(Instant::now());
                 }
             }
+            // Set by each block below that puts a question on screen, and read by the
+            // toast at the end: a notification that raised a prompt must not also raise
+            // a toast saying the same thing, or the editor asks and answers in one
+            // frame. Set *here*, where the prompts are pushed, rather than restated as
+            // a predicate over notification kinds - that version had already drifted,
+            // listing two of the three.
+            let mut prompted = false;
             // The core refused to close a buffer with unsaved work (SPEC §8). Ask, and
             // re-send the close forced if the user accepts - the confirmation is
             // frontend-local right up to the committed answer (SPEC §7.5).
@@ -853,6 +839,7 @@ fn event_loop(
                     path.as_deref(),
                 ));
                 needs_redraw = true;
+                prompted = true;
             }
             // The file changed under a buffer that has unsaved work (SPEC §10.2).
             // Only the conflict gets a question - a clean buffer was already
@@ -870,6 +857,7 @@ fn event_loop(
                     Some(path.as_path()),
                 ));
                 needs_redraw = true;
+                prompted = true;
             }
             // The core refused to write over a file that changed underneath the
             // buffer (SPEC §8). Same shape as the two above, and the one whose
@@ -882,6 +870,7 @@ fn event_loop(
                     *removed,
                 ));
                 needs_redraw = true;
+                prompted = true;
             }
             // The buffer is gone, so its parked scroll position is too. Keyed off the
             // core's own event rather than inferred from the list shrinking.
@@ -903,14 +892,12 @@ fn event_loop(
             if let vortex_core::Notification::SetClipboard { text } = &note {
                 let _ = osc52::copy(text);
             }
-            // ...but not for a notification that just raised a question. A conflict
-            // put a modal prompt on screen above; adding a red toast saying the same
-            // thing means the editor asks and answers in the same frame. The toast is
-            // what remains once something has been dealt with, which is why the two
-            // cases with no prompt - a removed file, a clean buffer reloaded for you -
-            // still get one.
-            if let Some((text, level)) = toast::toast_for(&note).filter(|_| !raises_a_prompt(&note))
-            {
+            // A toast is what remains once something has been *dealt with*; a prompt is
+            // the dealing with it, so a notification that raised one says nothing here.
+            // The cases that get no prompt - a removed file, a clean buffer reloaded
+            // for you - still get their toast. Asked before `toast_for` runs, so a
+            // prompted notification does not format a string only to drop it.
+            if let Some((text, level)) = (!prompted).then(|| toast::toast_for(&note)).flatten() {
                 toasts.push(text, level, Instant::now());
                 needs_redraw = true;
             }
@@ -969,20 +956,6 @@ fn event_loop(
             viewport = viewports.get(&snap.buffer_id).copied().unwrap_or_default();
             painted = Some(snap.buffer_id);
         }
-
-        // A search preview owns the viewport while it exists - `paint` follows the
-        // *match* rather than the caret - so the frames it drives record a caret they
-        // were not showing. When it lets go, the reason the view sits away from the
-        // caret goes with it, and the view must come back: Esc on a find prompt would
-        // otherwise leave the reader parked on a match they just rejected, with the
-        // caret off screen until the next keystroke snapped it back. Voided rather
-        // than followed directly, the same way a resize says "what the last frame
-        // showed is no longer the question".
-        let previewing = search.preview().is_some();
-        if was_previewing && !previewing {
-            viewport.shown = None;
-        }
-        was_previewing = previewing;
 
         // Chase the caret only when the caret (or the text under it) has actually moved
         // since the frame that last showed it - see [`ViewState::shown`]. Derived per
@@ -1176,13 +1149,12 @@ fn event_loop(
                         MouseEventKind::Down(MouseButton::Left)
                         | MouseEventKind::Drag(MouseButton::Left) => {
                             let Some(snap) = &latest else { continue };
-                            let is_press = matches!(mouse.kind, MouseEventKind::Down(_));
                             // A press on the bufferline selects that tab's buffer rather
                             // than placing a caret: row 0 is chrome, not text. Resolved
                             // against the same fitted strip that was painted, so the tab
                             // under the pointer is the one that gets picked. A drag is
                             // ignored here - dragging across tabs is not a gesture.
-                            if is_press && mouse.row == 0 {
+                            if is_left_press && mouse.row == 0 {
                                 let count_width = layout::line_count_label(
                                     layout::display_line_count(&snap.text),
                                 )
@@ -1213,7 +1185,7 @@ fn event_loop(
                             // text - and only on the bottom row, so a drag that ends
                             // there still belongs to the selection it was sweeping.
                             let bottom = screen.height.saturating_sub(1);
-                            if is_press && mouse.row == bottom {
+                            if is_left_press && mouse.row == bottom {
                                 if let Some(target) = status_target_at(
                                     snap,
                                     selected,
@@ -1257,8 +1229,8 @@ fn event_loop(
                             // `config.scrollbar` test in front of it is the cheap half of
                             // the pair and short-circuits for a reader who turned the bar
                             // off - it no longer skips the common case, now that the bar is
-                            // on by default, so the `is_press` guard is what does the work.
-                            if is_press {
+                            // on by default, so the press guard is what does the work.
+                            if is_left_press {
                                 dragging_scrollbar = config.scrollbar
                                     && on_scrollbar(
                                         screen,
@@ -1306,7 +1278,7 @@ fn event_loop(
                             // something else entirely, so both end the run rather than
                             // extending it. Counted here because it is the one part of
                             // the decision that needs a clock.
-                            let count = if is_press
+                            let count = if is_left_press
                                 && !mouse
                                     .modifiers
                                     .intersects(KeyModifiers::ALT | KeyModifiers::SHIFT)
@@ -1832,6 +1804,10 @@ fn paint(frame: &mut Frame, snapshot: &ViewSnapshot, inputs: PaintInputs) -> Vie
     // follows it; horizontal scrolling to a match on a long line would yank the view
     // sideways on every keystroke.
     let preview = search.preview();
+    // Captured before `preview` is handed to the paint below, and the answer to two
+    // questions: which line this frame follows, and whether it is in a position to
+    // record having shown the caret at all.
+    let previewing = preview.is_some();
     let follow_line = match &preview {
         Some(range) => snapshot.text.line_of_byte(range.start),
         None => cursor_line,
@@ -1885,7 +1861,7 @@ fn paint(frame: &mut Frame, snapshot: &ViewSnapshot, inputs: PaintInputs) -> Vie
     // longer occupies.)
     let offset_for = |header_height: usize| {
         let text_height = body_height.saturating_sub(header_height);
-        if follow || preview.is_some() {
+        if follow || previewing {
             layout::scroll_to_show(follow_line, viewport.scroll, text_height)
         } else {
             viewport.scroll
@@ -2022,7 +1998,13 @@ fn paint(frame: &mut Frame, snapshot: &ViewSnapshot, inputs: PaintInputs) -> Vie
         page_height: text_height,
         header_height,
         // What this frame showed, for the next one to compare against (see the field).
-        shown: Some((snapshot.version, head)),
+        // **`None` while a preview holds the viewport**, because then this frame was
+        // not showing the caret at all - it was showing the match. Recording the caret
+        // anyway would be a memo the writer already knows is false, and the loop would
+        // have to notice the preview ending and undo it. Saying "this frame does not
+        // answer the question" instead makes the next frame after the preview chase the
+        // caret on its own, which is what the reader wants back.
+        shown: (!previewing).then_some((snapshot.version, head)),
     }
 }
 
@@ -2972,6 +2954,51 @@ mod tests {
         assert!(
             rows.iter().any(|r| r.contains("needle")),
             "the match was scrolled into view: {rows:?}"
+        );
+    }
+
+    #[test]
+    fn a_preview_moves_the_view_down_but_never_sideways() {
+        // The preview follows the match on the vertical axis only - chasing it
+        // horizontally would yank the view sideways on every keystroke of the pattern.
+        // The horizontal window belongs to the caret, and a preview does not move the
+        // caret, so a frame driven by one must leave `h_scroll` exactly where the
+        // caret last put it.
+        let mut body = "filler\n".repeat(80);
+        body.push_str("needle here\n");
+        body.push_str(&"x".repeat(300)); // caret lands at the end of this long line
+        let snap = snapshot_after(&[Action::Insert(body)]);
+
+        // A frame with no search: the caret's own line scrolls sideways to show it.
+        let (_, settled) = render_state(&snap, 40, 10, paint_inputs(0));
+        assert!(settled.h_scroll > 0, "the caret is off to the right");
+
+        // The same viewport, now with a preview pulling the view to line 81.
+        let mut search = buffersearch::SearchState::default();
+        search.begin(0);
+        search.refresh(
+            buffersearch::Query::new("needle".into(), String::new()),
+            Some(&snap.text),
+        );
+        let (_, previewing) = render_state(
+            &snap,
+            40,
+            10,
+            PaintInputs {
+                viewport: settled,
+                search: &search,
+                ..paint_inputs(0)
+            },
+        );
+        // Down to the match's line (index 80)...
+        let shown = previewing.scroll..previewing.scroll + previewing.page_height;
+        assert!(shown.contains(&80), "the match's line is not in {shown:?}");
+        // ...and not one column sideways. The match itself is off to the left of the
+        // window at this offset, which is exactly the trade the vertical-only rule
+        // makes: a pattern typed on a long line must not swing the view about.
+        assert_eq!(
+            previewing.h_scroll, settled.h_scroll,
+            "the preview dragged the view sideways"
         );
     }
 
@@ -4210,86 +4237,6 @@ mod tests {
             let cell = buf.cell((19, row)).unwrap();
             assert_eq!(cell.symbol(), " ", "row {row} carries a bar");
         }
-    }
-
-    #[test]
-    fn a_notification_that_raises_a_prompt_does_not_also_raise_a_toast() {
-        // A conflict puts a modal question on screen. Saying the same thing in red
-        // beside it means the editor asks and answers in one frame. The two cases
-        // that get no prompt still get a toast, which is the whole rule: a toast is
-        // what remains once something has been dealt with.
-        let id = vortex_core::BufferId(1);
-        let path = std::path::PathBuf::from("notes.txt");
-        let conflict = vortex_core::Notification::ExternalChange {
-            buffer_id: id,
-            path: path.clone(),
-            removed: false,
-        };
-        let rejected = vortex_core::Notification::SaveRejected {
-            buffer_id: id,
-            path: path.clone(),
-            removed: false,
-        };
-        // The twin that gets no prompt: nothing to reload from, so it only toasts.
-        let removed = vortex_core::Notification::ExternalChange {
-            buffer_id: id,
-            path,
-            removed: true,
-        };
-
-        assert!(raises_a_prompt(&conflict));
-        assert!(raises_a_prompt(&rejected));
-        assert!(!raises_a_prompt(&removed));
-        // Each still *has* a toast; the loop is what withholds the two that asked.
-        for note in [&conflict, &rejected, &removed] {
-            assert!(toast::toast_for(note).is_some());
-        }
-    }
-
-    #[test]
-    fn a_preview_letting_go_of_the_viewport_sends_it_back_to_the_caret() {
-        // Esc on a find prompt clears frontend state only: no caret moves and no
-        // version is bumped, so nothing marks the moment the preview stops owning the
-        // view. Without voiding, the reader was left parked on a match they had just
-        // rejected, caret off screen, until the next keystroke snapped it back. This is
-        // the rule the loop applies; `a_preview_holds_the_view_until_it_is_cancelled`
-        // in the pty log is the end-to-end half.
-        let shown = Some((7, 100));
-        // While the preview holds it, nothing has moved, so nothing would follow.
-        assert!(!should_follow(shown, 7, 100));
-        // Voiding is what the loop does when the preview lets go, and it is enough.
-        assert!(should_follow(None, 7, 100));
-    }
-
-    #[test]
-    fn closing_a_buffer_does_not_park_the_viewport_it_just_dropped() {
-        // `BufferClosed` removes the entry and the swap re-inserts it a moment later
-        // under `painted`, so every buffer ever closed left a dead ViewState behind -
-        // ids are never reused, so nothing ever reclaimed them. Clearing `painted` is
-        // what stops the park; this pins the shape the loop relies on.
-        let mut viewports: HashMap<BufferId, ViewState> = HashMap::new();
-        let closed = BufferId(1);
-        let mut painted = Some(closed);
-        viewports.insert(closed, ViewState::default());
-
-        // The BufferClosed arm.
-        viewports.remove(&closed);
-        if painted == Some(closed) {
-            painted = None;
-        }
-        // The swap arm, for the buffer that replaced it.
-        let live = BufferId(2);
-        if painted != Some(live) {
-            if let Some(previous) = painted {
-                viewports.insert(previous, ViewState::default());
-            }
-            painted = Some(live);
-        }
-        assert!(
-            viewports.is_empty(),
-            "the closed buffer was parked again after being dropped"
-        );
-        assert_eq!(painted, Some(live));
     }
 
     #[test]

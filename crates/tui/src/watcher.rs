@@ -46,13 +46,14 @@ pub struct WatchSet {
     /// what stops the watch. Two files open from one directory is the common case,
     /// not a corner one.
     dirs: HashMap<PathBuf, usize>,
-    /// The spelling each watch was *requested* with, mapped to the key it resolved
-    /// to. Resolution needs the directory to exist, and a directory can be removed
-    /// while its file is open (`rm -rf` on a checkout) - after which the close that
-    /// follows could no longer name what it was releasing, and the entry and the
+    /// The spelling each watch was *requested* with, mapped to the key it resolved to.
+    ///
+    /// Resolution needs the file's directory to exist, and a directory can be removed
+    /// while its file is open (`rm -rf` on a checkout). After that the close which
+    /// follows could no longer name what it was releasing, and the entry plus the
     /// `notify` watch under it leaked for the rest of the session. The core asks to
     /// unwatch with the same path it asked to watch, so remembering that spelling
-    /// answers it without the filesystem.
+    /// answers without the filesystem.
     requested: HashMap<PathBuf, PathBuf>,
 }
 
@@ -82,22 +83,17 @@ impl WatchSet {
     /// `None` while other watched files still live in it.
     ///
     /// Falls back to the key this exact path resolved to *when it was watched* (see
-    /// [`Self::requested`]) whenever resolving it now does not name something watched.
-    /// Two ways that happens, and both leaked the entry and the `notify` watch under it
-    /// for the rest of the session - the accumulation this request exists to prevent,
-    /// in the cases that produce it:
-    ///
-    /// - The directory was removed while the file was open (`rm -rf` on a checkout), so
-    ///   `resolve_key` fails outright.
-    /// - The file is a symlink whose *target* was removed, so `resolve_key` **succeeds**
-    ///   and hands back the link's own location rather than the target the watch is
-    ///   keyed under. Testing only for failure would miss this one entirely.
+    /// [`Self::requested`]) whenever resolving it now does not name something watched -
+    /// a directory removed while its file was open, which leaves nothing on disk to
+    /// resolve through. Tested as "does the key name something watched" rather than
+    /// "did it resolve", because a resolution can succeed and still be the wrong
+    /// answer, and a leaked watch is silent either way.
     pub fn unwatch(&mut self, file: &Path) -> Option<PathBuf> {
+        let remembered = self.requested.remove(file);
         let key = match resolve_key(file) {
             Some(key) if self.files.contains(&key) => key,
-            _ => self.requested.get(file).cloned()?,
+            _ => remembered?,
         };
-        self.requested.remove(file);
         let dir = key.parent()?.to_path_buf();
         if !self.files.remove(&key) {
             return None;
@@ -125,33 +121,18 @@ impl WatchSet {
     }
 }
 
-/// A file's key: the path with **symlinks followed**, so a watch lands on the file
-/// whose bytes actually change. `None` when it has no file name, or its directory
-/// does not exist - both of which mean there is nothing here to watch.
+/// A file's watch key. [`vortex_core::watch::resolve`] does the work; this exists only
+/// to name why the watcher wants that particular reduction.
 ///
-/// **Following the link is the whole point.** A save resolves symlinks before it
-/// writes (`write_atomic`, so a link stays a link), and so does every other editor
-/// and dotfile manager - which means the write lands in the *target's* directory.
-/// Watching the link's own directory instead, as resolving only the parent did,
-/// left `~/.vimrc -> ~/dotfiles/vimrc` watching `~/` while every writer touched
-/// `~/dotfiles/`, so an external change to a symlinked file was never reported.
-///
-/// The core matches an event to a buffer by `file_identity`, which canonicalizes
-/// too, so reporting the resolved path still finds the document that was opened
-/// under the link. A file that does not exist yet cannot be canonicalized (and
-/// cannot be a symlink to anywhere useful), so it falls back to resolving the
-/// parent - a watch has to outlive the moment a rename replaces the file, which is
-/// the entire reason directories are what get watched.
+/// **Following the link is the whole point.** A save resolves symlinks before it writes
+/// (`write_atomic`, so a link stays a link), and so does every other editor and dotfile
+/// manager - which means the write lands in the *target's* directory. Watching the
+/// link's own directory instead left `~/.vimrc -> ~/dotfiles/vimrc` watching `~/` while
+/// every writer touched `~/dotfiles/`, so an external change to a symlinked file was
+/// never reported. The core matches events to buffers by the same reduction, so
+/// reporting the resolved path still finds the document opened under the link.
 fn resolve_key(file: &Path) -> Option<PathBuf> {
-    if let Ok(real) = file.canonicalize() {
-        return Some(real);
-    }
-    let name = file.file_name()?;
-    let parent = file
-        .parent()
-        .filter(|p| !p.as_os_str().is_empty())
-        .unwrap_or_else(|| Path::new("."));
-    Some(parent.canonicalize().ok()?.join(name))
+    vortex_core::watch::resolve(file)
 }
 
 /// Whether an event is worth forwarding. Access events (a file being opened or
