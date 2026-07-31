@@ -26,6 +26,12 @@ use vortex_core::action::CoreOptions;
 
 use crate::keymap::Keymap;
 
+/// The fewest characters a single complaint keeps when several share the one row a
+/// toast has. Below this a message is all ellipsis and names nothing, so a row that
+/// runs slightly long is the better failure - the point is to say which settings were
+/// wrong, and a truncated list says less than a long one.
+const MIN_COMPLAINT: usize = 40;
+
 /// Default display width of a tab stop (SPEC §4), when the config file says
 /// nothing. Four is the width the editor used before it was configurable.
 pub const DEFAULT_TAB_WIDTH: usize = 4;
@@ -307,7 +313,7 @@ fn parse(text: &str) -> (Config, Option<String>) {
     // eat the binding error behind it. A floor keeps a share readable when there are
     // many, at the cost of a row that can run slightly long.
     let problem = (!problems.is_empty()).then(|| {
-        let share = (crate::theme::MAX_ERROR / problems.len()).max(40);
+        let share = (crate::theme::MAX_ERROR / problems.len()).max(MIN_COMPLAINT);
         problems
             .iter()
             .map(|p| crate::theme::one_line_within(p, share))

@@ -1177,73 +1177,23 @@ async fn recv_attach<H>(attach: &Receiver<H>) -> H {
 /// The form a path is compared in to decide whether two buffers are the same *file*
 /// rather than the same spelling of one (SPEC §12.2).
 ///
-/// Canonicalized when the file exists, so `notes.md`, `./notes.md` and
-/// `/abs/notes.md` all resolve to one identity - and a symlink resolves to its
-/// target. This matters because the two ways a path reaches the core disagree by
-/// construction: argv passes what the user typed, while the file picker always sends
-/// an absolute path. Without this, launching on a relative path and then opening the
-/// same file from the picker yields two buffers over one file, each with its own
-/// history, and whichever is saved last silently discards the other's edits.
+/// One file's identity, however it is spelled: `notes.md`, `./notes.md` and
+/// `/abs/notes.md` all resolve to one, and a symlink resolves to its target. This
+/// matters because the ways a path reaches the core disagree by construction - argv
+/// passes what the user typed, the file picker always sends an absolute path, and the
+/// watcher reports whatever the platform gave it. Without this, launching on a relative
+/// path and then opening the same file from the picker yields two buffers over one
+/// file, each with its own history, and whichever is saved last silently discards the
+/// other's edits.
 ///
-/// A path whose *file* does not exist is resolved through its **directory** instead,
-/// which is the case that matters most: a file the watcher reports as deleted cannot
-/// be canonicalized by definition, and falling back to the raw spelling made it
-/// unmatchable. `vortex notes.txt` stores `notes.txt`, while the watcher reports the
-/// absolute path it derived from the directory it watches - so the deletion of a file
-/// opened by a relative path was never delivered to the buffer holding it, and
-/// `ExternalChange { removed: true }` could not fire at all for the ordinary
-/// command-line invocation.
-///
-/// **Deliberately the same algorithm the watcher's own key resolution uses.** The two
-/// sides of this comparison are computed in different crates from differently-spelled
-/// inputs, and the only thing that makes them meet is that they reduce a path the same
-/// way. Resolving the directory also handles a symlinked one (`/tmp` → `/private/tmp`),
-/// where the raw spellings differ even though neither is wrong.
-///
-/// **A broken symlink is followed one hop** before that is done, because the two sides
-/// are otherwise fed different files. `vortex ~/.vimrc` stores the *link*, while the
-/// watcher canonicalizes and so reports events against the *target* - and the moment
-/// the target is deleted, the link stops canonicalizing and the same algorithm applied
-/// to each gives two different answers. Reading the link restores the agreement. One
-/// hop, not a chain: a link to a link to a deleted file is rare enough not to pay for,
-/// and each extra hop is another `readlink`.
-///
-/// Only a path whose *directory* is also unresolvable falls back to itself: two
+/// [`watch::resolve`] is the reduction, shared with the frontend's watch set rather
+/// than restated here: an event only finds its buffer because both sides reduce a path
+/// identically, and that is an invariant a function can hold and two doc comments
+/// cannot. A path whose directory is unresolvable too falls back to itself - two
 /// spellings of a file in a directory that does not exist can still duplicate, which
 /// self-corrects the moment either is saved.
 fn file_identity(path: &Path) -> PathBuf {
-    if let Ok(real) = path.canonicalize() {
-        return real;
-    }
-    // A symlink whose target is gone: resolve what it pointed at instead of the link,
-    // since that is the path every other producer of this identity will be using. A
-    // relative target is relative to the link's own directory.
-    if let Ok(target) = path.read_link() {
-        let resolved = if target.is_absolute() {
-            target
-        } else {
-            path.parent().unwrap_or(Path::new(".")).join(target)
-        };
-        return resolve_through_parent(&resolved);
-    }
-    resolve_through_parent(path)
-}
-
-/// `path`'s directory canonicalized, plus its file name - the reduction that survives
-/// the file itself having been deleted. Falls back to `path` when even the directory
-/// is unresolvable.
-fn resolve_through_parent(path: &Path) -> PathBuf {
-    let Some(name) = path.file_name() else {
-        return path.to_path_buf();
-    };
-    let parent = path
-        .parent()
-        .filter(|p| !p.as_os_str().is_empty())
-        .unwrap_or_else(|| Path::new("."));
-    parent
-        .canonicalize()
-        .map(|dir| dir.join(name))
-        .unwrap_or_else(|_| path.to_path_buf())
+    crate::watch::resolve(path).unwrap_or_else(|| path.to_path_buf())
 }
 
 /// The LSP `languageId` for a path (the protocol's own identifiers, which are
@@ -2352,26 +2302,27 @@ async fn reload(
     // Every failure below names the document being *reloaded*, which a watcher event
     // can aim at any open buffer - not whichever one happens to be focused.
     let reloading = session.docs[index].id;
-    let metadata = match std::fs::metadata(&path) {
-        Ok(metadata) if !metadata.is_file() => {
-            let kind = if metadata.is_dir() {
-                "is a directory"
-            } else {
-                "not a regular file"
-            };
-            return report_file_error_for(
-                session,
-                reloading,
-                Some(path),
-                kind,
-                snapshots,
-                notifications,
-            );
-        }
-        Ok(metadata) => Some(metadata),
-        // Gone between the event and this stat. The read below reports it.
-        Err(_) => None,
-    };
+    // Same shape as `open_file`'s guard, deliberately: one rule about what may be
+    // read, written once per path that reads. A stat that fails means the file went
+    // away between the event and here, which the read below reports.
+    let metadata = std::fs::metadata(&path).ok();
+    if let Some(metadata) = &metadata
+        && !metadata.is_file()
+    {
+        let kind = if metadata.is_dir() {
+            "is a directory"
+        } else {
+            "not a regular file"
+        };
+        return report_file_error_for(
+            session,
+            reloading,
+            Some(path),
+            kind,
+            snapshots,
+            notifications,
+        );
+    }
     let bytes = match std::fs::read(&path) {
         Ok(bytes) if crate::file::is_binary(&bytes) => {
             return report_file_error_for(
@@ -2448,12 +2399,12 @@ async fn reload(
     doc.conflict = false;
 
     let id = doc.id;
+    let len = doc.buffer.byte_len();
     // Only when this document is the one the snapshot will describe. `Session::snapshot`
     // publishes the *active* buffer, and a background buffer reloading (a watcher event
     // for a file behind another tab) would otherwise attach its byte range to text that
     // never had those bytes - a repaint hint pointing past the end of what it describes.
-    let dirty =
-        (changed && index == session.active).then(|| 0..session.docs[index].buffer.byte_len());
+    let dirty = (changed && index == session.active).then_some(0..len);
     let _ = notifications.try_send(Notification::FileReloaded {
         buffer_id: id,
         path,
