@@ -368,21 +368,18 @@ impl SelectionSet {
         *self = Self::single(*self.primary());
     }
 
-    /// Sort `sels` by start and merge overlapping/touching selections, store the
-    /// result as the new (single) `Arc`, and point `primary` at whichever surviving
-    /// selection covers `primary_head`. Taking the working `Vec` by value keeps the
-    /// one allocation a mutation already needs and rebuilds the shared `Arc` once.
+    /// Sort `sels` by start, fold each into its predecessor where [`absorbs`] says
+    /// it belongs there, store the result as the new (single) `Arc`, and point
+    /// `primary` at whichever surviving selection covers `primary_head`. Taking the
+    /// working `Vec` by value keeps the one allocation a mutation already needs and
+    /// rebuilds the shared `Arc` once.
     fn normalize(&mut self, mut sels: Vec<Selection>, primary_head: usize) {
         sels.sort_by_key(Selection::start);
 
         let mut merged: Vec<Selection> = Vec::with_capacity(sels.len());
         for sel in sels {
             match merged.last_mut() {
-                // Sorted by start, so `sel.start() >= prev.start()`. Merge when
-                // the ranges overlap or touch (`sel.start() <= prev.end()`); this
-                // also collapses coincident cursors. Touching-merges keep the set
-                // strictly disjoint, which the invariant depends on.
-                Some(prev) if sel.start() <= prev.end() => {
+                Some(prev) if absorbs(prev, &sel) => {
                     let start = prev.start();
                     let end = prev.end().max(sel.end());
                     // Forward-oriented merged selection. Direction preservation
@@ -399,6 +396,29 @@ impl SelectionSet {
         self.primary = covering(&merged, primary_head).unwrap_or(0);
         self.selections = merged.into();
     }
+}
+
+/// Whether `sel` belongs *inside* `prev` rather than beside it, for a `sels` list
+/// already sorted by start (so `sel.start() >= prev.start()`).
+///
+/// Two rules, and the gap between them is load-bearing:
+///
+/// - **Overlap merges.** Selections that share a byte cannot both stand: an edit
+///   maps over the set, and two cursors rewriting the same byte have no defined
+///   result. This is what keeps the set disjoint, which every edit path assumes.
+/// - **Touching merges only when a bare cursor is involved** - a caret coincident
+///   with another, or sitting exactly at a selection's edge, is absorbed. That is
+///   what dedupes an `add_cursor` onto a caret that is already there.
+///
+/// **Two non-empty spans that merely touch stay separate**, and that is the whole
+/// point: `abc` selected as `a|b|c` is three regions, not one. Merging them was a
+/// silent defeat of select-all-matches for any pattern whose hits can abut - a
+/// single-character pattern, `\w`, `.` - which turned "one cursor per occurrence"
+/// into "one cursor per *run* of occurrences", so typing over the result replaced
+/// each run with a single copy of what was typed. They are disjoint either way,
+/// so nothing downstream needs them fused.
+fn absorbs(prev: &Selection, sel: &Selection) -> bool {
+    sel.start() < prev.end() || (sel.start() == prev.end() && (prev.is_cursor() || sel.is_cursor()))
 }
 
 /// Index of the selection whose span covers byte `offset` (both ends inclusive),

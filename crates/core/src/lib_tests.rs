@@ -2600,6 +2600,27 @@ fn every_search_action_reports_a_pattern_that_will_not_compile() {
 }
 
 #[test]
+fn select_all_matches_gives_adjacent_hits_a_cursor_each() {
+    // The regression, end to end and in the terms a user would state it: rewriting
+    // every occurrence has to rewrite every occurrence, including in a run where the
+    // matches touch. Merging touching selections made a run of three `a`s one cursor,
+    // so typing over the result left one `X` where three belonged.
+    drive(|h| async move {
+        step(&h, Action::Insert("aaa bbb aaa".into())).await;
+        let selected = step(
+            &h,
+            Action::SelectAllMatches {
+                pattern: "a".into(),
+            },
+        )
+        .await;
+        assert_eq!(selected.selections.len(), 6, "one per `a`, not one per run");
+        let typed = step(&h, Action::Insert("X".into())).await;
+        assert_eq!(typed.text.to_string(), "XXX bbb XXX");
+    });
+}
+
+#[test]
 fn select_all_matches_with_no_match_reports_and_keeps_the_selection() {
     drive(|h| async move {
         typed(&h, "alpha beta").await;
