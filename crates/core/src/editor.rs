@@ -28,7 +28,7 @@ use async_channel::{Receiver, Sender};
 use futures::future::Either;
 
 use crate::action::{Action, CoreOptions, Granularity as CoreGranularity};
-use crate::anchor::{Anchor, Edit};
+use crate::anchor::{AfterWalk, Anchor, Edit};
 use crate::buffer::{Buffer, ByteRange, RopeBuffer};
 use crate::decoration::{Decoration, DecorationSet, DecorationSource};
 use crate::file::FileFormat;
@@ -2777,10 +2777,16 @@ fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), String> {
 /// invariant holds: the pre-edit heads are ascending and the transform is monotonic,
 /// so the results stay ordered (coincident carets merge).
 fn selections_after_edits(before: &SelectionSet, edits: &[Edit]) -> SelectionSet {
+    // One pass over the batch for the whole set rather than one per caret: the heads
+    // are non-decreasing (the set is sorted and disjoint, and a head lies inside its
+    // own span), which is exactly what `AfterWalk` needs. Per-caret transforms made
+    // one keystroke over N cursors O(N²) - 68 ms at 8 000 carets, which
+    // select-all-matches over a common word reaches on a large file.
+    let mut walk = AfterWalk::new(edits);
     let cursors: Vec<Selection> = before
         .all()
         .iter()
-        .map(|sel| Selection::cursor(Anchor::after(sel.head).transform_through(edits).offset()))
+        .map(|sel| Selection::cursor(walk.offset(sel.head)))
         .collect();
     let mut set = SelectionSet::from_sorted_cursors(cursors);
     // Carry the primary across the edit: transform its caret the same way and keep

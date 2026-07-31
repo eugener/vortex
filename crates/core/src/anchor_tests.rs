@@ -154,3 +154,67 @@ fn offset_and_constructors_round_trip() {
     let a = Anchor::before(0).transform(0, 0, 3);
     assert_eq!(a, Anchor::before(0)); // Before@0, insert at 0 -> stays at 0
 }
+
+/// An edit batch built from `(gap, deleted, inserted)` triples: each edit starts
+/// `gap` bytes after the previous one ended, so the batch is sorted, disjoint and
+/// in base coordinates - the contract both transforms take.
+fn batch(parts: &[(usize, usize, usize)]) -> Vec<Edit> {
+    let mut at = 0;
+    parts
+        .iter()
+        .map(|&(gap, deleted, inserted)| {
+            let start = at + gap;
+            let old_end = start + deleted;
+            at = old_end;
+            Edit {
+                start,
+                old_end,
+                insert_len: inserted,
+            }
+        })
+        .collect()
+}
+
+#[test]
+fn after_walk_agrees_with_transforming_each_offset() {
+    // The whole justification for the single-pass walk: it must answer exactly what
+    // the per-anchor transform answers, for every offset in an ordered sequence -
+    // before, inside, at both edges of, and past each edit.
+    let cases: Vec<Vec<(usize, usize, usize)>> = vec![
+        vec![(0, 1, 1)],                       // replace one byte at 0
+        vec![(0, 0, 3)],                       // pure insert at 0
+        vec![(5, 3, 0)],                       // pure delete
+        vec![(2, 1, 1), (2, 1, 1), (2, 1, 1)], // the multi-cursor keystroke
+        vec![(0, 4, 1), (1, 0, 9), (3, 2, 2)], // mixed shrink/grow
+        vec![(1, 0, 0)],                       // empty edit
+        vec![(0, 2, 5), (0, 3, 0)],            // back-to-back, no gap
+    ];
+    for parts in cases {
+        let edits = batch(&parts);
+        let span = edits.last().map_or(0, |e| e.old_end) + 4;
+        let mut walk = AfterWalk::new(&edits);
+        for offset in 0..=span {
+            let expected = Anchor::after(offset).transform_through(&edits).offset();
+            assert_eq!(
+                walk.offset(offset),
+                expected,
+                "offset {offset} through {edits:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn after_walk_handles_an_empty_batch_and_a_repeated_offset() {
+    let mut walk = AfterWalk::new(&[]);
+    assert_eq!(walk.offset(0), 0);
+    assert_eq!(walk.offset(7), 7);
+
+    // Coincident carets ask the same question twice; both must get the same answer,
+    // since the edit they sit in is not consumed by the first.
+    let edits = batch(&[(3, 2, 5)]);
+    let mut walk = AfterWalk::new(&edits);
+    let first = walk.offset(4);
+    assert_eq!(walk.offset(4), first);
+    assert_eq!(first, Anchor::after(4).transform_through(&edits).offset());
+}
