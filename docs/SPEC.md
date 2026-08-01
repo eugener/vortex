@@ -934,8 +934,212 @@ existed to configure them from:
     commands should be named deliberately rather than after the fact.
   - **Text entry is a fallback, not a binding:** an unbound printable char with no Ctrl
     inserts itself, so the map never enumerates every letter.
-  - **Open:** modal-vs-modeless, chord *sequences* (multi-key), and per-mode maps are the
-    remaining design, drafted alongside the §12.2 `Action` vocabulary.
+  - **Open:** modal-vs-modeless is the remaining design question, drafted alongside the
+    §12.2 `Action` vocabulary. Chord *sequences* and per-mode maps stay deferred with
+    their triggers (§11); everything else the table owes is settled in "Every binding is
+    data" below.
+
+#### Every binding is data (M9, specified)
+
+M0-M8 made the *editor's* bindings data and left everything else in code. Five surfaces
+match key codes directly in a `match key.code` of their own - the pickers, the prompt, the
+find prompt, the confirmation and the query-replace walk - so not one of their keys can be
+rebound. A default binding can be replaced but never removed, so `ctrl+f` cannot be freed.
+The platform split lives in `cfg!`. And the defaults themselves are a Rust table no user
+can read. M9 closes all four, under one rule: **a key that does something has a name and a
+table row**, and what stays in code is only what a table cannot say (listed at the end).
+
+Two stages, in order. Stage 1 needs no new machinery and is worth shipping alone.
+
+**Stage 1 - the table gets what every editor's table already has.**
+
+- **`mod` is the platform command modifier**: Cmd on macOS (crossterm `SUPER`), Ctrl
+  elsewhere, resolved by `Chord::parse` at parse time. `"mod+c" = "copy"` is then one row
+  that means the right thing on both, and `COMMAND_MOD_BINDINGS`' `cfg!` split disappears
+  into it. `Chord::display` renders the *resolved* modifier (`Cmd+C` on a Mac), because
+  the palette must show the key the user actually presses. Zed's `secondary-` is the same
+  device.
+- **`nop` unbinds.** `"ctrl+f" = "nop"` binds the chord to nothing and - the part that
+  matters - **consumes it**: the lookup returns before the text-entry fallback, which
+  would otherwise turn an unbound printable chord back into typing. Helix's `no_op` and
+  Zed's `null` are the same answer; TOML has no null, so it is a command name. Under
+  contexts (Stage 2) `nop` is also how a config says "swallow this here", as distinct from
+  "let it fall through".
+- **The defaults are a file.** `crates/tui/keys.toml`, compiled in with `include_str!`
+  beside `themes/*.toml`, parsed by the same loader the user's file goes through. The Rust
+  tables are *deleted* rather than mirrored, so the two cannot drift and no equality test
+  is needed - unlike `Theme::default()`, which keeps its hand-written twin because a theme
+  must exist before any parsing can fail, a bootstrap need a keymap does not have (a
+  `keys.toml` that will not parse is a build-time bug the `Keymap::default` test catches).
+  It also answers a question the editor cannot answer today - *what are the defaults?* -
+  since the file is the reference a user copies a row out of.
+
+**Stage 2 - contexts, so the surfaces are bindable too.**
+
+A **context** is a name. At any instant an ordered list of them is active, lowest first:
+
+1. `editor`, always - the `[keys]` table itself.
+2. the platform - `macos`, `linux` or `windows`, one of them, fixed at startup.
+3. one per open overlay, bottom-to-top, mirroring the compositor's own stack.
+
+Lookup walks that list **from the top down** and takes the first context that binds the
+chord. That one sentence replaces four separate rules: which surface owns a key, whether a
+shortcut fires over an open picker, what a platform-specific binding is, and what
+precedence means.
+
+*Why a stack of names and not a predicate language.* Zed evaluates context predicates
+(`&&`, `!`, `>` for ancestry, `os == macos`) against a focus chain; VS Code evaluates
+`when` clauses over a registry of global context keys; Sublime evaluates a `context` array
+of key/operator/operand tests. All three need an expression language because many regions
+can hold focus at once and their conditions do not nest. Vortex's focus chain *is* the
+compositor stack - already an ordered list, and two deep. A stack of names is the same
+power here for none of the machinery; it is Emacs' model rather than a thinned-out Zed.
+**Trigger to revisit:** the first binding whose condition is not "which surface is on top"
+- a language filter, a read-only buffer, a debugger state. Contexts grow a predicate then,
+and this paragraph is the record of why they did not have one before.
+
+*Why it is urgent rather than nice.* Helix has this compositor shape and these hardcoded
+surface keys, and has not been able to undo it: the request is open since
+[#615](https://github.com/helix-editor/helix/issues/615), with
+[#5505](https://github.com/helix-editor/helix/issues/5505) (remapping for any component)
+and [#3205](https://github.com/helix-editor/helix/issues/3205) (bindings for prompts)
+behind it, because the fix needs an architecture change to its component layer. That
+change is cheap at five surfaces and expensive at fifteen.
+
+The contexts are a **closed set** - an unknown name in a config file is an error, not a
+silent no-op, the rule §10.5 already applies to chords and commands:
+
+| context | raised by | an unbound printable key is |
+|---|---|---|
+| `editor` | always | text (inserted) |
+| `macos` / `linux` / `windows` | the platform | - |
+| `picker` | `Picker` (file, buffer, theme, encoding, line-ending, palette, global search) | text (the query) |
+| `prompt` | `Prompt` (save-as) | text (the input) |
+| `find` | `Find` (the find / replace prompt) | text (the focused field) |
+| `confirm` | `Confirm` (close guard, external-change reload, overwrite) | a decline |
+| `replace` | `QueryReplace` (the y/n/a/q walk) | the end of the walk |
+
+One `picker` context for all seven pickers, not one each: nothing today would bind them
+differently. **Trigger:** the first binding that should differ between two pickers.
+
+**Command names.** One namespace still - `Command::parse` answers for all of them, so the
+config's forward lookup and the palette's reverse lookup stay the two functions they are.
+What is new is that **a command declares which contexts it is valid in**, and a binding
+outside that scope is a `KeymapError::WrongContext`, reported like a bad chord. Without
+it, `next_item` written in `[keys]` would be a row that parses, applies, and never fires -
+the silent failure §8 forbids. Shared names where the meaning is shared, specific names
+where it is not:
+
+- `accept` - commit the surface (`picker`, `prompt`, `find`).
+- `cancel` - dismiss it (`picker`, `prompt`, `find`, `confirm`, `replace`).
+- `delete_backward` - already the editor's name for it, and scoped to `picker`, `prompt`
+  and `find` as well: it is the same intent over whatever field has focus.
+- `next_item` / `previous_item` - move the highlight (`picker`).
+- `next_field` - the replace prompt's second field (`find`).
+- `confirm_yes` / `confirm_no` (`confirm`).
+- `replace_yes` / `replace_no` / `replace_all` / `replace_quit` (`replace`).
+- `nop` - every context.
+
+They become a public contract the moment `keys.toml` ships, which is why they are settled
+here rather than after the fact (§10.5's own rule about command names). None of them joins
+the **palette**: its list is curated by hand rather than derived from the vocabulary, and a
+surface command is unrunnable from the one place its surface is not open. The scope a
+command declares is what makes that a rule instead of an oversight - the palette lists
+editor-scoped commands, and `shortcut_for` is asked in the editor context to fill its
+shortcut column.
+
+**What a layer does with a key it was not given.** The compositor resolves the chord in
+the layer's context and hands the layer *both* the key and whatever binding it found
+(`handle_key(key, bound: Option<Command>)` - one method rather than two, so the layer
+still owns the decision). A miss is not one behavior but three, and each is a property of
+the surface rather than of the table:
+
+- **take it as text** - the picker's query, the prompt's input, the find prompt's field;
+- **treat it as a decline** - `Confirm` answers no to every key but `y`, and
+  `QueryReplace` ends the walk on anything that is not `y`/`n`/`a`. Neither is expressible
+  as a binding ("bind everything else"), and both are what makes a mistyped key harmless;
+- **defer it** - fall through to the next context down.
+
+This is what replaces the `if key.modifiers.contains(CONTROL) { return Ignored }` guard
+copied into five layers today: a Ctrl chord reaches the editor because nothing above it
+bound the chord, not because it is a Ctrl chord. Two §11 debt entries are paid off here -
+the one wanting an explicit `EventResult::Deferred`, and the one about that convention
+being split across two files.
+
+**No surface can be locked shut by a config.** Unbind `cancel` in `[keys.picker]` and Esc
+is unbound *there*; it is not printable, so it is not taken as text, so it falls through
+to the editor context - where it is `collapse_selections`, which fires and dismisses the
+overlay. The way out survives a bad config by construction, not by a special case.
+
+**Config shape.** `[keys]` stays the editor table it already is; a *sub*table is a context:
+
+```toml
+[keys]                 # the editor context
+"ctrl+e" = "quit"
+"ctrl+f" = "nop"       # free the chord
+
+[keys.macos]           # only on macOS
+"ctrl+c" = "quit"
+
+[keys.picker]
+"ctrl+n" = "next_item"
+```
+
+`[keys]` is the editor context rather than `[keys.editor]` being required: one way to say
+it, and the common case stays a line shorter. A value is either a string (a binding) or a
+table (a context); contexts do not nest, so a table inside a table is an error. The rest
+is the rule already in force - later rows win, the file layers over the built-ins per
+context, and one bad row costs one binding and is reported.
+
+**No chord reaches the screen as a literal.** A binding the user can change is a binding
+the editor must not hard-code into the text it shows. `shortcut_for` grows a context
+argument (the palette asks the editor's) and becomes the *only* way a key name is
+rendered anywhere.
+
+This is not a tidiness rule; the drift has already happened. `--help` advertises
+`Ctrl+F  Search the project`, and has since M7 moved project search to Ctrl+Shift+F and
+gave Ctrl+F to the in-buffer find. Nothing failed, because nothing connects the sentence
+to the binding. Every site below is the same hazard, and rebinding multiplies it - a user
+who moves a key today gets an editor that confidently names the old one.
+
+The full inventory of places a chord is shown, and what each becomes:
+
+| site | today | after |
+|---|---|---|
+| the palette's shortcut column | `shortcut_for` | unchanged - it is the model for the rest |
+| the query-replace question (`(y)es (n)o (a)ll (q)uit`) | literal | rendered from the `replace` bindings |
+| the four confirmations (`(y/N)`) | literal | rendered from the `confirm` bindings |
+| `--help`'s key list | literal, plus a `cfg!` twin for the OS-conditional lines | label + `shortcut_for`, per row; the `cfg!` twin deleted, since `mod` resolves per OS |
+| the README's key table | literal | still literal - a document cannot query a keymap - but **held to the default keymap by a test**, the device the theme default already uses (`Theme::default()` against `undertow.toml`, and the README's own config example against the real parser) |
+
+The help's list and the palette's list stay **two** curated lists, not one: they carry
+different labels for different audiences (the help explains, the palette names), and only
+the *chord* is generated. The rule is "no literal chord", not "one list". A help row whose
+command has no binding is **omitted** rather than printed blank, so unbinding something
+removes it from the help instead of advertising a key that does nothing.
+
+**What is deliberately not data**, each with the condition that would change it:
+
+- **The text-entry fallback and the three unbound-key policies above.** They are what a
+  table cannot express.
+- **Mouse gestures.** A drag has no chord. *Trigger:* a second pointer convention worth
+  choosing between.
+- **Key *sequences*.** Unchanged from §11 - trie, pending-prefix state, config grammar,
+  `shortcut_for` rendering, then the which-key popup, in that order. Contexts do not need
+  sequences and sequences do not need contexts, so neither blocks the other. *Trigger:*
+  unchanged - modal editing or a leader key.
+- **Command arguments.** Zed passes `["workspace::ActivatePane", 0]` and VS Code an `args`
+  object; Vortex names `insert_tab` and `insert_newline` separately instead. Arguments
+  would end `Command` as a data-free `Copy` enum, which is exactly what makes
+  `shortcut_for`'s identity match exact and page-free (§10.5). *Trigger:* the first
+  command whose useful values do not fit a handful of names.
+- **Command *lists*** (Helix's `"ret" = ["open_below", "normal_mode"]`). *Trigger:* a
+  macro facility, or a user wanting to compose two commands.
+- **Per-platform *surface* bindings.** The active list is flat and the platform sits below
+  the layers, so it cannot qualify one. *Trigger:* the first surface binding that must
+  differ per OS.
+- **Runtime rebinding.** A theme is swappable mid-session because previewing one is the
+  point; a keymap is not. The config file stays its only writer.
 
 #### Theme files (built)
 
@@ -1124,10 +1328,12 @@ None is a correctness bug today.
   bound. Neither half is expressed in the `Layer` contract, so the next layer type must
   rediscover the heuristic or shortcuts silently stop working over it. An explicit
   `EventResult::Deferred` ("not mine; if it resolves to a command, close me") would put
-  the rule in the seam. **Deferred because** there is still only one layer type, so the
-  rule has not been duplicated even once. **Trigger:** the prompt layer (§7.5), which is
-  the second implementor - and also the point where dismiss-*all* becomes the wrong scope
-  for nested overlays.
+  the rule in the seam. The guard is now copied into five layers, so the duplication this
+  entry waited for has happened. **Trigger: M9 Stage 2** (§10.5, "Every binding is data"),
+  which pays it off as a side effect rather than as its own change: once a layer is handed
+  the binding its context resolved, a Ctrl chord falls through because nothing above bound
+  it, not because it is a Ctrl chord. That is also the point where dismiss-*all* becomes
+  the wrong scope for nested overlays.
 - **A shortcut fired over the theme picker keeps the preview.** `Compositor::dismiss`
   drops the stack without asking the layers, so the "Esc restores what you opened with"
   contract is only honored by Esc: pressing Ctrl+S while previewing leaves the previewed
@@ -1511,7 +1717,38 @@ Incremental build order so the risky assumptions are validated early, not at the
   caught the follow bug the §7.5 entry records; the unit test that was supposed to cover
   it had asserted the wrong invariant and passed.
 
-Extensibility (§12.1) sits after the M0-M8 build order and is gated on that decision.
+- **M9 - Every binding is data.** *(Specified, not started - see §10.5 "Every binding is
+  data" for the full design and the reasoning behind each choice.)* M0-M8 externalized the
+  *editor's* bindings and left the rest in code: five surfaces match key codes directly, a
+  default binding cannot be removed, the platform split lives in `cfg!`, and the defaults
+  are a Rust table no user can read. Two stages, in order, each shippable alone.
+  **Stage 1** is the three things every editor's keymap has and this one does not: a `mod`
+  token for the platform command modifier, `nop` to unbind a chord, and the built-in
+  bindings moved out of Rust into a compiled-in `keys.toml` (the Rust tables deleted, not
+  mirrored). No new machinery, and each closes a gap a user meets on the first day. It also
+  takes the first half of "no chord reaches the screen as a literal": `--help`'s key list
+  is rendered per row from `shortcut_for` (deleting its `cfg!` twin, which `mod` makes
+  unnecessary) and the README's table is held to the default keymap by a test. That half
+  fixes a live bug rather than preventing a future one - the help has advertised
+  `Ctrl+F  Search the project` since M7 moved project search off that chord.
+  **Stage 2** is keymap **contexts**: a name per active scope - `editor`, the platform, and
+  one per open overlay mirroring the compositor stack - looked up top-down, first match
+  wins. The pickers, prompts, the confirmation and the query-replace walk stop matching key
+  codes and start matching commands, so every key in the editor becomes bindable; the
+  "a Ctrl chord falls through an overlay" heuristic copied into five layers becomes a
+  consequence of the table rather than a rule of its own; and two §11 debt entries are paid
+  off with it. The design is a stack of names, not a predicate language, because this
+  focus chain is the compositor's own ordered stack and is two deep - the reasoning, and
+  the trigger that would overturn it, are in §10.5. It finishes the display rule with the
+  two sites that need a surface context: the query-replace question and the four
+  confirmations stop spelling `y`/`n`/`a`/`q` and `(y/N)` themselves.
+  *Verify:* a config that rebinds one key in each context, driven in a pty - the picker's
+  highlight moving on the rebound key, `cancel` unbound in the picker and Esc still
+  escaping through the editor context beneath it, a `nop`'d chord doing nothing at all
+  (not typing itself), the query-replace question naming the rebound answers instead of
+  `y`/`n`/`a`/`q`, and `--help` naming every chord the config actually resolved.
+
+Extensibility (§12.1) sits after the M0-M9 build order and is gated on that decision.
 
 ---
 
