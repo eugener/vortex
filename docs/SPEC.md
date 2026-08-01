@@ -549,6 +549,9 @@ adopt a component framework.**
 | **Pickers** (file / theme / buffer / encoding / line-ending / global-search / symbol) | overlay | emits `Action` on pick | **file + theme + buffer + global-search + the two format pickers built (M7).** fuzzy list + optional preview pane (**built (M7)**, opt-in per picker, filled when the highlight *moves*; the file picker uses it, and it is dropped below 80 columns rather than halving a narrow screen into two unreadable ones); large lists stream in without blocking. Mouse-driven: a click on a row picks it, the wheel moves the highlight, a click outside dismisses |
 | **Theme picker** | overlay | **none** | **built (M7).** the one surface whose commit never crosses the seam at all - chrome is frontend-owned, so it also *previews* as the highlight moves (§10.5) |
 | **Global-search picker** | overlay | emits `Action` on pick | **built (M7).** the one picker whose rows are not a list it was handed: the query *is* the search, a worker thread walks the project, and results stream in through `Layer::tick`. A pick is two actions - `Open` then `PlaceCursorAt` - so it lands on the match, not the top of the file |
+| **Message log** | overlay | none | **specified (M10).** the retained ring the toast is a 4-second preview of - the same picker surface, so it costs a command rather than a widget. What makes an LSP spawn failure reportable at last (§14 M2) |
+| **Diagnostics picker** | overlay | emits `Action` on pick | **specified (M10).** the head bar's `✗3` is the control that opens it, and it jumps like the global-search picker does. A count that names a problem is also the way to reach it |
+| **Empty-state hints** | base | none | **specified (M10).** three chords, rendered from the keymap (§10.5), on an empty pathless buffer only, gone on the first keystroke |
 | **Which-key popup** | overlay | none | **deferred out of M7 (§11).** It is the one surface with a prerequisite it cannot supply itself: "the available continuations from the keymap" presupposes a keymap that *has* continuations, and this one is flat by design (§10.5). Revisit with chord sequences, not before |
 | **Completion popup** | overlay | emits `Action`, reads decorations | LSP completion menu; ghost-preview of the selected item as a `VirtualText` decoration |
 | **Hover / diagnostic popup** | overlay | reads decorations | LSP hover + full diagnostic text on demand |
@@ -558,6 +561,172 @@ typing in a picker filter) is **pure frontend** and never round-trips to the cor
 anti-Xi rule as scrolling (§5). Only the *committed intent* (the picked command, the
 submitted path, the accepted completion) becomes an `Action`. Fuzzy matching runs
 frontend-side, on `nucleo-matcher` (Helix's matcher; §3), which landed with the pickers.
+
+### What the chrome says (the information architecture, M10 - specified)
+
+The table above says *which surfaces exist*. This says **what each one is allowed to put on
+screen**, which is a different question and had never been answered: the head bar's right
+segment holds a line count, the status bar carries an internal document version, and three
+things the editor knows - the diagnostic count, the language server's health, and which
+grammar is attached - are on screen nowhere at all.
+
+**The rule, and it settles most of the argument:** *a chrome cell is spent on what the user
+cannot otherwise learn - and a readout that is always present stops being read, so presence
+itself is the signal.* The line count fails it, because the gutter already counts lines and
+the scrollbar already shows position. The document version fails it. The byte size fails
+it, because the filesystem answers it. Encoding passes, because the buffer holds UTF-8 with
+LF whatever the file holds (§10.1), so nothing else on screen can tell you the file is
+CP-1252. Diagnostic counts pass. Server health passes. Indentation passes, because it
+silently decides what the Tab key inserts.
+
+The second half of the rule is what keeps the bars quiet. A segment reading `0 errors`
+forever teaches the eye to skip the place errors will appear, so a segment is **absent at
+nominal and present when it has something to say**, in a slot it never leaves.
+
+**Three zones, one question each.** The split is what stops the bars and the toasts
+duplicating each other:
+
+| zone | answers | carries |
+|---|---|---|
+| head bar | *what am I in?* | identity and its condition - buffer, branch, language, health |
+| status bar | *where am I, and how is this written?* | caret position, and the format a save will reproduce |
+| toast + log | *what just happened?* | events, never standing conditions |
+
+From which: **an event that leaves a standing condition toasts once, then lives in the bar
+and in the log.** The bar never re-announces; the toast never reports something that is
+still true and already shown.
+
+#### The head bar
+
+Tabs keep the left, as M7 built them, plus one fix: **colliding names take the shortest
+parent that separates them** (`tui/layout.rs` beside `core/layout.rs`), never two tabs both
+reading `layout.rs`. The right becomes a state cluster, and the *presence* rule is what
+decides each member - this is where the design first went wrong and was corrected, so the
+reasoning is recorded rather than the outcome alone:
+
+- **`⎇ main*`** - always, inside a repository. The one identity fact a full-screen editor
+  hides from you, and a wrong-branch edit is expensive. First to drop under narrowing.
+- **`◐ indexing` / `✗ no server`** - only while the server is **not** ready. A permanent
+  `● rust-analyzer` would spend fourteen columns reporting that nothing is wrong, which is
+  the rule's own violation.
+- **language** - only when the grammar **disagrees with the file name**: a failed `dlopen`
+  (§14 M4) reads `plain`, an override reads what it overrode to. `sample.rs` opened by the
+  Rust grammar needs no label; the name already said it.
+- **`✗3 ⚠1`** - flush right, absent at zero, and **never dropped**. Of everything on this
+  bar, a count of errors is what a user must not have to widen a window to discover. It is
+  the head bar's twin of `[read-only]` leading the status bar's left segment.
+
+**The width budget is 80 columns** - already the width at which the file picker drops its
+preview pane, so the editor has one narrow-terminal number rather than two. Drop order,
+left to right: branch, then server (which keeps its glyph and loses its word below ~90),
+then indentation, then encoding. Problems and caret position survive every width. The first
+draft of this design was laid out against a 100-column capture and **did not fit in 80**,
+which is why the budget is written down here instead of being rediscovered per feature.
+
+#### The status bar
+
+| segment | now | then | why |
+|---|---|---|---|
+| `[read-only]` | leads the left | keep | Survives every truncation, which is the point of its placement |
+| position | `Ln 22, Col 1` | keep | The reason the bar exists |
+| selection size | `(14 selected)` | keep | Already obeys the presence rule |
+| **cursor count** | - | **add** | Cursor state is a `SelectionSet` (§2.2); the bar reports the primary as though cursors were singular. Above one it says `3 cursors` |
+| **indentation** | - | **add** | Invisible otherwise, and it decides what Tab inserts |
+| encoding · EOL | `UTF-8 · LF` | keep | Unlearnable from the buffer, and already clickable (§10.5) |
+| byte size | `749B` | **drop** | The filesystem answers it; never the question mid-edit |
+| version | `v1` | **drop** | Instrumentation. §5 scoped it to "while the delta/version model is young"; it is no longer young |
+| **caret diagnostic** | - | **add** | Takes the right segment once the caret has *rested* on a flagged line |
+
+**The rest rule is not a refinement.** Without it the diagnostic replaces the encoding
+readout on every keystroke that crosses a bad line, and a strobing segment is worse than an
+absent one. It reuses the 150ms `HIGHLIGHT_WAIT` the global-search debounce already
+established (§11), so the editor has one "the user has stopped" constant, not two.
+
+**Indentation carries new scope, and it is the only new scope here.** `spaces:4` is a
+readout of a setting that does not exist - `insert_tab` always inserts a tab. The
+*frontend* already decides what that command inserts (§10.5: a tab is one byte whatever it
+is painted as), so an `indent_style` is a frontend change, not a core one.
+
+#### A count that names a problem is also the control that reaches it
+
+`✗3` is clickable and opens a **diagnostics picker** over the shared picker surface, and
+`next_diagnostic` / `previous_diagnostic` join the command vocabulary. This generalizes a
+decision the status bar already made (§10.5): clicking the encoding readout opens the
+encoding picker, *because the place that shows the answer is the place to change it*.
+Reporting three errors and offering no way to reach them is half a feature.
+
+#### One dialog anatomy
+
+Every overlay is the same shape, so the surface is learned once: **title and result count
+in the border** (free real estate - it costs no row), a query row, rows that show *why*
+they ranked, an optional preview pane, and a hint footer. Three of the four are new:
+
+- **The count** (`9 of 240`) is what tells you whether to keep typing or start arrowing.
+- **Matched characters are marked.** `nucleo_matcher::Matcher::fuzzy_indices` returns the
+  positions beside the score, so this is a call, not a second pass. Unmarked, a ranked list
+  looks arbitrary.
+- **Path rows read as paths** - directory dimmed, file name in full ink.
+- **The hint footer is generated from the keymap**, never written as a literal. That is the
+  §10.5 rule M9 establishes, and it is why M10 follows M9 rather than preceding it.
+
+*Rejected:* a **frameless panel on a dimmed backdrop** - handsomer, but it needs a dimming
+slot in all four themes and collapses to nothing on a 16-colour terminal, and Phosphor has
+exactly one hue to spend (§10.5 theme files). A **full-width query bar with the list
+beneath** - more room per row, less obviously modal, and an overlay that is modal over the
+keyboard should look it.
+
+**Confirmations stay a single bottom line.** A modal box for one keypress weighs more than
+the question. Two changes only: the answers render from the `confirm` context's bindings
+(M9), and the destructive answer is *marked* rather than merely capitalized.
+
+#### Messages
+
+The toast stays; what it loses - everything, after 4 seconds - gets a **message log**: the
+existing picker over a retained ring, timestamped and severity-marked. One command, no new
+widget, and it changes what the editor is permitted to tell you. M2 deferred surfacing an
+LSP spawn failure precisely because reporting it meant shouting once and vanishing; with a
+log it can toast once, sit in the head bar as `✗ no server`, and stay in the log.
+
+One placement rule the toast lacks today: **it never covers the caret's own row.** The
+stack sits top-right and drops to bottom-right when the caret is on a row it would cover.
+The frontend knows the caret's screen row, so this is a comparison, not a mechanism.
+
+*Rejected:* moving messages into a middle zone of the status bar. That re-hijacks the bar
+the toast surface was built to stop hijacking (§7.5 surfaces table, M6).
+
+#### The empty state
+
+`vortex` with no file opens an unnamed buffer and says nothing else - the first screen a
+new user sees, undesigned. It gets three centred, dim lines: open a file, the command
+palette, quit, **with their chords rendered from the keymap** like every other chord (M9).
+Shown only for an empty buffer with no path, and gone on the first keystroke: a splash
+screen you have to dismiss is a splash screen that was not worth showing.
+
+#### Glyphs, and the terminals that lack them
+
+**Shape carries the meaning; colour reinforces it.** The counts read `✗3 ⚠1` and never a
+red 3 beside an amber 1. Instrument is the proof this is a constraint and not a courtesy -
+it is achromatic and spends its single hue on errors alone (§10.5) - and the same rule
+serves a colourblind reader and a 16-colour terminal, which is why it is a design rule
+rather than an accessibility footnote.
+
+**A font profile, not a hope.** `⎇` and `◐` are absent from many terminal fonts, and a
+missing glyph renders as a box that misaligns every cell after it. A `glyphs =
+"unicode" | "ascii"` config selects a full replacement set (`●`→`*`, `✗`→`E`, `⚠`→`W`,
+`◐`→`~`, `⎇`→`git:`), every substitute **one cell wide**, since a two-cell fallback would
+move the text under it - the same width discipline §4 imposes on the buffer.
+
+#### The body
+
+Almost nothing: it is the part that already works. **Severity glyphs in the gutter**, which
+the decoration channel has produced since M2 (`GutterMark`) and the painter has never
+drawn. Inline end-of-line diagnostic text stays deferred - it wants the `VirtualText`
+decoration §11 already names.
+
+**Deliberately not designed here:** the completion popup and the hover panel. Those are LSP
+work, not chrome work - the client sends `didOpen`/`didChange` and consumes
+`publishDiagnostics`, and nothing else (§14 M2). Drawing their panels before the requests
+exist would be framing an empty room.
 
 ### Chrome and polish (frontend-owned, incremental)
 
@@ -1748,7 +1917,34 @@ Incremental build order so the risky assumptions are validated early, not at the
   (not typing itself), the query-replace question naming the rebound answers instead of
   `y`/`n`/`a`/`q`, and `--help` naming every chord the config actually resolved.
 
-Extensibility (§12.1) sits after the M0-M9 build order and is gated on that decision.
+- **M10 - What the chrome says.** *(Specified, not started - see §7.5 "What the chrome
+  says" for the full design.)* M0-M8 built the surfaces; nothing had ever settled what each
+  one is *allowed to put on screen*, and the answer had drifted: the head bar's right
+  segment holds a line count, the status bar carries an internal document version, and the
+  diagnostic count, the server's health and the attached grammar appear nowhere at all.
+  One rule decides it - **a chrome cell is spent on what the user cannot otherwise learn,
+  and presence is itself the signal** - together with three zones that stop the bars and
+  the toasts duplicating each other: the head bar answers *what am I in*, the status bar
+  answers *where am I and how is this written*, the toast and log answer *what just
+  happened*.
+  **Follows M9, and not by preference:** the dialog hint footer, the confirmation's
+  answers and the empty state all render chords, and M9 is what makes rendering a chord
+  something other than writing a literal (§10.5).
+  Ordered so the cheap half lands first: the status-bar audit, the picker's count / hint
+  footer / match marks / path rows, tab-name disambiguation, the empty state and the glyph
+  profile are small; the head bar's state cluster, the message log, and the gutter
+  diagnostics with their picker are medium. The one piece of **new scope** is an
+  `indent_style` setting behind the `spaces:4` readout - a frontend change, since the
+  frontend already decides what `insert_tab` inserts.
+  *Verify:* driven in a pty at **80 columns**, which is the budget the design is written
+  against and the width the first draft failed - a nominal frame carrying tabs and a branch
+  and nothing else, then the same file with the server indexing and three errors, with
+  every added segment in the slot it was promised and the caret readout unmoved; a caret
+  walked across a flagged line without the encoding readout strobing; `✗3` clicked to the
+  diagnostics picker and back to the hit; a message read out of the log after its toast
+  expired; and the whole run repeated under `glyphs = "ascii"` with no row misaligned.
+
+Extensibility (§12.1) sits after the M0-M10 build order and is gated on that decision.
 
 ---
 
