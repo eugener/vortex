@@ -99,7 +99,7 @@ cargo build --release
 | `Ctrl+O` | Open a file (fuzzy picker over the working directory, previewing the highlighted one) |
 | `Ctrl+F` | Find in this buffer (regex; matches highlight and the view follows as you type, `Enter` goes there) |
 | `F3` / `Shift+F3` | Next / previous match (`Ctrl+G` also finds the next) |
-| `Ctrl+H` | Find and replace (`Tab` between the fields; then `y`/`n`/`a`/`q` per match) |
+| `Ctrl+H` | Find and replace (`Tab` between the fields; then `y`, `n`, `a` or `q` per match) |
 | `Ctrl+Shift+F` or `Alt+F` | Search the project (regex, gitignore-aware; Enter jumps to the match) |
 | `Ctrl+Shift+L` | Put a cursor on every match of the last search |
 | `Ctrl+P` | Command palette |
@@ -208,6 +208,12 @@ final_newline = true         # add a trailing newline on save if the file lacks 
 "ctrl+w"      = "close_buffer"
 "mod+e"       = "add_cursor_above"   # Cmd on macOS, Ctrl elsewhere
 "ctrl+f"      = "nop"                # free the chord entirely
+
+[keys.macos]                 # only on macOS; `linux` and `windows` are the others
+"ctrl+c"      = "quit"
+
+[keys.picker]                # only while a picker is open
+"ctrl+n"      = "next_item"
 ```
 
 Chords are `modifier+…+key` with `ctrl`, `shift`, `alt`, `cmd` and `mod` in any order.
@@ -217,9 +223,21 @@ the palette lists. Rebinding one chord leaves every other binding alone, and **`
 unbinds one**: the chord then does nothing at all, rather than falling back to typing
 itself.
 
+`[keys]` is the editor, and **a subtable is a context** - a scope that is active only
+sometimes. The set is `macos`, `linux`, `windows` (one of them, fixed at startup) and
+one per open surface: `picker`, `prompt`, `find`, `confirm`, `replace`. At any moment an
+ordered list of them is active - the editor, the platform, then whatever is on top - and
+a chord goes to the highest one that binds it. So every key a picker, a prompt, a
+confirmation or a replace walk answers to is a row you can change, and a chord the
+surface does not bind falls through to the editor beneath rather than being swallowed.
+That fall-through is why no config can lock a surface shut: unbind the picker's `cancel`
+and `Esc` finds `collapse_selections` below, which closes it anyway. Use `nop` when you
+mean "swallow this here" instead. A command only works where it makes sense - `next_item`
+in `[keys]` is reported as an error rather than being a row that never fires.
+
 The built-in bindings are a file too - [`crates/tui/keys.toml`](crates/tui/keys.toml),
-in exactly this format. It is the list to copy a row out of, and there is no second copy
-of it in the source to disagree with it.
+in exactly this format, contexts and all. It is the list to copy a row out of, and there
+is no second copy of it in the source to disagree with it.
 
 `line_numbers = "relative"` numbers each row by its distance from the cursor - the count
 you would type before a motion - except the cursor's own row, which shows its absolute

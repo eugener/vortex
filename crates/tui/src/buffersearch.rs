@@ -26,9 +26,7 @@
 use std::ops::Range;
 
 use ratatui::buffer::Buffer;
-use ratatui::crossterm::event::{
-    KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
-};
+use ratatui::crossterm::event::{KeyEvent, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::layout::{Position, Rect};
 use ratatui::style::Style;
 use unicode_width::UnicodeWidthStr;
@@ -37,6 +35,9 @@ use vortex_core::{Action, Text};
 use crate::command::Command;
 use crate::compositor::{EventResult, Layer};
 use crate::config::Theme;
+// The keymap's `Command` is the *binding* side - what a chord names - while this
+// module's `Command` is what a committed choice dispatches (see `picker`).
+use crate::keymap::{Command as Bound, Context, Keymap};
 
 /// The live query: the pattern, its compiled form, and what a replace would write.
 ///
@@ -259,23 +260,20 @@ impl Layer for Find {
         buf.set_stringn(row.x, row.y, self.line(), row.width as usize, self.style);
     }
 
-    fn handle_key(&mut self, key: KeyEvent) -> EventResult {
-        // A Ctrl/Cmd chord is a keybinding, not input - deferred so the shortcut runs,
-        // the same rule `Prompt` and the pickers follow (SPEC §7.5).
-        if key.modifiers.contains(KeyModifiers::CONTROL)
-            || key.modifiers.contains(KeyModifiers::SUPER)
-        {
-            return EventResult::Ignored;
-        }
-        match key.code {
-            // Escape is the one gesture that means "done searching": it takes the
+    fn context(&self) -> Context {
+        Context::Find
+    }
+
+    fn handle_key(&mut self, key: KeyEvent, bound: Option<Bound>) -> EventResult {
+        match bound {
+            // Cancel is the one gesture that means "done searching": it takes the
             // highlights down with it, which is why it commits a clear rather than
             // just closing.
-            KeyCode::Esc => {
+            Some(Bound::Cancel) => {
                 self.outbox.push(Command::ClearSearch);
                 self.finished = true;
             }
-            KeyCode::Enter => {
+            Some(Bound::Accept) => {
                 // A replace commits into the query-replace walk; a plain find just
                 // goes to the match. Either way the query survives, so the
                 // highlights stay up and find-next has a pattern to repeat.
@@ -286,25 +284,30 @@ impl Layer for Find {
                 });
                 self.finished = true;
             }
-            // Tab moves between the two fields of a replace. In a plain find there is
-            // nowhere to go, so it is swallowed rather than inserting a tab into the
-            // pattern, where it would be a character the user cannot see.
-            KeyCode::Tab if self.replacing => {
+            // Guarded, because in a plain find there is no second field to go to: the
+            // key then falls to the arm below and is swallowed rather than typing a
+            // character the user cannot see into the pattern.
+            Some(Bound::NextField) if self.replacing => {
                 self.focus = match self.focus {
                     Field::Pattern => Field::Replacement,
                     Field::Replacement => Field::Pattern,
                 };
             }
-            KeyCode::Backspace => {
+            Some(Bound::DeleteBackward) => {
                 self.active().pop();
                 self.publish();
             }
-            KeyCode::Char(c) => {
-                self.active().push(c);
-                self.publish();
-            }
-            // Modal: swallow anything else so it never reaches the editor beneath.
-            _ => {}
+            // `nop`, and anything this context should not have been able to hold.
+            Some(_) => {}
+            // Unbound: a printable key is the focused field, and anything else falls
+            // through to the context below (SPEC §10.5).
+            None => match crate::keymap::text_key(&key) {
+                Some(c) => {
+                    self.active().push(c);
+                    self.publish();
+                }
+                None => return EventResult::Ignored,
+            },
         }
         EventResult::Consumed
     }
@@ -341,6 +344,29 @@ impl Layer for Find {
     }
 }
 
+/// The walk's answer list, rendered from the `replace` context rather than written
+/// out as `(y)es (n)o (a)ll (q)uit`.
+///
+/// A chord no longer fits inside its own word once it can be rebound - `(Ctrl+Y)es`
+/// is not a word - so each answer is its chord, then what it does. An answer whose
+/// command is **unbound is left out** rather than printed chordless: the same rule
+/// `--help` follows, and for the same reason (SPEC §10.5).
+fn answers(keymap: &Keymap) -> String {
+    [
+        (Bound::ReplaceYes, "yes"),
+        (Bound::ReplaceNo, "no"),
+        (Bound::ReplaceAll, "all"),
+        (Bound::ReplaceQuit, "quit"),
+    ]
+    .iter()
+    .filter_map(|(command, label)| {
+        let chord = keymap.shortcut_for(*command, Context::Replace)?;
+        Some(format!("{chord}={label}"))
+    })
+    .collect::<Vec<_>>()
+    .join(" ")
+}
+
 /// The query-replace walk: sit on a match and ask what to do with it (SPEC §11).
 ///
 /// The shape a terminal can actually offer for "replace one at a time". The
@@ -356,27 +382,34 @@ impl Layer for Find {
 pub struct QueryReplace {
     pattern: String,
     replacement: String,
+    /// The rendered answer list (`Y=yes N=no …`), settled once at construction from
+    /// the `replace` context. Held rather than re-derived per frame because the
+    /// keymap cannot change while the walk is open - a rebind needs a config reload,
+    /// which needs the walk to be over.
+    answers: String,
     style: Style,
     finished: bool,
     outbox: Vec<Command>,
 }
 
 impl QueryReplace {
-    pub fn new(theme: &Theme, pattern: String, replacement: String) -> Self {
+    pub fn new(theme: &Theme, keymap: &Keymap, pattern: String, replacement: String) -> Self {
         Self {
             pattern,
             replacement,
+            answers: answers(keymap),
             style: theme.palette,
             finished: false,
             outbox: Vec::new(),
         }
     }
 
-    /// The question, naming both halves so the user can see what they agreed to.
+    /// The question, naming both halves so the user can see what they agreed to, and
+    /// then what each answer costs.
     fn question(&self) -> String {
         format!(
-            "Replace `{}` with `{}`? (y)es (n)o (a)ll (q)uit ",
-            self.pattern, self.replacement
+            "Replace `{}` with `{}`? {}",
+            self.pattern, self.replacement, self.answers
         )
     }
 
@@ -410,35 +443,48 @@ impl Layer for QueryReplace {
         );
     }
 
-    fn handle_key(&mut self, key: KeyEvent) -> EventResult {
-        if key.modifiers.contains(KeyModifiers::CONTROL)
-            || key.modifiers.contains(KeyModifiers::SUPER)
-        {
-            return EventResult::Ignored;
-        }
-        match key.code {
-            KeyCode::Char('y') | KeyCode::Char('Y') => {
+    fn context(&self) -> Context {
+        Context::Replace
+    }
+
+    fn handle_key(&mut self, key: KeyEvent, bound: Option<Bound>) -> EventResult {
+        match bound {
+            Some(Bound::ReplaceYes) => {
                 let commands = self.replace_one();
                 self.outbox.extend(commands);
                 // Deliberately still open: the point of a walk is the next question.
             }
-            KeyCode::Char('n') | KeyCode::Char('N') => {
+            Some(Bound::ReplaceNo) => {
                 self.outbox.push(Command::Editor(Action::SelectNextMatch {
                     pattern: self.pattern.clone(),
                     backward: false,
                 }));
             }
-            KeyCode::Char('a') | KeyCode::Char('A') => {
+            Some(Bound::ReplaceAll) => {
                 self.outbox.push(Command::Editor(Action::ReplaceAllMatches {
                     pattern: self.pattern.clone(),
                     replacement: self.replacement.clone(),
                 }));
                 self.finished = true;
             }
-            // Every other key stops the walk without replacing - `q`, Escape, or a
-            // stray one. The destructive answers are exactly `y` and `a`, so a
-            // mistyped key can only ever end the walk early.
-            _ => {
+            // Quitting, cancelling, and every *unbound* printable key stop the walk
+            // without replacing. The destructive answers are exactly the two that are
+            // named, so a mistyped key can only ever end the walk early.
+            Some(Bound::ReplaceQuit | Bound::Cancel) => {
+                self.outbox.push(Command::ClearSearch);
+                self.finished = true;
+            }
+            // `nop`, and anything this context should not have been able to hold.
+            Some(_) => {}
+            None => {
+                if crate::keymap::is_command_chord(&key) {
+                    // Somebody's shortcut, not an answer: the context below gets its
+                    // turn (SPEC §10.5), so a walk does not shadow the whole keymap.
+                    return EventResult::Ignored;
+                }
+                // Everything else ends the walk, which is the same modal rule
+                // `Confirm` follows: the only keys that leave a question are the ones
+                // that were never its to answer.
                 self.outbox.push(Command::ClearSearch);
                 self.finished = true;
             }

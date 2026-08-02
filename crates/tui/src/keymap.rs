@@ -4,14 +4,15 @@
 //! Key->intent mapping is **frontend-owned**: the core only ever sees intent
 //! (`Action`), never keystrokes. A future GUI maps its own keys to the same actions.
 //!
-//! The map is **data, not code**: a [`Keymap`] is a set of `(chord -> command)`
-//! bindings, and [`command_for_key`] is a pure lookup over it. Both sides of a binding
-//! parse from strings ([`Chord::parse`], [`Command::parse`]), and the built-in
-//! [`Keymap::default`] is **a file** - `keys.toml`, compiled in with `include_str!`
-//! beside the themes and read through the same loader a user's `[keys]` table goes
-//! through. There is no Rust copy of the defaults to drift from it, and the file is
-//! the reference a user copies a row out of. Everything is a pure function of a key
-//! event, so it stays unit-testable without a terminal (SPEC §13).
+//! The map is **data, not code**: a [`Keymap`] is a set of `(context, chord ->
+//! command)` bindings, and [`command_for_key`] is a pure lookup over it. Both sides of
+//! a binding parse from strings ([`Chord::parse`], [`Command::parse`]), and the
+//! built-in [`Keymap::default`] is **a file** - `keys.toml`, compiled in with
+//! `include_str!` beside the themes and read through [`Keymap::extend_from_table`],
+//! the same and only loader a user's `[keys]` table goes through. There is no Rust
+//! copy of the defaults to drift from it, and the file is the reference a user copies
+//! a row out of. Everything is a pure function of a key event, so it stays
+//! unit-testable without a terminal (SPEC §13).
 //!
 //! **One vocabulary, one table.** [`Command`] names everything a key can be bound to,
 //! whether it becomes a core `Action` (`save`, `move_left`) or opens a frontend
@@ -27,7 +28,7 @@
 //! Bindings match the **full chord** (modifiers included), so `right` and `shift+right`
 //! are distinct entries - `extend` is baked into the command, not derived at runtime.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::HashMap;
 use std::fmt;
 
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
@@ -56,11 +57,33 @@ struct Chord {
 impl Chord {
     /// The chord an incoming key event represents (only Ctrl/Shift/Alt/Cmd are
     /// read; other modifier bits are ignored so lookup is stable across terminals).
+    ///
+    /// A letter is folded to lower case and **its case becomes the shift**, rather
+    /// than the shift being read off the modifier bit alone. Terminals disagree about
+    /// which of the two they send: with the Kitty protocol negotiated a shifted `y`
+    /// arrives as `Y` *and* `SHIFT`, and a classic terminal sends `Y` with no modifier
+    /// at all. Deriving it from the case makes `"shift+y"` one row that matches both,
+    /// and makes `"ctrl+shift+f"` fire whether `f` or `F` is reported.
+    ///
+    /// It also makes the upper-case form *expressible*: [`Chord::parse`] lowercases
+    /// every token, so without this there is no way to write a chord for a capital
+    /// letter. Caps Lock is indistinguishable from Shift here, but that is the
+    /// terminal's doing rather than this function's.
+    ///
+    /// Text entry is unaffected: [`text_key`] reads `key.code` rather than the chord,
+    /// so an upper-case letter still types itself.
     fn from_event(key: &KeyEvent) -> Self {
+        let (code, shifted_letter) = match key.code {
+            KeyCode::Char(c) => (
+                KeyCode::Char(c.to_ascii_lowercase()),
+                c.is_ascii_uppercase(),
+            ),
+            other => (other, false),
+        };
         Self {
-            code: key.code,
+            code,
             ctrl: key.modifiers.contains(KeyModifiers::CONTROL),
-            shift: key.modifiers.contains(KeyModifiers::SHIFT),
+            shift: shifted_letter || key.modifiers.contains(KeyModifiers::SHIFT),
             alt: key.modifiers.contains(KeyModifiers::ALT),
             cmd: key.modifiers.contains(KeyModifiers::SUPER),
         }
@@ -176,6 +199,98 @@ fn parse_key_code(token: &str) -> Option<KeyCode> {
     })
 }
 
+/// A scope a binding lives in: the editor itself, the platform, or one open surface
+/// (SPEC §10.5). At any instant an ordered list of contexts is active - `editor`
+/// always, the platform, then one per open overlay bottom-to-top - and a chord is
+/// resolved by walking that list from the top down, first match winning.
+///
+/// A **name**, not a predicate language. Zed, VS Code and Sublime all need an
+/// expression grammar because many regions can hold focus at once; this focus chain
+/// *is* the compositor's own stack and is two deep, so a stack of names is the same
+/// power for none of the machinery. The trigger that would overturn that - the first
+/// binding whose condition is not "which surface is on top" - is recorded in §10.5.
+///
+/// A **closed set**: an unknown name in a config file is an error, not a silently
+/// ignored table (SPEC §8).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum Context {
+    /// The buffer, and the `[keys]` table itself. Always active, always lowest.
+    Editor,
+    Macos,
+    Linux,
+    Windows,
+    /// Every picker - file, buffer, theme, encoding, line-ending, palette, global
+    /// search. One context for all seven, because nothing today would bind them
+    /// differently. *Trigger:* the first binding that should differ between two.
+    Picker,
+    /// The one-line value prompt (save-as).
+    Prompt,
+    /// The find / replace prompt.
+    Find,
+    /// A yes/no confirmation (close guard, external-change reload, overwrite).
+    Confirm,
+    /// The query-replace walk.
+    Replace,
+}
+
+impl Context {
+    /// The platform context for this build. Fixed at compile time, since the
+    /// platform cannot change while the editor runs - which is what lets the whole
+    /// `cfg!` split live here rather than being spread over the tables.
+    pub const PLATFORM: Context = if cfg!(target_os = "macos") {
+        Context::Macos
+    } else if cfg!(target_os = "windows") {
+        Context::Windows
+    } else {
+        Context::Linux
+    };
+
+    /// The contexts active when no overlay is open, **lowest first**: the platform
+    /// over the editor. Lookup walks it from the top down.
+    const EDITOR_STACK: [Context; 2] = [Context::Editor, Context::PLATFORM];
+
+    /// Parse a context name - the name of a subtable under `[keys]`.
+    fn parse(name: &str) -> Option<Context> {
+        Some(match name {
+            "editor" => Context::Editor,
+            "macos" => Context::Macos,
+            "linux" => Context::Linux,
+            "windows" => Context::Windows,
+            "picker" => Context::Picker,
+            "prompt" => Context::Prompt,
+            "find" => Context::Find,
+            "confirm" => Context::Confirm,
+            "replace" => Context::Replace,
+            _ => return None,
+        })
+    }
+
+    /// The name, for the error messages that quote it back.
+    fn name(self) -> &'static str {
+        match self {
+            Context::Editor => "editor",
+            Context::Macos => "macos",
+            Context::Linux => "linux",
+            Context::Windows => "windows",
+            Context::Picker => "picker",
+            Context::Prompt => "prompt",
+            Context::Find => "find",
+            Context::Confirm => "confirm",
+            Context::Replace => "replace",
+        }
+    }
+
+    /// The scope a binding written here is checked against. A platform context sits
+    /// in the *editor's* own stack rather than over a surface, so it holds exactly
+    /// what the editor holds and answers to the editor's scope.
+    fn scope(self) -> Context {
+        match self {
+            Context::Macos | Context::Linux | Context::Windows => Context::Editor,
+            other => other,
+        }
+    }
+}
+
 /// A bindable command: the intent side of a binding, carrying no runtime data.
 ///
 /// This is the single command vocabulary - the stable identifiers a config file
@@ -268,6 +383,31 @@ pub enum Command {
     FindPrevious,
     /// Put a cursor on every match of the last pattern (SPEC §12.2).
     SelectAllMatches,
+    /// Commit the open surface: pick the highlighted row, submit the typed value,
+    /// run the search (`picker`, `prompt`, `find`).
+    Accept,
+    /// Dismiss the open surface without committing (`picker`, `prompt`, `find`,
+    /// `confirm`, `replace`).
+    Cancel,
+    /// Move a picker's highlight down (`picker`).
+    NextItem,
+    /// Move a picker's highlight up (`picker`).
+    PreviousItem,
+    /// Move to the replace prompt's second field (`find`).
+    NextField,
+    /// Answer a confirmation yes - the one answer that commits (`confirm`).
+    ConfirmYes,
+    /// Answer a confirmation no (`confirm`). Every unbound printable key means this
+    /// too; the binding is what gives the answer a name to show and to rebind.
+    ConfirmNo,
+    /// Replace the match under the caret and walk on (`replace`).
+    ReplaceYes,
+    /// Leave the match alone and walk on (`replace`).
+    ReplaceNo,
+    /// Replace this match and every one after it, in a single edit (`replace`).
+    ReplaceAll,
+    /// Stop the walk (`replace`).
+    ReplaceQuit,
     /// Do nothing - and, the part that matters, **consume the chord**.
     ///
     /// This is how a config unbinds: `"ctrl+f" = "nop"` frees the chord. Leaving the
@@ -276,6 +416,9 @@ pub enum Command {
     /// as one (Helix's `no_op`, Zed's `null`). Consuming is what separates it from an
     /// unbound key: [`command_for_key`]'s text-entry fallback would otherwise turn a
     /// freed printable chord back into typing.
+    ///
+    /// Under contexts it is also how a table says "swallow this **here**", as distinct
+    /// from letting the chord fall through to the context below.
     Nop,
 }
 
@@ -373,9 +516,61 @@ impl Command {
             "find_next" => Command::FindNext,
             "find_previous" => Command::FindPrevious,
             "select_all_matches" => Command::SelectAllMatches,
+            "accept" => Command::Accept,
+            "cancel" => Command::Cancel,
+            "next_item" => Command::NextItem,
+            "previous_item" => Command::PreviousItem,
+            "next_field" => Command::NextField,
+            "confirm_yes" => Command::ConfirmYes,
+            "confirm_no" => Command::ConfirmNo,
+            "replace_yes" => Command::ReplaceYes,
+            "replace_no" => Command::ReplaceNo,
+            "replace_all" => Command::ReplaceAll,
+            "replace_quit" => Command::ReplaceQuit,
             "nop" => Command::Nop,
             _ => return None,
         })
+    }
+
+    /// Whether this command may be bound in `context`.
+    ///
+    /// Without the check, `next_item` written in `[keys]` would be a row that parses,
+    /// applies, and never fires - the silent failure SPEC §8 forbids. It is also what
+    /// makes "the palette lists editor commands" a rule rather than an oversight: a
+    /// surface command is unrunnable from the one place its surface is not open.
+    ///
+    /// Shared names where the meaning is shared: `delete_backward` is one intent over
+    /// whatever field has focus, so it is the editor's *and* every text surface's.
+    fn allowed_in(self, context: Context) -> bool {
+        let scope = context.scope();
+        match self {
+            // Every context: unbinding has to be possible wherever binding is.
+            Command::Nop => true,
+            Command::Accept => {
+                matches!(scope, Context::Picker | Context::Prompt | Context::Find)
+            }
+            Command::Cancel => matches!(
+                scope,
+                Context::Picker
+                    | Context::Prompt
+                    | Context::Find
+                    | Context::Confirm
+                    | Context::Replace
+            ),
+            Command::DeleteBackward => matches!(
+                scope,
+                Context::Editor | Context::Picker | Context::Prompt | Context::Find
+            ),
+            Command::NextItem | Command::PreviousItem => scope == Context::Picker,
+            Command::NextField => scope == Context::Find,
+            Command::ConfirmYes | Command::ConfirmNo => scope == Context::Confirm,
+            Command::ReplaceYes
+            | Command::ReplaceNo
+            | Command::ReplaceAll
+            | Command::ReplaceQuit => scope == Context::Replace,
+            // Everything else is the editor's, and only the editor's.
+            _ => scope == Context::Editor,
+        }
     }
 
     /// Finalize into the dispatchable command for this frame (`page` sizes page
@@ -385,6 +580,21 @@ impl Command {
     pub fn resolve(self, page: usize) -> Option<FrontendCommand> {
         let action = match self {
             Command::Nop => return None,
+            // A surface command is dispatched by the surface that was handed it, not
+            // by the loop - the layer holds the query, the highlight and the walk this
+            // would have to act on. It cannot reach here anyway: `allowed_in` keeps it
+            // out of every context the editor is looked up in.
+            Command::Accept
+            | Command::Cancel
+            | Command::NextItem
+            | Command::PreviousItem
+            | Command::NextField
+            | Command::ConfirmYes
+            | Command::ConfirmNo
+            | Command::ReplaceYes
+            | Command::ReplaceNo
+            | Command::ReplaceAll
+            | Command::ReplaceQuit => return None,
             Command::OpenPalette => return Some(FrontendCommand::OpenPalette),
             Command::OpenFilePicker => return Some(FrontendCommand::OpenFilePicker),
             Command::OpenThemePicker => return Some(FrontendCommand::OpenThemePicker),
@@ -464,98 +674,163 @@ fn parse_move_kind(name: &str) -> Option<MoveKind> {
 /// catches it.
 const BUILTIN_KEYS: &str = include_str!("../keys.toml");
 
-/// The macOS-only additions, layered over [`BUILTIN_KEYS`] there (see the file's own
-/// note: `mod` cannot express a chord that is free *because* of what `mod` resolved
-/// to). Compiled in on every platform so the tests parse it everywhere, and chosen at
-/// runtime by [`Keymap::default`].
-const BUILTIN_KEYS_MACOS: &str = include_str!("../keys-macos.toml");
-
-/// Parse a built-in `chord = command` table. The same `toml` shape a user's `[keys]`
-/// table deserializes to, so the defaults reach [`Keymap::from_pairs`] by exactly the
-/// path a config file takes.
+/// Parse a built-in keymap file. The same `toml` shape a user's `[keys]` table has,
+/// so the defaults reach [`Keymap::extend_from_table`] by exactly the path a config
+/// file takes.
 ///
 /// Panics on a malformed file, which is a build-time bug in a compiled-in constant
 /// rather than anything a user can cause - the invariant [`Keymap::default`]'s test
 /// proves.
-fn builtin_table(text: &str) -> BTreeMap<String, String> {
-    toml::from_str(text).expect("built-in keymap file must be a valid chord = command table")
+fn builtin_table(text: &str) -> toml::Table {
+    toml::from_str(text).expect("built-in keymap file must be a valid keys table")
 }
 
-/// The resolved key bindings. Opaque so its representation can change (e.g. gain
-/// per-mode maps) without touching call sites; built via [`Keymap::from_pairs`].
+/// The resolved key bindings, per context. Opaque so its representation can change
+/// (e.g. gain chord *sequences*) without touching call sites.
 ///
-/// One table for every binding, edit and overlay alike: a second map would be a
-/// second thing `from_pairs` has to remember to populate, and the M5 config path
-/// goes through `from_pairs` only - so anything it missed would silently vanish the
-/// first time a user wrote a config file.
+/// One table for every binding - edit, overlay trigger and surface key alike - keyed
+/// by `(context, chord)`. A map per context would be a second thing every loader has
+/// to remember to populate, and the config path goes through
+/// [`Keymap::extend_from_table`] only, so anything it missed would silently vanish
+/// the first time a user wrote a config file.
 #[derive(Debug, Clone)]
 pub struct Keymap {
-    bindings: HashMap<Chord, Command>,
+    bindings: HashMap<(Context, Chord), Command>,
 }
 
 impl Keymap {
-    /// Build a keymap from `(chord, command)` string pairs - the shape a config
-    /// file's `[keys]` table deserializes to. Later pairs override earlier ones on
-    /// the same chord (so a user table layered after the defaults wins).
+    /// Build an **editor-context** keymap from `(chord, command)` string pairs.
+    ///
+    /// Not the config path - that is [`Keymap::extend_from_table`], which is the only
+    /// loader a `[keys]` table reaches and the only one that can express a context.
+    /// This is the terse constructor for a keymap with a handful of editor rows and
+    /// nothing else, which is what most of this module's tests want.
     ///
     /// # Errors
-    /// Returns [`KeymapError`] naming the first unparseable chord or command, so a
-    /// bad config line is surfaced to the user rather than silently dropped (SPEC §8).
+    /// Returns [`KeymapError`] naming the first unusable row, so a bad line is
+    /// surfaced rather than silently dropped (SPEC §8).
     pub fn from_pairs<'a, I>(pairs: I) -> Result<Self, KeymapError>
     where
         I: IntoIterator<Item = (&'a str, &'a str)>,
     {
-        let mut bindings = HashMap::new();
+        let mut keymap = Self {
+            bindings: HashMap::new(),
+        };
         for (chord, command) in pairs {
-            let chord_key =
-                Chord::parse(chord).ok_or_else(|| KeymapError::UnknownChord(chord.to_string()))?;
-            let command = Command::parse(command)
-                .ok_or_else(|| KeymapError::UnknownCommand(command.to_string()))?;
-            bindings.insert(chord_key, command);
+            keymap.bind(Context::Editor, chord, command)?;
         }
-        Ok(Self { bindings })
+        Ok(keymap)
     }
 
-    /// Apply `pairs` over the existing bindings - a config file's `[keys]` table
-    /// layered on the built-in map (SPEC §10.5). Rebinding a chord that is already
-    /// bound replaces it, which is the point; every chord left alone keeps working,
+    /// Apply a `[keys]` table over the existing bindings - the shape a config file
+    /// writes and the shape `keys.toml` is written in (SPEC §10.5).
+    ///
+    /// A **string** value is a binding in the editor context; a **table** value is a
+    /// context, and its rows are bindings in it. Contexts do not nest, so a table
+    /// inside a table is an error. Rebinding a chord that is already bound in that
+    /// context replaces it, which is the point; every chord left alone keeps working,
     /// so a user who rebinds one key does not lose the other fifty.
     ///
     /// # Errors
-    /// Returns one error per unparseable chord or command, in the order given, and
-    /// applies **every** binding that did parse.
+    /// Returns one error per bad row and applies **every** binding that did parse.
     ///
     /// Deliberately not "stop at the first bad one". That version's promise - a typo
-    /// on line 9 leaves lines 1 to 8 applied - was never true, because the pairs
-    /// arrive from a `toml` table and so in *alphabetical* order rather than file
-    /// order: a bad `ctrl+a` discarded a good `ctrl+z` written above it. Applying
-    /// what parses makes the outcome independent of the order entirely, which is the
-    /// only version of the promise that survives not controlling that order, and it
-    /// is what the user wants anyway - one typo should cost one binding.
+    /// on line 9 leaves lines 1 to 8 applied - was never true, because the rows arrive
+    /// from a `toml` table and so in *alphabetical* order rather than file order: a bad
+    /// `ctrl+a` discarded a good `ctrl+z` written above it. Applying what parses makes
+    /// the outcome independent of the order entirely, which is the only version of the
+    /// promise that survives not controlling that order, and it is what the user wants
+    /// anyway - one typo should cost one binding.
     ///
-    /// `#[must_use]` by hand: this returned a `Result` before, which carries it for
-    /// free, and dropping to a plain `Vec` would otherwise let a caller discard every
-    /// binding error and leave a user's typo silently unbound (SPEC §8).
+    /// `#[must_use]` by hand: dropping to a plain `Vec` would otherwise let a caller
+    /// discard every binding error and leave a user's typo silently unbound (SPEC §8).
     #[must_use]
-    pub fn extend_from_pairs(&mut self, pairs: &[(&str, &str)]) -> Vec<KeymapError> {
+    pub fn extend_from_table(&mut self, table: &toml::Table) -> Vec<KeymapError> {
         let mut rejected = Vec::new();
-        for (chord, command) in pairs {
-            let Some(chord_key) = Chord::parse(chord) else {
-                rejected.push(KeymapError::UnknownChord(chord.to_string()));
-                continue;
+        for (key, value) in table {
+            // A table is a context and its rows are the bindings; anything else is a
+            // row of the editor's own table, `key` being the chord.
+            let (context, rows) = match value {
+                toml::Value::Table(rows) => match Context::parse(key) {
+                    Some(context) => (context, rows.iter()),
+                    None => {
+                        rejected.push(KeymapError::UnknownContext(key.clone()));
+                        continue;
+                    }
+                },
+                _ => {
+                    rejected.extend(self.bind_value(Context::Editor, key, value).err());
+                    continue;
+                }
             };
-            let Some(command) = Command::parse(command) else {
-                rejected.push(KeymapError::UnknownCommand(command.to_string()));
-                continue;
-            };
-            self.bindings.insert(chord_key, command);
+            for (chord, value) in rows {
+                rejected.extend(self.bind_value(context, chord, value).err());
+            }
         }
         rejected
     }
 
-    /// The shortcut bound to `command`, formatted for display (e.g. `"Ctrl+S"`), or
-    /// `None` if it is unbound. Lets the palette show each command's key without a
-    /// second source of truth - a rebind (M5 config) keeps the palette correct.
+    /// Bind one row whose command side is still a `toml` value.
+    ///
+    /// A value that is not a string has no reading as a binding - under a context that
+    /// means a nested table, which contexts do not have, and at the top level it means
+    /// a number or a list where a command name belongs. Both are typos, and saying so
+    /// beats binding nothing quietly (SPEC §8).
+    fn bind_value(
+        &mut self,
+        context: Context,
+        chord: &str,
+        value: &toml::Value,
+    ) -> Result<(), KeymapError> {
+        match value.as_str() {
+            Some(command) => self.bind(context, chord, command),
+            None => Err(KeymapError::NotABinding {
+                chord: chord.to_string(),
+                kind: value.type_str(),
+            }),
+        }
+    }
+
+    /// Bind one row, or say what was wrong with it.
+    fn bind(&mut self, context: Context, chord: &str, command: &str) -> Result<(), KeymapError> {
+        let chord_key =
+            Chord::parse(chord).ok_or_else(|| KeymapError::UnknownChord(chord.to_string()))?;
+        let parsed = Command::parse(command)
+            .ok_or_else(|| KeymapError::UnknownCommand(command.to_string()))?;
+        if !parsed.allowed_in(context) {
+            return Err(KeymapError::WrongContext {
+                command: command.to_string(),
+                context,
+            });
+        }
+        self.bindings.insert((context, chord_key), parsed);
+        Ok(())
+    }
+
+    /// The command `key` is bound to in `context`, or `None` if that context leaves
+    /// the chord alone. One context, not the stack: a [`crate::compositor::Layer`]
+    /// asks about its own, and a chord it does not bind falls through by the layer
+    /// declining the key, which is how the next context down gets its turn.
+    ///
+    /// Key **releases** answer `None` - the Kitty protocol reports them (SPEC §9) and
+    /// acting on both edges would double-fire every binding.
+    pub fn bound(&self, context: Context, key: KeyEvent) -> Option<Command> {
+        if key.kind == KeyEventKind::Release {
+            return None;
+        }
+        self.bindings
+            .get(&(context, Chord::from_event(&key)))
+            .copied()
+    }
+
+    /// The shortcut bound to `command` in `context`, formatted for display (e.g.
+    /// `"Ctrl+S"`), or `None` if it is unbound there. This is the **only** way a key
+    /// name is rendered anywhere (SPEC §10.5): a binding the user can change is one
+    /// the editor must not hard-code into the text it shows.
+    ///
+    /// [`Context::Editor`] also searches the platform context, because the platform is
+    /// part of the editor's own stack rather than a surface of its own - without it a
+    /// command bound only in `[keys.macos]` would have no chord to show on a Mac.
     ///
     /// Matched on the command **identity**, so the lookup is exact: comparing
     /// *resolved* values instead would need a page size to resolve against, and any
@@ -565,41 +840,66 @@ impl Keymap {
     /// A command may have several bindings (on macOS Quit is both Ctrl+Q and Ctrl+C);
     /// `max` picks one **deterministically** - HashMap order is not stable - and
     /// happens to prefer Ctrl+Q over Ctrl+C.
-    pub fn shortcut_for(&self, command: Command) -> Option<String> {
+    pub fn shortcut_for(&self, command: Command, context: Context) -> Option<String> {
+        let searched: &[Context] = if context == Context::Editor {
+            &Context::EDITOR_STACK
+        } else {
+            std::slice::from_ref(&context)
+        };
         self.bindings
             .iter()
-            .filter(|(_, bound)| **bound == command)
-            .map(|(chord, _)| chord.display())
+            .filter(|((ctx, _), bound)| searched.contains(ctx) && **bound == command)
+            .map(|((_, chord), _)| chord.display())
             .max()
     }
 }
 
 impl Default for Keymap {
-    /// The built-in keymap: [`BUILTIN_KEYS`], plus [`BUILTIN_KEYS_MACOS`] layered over
-    /// it on a Mac. `mod` carries the rest of the platform split (see [`Chord::parse`]),
-    /// so this `cfg!` is the whole of what is left of it.
+    /// The built-in keymap: [`BUILTIN_KEYS`], read through the same loader a user's
+    /// `[keys]` table goes through.
     ///
-    /// Parsing cannot fail - both files are compiled-in constants covered by a test -
-    /// so the `expect` is invariant-proven. Nothing is added after `from_pairs`, so the
-    /// defaults are reachable by exactly the path a config file takes.
+    /// No `cfg!` left. The platform-only rows live in the file's own `[macos]` table
+    /// and are loaded everywhere; the platform *context* is what is active on one OS
+    /// and not the others, which is the whole of what is left of the platform split
+    /// (`mod` carries the rest - see [`Chord::parse`]).
+    ///
+    /// Parsing cannot fail - the file is a compiled-in constant covered by a test - so
+    /// the `expect` is invariant-proven.
     fn default() -> Self {
-        let mut table = builtin_table(BUILTIN_KEYS);
-        if cfg!(target_os = "macos") {
-            table.extend(builtin_table(BUILTIN_KEYS_MACOS));
-        }
-        let pairs = table
-            .iter()
-            .map(|(chord, command)| (chord.as_str(), command.as_str()));
-        Self::from_pairs(pairs).expect("built-in default bindings must be valid")
+        let mut keymap = Self {
+            bindings: HashMap::new(),
+        };
+        let rejected = keymap.extend_from_table(&builtin_table(BUILTIN_KEYS));
+        assert!(
+            rejected.is_empty(),
+            "built-in default bindings must be valid: {rejected:?}"
+        );
+        keymap
     }
 }
 
-/// A binding that failed to parse, naming the offending token so the user can fix
-/// their config. Carries no source location yet (M5 adds line context on file load).
+/// A row of a keys table that could not be applied, naming what was wrong with it so
+/// the user can fix their config. Carries no source location yet (M5 adds line context
+/// on file load).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum KeymapError {
     UnknownChord(String),
     UnknownCommand(String),
+    /// A subtable of `[keys]` that names no context. The set is closed, so this is a
+    /// typo rather than a table for a surface that does not exist yet (SPEC §8).
+    UnknownContext(String),
+    /// A command that parses but cannot fire where it was written - `next_item` in
+    /// `[keys]`, say. Reported rather than applied, because a binding that never fires
+    /// is the silent failure SPEC §8 forbids.
+    WrongContext {
+        command: String,
+        context: Context,
+    },
+    /// A value that is neither a command name nor a context table.
+    NotABinding {
+        chord: String,
+        kind: &'static str,
+    },
 }
 
 impl fmt::Display for KeymapError {
@@ -607,6 +907,15 @@ impl fmt::Display for KeymapError {
         match self {
             KeymapError::UnknownChord(s) => write!(f, "unknown key chord `{s}`"),
             KeymapError::UnknownCommand(s) => write!(f, "unknown command `{s}`"),
+            KeymapError::UnknownContext(s) => write!(f, "unknown key context `{s}`"),
+            KeymapError::WrongContext { command, context } => write!(
+                f,
+                "command `{command}` cannot be bound in the `{}` context",
+                context.name()
+            ),
+            KeymapError::NotABinding { chord, kind } => {
+                write!(f, "`{chord}` is bound to a {kind}, not a command name")
+            }
         }
     }
 }
@@ -616,8 +925,13 @@ impl std::error::Error for KeymapError {}
 /// Translate a key event into the [`FrontendCommand`] the event loop dispatches
 /// (SPEC §7.5), or `None` if the key is unmapped.
 ///
-/// One lookup for every binding, edit and overlay alike - the routing decision lives
-/// in the command a chord names, not in which table it was found in. Only key
+/// The **editor's** end of the lookup: the platform context over the editor one,
+/// walked from the top down, which is the stack that is active whenever no overlay
+/// holds the key. An overlay's own context is resolved by the compositor
+/// ([`Keymap::bound`]) and only reaches here when the layer declines the key.
+///
+/// One lookup for every binding, edit and overlay trigger alike - the routing decision
+/// lives in the command a chord names, not in which table it was found in. Only key
 /// **press** (and repeat) events map; releases are ignored so the Kitty protocol's
 /// release reporting (SPEC §9) does not double-fire edits. `page` sizes any page
 /// motion. An unbound **printable char** with no Ctrl falls back to inserting itself,
@@ -629,13 +943,15 @@ pub fn command_for_key(keymap: &Keymap, key: KeyEvent, page: usize) -> Option<Fr
         return None;
     }
 
-    let chord = Chord::from_event(&key);
-    if let Some(command) = keymap.bindings.get(&chord) {
-        // A bound chord is answered here whatever it resolves to - including `nop`,
-        // which resolves to nothing. Returning is what *consumes* it: falling through
-        // to the text-entry fallback below would turn a freed printable chord back
-        // into typing, which is the opposite of unbinding it.
-        return command.resolve(page);
+    // Top down: the platform's row wins over the editor's on the same chord.
+    for context in Context::EDITOR_STACK.iter().rev() {
+        if let Some(command) = keymap.bound(*context, key) {
+            // A bound chord is answered here whatever it resolves to - including
+            // `nop`, which resolves to nothing. Returning is what *consumes* it:
+            // falling through to the text-entry fallback below would turn a freed
+            // printable chord back into typing, the opposite of unbinding it.
+            return command.resolve(page);
+        }
     }
 
     // Text-entry fallback: an unbound printable char inserts itself. A Ctrl- or
@@ -643,14 +959,38 @@ pub fn command_for_key(keymap: &Keymap, key: KeyEvent, page: usize) -> Option<Fr
     // otherwise an unbound Cmd+S / Ctrl+A would type a literal `s`/`a`. (Alt is
     // deliberately allowed through: on many layouts Alt/Option composes accented
     // characters that are legitimate text.)
-    if !chord.ctrl
-        && !chord.cmd
-        && let KeyCode::Char(c) = key.code
-    {
-        return Some(FrontendCommand::Editor(Action::Insert(c.to_string())));
-    }
+    text_key(&key).map(|c| FrontendCommand::Editor(Action::Insert(c.to_string())))
+}
 
-    None
+/// The character an **unbound** key types, or `None` if it is not text at all.
+///
+/// The one test every text-taking surface applies to a key its context did not bind:
+/// the editor inserts it, a picker filters by it, a prompt types it. A Ctrl- or
+/// Cmd-modified char is a command chord, never text - otherwise an unbound Cmd+S would
+/// type a literal `s`. (Alt is deliberately allowed through: on many layouts
+/// Alt/Option composes accented characters that are legitimate text.)
+///
+/// One function rather than the same condition in five files, because the five must
+/// agree: a surface that disagreed would take a shortcut as typing. Reads `key.code`
+/// rather than the chord, so a shifted letter types its upper-case form - the chord
+/// folds the case away, which is a lookup concern rather than a typing one.
+pub fn text_key(key: &KeyEvent) -> Option<char> {
+    match key.code {
+        KeyCode::Char(c) if !is_command_chord(key) => Some(c),
+        _ => None,
+    }
+}
+
+/// Whether `key` carries a **command modifier** - Ctrl, or Cmd on a Mac.
+///
+/// The test a surface applies to a key its context did not bind when its miss policy
+/// is "decline": a command chord is somebody's shortcut and is offered to the context
+/// below, while everything else is an answer of "no". Without the distinction a
+/// confirmation would either swallow Ctrl+S (so a shortcut stops working the moment a
+/// question is up) or defer Backspace (so answering a question edits the buffer behind
+/// it). Alt is not a command modifier here, for the reason [`text_key`] gives.
+pub fn is_command_chord(key: &KeyEvent) -> bool {
+    key.modifiers.contains(KeyModifiers::CONTROL) || key.modifiers.contains(KeyModifiers::SUPER)
 }
 
 #[cfg(test)]
@@ -690,25 +1030,51 @@ mod tests {
         let _ = Keymap::default();
     }
 
+    /// How many `chord = command` rows `keys.toml` spells out, counted from the *file*
+    /// rather than from the map it produced - which is the whole point of the caller
+    /// below, since a row that collapsed onto another is exactly what it looks for.
+    fn builtin_row_count() -> usize {
+        builtin_table(BUILTIN_KEYS)
+            .values()
+            .map(|value| match value {
+                toml::Value::Table(rows) => rows.len(),
+                _ => 1,
+            })
+            .sum()
+    }
+
     #[test]
-    fn every_row_of_both_built_in_files_parses() {
-        // The invariant `Keymap::default`'s `expect` rests on, checked against *both*
-        // files on every platform - the macOS one is compiled in everywhere precisely
-        // so a typo in it cannot wait for a Mac to be found.
-        for (name, text) in [
-            ("keys.toml", BUILTIN_KEYS),
-            ("keys-macos.toml", BUILTIN_KEYS_MACOS),
+    fn the_built_in_file_binds_every_context_the_closed_set_names() {
+        // That each row *parses in the context it is written in* is not asserted here:
+        // `Keymap::default` runs the real loader and panics with the whole rejected
+        // list, so a bad chord, an unknown command, an unknown context or a command
+        // outside its scope already fails `default_keymap_builds_without_panicking`.
+        // Re-checking it row by row would be a second loader to keep in step.
+        //
+        // What that cannot catch is a table nobody wrote. Every context is checked on
+        // every platform - the `[macos]` table is read everywhere precisely so a typo
+        // in it cannot wait for a Mac to be found.
+        let km = Keymap::default();
+        for context in [
+            Context::Editor,
+            Context::Macos,
+            Context::Picker,
+            Context::Prompt,
+            Context::Find,
+            Context::Confirm,
+            Context::Replace,
         ] {
-            let table = builtin_table(text);
-            assert!(!table.is_empty(), "{name} bound nothing at all");
-            for (chord, command) in &table {
-                assert!(Chord::parse(chord).is_some(), "{name}: bad chord `{chord}`");
-                assert!(
-                    Command::parse(command).is_some(),
-                    "{name}: bad command `{command}`"
-                );
-            }
+            assert!(
+                km.bindings.keys().any(|(ctx, _)| *ctx == context),
+                "keys.toml binds nothing in the `{}` context",
+                context.name()
+            );
         }
+        assert!(
+            builtin_row_count() > 50,
+            "keys.toml bound only {}",
+            builtin_row_count()
+        );
     }
 
     #[test]
@@ -716,30 +1082,38 @@ mod tests {
         // Two rows can spell one chord - `mod+c` and `ctrl+c` are the same key off a
         // Mac - and the loser then vanishes silently, with *which* one loses decided by
         // the alphabetical order `toml` hands the table back in. That is exactly the
-        // ordering `extend_from_pairs` refuses to depend on, so the built-ins are held
+        // ordering `extend_from_table` refuses to depend on, so the built-ins are held
         // to never needing it: every row must survive into the map.
-        let mut rows = builtin_table(BUILTIN_KEYS);
-        if cfg!(target_os = "macos") {
-            rows.extend(builtin_table(BUILTIN_KEYS_MACOS));
-        }
         assert_eq!(
             Keymap::default().bindings.len(),
-            rows.len(),
+            builtin_row_count(),
             "two built-in rows collapsed onto one chord"
         );
     }
 
     #[test]
-    fn the_macos_only_file_is_layered_only_on_a_mac() {
+    fn the_macos_table_is_active_only_on_a_mac() {
         // Its one row keeps Ctrl+C on quit where the clipboard sits on Cmd. Elsewhere
-        // `mod+c` *is* Ctrl+C, so layering it would silently take copy's chord away.
+        // `mod+c` *is* Ctrl+C, so applying it would silently take copy's chord away.
+        // The row is *loaded* on every platform now; what changes is which context is
+        // in the editor's stack, which is the whole of the platform split.
         let km = Keymap::default();
-        let quit = Chord::parse("ctrl+c").expect("a chord");
-        if cfg!(target_os = "macos") {
-            assert_eq!(km.bindings.get(&quit), Some(&Command::Quit));
-        } else {
-            assert_eq!(km.bindings.get(&quit), Some(&Command::Copy));
-        }
+        let ctrl_c = with_mods(KeyCode::Char('c'), KeyModifiers::CONTROL);
+        assert_eq!(km.bound(Context::Macos, ctrl_c), Some(Command::Quit));
+        // The editor's own `mod+c` *is* Ctrl+C off a Mac, and Cmd+C on one - so what
+        // the `[macos]` row shadows there is nothing at all.
+        assert_eq!(
+            km.bound(Context::Editor, ctrl_c),
+            (!cfg!(target_os = "macos")).then_some(Command::Copy)
+        );
+        assert_eq!(
+            act(ctrl_c),
+            Some(if cfg!(target_os = "macos") {
+                Action::Quit
+            } else {
+                Action::Copy
+            })
+        );
     }
 
     #[test]
@@ -806,7 +1180,10 @@ mod tests {
         assert_eq!(Command::parse("nop"), Some(Command::Nop));
         assert_eq!(Command::Nop.resolve(PAGE), None);
         // It is never bound by default, so nothing in the built-in map disappears.
-        assert_eq!(Keymap::default().shortcut_for(Command::Nop), None);
+        assert_eq!(
+            Keymap::default().shortcut_for(Command::Nop, Context::Editor),
+            None
+        );
     }
 
     #[test]
@@ -862,9 +1239,18 @@ mod tests {
         assert_eq!(Command::parse("close_buffer"), Some(Command::CloseBuffer));
         // The palette shows these, so the reverse lookup has to find them.
         let km = Keymap::default();
-        assert!(km.shortcut_for(Command::NextBuffer).is_some());
-        assert!(km.shortcut_for(Command::PrevBuffer).is_some());
-        assert!(km.shortcut_for(Command::CloseBuffer).is_some());
+        assert!(
+            km.shortcut_for(Command::NextBuffer, Context::Editor)
+                .is_some()
+        );
+        assert!(
+            km.shortcut_for(Command::PrevBuffer, Context::Editor)
+                .is_some()
+        );
+        assert!(
+            km.shortcut_for(Command::CloseBuffer, Context::Editor)
+                .is_some()
+        );
     }
 
     #[test]
@@ -1051,7 +1437,8 @@ mod tests {
             Some(Command::OpenThemePicker)
         );
         assert_eq!(
-            km.shortcut_for(Command::OpenThemePicker).as_deref(),
+            km.shortcut_for(Command::OpenThemePicker, Context::Editor)
+                .as_deref(),
             Some("Ctrl+T")
         );
     }
@@ -1070,11 +1457,16 @@ mod tests {
             Command::ToggleLineNumbers.resolve(PAGE),
             Some(FrontendCommand::ToggleLineNumbers)
         );
-        assert_eq!(km.shortcut_for(Command::ToggleLineNumbers), None);
+        assert_eq!(
+            km.shortcut_for(Command::ToggleLineNumbers, Context::Editor),
+            None
+        );
         // A config file can give it one, and the palette then shows that chord.
         let bound = Keymap::from_pairs([("ctrl+l", "toggle_line_numbers")]).unwrap();
         assert_eq!(
-            bound.shortcut_for(Command::ToggleLineNumbers).as_deref(),
+            bound
+                .shortcut_for(Command::ToggleLineNumbers, Context::Editor)
+                .as_deref(),
             Some("Ctrl+L")
         );
     }
@@ -1092,7 +1484,7 @@ mod tests {
             Some(FrontendCommand::ToggleStickyContext)
         );
         assert_eq!(
-            Keymap::default().shortcut_for(Command::ToggleStickyContext),
+            Keymap::default().shortcut_for(Command::ToggleStickyContext, Context::Editor),
             None
         );
     }
@@ -1142,7 +1534,8 @@ mod tests {
             Some(FrontendCommand::OpenSearchPicker)
         );
         assert_eq!(
-            km.shortcut_for(Command::OpenFind).as_deref(),
+            km.shortcut_for(Command::OpenFind, Context::Editor)
+                .as_deref(),
             Some("Ctrl+F")
         );
     }
@@ -1159,7 +1552,8 @@ mod tests {
         );
         // The conventional chord is the one the palette advertises, of the two.
         assert_eq!(
-            km.shortcut_for(Command::OpenSearchPicker).as_deref(),
+            km.shortcut_for(Command::OpenSearchPicker, Context::Editor)
+                .as_deref(),
             Some("Ctrl+Shift+F")
         );
     }
@@ -1177,7 +1571,11 @@ mod tests {
             command_for_key(&km, with_mods(KeyCode::F(3), KeyModifiers::SHIFT), PAGE),
             Some(FrontendCommand::FindPrevious)
         );
-        assert_eq!(km.shortcut_for(Command::FindNext).as_deref(), Some("F3"));
+        assert_eq!(
+            km.shortcut_for(Command::FindNext, Context::Editor)
+                .as_deref(),
+            Some("F3")
+        );
     }
 
     #[test]
@@ -1225,14 +1623,22 @@ mod tests {
         // Editor commands and overlay triggers are looked up the same way - one table,
         // one identity - so the palette needs no per-kind branch.
         let km = Keymap::default();
-        assert_eq!(km.shortcut_for(Command::Save).as_deref(), Some("Ctrl+S"));
-        assert_eq!(km.shortcut_for(Command::Quit).as_deref(), Some("Ctrl+Q"));
         assert_eq!(
-            km.shortcut_for(Command::OpenFilePicker).as_deref(),
+            km.shortcut_for(Command::Save, Context::Editor).as_deref(),
+            Some("Ctrl+S")
+        );
+        assert_eq!(
+            km.shortcut_for(Command::Quit, Context::Editor).as_deref(),
+            Some("Ctrl+Q")
+        );
+        assert_eq!(
+            km.shortcut_for(Command::OpenFilePicker, Context::Editor)
+                .as_deref(),
             Some("Ctrl+O")
         );
         assert_eq!(
-            km.shortcut_for(Command::OpenPalette).as_deref(),
+            km.shortcut_for(Command::OpenPalette, Context::Editor)
+                .as_deref(),
             Some("Ctrl+P")
         );
     }
@@ -1244,10 +1650,13 @@ mod tests {
         // and its shortcut silently disappeared. Identity matching is page-free.
         let km = Keymap::default();
         assert_eq!(
-            km.shortcut_for(Command::Move {
-                kind: MoveKind::PageDown,
-                extend: false,
-            })
+            km.shortcut_for(
+                Command::Move {
+                    kind: MoveKind::PageDown,
+                    extend: false,
+                },
+                Context::Editor
+            )
             .as_deref(),
             Some("PageDown")
         );
@@ -1257,9 +1666,15 @@ mod tests {
     fn shortcut_for_is_none_when_unbound() {
         // A keymap with only Save bound: everything else has no shortcut to show.
         let km = Keymap::from_pairs([("ctrl+s", "save")]).unwrap();
-        assert_eq!(km.shortcut_for(Command::Save).as_deref(), Some("Ctrl+S"));
-        assert_eq!(km.shortcut_for(Command::Undo), None);
-        assert_eq!(km.shortcut_for(Command::OpenFilePicker), None);
+        assert_eq!(
+            km.shortcut_for(Command::Save, Context::Editor).as_deref(),
+            Some("Ctrl+S")
+        );
+        assert_eq!(km.shortcut_for(Command::Undo, Context::Editor), None);
+        assert_eq!(
+            km.shortcut_for(Command::OpenFilePicker, Context::Editor),
+            None
+        );
     }
 
     #[test]
@@ -1378,7 +1793,7 @@ mod tests {
             Some(FrontendCommand::OpenSavePrompt)
         );
         assert_eq!(
-            km.shortcut_for(Command::SaveAs).as_deref(),
+            km.shortcut_for(Command::SaveAs, Context::Editor).as_deref(),
             Some("Ctrl+Shift+S")
         );
     }
@@ -1523,6 +1938,265 @@ mod tests {
             Some(Action::Quit)
         );
     }
+
+    // --- Contexts (M9 Stage 2, SPEC §10.5) ------------------------------------
+
+    /// A user config's `[keys]` table, layered over the built-ins the way
+    /// `config::parse` does it.
+    fn layered(toml_text: &str) -> (Keymap, Vec<KeymapError>) {
+        let mut keymap = Keymap::default();
+        let table: toml::Table = toml::from_str(toml_text).expect("test table parses");
+        let rejected = keymap.extend_from_table(&table);
+        (keymap, rejected)
+    }
+
+    #[test]
+    fn a_subtable_binds_in_that_context_and_nowhere_else() {
+        // The shape a config writes: flat rows are the editor's, a subtable is a
+        // context. A picker binding must not become an editor one.
+        let (km, rejected) =
+            layered("\"ctrl+n\" = \"quit\"\n[picker]\n\"ctrl+n\" = \"next_item\"\n");
+        assert!(rejected.is_empty(), "{rejected:?}");
+        let ctrl_n = with_mods(KeyCode::Char('n'), KeyModifiers::CONTROL);
+        assert_eq!(km.bound(Context::Picker, ctrl_n), Some(Command::NextItem));
+        assert_eq!(km.bound(Context::Editor, ctrl_n), Some(Command::Quit));
+        assert_eq!(km.bound(Context::Prompt, ctrl_n), None);
+    }
+
+    #[test]
+    fn a_command_written_outside_its_scope_is_reported_rather_than_applied() {
+        // A binding that parses, applies and never fires is the silent failure SPEC
+        // §8 forbids - so the scope is checked where the row is read.
+        let (km, rejected) = layered("\"ctrl+n\" = \"next_item\"\n");
+        assert_eq!(
+            rejected,
+            vec![KeymapError::WrongContext {
+                command: "next_item".to_string(),
+                context: Context::Editor,
+            }]
+        );
+        assert_eq!(
+            km.bound(
+                Context::Editor,
+                with_mods(KeyCode::Char('n'), KeyModifiers::CONTROL)
+            ),
+            None,
+            "the bad row bound nothing"
+        );
+        // And the other way round: an editor command in a surface table.
+        let (_, rejected) = layered("[confirm]\n\"ctrl+s\" = \"save\"\n");
+        assert_eq!(
+            rejected,
+            vec![KeymapError::WrongContext {
+                command: "save".to_string(),
+                context: Context::Confirm,
+            }]
+        );
+        assert_eq!(
+            rejected[0].to_string(),
+            "command `save` cannot be bound in the `confirm` context"
+        );
+    }
+
+    #[test]
+    fn the_context_set_is_closed_and_a_bad_row_costs_only_itself() {
+        // An unknown subtable is a typo, not a table for a surface that does not exist
+        // yet; and reporting it must not cost the rows around it.
+        let (km, rejected) =
+            layered("[pickr]\n\"ctrl+n\" = \"next_item\"\n[picker]\n\"ctrl+j\" = \"next_item\"\n");
+        assert_eq!(
+            rejected,
+            vec![KeymapError::UnknownContext("pickr".to_string())]
+        );
+        assert_eq!(rejected[0].to_string(), "unknown key context `pickr`");
+        assert_eq!(
+            km.bound(
+                Context::Picker,
+                with_mods(KeyCode::Char('j'), KeyModifiers::CONTROL)
+            ),
+            Some(Command::NextItem),
+            "the good table still applied"
+        );
+    }
+
+    #[test]
+    fn contexts_do_not_nest_and_a_value_that_is_not_a_name_is_reported() {
+        let (_, rejected) = layered("[picker.inner]\n\"ctrl+n\" = \"next_item\"\n");
+        assert_eq!(
+            rejected,
+            vec![KeymapError::NotABinding {
+                chord: "inner".to_string(),
+                kind: "table",
+            }]
+        );
+        assert_eq!(
+            rejected[0].to_string(),
+            "`inner` is bound to a table, not a command name"
+        );
+        // The same at the top level, where a number is no more a command than a table.
+        let (_, rejected) = layered("\"ctrl+n\" = 3\n");
+        assert_eq!(
+            rejected,
+            vec![KeymapError::NotABinding {
+                chord: "ctrl+n".to_string(),
+                kind: "integer",
+            }]
+        );
+    }
+
+    #[test]
+    fn nop_is_bindable_in_every_context_and_nothing_else_is_universal() {
+        for context in [
+            Context::Editor,
+            Context::Macos,
+            Context::Picker,
+            Context::Prompt,
+            Context::Find,
+            Context::Confirm,
+            Context::Replace,
+        ] {
+            assert!(Command::Nop.allowed_in(context), "{}", context.name());
+        }
+        // `cancel` is every *surface*, and no platform or editor table.
+        assert!(!Command::Cancel.allowed_in(Context::Editor));
+        assert!(!Command::Cancel.allowed_in(Context::Macos));
+        assert!(Command::Cancel.allowed_in(Context::Picker));
+        // `delete_backward` is the shared name: one intent over whatever has focus.
+        for context in [
+            Context::Editor,
+            Context::Picker,
+            Context::Prompt,
+            Context::Find,
+        ] {
+            assert!(
+                Command::DeleteBackward.allowed_in(context),
+                "{}",
+                context.name()
+            );
+        }
+        assert!(!Command::DeleteBackward.allowed_in(Context::Confirm));
+    }
+
+    #[test]
+    fn a_platform_table_holds_editor_commands_and_only_editor_commands() {
+        // It sits in the *editor's* stack rather than over a surface, so it answers to
+        // the editor's scope - which is what lets `keys.toml`'s own `[macos]` row exist.
+        let (_, rejected) = layered("[macos]\n\"ctrl+k\" = \"save\"\n");
+        assert!(rejected.is_empty(), "{rejected:?}");
+        let (_, rejected) = layered("[linux]\n\"ctrl+k\" = \"accept\"\n");
+        assert_eq!(
+            rejected,
+            vec![KeymapError::WrongContext {
+                command: "accept".to_string(),
+                context: Context::Linux,
+            }]
+        );
+    }
+
+    #[test]
+    fn the_platform_context_wins_over_the_editors_on_the_same_chord() {
+        // Top down through the editor's stack: the platform row shadows the editor's.
+        // Written against `Context::PLATFORM` so it asserts the same thing everywhere.
+        let table = format!("[{}]\n\"ctrl+s\" = \"quit\"\n", Context::PLATFORM.name());
+        let (km, rejected) = layered(&table);
+        assert!(rejected.is_empty(), "{rejected:?}");
+        assert_eq!(
+            act_on(
+                &km,
+                with_mods(KeyCode::Char('s'), KeyModifiers::CONTROL),
+                PAGE
+            ),
+            Some(Action::Quit),
+            "the platform row shadowed `save`"
+        );
+    }
+
+    #[test]
+    fn a_surface_context_never_answers_for_the_editor() {
+        // The one thing `bound` must not do: a picker's Enter is not the editor's.
+        let km = Keymap::default();
+        assert_eq!(
+            command_for_key(&km, press(KeyCode::Enter), PAGE),
+            Some(FrontendCommand::Editor(Action::Insert("\n".into()))),
+            "Enter is still a newline in the buffer"
+        );
+        assert_eq!(
+            km.bound(Context::Picker, press(KeyCode::Enter)),
+            Some(Command::Accept)
+        );
+    }
+
+    #[test]
+    fn shortcut_for_answers_in_the_context_it_is_asked_about() {
+        // The display rule's whole mechanism: the walk's question renders `Y` from the
+        // `replace` context, and the palette never sees it in the editor's.
+        let km = Keymap::default();
+        assert_eq!(
+            km.shortcut_for(Command::ReplaceYes, Context::Replace)
+                .as_deref(),
+            Some("Y")
+        );
+        assert_eq!(km.shortcut_for(Command::ReplaceYes, Context::Editor), None);
+        assert_eq!(
+            km.shortcut_for(Command::ConfirmYes, Context::Confirm)
+                .as_deref(),
+            Some("Y")
+        );
+        // A rebind moves what is displayed, which is the point of rendering it.
+        let (rebound, _) = layered("[replace]\n\"ctrl+y\" = \"replace_yes\"\n\"y\" = \"nop\"\n");
+        assert_eq!(
+            rebound
+                .shortcut_for(Command::ReplaceYes, Context::Replace)
+                .as_deref(),
+            Some("Ctrl+Y")
+        );
+    }
+
+    #[test]
+    fn the_editor_context_shows_a_chord_only_the_platform_table_binds() {
+        // The platform is part of the editor's own stack rather than a surface, so a
+        // command bound only there still has a chord to show. Off a Mac `quit` has two
+        // bindings and the deterministic pick is Ctrl+Q either way.
+        let table = format!(
+            "[{}]\n\"ctrl+alt+k\" = \"toggle_scrollbar\"\n",
+            Context::PLATFORM.name()
+        );
+        let (km, _) = layered(&table);
+        assert_eq!(
+            km.shortcut_for(Command::ToggleScrollbar, Context::Editor)
+                .as_deref(),
+            Some("Ctrl+Alt+K")
+        );
+    }
+
+    #[test]
+    fn a_shifted_letter_is_one_chord_however_the_terminal_reports_it() {
+        // Kitty sends `Y` *and* SHIFT; a classic terminal sends `Y` alone. Both have to
+        // reach the same row, or a binding works in one terminal and not the other.
+        let km = Keymap::from_pairs([("shift+y", "quit"), ("y", "save")]).unwrap();
+        for reported in [
+            press(KeyCode::Char('Y')),
+            with_mods(KeyCode::Char('Y'), KeyModifiers::SHIFT),
+            with_mods(KeyCode::Char('y'), KeyModifiers::SHIFT),
+        ] {
+            assert_eq!(
+                act_on(&km, reported, PAGE),
+                Some(Action::Quit),
+                "{reported:?}"
+            );
+        }
+        // The unshifted key is still its own row.
+        assert_eq!(
+            act_on(&km, press(KeyCode::Char('y')), PAGE),
+            Some(Action::Save { force: false })
+        );
+        // And an *unbound* upper-case letter still types its own case: the fold is a
+        // lookup concern, not a typing one.
+        assert_eq!(
+            act(press(KeyCode::Char('Q'))),
+            Some(Action::Insert("Q".into()))
+        );
+    }
 }
 
 #[cfg(test)]
@@ -1537,10 +2211,12 @@ mod readme_tests {
     ///   would hide a real binding from the reader.
     /// - `Shift` and `mod` are bare modifiers named in prose ("hold `Shift` to
     ///   select", "`mod` is whichever key the platform commands with"), not chords.
-    /// - `y`/`n`/`a`/`q` are the query-replace walk's own answers. That surface still
-    ///   matches key codes directly; M9 Stage 2's `replace` context is what turns them
-    ///   into bindings, and this list is what should shrink when it does.
-    const NOT_CHORDS: &[&str] = &["Alt+Click", "Shift", "mod", "y", "n", "a", "q"];
+    ///
+    /// The query-replace walk's `y`/`n`/`a`/`q` **left this list** at M9 Stage 2: they
+    /// are rows in the `replace` context now, so the README is held to them like every
+    /// other chord. This list shrinking is what a surface becoming bindable looks
+    /// like from here.
+    const NOT_CHORDS: &[&str] = &["Alt+Click", "Shift", "mod"];
 
     /// A document cannot query a keymap, so the README's key table stays literal -
     /// and is held to the default keymap by this test instead, the same device the
@@ -1570,9 +2246,16 @@ mod readme_tests {
             }
             let chord = Chord::parse(token)
                 .unwrap_or_else(|| panic!("README names `{token}`, which is not a chord"));
-            let bound = keymap.bindings.get(&chord);
+            // In **any** context, since the README describes surfaces as well as the
+            // buffer: `y` is a real binding, just not one the editor context holds.
+            // Which context a chord belongs to is a claim the prose makes and this
+            // test cannot check, so it checks the part it can - that the chord does
+            // something somewhere.
             assert!(
-                bound.is_some_and(|command| *command != Command::Nop),
+                keymap
+                    .bindings
+                    .iter()
+                    .any(|((_, bound), command)| *bound == chord && *command != Command::Nop),
                 "README advertises `{token}`, which the default keymap does not bind"
             );
             checked += 1;

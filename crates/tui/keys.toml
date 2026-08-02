@@ -16,6 +16,14 @@
 # no Ctrl inserts itself, so this file never has to enumerate the alphabet. Bindings
 # match the full chord, so `right` and `shift+right` are separate rows - `extend` is
 # part of the command name (`select_*`), not a runtime modifier.
+#
+# A **subtable is a context** (SPEC §10.5): the rows above are the editor's, and
+# `[picker]`, `[prompt]`, `[find]`, `[confirm]`, `[replace]` and the platform tables
+# below belong to the surface or the OS they name. At any instant an ordered list of
+# contexts is active - the editor, the platform, then one per open overlay - and a
+# chord is resolved from the top down, first match winning. A chord a surface does not
+# bind is not swallowed: it falls through to the context below, which is why no config
+# can lock a surface shut. `nop` is how a table says "swallow this *here*" instead.
 
 "ctrl+q" = "quit"
 "ctrl+s" = "save"
@@ -106,3 +114,74 @@
 # Kitty caveat and no plain-terminal alias: it is a discovery-surface command,
 # reachable from the palette, not one worth spending another Alt chord.
 "ctrl+shift+l" = "select_all_matches"
+
+# --- The platform contexts ---------------------------------------------------------
+#
+# Exactly one of `[macos]`, `[linux]` and `[windows]` is active, fixed at startup, and
+# it sits over the editor's own table. All three are *read* on every platform, so a
+# typo in one cannot wait for that OS to be found.
+
+[macos]
+# The one row `mod` cannot express: `mod` says "whichever modifier this platform
+# commands with", while this says "a chord that is free *because* of what `mod`
+# resolved to". On macOS the clipboard is on Cmd, which leaves Ctrl+C free to keep its
+# terminal-conventional meaning; elsewhere Ctrl+C *is* copy, and quit is Ctrl+Q alone.
+"ctrl+c" = "quit"
+
+# --- The surface contexts ----------------------------------------------------------
+#
+# One context per open overlay, mirroring the compositor's own stack. `accept`,
+# `cancel` and `delete_backward` are shared names because the intent is shared - the
+# last is the editor's own, over whatever field has focus.
+
+# Every picker: file, buffer, theme, encoding, line-ending, palette, global search. One
+# table for all seven, because nothing today would bind them differently.
+[picker]
+"enter" = "accept"
+"esc" = "cancel"
+"up" = "previous_item"
+"down" = "next_item"
+"backspace" = "delete_backward"
+# Tab means completion in every picker a user has met, and there is nothing here to
+# complete. Swallowed rather than left to fall through, where the editor would take it
+# as an indent - typing into the buffer behind a picker the user is still reading.
+"tab" = "nop"
+
+# The one-line value prompt (save-as).
+[prompt]
+"enter" = "accept"
+"esc" = "cancel"
+"backspace" = "delete_backward"
+"tab" = "nop"
+
+# The find / replace prompt. Tab moves between the two fields of a replace; in a plain
+# find there is nowhere to go, and the prompt swallows it rather than typing a
+# character the user cannot see.
+[find]
+"enter" = "accept"
+"esc" = "cancel"
+"tab" = "next_field"
+"backspace" = "delete_backward"
+
+# A yes/no confirmation. `y` is the only answer that commits: every other printable key
+# declines, which is what makes a mistyped key harmless, so `confirm_no` is here to
+# give "no" a name and a chord rather than to be the only way to say it.
+#
+# **Lower case only, here and in `[replace]`.** `shift+y` used to be an alias for `y`,
+# but an alias is a second row for one answer, and the question renders its chords from
+# these rows now - so the alias would decide what the question *says*. A shifted answer
+# is simply not one of the named keys, and every key that is not named declines.
+[confirm]
+"y" = "confirm_yes"
+"n" = "confirm_no"
+"esc" = "cancel"
+
+# The query-replace walk. `y` replaces and moves on, `n` skips, `a` finishes the rest
+# in one edit, `q` and Escape stop. Anything else printable ends the walk too, so the
+# destructive answers are exactly the two that are named.
+[replace]
+"y" = "replace_yes"
+"n" = "replace_no"
+"a" = "replace_all"
+"q" = "replace_quit"
+"esc" = "cancel"

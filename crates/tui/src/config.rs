@@ -155,11 +155,16 @@ struct ConfigFile {
     scrollbar: Option<bool>,
     sticky_context: Option<bool>,
     final_newline: Option<bool>,
-    /// Chord → command name, merged over the built-in bindings rather than
-    /// replacing them: a user who binds one key keeps the other fifty. Binding a
-    /// chord that already exists overrides it, which is the whole point.
+    /// The keys table, merged over the built-in bindings rather than replacing them:
+    /// a user who binds one key keeps the other fifty. Binding a chord that already
+    /// exists overrides it, which is the whole point.
+    ///
+    /// Left as a raw `toml::Table` because its values have two shapes - a command
+    /// name, or a *context* subtable (SPEC §10.5) - and a `serde` enum over the two
+    /// would fail the whole file on one bad row. The keymap reads it row by row and
+    /// reports each one it could not apply, so one typo costs one binding.
     #[serde(default)]
-    keys: std::collections::BTreeMap<String, String>,
+    keys: toml::Table,
 }
 
 /// The user's config file: `$XDG_CONFIG_HOME/vortex/config.toml`, else
@@ -291,17 +296,12 @@ fn parse(text: &str) -> (Config, Option<String>) {
         }
     }
     if !file.keys.is_empty() {
-        let pairs: Vec<(&str, &str)> = file
-            .keys
-            .iter()
-            .map(|(chord, command)| (chord.as_str(), command.as_str()))
-            .collect();
         // Every binding that parses is applied, whatever else in the table did not,
         // so one typo costs exactly the one key it is on.
         problems.extend(
             config
                 .keymap
-                .extend_from_pairs(&pairs)
+                .extend_from_table(&file.keys)
                 .iter()
                 .map(|err| err.to_string()),
         );
@@ -787,6 +787,31 @@ mod tests {
         assert_eq!(
             command_for_key(&config.keymap, ctrl_s, 10),
             Some(Command::Editor(vortex_core::Action::Save { force: false }))
+        );
+    }
+
+    #[test]
+    fn a_keys_subtable_binds_a_surface_and_reports_a_bad_context() {
+        use crate::keymap::{Command as Bound, Context};
+        use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+        // `[keys]` is still the editor's table and `[keys.picker]` is a context, so a
+        // user can rebind a surface key the frontend used to hold in code (SPEC §10.5).
+        let (config, problem) = parse("[keys.picker]\n\"ctrl+n\" = \"next_item\"\n");
+        assert_eq!(problem, None);
+        let ctrl_n = KeyEvent::new(KeyCode::Char('n'), KeyModifiers::CONTROL);
+        assert_eq!(
+            config.keymap.bound(Context::Picker, ctrl_n),
+            Some(Bound::NextItem)
+        );
+        // The contexts are a closed set and the commands are scoped, so a typo in
+        // either is a complaint rather than a row that never fires (SPEC §8).
+        let (_, problem) = parse("[keys.pickr]\n\"ctrl+n\" = \"next_item\"\n");
+        assert!(problem.unwrap().contains("unknown key context"));
+        let (_, problem) = parse("[keys]\n\"ctrl+n\" = \"next_item\"\n");
+        assert!(
+            problem.unwrap().contains("cannot be bound in the `editor`"),
+            "a surface command in the editor table is reported"
         );
     }
 

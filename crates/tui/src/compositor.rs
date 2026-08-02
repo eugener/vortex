@@ -26,6 +26,7 @@ use ratatui::crossterm::event::{KeyEvent, MouseEvent};
 use ratatui::layout::{Position, Rect};
 
 use crate::command::Command;
+use crate::keymap::{Context, Keymap};
 
 /// What a [`Layer`] decides about an input event.
 ///
@@ -55,10 +56,28 @@ pub trait Layer {
     /// layer overwrites the cells of an earlier one where they overlap.
     fn render(&self, screen: Rect, buf: &mut Buffer);
 
-    /// Handle a key. Returning [`EventResult::Consumed`] stops propagation; the
-    /// layer may also mark itself [finished](Layer::is_finished) here (e.g. Enter
-    /// submits, Esc cancels) so the compositor pops it after the dispatch.
-    fn handle_key(&mut self, key: KeyEvent) -> EventResult;
+    /// The keymap context this surface's keys are resolved in (SPEC §10.5). Every
+    /// key it can act on has a name and a row in that context's table, so a user can
+    /// rebind it.
+    fn context(&self) -> Context;
+
+    /// Handle a key, together with whatever [`Self::context`] bound it to - `None`
+    /// when that context leaves the chord alone.
+    ///
+    /// One method rather than two, so the layer still owns the decision. A miss is
+    /// not one behavior but three, and each is a property of the surface rather than
+    /// of the table: **take it as text** (a picker's query, a prompt's input), **treat
+    /// it as a decline** (a confirmation answers no to every key but one), or **defer
+    /// it** - return [`EventResult::Ignored`] and let the context below have its turn.
+    ///
+    /// The third is what replaces the "a Ctrl chord is a shortcut, pass it down" guard
+    /// every layer used to carry: a Ctrl chord reaches the editor because nothing above
+    /// it bound the chord, not because it is a Ctrl chord.
+    ///
+    /// Returning [`EventResult::Consumed`] stops propagation; the layer may also mark
+    /// itself [finished](Layer::is_finished) here (`accept` submits, `cancel` closes)
+    /// so the compositor pops it after the dispatch.
+    fn handle_key(&mut self, key: KeyEvent, bound: Option<crate::keymap::Command>) -> EventResult;
 
     /// Handle a mouse event, with `screen` the full terminal area so the layer can
     /// hit-test against wherever [`Layer::render`] would put it. Same contract as
@@ -186,15 +205,20 @@ impl Compositor {
     /// the handling layers committed. On [`EventResult::Ignored`] the caller falls
     /// through to the editor's keymap; the returned commands are dispatched.
     ///
+    /// The chord is resolved **in each layer's own context** as it is offered, so the
+    /// §10.5 rule - walk the active contexts from the top down, first match wins - is
+    /// this loop rather than a second one beside it: a layer that declines a key is
+    /// what lets the context below answer for it.
+    ///
     /// Every finished layer is then removed, order preserved. Normally that is just
     /// the top one a submit/cancel closed; but a lower layer that finished on a key
     /// the top *ignored* is pruned too, so no finished layer can leak beneath an open
     /// one. A committing layer's commands are collected *before* it is removed.
-    pub fn handle_key(&mut self, key: KeyEvent) -> (EventResult, Vec<Command>) {
+    pub fn handle_key(&mut self, key: KeyEvent, keymap: &Keymap) -> (EventResult, Vec<Command>) {
         let mut result = EventResult::Ignored;
         let mut commands = Vec::new();
         for layer in self.layers.iter_mut().rev() {
-            let outcome = layer.handle_key(key);
+            let outcome = layer.handle_key(key, keymap.bound(layer.context(), key));
             commands.append(&mut layer.take_commands());
             if outcome == EventResult::Consumed {
                 result = EventResult::Consumed;
@@ -239,6 +263,20 @@ impl Compositor {
     pub fn cursor(&self, screen: Rect) -> Option<Position> {
         self.layers.last().and_then(|l| l.cursor(screen))
     }
+}
+
+/// Deliver `key` to one `layer` the way [`Compositor::handle_key`] does: resolved
+/// against the default keymap **in the layer's own context** (SPEC §10.5).
+///
+/// A layer no longer reads key codes, so a test that called [`Layer::handle_key`]
+/// directly would have to spell out the binding it expects - and could then agree
+/// with a layer that both had wrong. Going through the real keymap is what makes a
+/// surface test an assertion about the *default bindings* as well as about the layer.
+#[cfg(test)]
+pub fn send(layer: &mut dyn Layer, key: KeyEvent) -> EventResult {
+    let keymap = Keymap::default();
+    let bound = keymap.bound(layer.context(), key);
+    layer.handle_key(key, bound)
 }
 
 #[cfg(test)]
@@ -313,7 +351,17 @@ mod tests {
                 buf.set_string(x, y, self.id.to_string(), ratatui::style::Style::default());
             }
         }
-        fn handle_key(&mut self, key: KeyEvent) -> EventResult {
+        /// A context of its own, so a `Fake` never picks up a real surface's
+        /// bindings: these tests are about routing, not about any one table.
+        fn context(&self) -> Context {
+            Context::Prompt
+        }
+
+        fn handle_key(
+            &mut self,
+            key: KeyEvent,
+            _bound: Option<crate::keymap::Command>,
+        ) -> EventResult {
             self.log.borrow_mut().push(self.id);
             if self.finish_on == Some(key.code) {
                 self.finished = true;
@@ -407,7 +455,7 @@ mod tests {
         let screen = Rect::new(0, 0, 10, 4);
         assert!(c.is_empty());
         // No overlay: the key falls through (Ignored) so the editor keymap runs.
-        let (res, actions) = c.handle_key(key('a'));
+        let (res, actions) = c.handle_key(key('a'), &Keymap::default());
         assert_eq!(res, EventResult::Ignored);
         assert!(actions.is_empty());
         assert_eq!(c.cursor(screen), None);
@@ -424,7 +472,10 @@ mod tests {
         let mut c = Compositor::new();
         c.push(boxed(Fake::new(1, true, &log)));
         assert!(!c.is_empty());
-        assert_eq!(c.handle_key(key('x')).0, EventResult::Consumed);
+        assert_eq!(
+            c.handle_key(key('x'), &Keymap::default()).0,
+            EventResult::Consumed
+        );
         assert_eq!(*log.borrow(), vec![1]);
     }
 
@@ -436,7 +487,10 @@ mod tests {
         let mut c = Compositor::new();
         c.push(boxed(Fake::new(1, true, &log))); // bottom, consumes
         c.push(boxed(Fake::new(2, false, &log))); // top, ignores
-        assert_eq!(c.handle_key(key('k')).0, EventResult::Consumed);
+        assert_eq!(
+            c.handle_key(key('k'), &Keymap::default()).0,
+            EventResult::Consumed
+        );
         // Order proves top-down offering: layer 2 saw it before layer 1.
         assert_eq!(*log.borrow(), vec![2, 1]);
     }
@@ -448,7 +502,10 @@ mod tests {
         let mut c = Compositor::new();
         c.push(boxed(Fake::new(1, false, &log)));
         c.push(boxed(Fake::new(2, false, &log)));
-        assert_eq!(c.handle_key(key('z')).0, EventResult::Ignored);
+        assert_eq!(
+            c.handle_key(key('z'), &Keymap::default()).0,
+            EventResult::Ignored
+        );
         assert_eq!(*log.borrow(), vec![2, 1]);
     }
 
@@ -461,7 +518,7 @@ mod tests {
         c.push(boxed(
             Fake::new(1, true, &log).emitting(Command::OpenPalette),
         ));
-        let (res, commands) = c.handle_key(key('x'));
+        let (res, commands) = c.handle_key(key('x'), &Keymap::default());
         assert_eq!(res, EventResult::Consumed);
         assert!(matches!(commands.as_slice(), [Command::OpenPalette]));
     }
@@ -474,7 +531,10 @@ mod tests {
         let mut c = Compositor::new();
         c.push(boxed(Fake::new(1, true, &log).finishing_on(KeyCode::Esc)));
         assert!(!c.is_empty());
-        assert_eq!(c.handle_key(esc()).0, EventResult::Consumed);
+        assert_eq!(
+            c.handle_key(esc(), &Keymap::default()).0,
+            EventResult::Consumed
+        );
         assert!(c.is_empty(), "finished layer should be popped");
     }
 
@@ -486,10 +546,16 @@ mod tests {
         let mut c = Compositor::new();
         c.push(boxed(Fake::new(1, false, &log))); // bottom, never finishes
         c.push(boxed(Fake::new(2, true, &log).finishing_on(KeyCode::Esc))); // top
-        assert_eq!(c.handle_key(esc()).0, EventResult::Consumed);
+        assert_eq!(
+            c.handle_key(esc(), &Keymap::default()).0,
+            EventResult::Consumed
+        );
         assert!(!c.is_empty(), "the lower layer must remain");
         // The surviving layer still receives the next key.
-        assert_eq!(c.handle_key(key('a')).0, EventResult::Ignored);
+        assert_eq!(
+            c.handle_key(key('a'), &Keymap::default()).0,
+            EventResult::Ignored
+        );
         assert_eq!(*log.borrow(), vec![2, 1]);
     }
 
@@ -502,12 +568,55 @@ mod tests {
         let mut c = Compositor::new();
         c.push(boxed(Fake::new(1, true, &log).finishing_on(KeyCode::Esc))); // bottom
         c.push(boxed(Fake::new(2, false, &log))); // top, ignores
-        assert_eq!(c.handle_key(esc()).0, EventResult::Consumed);
+        assert_eq!(
+            c.handle_key(esc(), &Keymap::default()).0,
+            EventResult::Consumed
+        );
         assert!(!c.is_empty(), "the open top layer remains");
         // Only layer 2 is left: the next key reaches it, never the pruned layer 1.
         log.borrow_mut().clear();
-        c.handle_key(key('a'));
+        c.handle_key(key('a'), &Keymap::default());
         assert_eq!(*log.borrow(), vec![2]);
+    }
+
+    #[test]
+    fn a_question_stacked_over_a_picker_does_not_commit_the_picker() {
+        // Regression, and the reason a question's miss policy is "decline" rather than
+        // "decline if printable". A confirmation is pushed by an async notification
+        // onto whatever is already open, so it can land over a live picker. When it
+        // deferred Enter, the compositor offered the key to the layer below - resolved
+        // in *that* layer's context, where Enter is `accept` - and the picker the user
+        // could not see committed its highlighted row while they answered the question.
+        use crate::config::Theme;
+        use crate::keymap::Keymap;
+        let keymap = Keymap::default();
+        let mut c = Compositor::new();
+        c.push(crate::palette::open(&Theme::default(), &keymap));
+        c.push(crate::prompt::confirm_close(
+            &Theme::default(),
+            &keymap,
+            vortex_core::BufferId(1),
+            Some(std::path::Path::new("notes.txt")),
+        ));
+        let (result, commands) =
+            c.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &keymap);
+        assert_eq!(
+            result,
+            EventResult::Consumed,
+            "the question answered for it"
+        );
+        assert!(commands.is_empty(), "the buried palette committed a row");
+        assert_eq!(c.layers.len(), 1, "the question closed, the palette stayed");
+        // A command chord still reaches past both, which is what the deferral is for.
+        let ctrl_s = KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL);
+        let mut c = Compositor::new();
+        c.push(crate::prompt::confirm_close(
+            &Theme::default(),
+            &keymap,
+            vortex_core::BufferId(1),
+            None,
+        ));
+        assert_eq!(c.handle_key(ctrl_s, &keymap).0, EventResult::Ignored);
     }
 
     #[test]
@@ -637,7 +746,14 @@ mod tests {
         struct Silent;
         impl Layer for Silent {
             fn render(&self, _screen: Rect, _buf: &mut Buffer) {}
-            fn handle_key(&mut self, _key: KeyEvent) -> EventResult {
+            fn context(&self) -> Context {
+                Context::Prompt
+            }
+            fn handle_key(
+                &mut self,
+                _key: KeyEvent,
+                _bound: Option<crate::keymap::Command>,
+            ) -> EventResult {
                 EventResult::Ignored
             }
         }

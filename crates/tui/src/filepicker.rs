@@ -200,6 +200,7 @@ pub fn open(theme: &Theme, root: &Path) -> Box<dyn Layer> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::compositor::send;
     use crate::testutil::TempDir;
 
     #[test]
@@ -412,10 +413,13 @@ mod tests {
         let shown: String = buf.content().iter().map(|c| c.symbol()).collect();
         assert!(shown.contains("fn main() {}"), "no preview painted");
         // …and the row it previews is still the row it opens.
-        layer.handle_key(ratatui::crossterm::event::KeyEvent::new(
-            ratatui::crossterm::event::KeyCode::Enter,
-            ratatui::crossterm::event::KeyModifiers::NONE,
-        ));
+        send(
+            &mut *layer,
+            ratatui::crossterm::event::KeyEvent::new(
+                ratatui::crossterm::event::KeyCode::Enter,
+                ratatui::crossterm::event::KeyModifiers::NONE,
+            ),
+        );
         assert_eq!(
             layer.take_commands(),
             vec![Command::Editor(Action::Open(t.path.join("a.rs")))]
