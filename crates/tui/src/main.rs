@@ -919,6 +919,9 @@ fn event_loop(
     // The wait is `HIGHLIGHT_WAIT`, reused rather than duplicated: the editor gets
     // one "the user has stopped" constant, not two.
     let mut caret_state: (Option<(usize, Instant)>, bool) = (None, false);
+    // The first-screen hints are shown until the user does anything at all - a splash
+    // you have to dismiss is a splash that was not worth showing (SPEC §7.5, M10).
+    let mut hints_dismissed = false;
     // When the last frame went out, which is what bounds how long a burst of input may
     // postpone the next one (see [`COALESCE`]). Starts now rather than at the epoch so
     // the first frame is not treated as already overdue.
@@ -1146,6 +1149,8 @@ fn event_loop(
                     selected,
                     tab_width: config.tab_width,
                     indent: &config.indent_style.indent_readout(config.tab_width),
+                    keymap: &config.keymap,
+                    hint_empty: !hints_dismissed,
                     caret_rested,
                     line_numbers: config.line_numbers,
                     rulers: &config.rulers,
@@ -1171,6 +1176,7 @@ fn event_loop(
             awaiting_highlight = None;
             match input {
                 Event::Key(key) => {
+                    hints_dismissed = true;
                     // Ignore key *releases* (the Kitty protocol reports them, SPEC
                     // §9): acting on press and release would double-fire, the same
                     // rule the keymap applies. Skipping early also shields overlays.
@@ -1920,6 +1926,11 @@ struct PaintInputs<'a> {
     tab_width: usize,
     /// What the Tab key inserts, rendered for the status bar (SPEC §7.5, M10).
     indent: &'a str,
+    /// The live keymap, for the chords the empty state names (SPEC §10.5, M10).
+    keymap: &'a Keymap,
+    /// Whether the first-screen hints are still owed. Cleared by the first key, so a
+    /// signpost the user has walked past does not stay up (SPEC §7.5, M10).
+    hint_empty: bool,
     /// Whether the caret has sat still for [`HIGHLIGHT_WAIT`], which is when its
     /// diagnostic is worth putting on the status bar (SPEC §7.5, M10).
     caret_rested: bool,
@@ -1949,6 +1960,34 @@ struct PaintInputs<'a> {
     search: &'a buffersearch::SearchState,
 }
 
+/// The three hints an empty, unnamed buffer carries (SPEC §7.5, M10).
+///
+/// The rows are curated here and their **chords come from the keymap**, so a rebind
+/// moves what the first screen says and a `nop` takes the row off it entirely - the
+/// §10.5 rule, which is why M10 waited for M9. Three and no more: how to open
+/// something, where everything else is, and how to leave.
+fn paint_empty_hints(frame: &mut Frame, body: Rect, keymap: &Keymap, style: Style) {
+    const HINTS: [(Bindable, &str); 3] = [
+        (Bindable::OpenFilePicker, "open a file"),
+        (Bindable::OpenPalette, "everything else"),
+        (Bindable::Quit, "quit"),
+    ];
+    let rows: Vec<(String, &str)> = HINTS
+        .iter()
+        .filter_map(|&(command, label)| {
+            Some((
+                keymap.shortcut_for(command, keymap::Context::Editor)?,
+                label,
+            ))
+        })
+        .collect();
+    for (x, y, line) in layout::empty_hints(body, &rows) {
+        frame
+            .buffer_mut()
+            .set_stringn(x, y, &line, line.len(), style);
+    }
+}
+
 /// Compose the whole frame: head bar, gutter + text, status bar, and the cursor.
 /// Backend-generic (takes a `&mut Frame`) so a `TestBackend` render can assert on
 /// the painted cells (SPEC §13). Returns the scroll offset it settled on so the
@@ -1962,6 +2001,8 @@ fn paint(frame: &mut Frame, snapshot: &ViewSnapshot, inputs: PaintInputs) -> Vie
         selected,
         tab_width,
         indent,
+        keymap,
+        hint_empty,
         caret_rested,
         line_numbers,
         rulers,
@@ -2136,6 +2177,11 @@ fn paint(frame: &mut Frame, snapshot: &ViewSnapshot, inputs: PaintInputs) -> Vie
     paint_head_bar(frame, head_area, snapshot, &theme);
     paint_body(frame, text_area, snapshot, &body);
     paint_sticky_context(frame, context_area, snapshot, &body, &header);
+    // The first screen, over the (empty) body: three signposts on a buffer with
+    // nothing in it and nowhere to save it (SPEC §7.5, M10).
+    if hint_empty && snapshot.path.is_none() && snapshot.text.byte_len() == 0 {
+        paint_empty_hints(frame, text_area, keymap, theme.empty_hint);
+    }
     // The scrollbar over the column `paint_body` left it, and only when the buffer
     // actually scrolls: a bar answers "where am I in something bigger than the
     // screen", so with nothing bigger there is nothing for it to say, and a
@@ -3443,6 +3489,7 @@ mod tests {
         // noise. The tests that *are* about it build their own and call `paint`.
         static NO_SEARCH: std::sync::OnceLock<buffersearch::SearchState> =
             std::sync::OnceLock::new();
+        static EMPTY_HINT_KEYMAP: std::sync::OnceLock<Keymap> = std::sync::OnceLock::new();
         PaintInputs {
             viewport: ViewState::default(),
             theme: config::Theme::default(),
@@ -3450,6 +3497,8 @@ mod tests {
             selected,
             tab_width: config::DEFAULT_TAB_WIDTH,
             indent: "tabs:4",
+            keymap: EMPTY_HINT_KEYMAP.get_or_init(Keymap::default),
+            hint_empty: true,
             caret_rested: false,
             line_numbers: config::LineNumbers::default(),
             rulers: &[],
@@ -5248,6 +5297,53 @@ mod tests {
             head.contains('●'),
             "head bar should show modified: {head:?}"
         );
+    }
+
+    #[test]
+    fn an_empty_unnamed_buffer_shows_the_way_in_and_the_way_out() {
+        // The first screen a new user sees, which nothing had ever designed. The
+        // chords come from the keymap, so this also pins that they are rendered and
+        // not written (SPEC §7.5, M10).
+        // An insert and its undo, since the harness needs at least one action: what
+        // matters is that the buffer ends empty and unnamed.
+        let snap = snapshot_after(&[Action::Insert("x".into()), Action::Undo]);
+        assert_eq!(snap.text.byte_len(), 0, "the fixture is not empty");
+        let frame = render_with(&snap, 60, 14, paint_inputs(0));
+        let text: String = (0..14)
+            .map(|y| row_text(&frame, y))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text.contains("open a file"), "{text}");
+        assert!(text.contains("everything else"), "{text}");
+        assert!(text.contains("quit"), "{text}");
+        assert!(
+            text.contains("Ctrl+O"),
+            "the chord was not rendered: {text}"
+        );
+    }
+
+    #[test]
+    fn the_first_screen_is_gone_the_moment_there_is_anything_to_show() {
+        // A splash you have to dismiss is a splash that was not worth showing. Three
+        // ways it goes: the buffer gets text, the buffer gets a path, or the user
+        // pressed a key (which the loop reports as `hint_empty: false`).
+        let typed = snapshot_after(&[Action::Insert("x".into())]);
+        let frame = render_with(&typed, 60, 14, paint_inputs(0));
+        let text: String = (0..14).map(|y| row_text(&frame, y)).collect();
+        assert!(!text.contains("open a file"), "text in the buffer: {text}");
+
+        let empty = snapshot_after(&[Action::Insert("x".into()), Action::Undo]);
+        let frame = render_with(
+            &empty,
+            60,
+            14,
+            PaintInputs {
+                hint_empty: false,
+                ..paint_inputs(0)
+            },
+        );
+        let text: String = (0..14).map(|y| row_text(&frame, y)).collect();
+        assert!(!text.contains("open a file"), "a key was pressed: {text}");
     }
 
     #[test]

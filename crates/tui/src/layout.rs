@@ -15,6 +15,7 @@ use std::collections::BTreeMap;
 use std::ops::Range;
 use std::path::Path;
 
+use ratatui::layout::Rect;
 use ratatui::style::Style;
 use ratatui::text::Span;
 use ratatui::widgets::{Scrollbar, ScrollbarOrientation, ScrollbarState};
@@ -1148,6 +1149,49 @@ fn tail(path: &Path, depth: usize) -> String {
         .map(|c| c.as_os_str().to_string_lossy())
         .collect::<Vec<_>>()
         .join(std::path::MAIN_SEPARATOR_STR)
+}
+
+/// The three lines an empty, unnamed buffer shows, centred in `body` (SPEC §7.5, M10).
+///
+/// `vortex` with no file used to open a blank screen and say nothing - the first thing
+/// a new user sees, and the one screen nobody had designed. Three signposts is the
+/// whole of it: how to open something, where everything else lives, and how to leave.
+///
+/// **The chords are passed in, never written here.** They come from the keymap like
+/// every other chord on screen (§10.5), which is why M10 follows M9 - and a row whose
+/// command is unbound is dropped rather than printed chordless, the same rule `--help`
+/// follows. A user who has `nop`'d the palette is not told about it.
+///
+/// Returns `(x, y, text)` per line, already centred and clipped: nothing is emitted at
+/// all when the body is too small to hold the block without crowding the text, since a
+/// signpost that overlaps what it points at is worse than none.
+pub fn empty_hints(body: Rect, rows: &[(String, &str)]) -> Vec<(u16, u16, String)> {
+    let lines: Vec<String> = rows
+        .iter()
+        .map(|(chord, label)| format!("{chord}  {label}"))
+        .collect();
+    let widest = lines.iter().map(|l| l.width()).max().unwrap_or(0);
+    // One cell of breathing room either side, and a body shorter than the block plus
+    // a row above and below is one the block does not belong in.
+    if lines.is_empty()
+        || body.width as usize <= widest + 2
+        || (body.height as usize) < lines.len() + 2
+    {
+        return Vec::new();
+    }
+    let top = body.y + (body.height - lines.len() as u16) / 2;
+    lines
+        .into_iter()
+        .enumerate()
+        .map(|(index, line)| {
+            // The *block* is centred and every line starts at its left edge, rather
+            // than each line being centred on its own width. Three ragged lines read
+            // as three unrelated remarks; one column of chords reads as a key list,
+            // which is what it is.
+            let x = body.x + (body.width as usize - widest) as u16 / 2;
+            (x, top + index as u16, line)
+        })
+        .collect()
 }
 
 /// A tab's painted label: the buffer's display name with one cell of padding either
@@ -2519,6 +2563,49 @@ mod tests {
             diagnostic: None,
             read_only: false,
         }
+    }
+
+    #[test]
+    fn the_empty_state_centres_its_block_and_keeps_the_chords_in_a_column() {
+        let rows = vec![
+            ("Ctrl+O".to_string(), "open a file"),
+            ("Ctrl+P".to_string(), "everything else"),
+            ("Ctrl+Q".to_string(), "quit"),
+        ];
+        let placed = empty_hints(Rect::new(0, 1, 40, 11), &rows);
+        assert_eq!(placed.len(), 3);
+        // Vertically centred inside the body, which starts at y=1.
+        assert_eq!(placed[0].1, 5);
+        assert_eq!(placed[2].1, 7);
+        // Each line is centred on the *block*, not on itself, so the chords line up
+        // rather than ragging around the middle.
+        let widest = rows
+            .iter()
+            .map(|(c, l)| format!("{c}  {l}").width())
+            .max()
+            .unwrap();
+        let left = (40 - widest) / 2;
+        // Every line starts at the block's left edge, so the chords form a column.
+        assert!(
+            placed.iter().all(|(x, ..)| *x as usize == left),
+            "the lines ragged instead of forming a column: {placed:?}"
+        );
+    }
+
+    #[test]
+    fn the_empty_state_says_nothing_when_it_would_crowd_the_screen() {
+        // A signpost that overlaps what it points at is worse than none.
+        let rows = vec![("Ctrl+O".to_string(), "open a file")];
+        assert!(
+            empty_hints(Rect::new(0, 0, 12, 10), &rows).is_empty(),
+            "too narrow"
+        );
+        assert!(
+            empty_hints(Rect::new(0, 0, 40, 2), &rows).is_empty(),
+            "too short"
+        );
+        // ...and nothing to say is also nothing to draw: every command unbound.
+        assert!(empty_hints(Rect::new(0, 0, 40, 10), &[]).is_empty());
     }
 
     #[test]

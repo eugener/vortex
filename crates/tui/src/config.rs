@@ -439,6 +439,10 @@ pub struct Theme {
     /// eye while scanning structure, and one loud enough to read directly would
     /// compete with the code for attention on every single row.
     pub indent_guide: Style,
+    /// The three hints on an empty, unnamed buffer (SPEC §7.5, M10) - the first
+    /// screen a new user sees. Dim on purpose: it is a signpost, not content, and it
+    /// is gone on the first keystroke.
+    pub empty_hint: Style,
     /// The scrollbar's track (SPEC §7.5) - the part of the column the thumb is *not*
     /// on. Quiet, since it is the background of a control rather than the control.
     pub scrollbar_track: Style,
@@ -596,6 +600,7 @@ impl Default for Theme {
             // text on screen: a guide repeats on every row of every indented block,
             // so it has to sit below the threshold at which the eye stops on it.
             indent_guide: Style::new().fg(Color::Rgb(0x2f, 0x36, 0x50)),
+            empty_hint: Style::new().fg(Color::Rgb(0x5b, 0x64, 0x80)),
             // The track sits at the gutter's weight and the thumb well above it: the
             // pair has to be separable at a glance from the far edge of the screen,
             // where nothing else is competing for the eye.

@@ -236,6 +236,7 @@ struct ThemeFile {
     current_line: Option<StyleSpec>,
     ruler: Option<StyleSpec>,
     indent_guide: Option<StyleSpec>,
+    empty_hint: Option<StyleSpec>,
     scrollbar_track: Option<StyleSpec>,
     scrollbar_thumb: Option<StyleSpec>,
     sticky_context: Option<StyleSpec>,
@@ -291,6 +292,7 @@ impl ThemeFile {
             current_line: slot("current_line", self.current_line, base.current_line)?,
             ruler: slot("ruler", self.ruler, base.ruler)?,
             indent_guide: slot("indent_guide", self.indent_guide, base.indent_guide)?,
+            empty_hint: slot("empty_hint", self.empty_hint, base.empty_hint)?,
             scrollbar_track: slot(
                 "scrollbar_track",
                 self.scrollbar_track,

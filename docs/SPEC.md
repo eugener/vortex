@@ -705,9 +705,15 @@ the toast surface was built to stop hijacking (§7.5 surfaces table, M6).
 
 `vortex` with no file opens an unnamed buffer and says nothing else - the first screen a
 new user sees, undesigned. It gets three centred, dim lines: open a file, the command
-palette, quit, **with their chords rendered from the keymap** like every other chord (M9).
-Shown only for an empty buffer with no path, and gone on the first keystroke: a splash
-screen you have to dismiss is a splash screen that was not worth showing.
+palette, quit, **with their chords rendered from the keymap** like every other chord (M9),
+so a `nop`'d command leaves the screen rather than advertising a dead key. Shown only for
+an empty buffer with no path, and gone on the first keystroke: a splash screen you have to
+dismiss is a splash screen that was not worth showing.
+The *block* is centred and every line starts at its left edge, rather than each line being
+centred on its own width - three ragged lines read as three unrelated remarks, one column
+of chords reads as the key list it is. Nothing is drawn at all when the body cannot hold
+the block with a row to spare, since a signpost overlapping what it points at is worse
+than none.
 
 #### Glyphs, and the terminals that lack them
 
@@ -2026,7 +2032,7 @@ Incremental build order so the risky assumptions are validated early, not at the
   something other than writing a literal (§10.5).
   Ordered so the cheap half lands first: the status-bar audit (**done**), the picker's
   count (**done**) / hint footer / match marks (**done**) / path rows, tab-name
-  disambiguation (**done**), the empty state and the glyph profile are small; the head bar's state cluster, the message log, and the gutter
+  disambiguation (**done**), the empty state (**done**) and the glyph profile are small; the head bar's state cluster, the message log, and the gutter
   diagnostics with their picker are medium. The one piece of **new scope** is an
   `indent_style` setting behind the `spaces:4` readout - a frontend change, since the
   frontend already decides what `insert_tab` inserts.
