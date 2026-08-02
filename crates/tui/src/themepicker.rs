@@ -53,6 +53,7 @@ pub fn open(theme: &Theme, current: &str) -> Box<dyn Layer> {
 mod tests {
     use super::*;
     use crate::compositor::EventResult;
+    use crate::compositor::send;
     use crate::testutil::TempDir;
     use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
@@ -92,7 +93,7 @@ mod tests {
         assert!(picker.take_commands().is_empty());
         // The highlight is on the current theme, so committing straight away is a
         // no-op rather than a jump to whatever sorted first.
-        picker.handle_key(press(KeyCode::Enter));
+        send(&mut *picker, press(KeyCode::Enter));
         let committed = picker.take_commands();
         assert_eq!(theme_name(&committed[0]), "phosphor");
     }
@@ -100,7 +101,10 @@ mod tests {
     #[test]
     fn moving_previews_and_escaping_restores() {
         let mut picker = open(&Theme::default(), theme::DEFAULT);
-        assert_eq!(picker.handle_key(press(KeyCode::Up)), EventResult::Consumed);
+        assert_eq!(
+            send(&mut *picker, press(KeyCode::Up)),
+            EventResult::Consumed
+        );
         let previewed = picker.take_commands();
         assert_eq!(previewed.len(), 1, "moving previews exactly one theme");
         assert_ne!(
@@ -109,7 +113,7 @@ mod tests {
             "the highlight moved off the theme in use"
         );
 
-        picker.handle_key(press(KeyCode::Esc));
+        send(&mut *picker, press(KeyCode::Esc));
         assert!(picker.is_finished());
         let restored = picker.take_commands();
         assert_eq!(
@@ -125,7 +129,10 @@ mod tests {
         // under it, which is a move even though no arrow key was pressed.
         let mut picker = open(&Theme::default(), theme::DEFAULT);
         for c in "phos".chars() {
-            picker.handle_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
+            send(
+                &mut *picker,
+                KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE),
+            );
         }
         let previewed = picker.take_commands();
         assert_eq!(

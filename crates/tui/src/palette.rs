@@ -11,7 +11,7 @@ use crate::compositor::Layer;
 use crate::config::Theme;
 // The keymap's bindable-command identity, as distinct from the dispatchable
 // `crate::command::Command` the picker items carry.
-use crate::keymap::{Command as Bindable, Keymap};
+use crate::keymap::{Command as Bindable, Context, Keymap};
 use crate::picker::{Item, Picker};
 
 /// The curated command set the palette lists, in display order, each named by the
@@ -68,7 +68,10 @@ fn registry(keymap: &Keymap) -> Vec<Item> {
         .filter_map(|&(label, bound)| {
             Some(Item {
                 label: label.to_string(),
-                shortcut: keymap.shortcut_for(bound),
+                // In the editor's context, and only there: the palette lists what is
+                // runnable from the buffer, and a surface command is unrunnable from
+                // the one place its surface is not open (SPEC §10.5).
+                shortcut: keymap.shortcut_for(bound, Context::Editor),
                 command: bound.resolve(PALETTE_PAGE)?,
             })
         })

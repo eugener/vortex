@@ -1108,7 +1108,7 @@ existed to configure them from:
     their triggers (§11); everything else the table owes is settled in "Every binding is
     data" below.
 
-#### Every binding is data (M9 - Stage 1 built, Stage 2 specified)
+#### Every binding is data (M9 - built)
 
 M0-M8 made the *editor's* bindings data and left everything else in code. Five surfaces
 match key codes directly in a `match key.code` of their own - the pickers, the prompt, the
@@ -1119,6 +1119,7 @@ can read. M9 closes all four, under one rule: **a key that does something has a 
 table row**, and what stays in code is only what a table cannot say (listed at the end).
 
 Two stages, in order. Stage 1 needs no new machinery and is worth shipping alone.
+Both are built; what building them settled is recorded with M9 in §14.
 
 **Stage 1 - the table gets what every editor's table already has. Built** - the two
 details this design left open (the one macOS-only binding, and which keymap `--help`
@@ -1145,7 +1146,7 @@ renders against) are recorded with M9 in §14.
   It also answers a question the editor cannot answer today - *what are the defaults?* -
   since the file is the reference a user copies a row out of.
 
-**Stage 2 - contexts, so the surfaces are bindable too.**
+**Stage 2 - contexts, so the surfaces are bindable too. Built.**
 
 A **context** is a name. At any instant an ordered list of them is active, lowest first:
 
@@ -1230,6 +1231,23 @@ the surface rather than of the table:
   `QueryReplace` ends the walk on anything that is not `y`/`n`/`a`. Neither is expressible
   as a binding ("bind everything else"), and both are what makes a mistyped key harmless;
 - **defer it** - fall through to the next context down.
+
+**Which of the three applies is decided by one test per policy, not by the surface's
+mood.** A *text* surface asks `is this key text?` (`text_key`) and defers everything
+else - that is what the table's last column is, and what keeps the guarantee below
+true: an unbound Esc is not printable, so it falls through. A *decline* surface asks
+the narrower `is this somebody's shortcut?` (`is_command_chord`) and declines
+everything else, because a question is modal over the keyboard: only the keys that were
+never its to answer may leave it. Ctrl+S over a confirmation therefore still saves,
+while Backspace answers "no" instead of reaching the buffer behind the question.
+
+Reading the decline policy as "decline if *printable*" - the same test the text
+surfaces use - is wrong twice over, and both were found by review rather than by the
+suite. Backspace at "discard your changes?" would delete a character behind the
+question and dismiss it unanswered. Worse, a confirmation is raised by an async
+notification onto whatever is already open, so it can sit over a live picker: a
+deferred Enter is offered to the layer below, resolved in *that* layer's context, where
+it is `accept` - and the picker the user cannot see commits its highlighted row.
 
 This is what replaces the `if key.modifiers.contains(CONTROL) { return Ignored }` guard
 copied into five layers today: a Ctrl chord reaches the editor because nothing above it
@@ -1493,18 +1511,19 @@ None is a correctness bug today.
   (`handle_event`, with defaults) would finish it. **Trigger:** pasting into the prompt -
   which is also what the prompt needs before a click can position its caret, since the
   caret only ever sits at the end of its input today.
-- **"A shortcut fires over a picker" is a convention split across two files.** It works
-  only because `Picker::handle_key` returns `Ignored` for any Ctrl/Cmd chord *and* the
-  event loop dismisses the whole overlay stack when a fall-through key turns out to be
-  bound. Neither half is expressed in the `Layer` contract, so the next layer type must
-  rediscover the heuristic or shortcuts silently stop working over it. An explicit
-  `EventResult::Deferred` ("not mine; if it resolves to a command, close me") would put
-  the rule in the seam. The guard is now copied into five layers, so the duplication this
-  entry waited for has happened. **Trigger: M9 Stage 2** (§10.5, "Every binding is data"),
-  which pays it off as a side effect rather than as its own change: once a layer is handed
-  the binding its context resolved, a Ctrl chord falls through because nothing above bound
-  it, not because it is a Ctrl chord. That is also the point where dismiss-*all* becomes
-  the wrong scope for nested overlays.
+- **~~"A shortcut fires over a picker" is a convention split across two files.~~ Paid off
+  by M9 Stage 2**, as that entry predicted it would be - as a side effect rather than as
+  its own change. The `Ignored`-for-any-Ctrl-chord guard is deleted from all five layers:
+  a layer is handed the binding its own context resolved (`handle_key(key, bound)`), so a
+  chord falls through because nothing above bound it, not because it carries Ctrl. The
+  rule is in the seam now, and a new layer type inherits it by declaring a context.
+  **What is left of it** is the other half the entry named: `overlays.dismiss()` still
+  clears the *whole* stack when a fall-through key turns out to be bound, which is the
+  wrong scope for nested overlays. A named `EventResult::Deferred` was not needed for the
+  first half and would not fix this one either - the fix is the event loop popping only
+  the layers that declined. **Trigger:** the first nesting a user can actually reach that
+  is not "everything closes anyway", and the theme-picker entry below, which wants the
+  same widening of the `Layer` seam.
 - **A shortcut fired over the theme picker keeps the preview.** `Compositor::dismiss`
   drops the stack without asking the layers, so the "Esc restores what you opened with"
   contract is only honored by Esc: pressing Ctrl+S while previewing leaves the previewed
@@ -1888,8 +1907,8 @@ Incremental build order so the risky assumptions are validated early, not at the
   caught the follow bug the §7.5 entry records; the unit test that was supposed to cover
   it had asserted the wrong invariant and passed.
 
-- **M9 - Every binding is data.** *(Stage 1 done; Stage 2 specified, not started - see
-  §10.5 "Every binding is data" for the full design and the reasoning behind each choice.)*
+- **M9 - Every binding is data.** *(Done - see §10.5 "Every binding is data" for the full
+  design and the reasoning behind each choice.)*
   M0-M8 externalized the
   *editor's* bindings and left the rest in code: five surfaces match key codes directly, a
   default binding cannot be removed, the platform split lives in `cfg!`, and the defaults
@@ -1907,9 +1926,9 @@ Incremental build order so the risky assumptions are validated early, not at the
   - **One macOS-only binding survives the move, as a second file.** `mod` folds away the
     *command-modifier* split, but not `ctrl+c = quit`, which says "a chord that is free
     *because* of what `mod` resolved to" - true on a Mac, and on Linux a silent theft of
-    copy's chord. It lives in `keys-macos.toml`, compiled in beside `keys.toml` and
-    layered over it by one `cfg!`, which is the whole of what is left of the platform
-    split and is exactly what Stage 2's `[keys.macos]` absorbs. Written as a row in the
+    copy's chord. It lived in `keys-macos.toml`, compiled in beside `keys.toml` and
+    layered over it by one `cfg!`, which was the whole of what was left of the platform
+    split - and is exactly what Stage 2's `[keys.macos]` absorbed, deleting the file. Written as a row in the
     same table instead - to be resolved by "later wins" - it would have depended on the
     `toml` crate handing back a *sorted* table, which is precisely the accident
     `extend_from_pairs` already refuses to rely on.
@@ -1937,17 +1956,48 @@ Incremental build order so the risky assumptions are validated early, not at the
   the whole difference between `nop` and an absent row), `X` beside it still typed, Ctrl+F
   opened nothing, Cmd+E opened the theme picker, and the saved file read exactly `Xhello`.
   `--help` under that config drops the find row and renders `Cmd+` on the clipboard rows.
-  **Stage 2** is keymap **contexts**: a name per active scope - `editor`, the platform, and
-  one per open overlay mirroring the compositor stack - looked up top-down, first match
-  wins. The pickers, prompts, the confirmation and the query-replace walk stop matching key
-  codes and start matching commands, so every key in the editor becomes bindable; the
-  "a Ctrl chord falls through an overlay" heuristic copied into five layers becomes a
+  **Stage 2 - DONE.** Keymap **contexts**: a name per active scope - `editor`, the
+  platform, and one per open overlay mirroring the compositor stack - looked up top-down,
+  first match wins. The pickers, prompts, the confirmation and the query-replace walk stop
+  matching key codes and start matching commands, so every key in the editor is bindable;
+  the "a Ctrl chord falls through an overlay" heuristic copied into five layers is now a
   consequence of the table rather than a rule of its own; and two §11 debt entries are paid
   off with it. The design is a stack of names, not a predicate language, because this
   focus chain is the compositor's own ordered stack and is two deep - the reasoning, and
   the trigger that would overturn it, are in §10.5. It finishes the display rule with the
   two sites that need a surface context: the query-replace question and the four
-  confirmations stop spelling `y`/`n`/`a`/`q` and `(y/N)` themselves.
+  confirmations no longer spell `y`/`n`/`a`/`q` and `(y/N)` themselves. `keys-macos.toml`
+  is deleted, absorbed into `keys.toml`'s own `[macos]` table - which is *read* on every
+  platform, so the last `cfg!` in the keymap is gone and what varies is only which context
+  is in the stack.
+  Four details the design did not settle, decided while building it:
+  - **The two unbound-key policies ask different questions, and the review caught the
+    first attempt asking one.** A text surface asks "is this text?" and defers the rest;
+    a *question* asks the narrower "is this somebody's shortcut?" and declines the rest,
+    because a question is modal over the keyboard. Reading both as the printable test
+    let Backspace at "discard your changes?" delete a character behind the question, and
+    - because a confirmation is raised asynchronously onto whatever is already open -
+    let a deferred Enter reach a picker buried under it and commit its highlighted row.
+    §10.5 carries the rule and the two failures.
+  - **A shifted letter is one chord however the terminal spells it.** Kitty reports `Y`
+    *and* `SHIFT`; a classic terminal reports `Y` alone. `Chord::from_event` folds the
+    letter to lower case and takes the shift from its *case*, so `"shift+y"` is one row
+    that matches both - and is expressible at all, which it was not before (`Chord::parse`
+    lowercases every token). It also makes `"ctrl+shift+f"` fire whether the terminal says
+    `f` or `F`, which had been a latent hole. Text entry is untouched: it reads the key
+    code, so an upper-case letter still types itself.
+  - **The uppercase answer aliases are gone.** `Y`/`N`/`A` used to be hard-coded twins of
+    `y`/`n`/`a`. As table rows they would be a second row for one answer, and the question
+    now *renders its chords from those rows* - so an alias would decide what the question
+    says (`Shift+N=no` won the tie-break). A shifted answer is simply not one of the named
+    keys, and every key that is not named declines or ends the walk, which is the safe
+    direction in both surfaces.
+  - **A confirmation names only the chord that commits.** `(y/N)` became `(Y to confirm)`
+    rather than `(Y/n)`: every other key declines, so naming the no key would suggest it
+    is the only way to say no, and capitalizing the default stops working the moment the
+    chord can be several characters long. The walk's answers became `Y=yes N=no A=all
+    Q=quit` for the same reason - a rebound chord does not fit inside `(y)es`. M10
+    restyles both; this stage only had to stop them being literals.
   *Verify:* a config that rebinds one key in each context, driven in a pty - the picker's
   highlight moving on the rebound key, `cancel` unbound in the picker and Esc still
   escaping through the editor context beneath it, a `nop`'d chord doing nothing at all

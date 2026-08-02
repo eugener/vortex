@@ -22,9 +22,7 @@
 use nucleo_matcher::pattern::{CaseMatching, Normalization, Pattern};
 use nucleo_matcher::{Config, Matcher};
 use ratatui::buffer::Buffer;
-use ratatui::crossterm::event::{
-    KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
-};
+use ratatui::crossterm::event::{KeyEvent, MouseButton, MouseEvent, MouseEventKind};
 use std::borrow::Cow;
 use std::path::Path;
 
@@ -36,6 +34,10 @@ use unicode_width::UnicodeWidthStr;
 use crate::command::Command;
 use crate::compositor::{EventResult, Layer};
 use crate::config::Theme;
+// The keymap's `Command` is the *binding* side - what a chord names - while this
+// module's `Command` is what a committed choice dispatches. Aliased rather than
+// qualified because the two appear a line apart in `handle_key`.
+use crate::keymap::{Command as Bound, Context};
 
 /// Rows the box is at most tall, and at most wide - with and without a preview
 /// pane, which is the whole reason the wider one exists.
@@ -619,38 +621,40 @@ impl Layer for Picker {
         }
     }
 
-    fn handle_key(&mut self, key: KeyEvent) -> EventResult {
-        // A Ctrl/Cmd chord is a keybinding, not picker input: defer it (Ignored) so
-        // the shortcut runs and the loop dismisses the picker. Kept generic (not
-        // naming keys), so configurable shortcuts (M5) work from a picker for free -
-        // the keymap stays the single source the picker also *displays* (§7.5, §10.5).
-        if key.modifiers.contains(KeyModifiers::CONTROL)
-            || key.modifiers.contains(KeyModifiers::SUPER)
-        {
-            return EventResult::Ignored;
-        }
-        match key.code {
-            KeyCode::Esc => self.cancel(),
-            KeyCode::Enter => self.commit(),
-            KeyCode::Up => self.selected = self.selected.saturating_sub(1),
-            KeyCode::Down => {
+    fn context(&self) -> Context {
+        Context::Picker
+    }
+
+    fn handle_key(&mut self, key: KeyEvent, bound: Option<Bound>) -> EventResult {
+        match bound {
+            Some(Bound::Cancel) => self.cancel(),
+            Some(Bound::Accept) => self.commit(),
+            Some(Bound::PreviousItem) => self.selected = self.selected.saturating_sub(1),
+            Some(Bound::NextItem) => {
                 let last = self.filtered.len().saturating_sub(1);
                 self.selected = (self.selected + 1).min(last);
             }
-            KeyCode::Backspace => {
+            Some(Bound::DeleteBackward) => {
                 self.query.pop();
                 self.refilter();
                 self.selected = 0;
             }
-            // Typing filters (Alt passes through for composed accented input; Ctrl/Cmd
-            // already returned above).
-            KeyCode::Char(c) => {
-                self.query.push(c);
-                self.refilter();
-                self.selected = 0;
-            }
-            // Modal: swallow anything else so it never reaches the editor beneath.
-            _ => {}
+            // `nop`, and anything the `picker` context should not have been able to
+            // hold: swallowed here rather than deferred, because the chord *is* bound
+            // - the table said this surface answers for it (SPEC §10.5).
+            Some(_) => {}
+            // Unbound. A printable key is the query - which is what a picker is for -
+            // and everything else falls through to the context below, where an
+            // unbound Esc finds `collapse_selections` and closes this picker on its
+            // way past. That fall-through is why no config can lock a surface shut.
+            None => match crate::keymap::text_key(&key) {
+                Some(c) => {
+                    self.query.push(c);
+                    self.refilter();
+                    self.selected = 0;
+                }
+                None => return EventResult::Ignored,
+            },
         }
         // Enter and Esc have already said their piece (and finished); every other
         // key may have moved the highlight, which is what a preview follows.
@@ -787,6 +791,8 @@ mod tests {
     use std::rc::Rc;
 
     use super::*;
+    use crate::compositor::send;
+    use ratatui::crossterm::event::{KeyCode, KeyModifiers};
     use vortex_core::Action;
 
     fn items() -> Vec<Item> {
@@ -823,7 +829,7 @@ mod tests {
 
     fn type_str(p: &mut Picker, s: &str) {
         for c in s.chars() {
-            p.handle_key(key(c));
+            send(&mut *p, key(c));
         }
     }
 
@@ -913,7 +919,7 @@ mod tests {
         // Esc's other job: a theme picker that previewed as you moved has to put the
         // old one back. A click outside means the same thing, so it does the same.
         let mut p = picker().previewing(Command::OpenPalette);
-        p.handle_key(press(KeyCode::Down));
+        send(&mut p, press(KeyCode::Down));
         let _ = p.take_commands(); // the preview
         p.handle_mouse(click(0, 0), SCREEN);
         assert_eq!(p.take_commands(), vec![Command::OpenPalette]);
@@ -970,7 +976,7 @@ mod tests {
         // and a hit test that ignored that would run the wrong item entirely.
         let mut p = long();
         for _ in 0..30 {
-            p.handle_key(press(KeyCode::Down));
+            send(&mut p, press(KeyCode::Down));
         }
         let (list, _) = p.columns(SCREEN).unwrap();
         let list_h = list.height.saturating_sub(1) as usize;
@@ -1011,12 +1017,12 @@ mod tests {
     #[test]
     fn down_and_up_move_the_selection_clamped() {
         let mut p = picker();
-        p.handle_key(press(KeyCode::Up)); // at top - clamps
+        send(&mut p, press(KeyCode::Up)); // at top - clamps
         assert_eq!(p.selected, 0);
-        p.handle_key(press(KeyCode::Down));
+        send(&mut p, press(KeyCode::Down));
         assert_eq!(p.selected, 1);
         for _ in 0..100 {
-            p.handle_key(press(KeyCode::Down));
+            send(&mut p, press(KeyCode::Down));
         }
         assert_eq!(p.selected, p.filtered.len() - 1);
     }
@@ -1025,18 +1031,20 @@ mod tests {
     fn enter_commits_the_highlighted_command_and_finishes() {
         let mut p = picker();
         type_str(&mut p, "quit");
-        p.handle_key(press(KeyCode::Enter));
+        send(&mut p, press(KeyCode::Enter));
         assert!(p.is_finished());
         assert_eq!(p.take_commands(), vec![Command::Editor(Action::Quit)]);
     }
 
     #[test]
     fn ctrl_chord_is_deferred_not_typed() {
-        // A Ctrl/Cmd chord is a shortcut, not filter input: the picker ignores it
-        // (so the loop runs the binding) and does not add it to the query.
+        // A Ctrl/Cmd chord is a shortcut, not filter input: the picker defers it (so
+        // the loop runs the binding) and does not add it to the query. It defers
+        // because the `picker` context does not *bind* it, not because it is a Ctrl
+        // chord - the guard that used to say so is gone (SPEC §10.5).
         let mut p = picker();
         let ctrl_s = KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL);
-        assert_eq!(p.handle_key(ctrl_s), EventResult::Ignored);
+        assert_eq!(send(&mut p, ctrl_s), EventResult::Ignored);
         assert!(p.query.is_empty(), "the chord must not filter");
         assert!(
             !p.is_finished(),
@@ -1045,9 +1053,65 @@ mod tests {
     }
 
     #[test]
+    fn a_config_cannot_lock_the_picker_shut() {
+        // Unbind `cancel` in `[keys.picker]` and Esc is unbound *there*. It is not
+        // printable, so it is not taken as the query - so it falls through to the
+        // editor context, where `collapse_selections` fires and the loop dismisses
+        // the overlay on its way past. The way out survives a bad config by
+        // construction rather than by a special case (SPEC §10.5).
+        // A keymap whose `picker` context binds nothing at all - the worst a config
+        // can do to this surface, since a row can be replaced but the table cannot be
+        // emptied by hand.
+        let stripped = crate::keymap::Keymap::from_pairs([("esc", "collapse_selections")]).unwrap();
+        let esc = press(KeyCode::Esc);
+        assert_eq!(stripped.bound(Context::Picker, esc), None);
+
+        let mut p = picker();
+        assert_eq!(
+            p.handle_key(esc, stripped.bound(Context::Picker, esc)),
+            EventResult::Ignored,
+            "an unbound Esc is offered to the context below"
+        );
+        assert!(!p.is_finished(), "the picker did not answer for it");
+        // What it finds down there is the editor's `collapse_selections`, and a binding
+        // firing over an open overlay dismisses that overlay (the event loop's rule).
+        assert!(
+            crate::keymap::command_for_key(&stripped, esc, 10).is_some(),
+            "the editor context answers, so the overlay is dismissed"
+        );
+    }
+
+    #[test]
+    fn a_nop_row_swallows_a_key_in_this_surface_alone() {
+        // The other half of the rule: `nop` is how a table says "swallow this *here*",
+        // as distinct from letting the chord fall through. Tab is `nop` in the built-in
+        // `[picker]` table because Tab means completion everywhere a user has met a
+        // picker, and falling through would type an indent into the buffer behind it.
+        let keymap = crate::keymap::Keymap::default();
+        let tab = press(KeyCode::Tab);
+        assert_eq!(keymap.bound(Context::Picker, tab), Some(Bound::Nop));
+        let mut p = picker();
+        assert_eq!(send(&mut p, tab), EventResult::Consumed);
+        assert!(p.query.is_empty(), "nop typed nothing");
+        assert!(!p.is_finished());
+    }
+
+    #[test]
+    fn a_key_the_picker_context_does_not_bind_falls_through() {
+        // Left/Right are the editor's motions and mean nothing to a list, so the
+        // picker declines them rather than swallowing them.
+        let mut p = picker();
+        for code in [KeyCode::Left, KeyCode::Right, KeyCode::Home] {
+            assert_eq!(send(&mut p, press(code)), EventResult::Ignored, "{code:?}");
+        }
+        assert!(p.query.is_empty());
+        assert!(!p.is_finished());
+    }
+
+    #[test]
     fn esc_cancels_with_no_command() {
         let mut p = picker();
-        p.handle_key(press(KeyCode::Esc));
+        send(&mut p, press(KeyCode::Esc));
         assert!(p.is_finished());
         assert!(p.take_commands().is_empty());
     }
@@ -1058,7 +1122,7 @@ mod tests {
         // opening a file per row visited would be a disaster. Preview is opt-in.
         let mut p = picker();
         for code in [KeyCode::Down, KeyCode::Down, KeyCode::Up] {
-            p.handle_key(press(code));
+            send(&mut p, press(code));
             assert!(p.take_commands().is_empty(), "moved but emitted");
         }
         type_str(&mut p, "cop");
@@ -1081,20 +1145,20 @@ mod tests {
         // Opening previews nothing: the highlight has not moved yet.
         assert!(p.take_commands().is_empty());
 
-        p.handle_key(press(KeyCode::Down));
+        send(&mut p, press(KeyCode::Down));
         assert_eq!(p.take_commands(), vec![Command::OpenPalette]); // row 1's command
         // A key that leaves the highlight where it is must not re-emit, or a held
         // Up at the top would fire the same preview over and over.
-        p.handle_key(press(KeyCode::Up));
+        send(&mut p, press(KeyCode::Up));
         assert_eq!(
             p.take_commands(),
             vec![Command::Editor(Action::Save { force: false })]
         );
-        p.handle_key(press(KeyCode::Up));
+        send(&mut p, press(KeyCode::Up));
         assert!(p.take_commands().is_empty(), "re-emitted without moving");
 
         // Cancelling emits the undo command; committing does not.
-        p.handle_key(press(KeyCode::Esc));
+        send(&mut p, press(KeyCode::Esc));
         assert_eq!(p.take_commands(), vec![cancel]);
     }
 
@@ -1131,7 +1195,7 @@ mod tests {
     fn enter_on_an_empty_result_commits_nothing() {
         let mut p = picker();
         type_str(&mut p, "zzzq");
-        p.handle_key(press(KeyCode::Enter));
+        send(&mut p, press(KeyCode::Enter));
         assert!(p.is_finished());
         assert!(p.take_commands().is_empty());
     }
@@ -1142,7 +1206,7 @@ mod tests {
         type_str(&mut p, "quit");
         assert_eq!(p.filtered.len(), 1);
         for _ in 0..4 {
-            p.handle_key(press(KeyCode::Backspace));
+            send(&mut p, press(KeyCode::Backspace));
         }
         assert!(p.query.is_empty());
         assert_eq!(p.filtered.len(), p.items.len());
@@ -1243,11 +1307,11 @@ mod tests {
     fn the_pane_refills_when_the_highlight_moves_and_not_otherwise() {
         // Every keystroke repaints; only a *move* is worth re-reading a file for.
         let (mut p, asked) = paned();
-        p.handle_key(press(KeyCode::Down));
+        send(&mut p, press(KeyCode::Down));
         assert_eq!(*asked.borrow(), vec!["Save File", "Open Palette"]);
-        p.handle_key(press(KeyCode::Up));
+        send(&mut p, press(KeyCode::Up));
         assert_eq!(asked.borrow().len(), 3);
-        p.handle_key(press(KeyCode::Up)); // already at the top: nothing moved
+        send(&mut p, press(KeyCode::Up)); // already at the top: nothing moved
         assert_eq!(asked.borrow().len(), 3, "re-read without moving");
         // The wheel is a move like any other.
         p.handle_mouse(wheel(false), SCREEN);
@@ -1419,7 +1483,7 @@ mod tests {
         let (mut p, asked, _) = sourced();
         type_str(&mut p, "ab");
         assert_eq!(*asked.borrow(), vec!["a", "ab"], "asked on every keystroke");
-        p.handle_key(press(KeyCode::Backspace));
+        send(&mut p, press(KeyCode::Backspace));
         assert_eq!(asked.borrow().last().unwrap(), "a");
     }
 
@@ -1469,8 +1533,8 @@ mod tests {
         type_str(&mut p, "x");
         *pending.borrow_mut() = vec![item("a"), item("b")];
         p.tick();
-        p.handle_key(press(KeyCode::Down));
-        p.handle_key(press(KeyCode::Enter));
+        send(&mut p, press(KeyCode::Down));
+        send(&mut p, press(KeyCode::Enter));
         assert_eq!(
             p.take_commands(),
             vec![Command::Editor(Action::Insert("b".to_string()))]
@@ -1602,7 +1666,7 @@ mod tests {
         let top = bar_column(&p, SCREEN);
         assert_eq!(top.chars().next(), Some('█'), "starts at the top: {top:?}");
         for _ in 0..40 {
-            p.handle_key(press(KeyCode::Down));
+            send(&mut p, press(KeyCode::Down));
         }
         let bottom = bar_column(&p, SCREEN);
         assert_eq!(

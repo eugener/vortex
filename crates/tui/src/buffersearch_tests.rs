@@ -1,6 +1,8 @@
 use super::*;
+use crate::compositor::send;
 use ratatui::Terminal;
 use ratatui::backend::TestBackend;
+use ratatui::crossterm::event::{KeyCode, KeyModifiers};
 use ratatui::style::Color;
 use vortex_core::{Buffer as _, RopeBuffer};
 
@@ -14,7 +16,7 @@ fn press(code: KeyCode) -> KeyEvent {
 
 fn type_str(layer: &mut dyn Layer, s: &str) {
     for c in s.chars() {
-        layer.handle_key(key(c));
+        send(&mut *layer, key(c));
     }
 }
 
@@ -176,7 +178,7 @@ fn backspace_publishes_too_so_the_highlights_shrink_back() {
     let mut p = find_prompt(false);
     type_str(&mut p, "ca");
     p.take_commands();
-    p.handle_key(press(KeyCode::Backspace));
+    send(&mut p, press(KeyCode::Backspace));
     assert_eq!(
         p.take_commands(),
         vec![Command::PreviewSearch {
@@ -191,7 +193,7 @@ fn enter_commits_a_find_and_closes() {
     let mut p = find_prompt(false);
     type_str(&mut p, "cat");
     p.take_commands();
-    assert_eq!(p.handle_key(press(KeyCode::Enter)), EventResult::Consumed);
+    assert_eq!(send(&mut p, press(KeyCode::Enter)), EventResult::Consumed);
     assert!(p.is_finished());
     assert_eq!(p.take_commands(), vec![Command::FindNext]);
 }
@@ -203,7 +205,7 @@ fn escape_takes_the_highlights_down_with_it() {
     let mut p = find_prompt(false);
     type_str(&mut p, "cat");
     p.take_commands();
-    p.handle_key(press(KeyCode::Esc));
+    send(&mut p, press(KeyCode::Esc));
     assert!(p.is_finished());
     assert_eq!(p.take_commands(), vec![Command::ClearSearch]);
 }
@@ -212,7 +214,7 @@ fn escape_takes_the_highlights_down_with_it() {
 fn the_prompt_reopens_on_the_last_pattern() {
     // Refining a search you just ran should not mean retyping it.
     let mut p = Find::new(&Theme::default(), "previous".into(), false);
-    p.handle_key(press(KeyCode::Enter));
+    send(&mut p, press(KeyCode::Enter));
     assert_eq!(p.take_commands(), vec![Command::FindNext]);
     assert_eq!(p.pattern, "previous");
 }
@@ -221,12 +223,12 @@ fn the_prompt_reopens_on_the_last_pattern() {
 fn tab_moves_between_the_two_fields_of_a_replace() {
     let mut p = find_prompt(true);
     type_str(&mut p, "cat");
-    p.handle_key(press(KeyCode::Tab));
+    send(&mut p, press(KeyCode::Tab));
     type_str(&mut p, "dog");
     assert_eq!(p.pattern, "cat");
     assert_eq!(p.replacement, "dog");
     // ...and back again, so a typo in the pattern is fixable without starting over.
-    p.handle_key(press(KeyCode::Tab));
+    send(&mut p, press(KeyCode::Tab));
     type_str(&mut p, "s");
     assert_eq!(p.pattern, "cats");
 }
@@ -237,7 +239,7 @@ fn tab_in_a_plain_find_is_swallowed_rather_than_typed() {
     // cannot see.
     let mut p = find_prompt(false);
     type_str(&mut p, "cat");
-    p.handle_key(press(KeyCode::Tab));
+    send(&mut p, press(KeyCode::Tab));
     assert_eq!(p.pattern, "cat");
 }
 
@@ -245,10 +247,10 @@ fn tab_in_a_plain_find_is_swallowed_rather_than_typed() {
 fn a_replace_commits_into_the_query_replace_walk() {
     let mut p = find_prompt(true);
     type_str(&mut p, "cat");
-    p.handle_key(press(KeyCode::Tab));
+    send(&mut p, press(KeyCode::Tab));
     type_str(&mut p, "dog");
     p.take_commands();
-    p.handle_key(press(KeyCode::Enter));
+    send(&mut p, press(KeyCode::Enter));
     assert!(p.is_finished());
     assert_eq!(p.take_commands(), vec![Command::StartReplace]);
 }
@@ -259,7 +261,7 @@ fn a_ctrl_chord_is_deferred_not_typed() {
     // same rule `Prompt` and the pickers follow.
     let mut p = find_prompt(false);
     let ctrl_s = KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL);
-    assert_eq!(p.handle_key(ctrl_s), EventResult::Ignored);
+    assert_eq!(send(&mut p, ctrl_s), EventResult::Ignored);
     assert!(p.pattern.is_empty());
     assert!(!p.is_finished());
 }
@@ -284,7 +286,7 @@ fn the_prompt_paints_both_of_its_fields() {
     // live search is actually asking.
     let mut p = find_prompt(true);
     type_str(&mut p, "cat");
-    p.handle_key(press(KeyCode::Tab));
+    send(&mut p, press(KeyCode::Tab));
     type_str(&mut p, "dog");
     let mut terminal = Terminal::new(TestBackend::new(60, 4)).unwrap();
     terminal
@@ -302,7 +304,7 @@ fn the_caret_sits_in_the_field_being_typed_into() {
     type_str(&mut p, "cat");
     // "Find: " is 6 cells, plus "cat".
     assert_eq!(p.cursor(screen), Some(Position::new(9, 3)));
-    p.handle_key(press(KeyCode::Tab));
+    send(&mut p, press(KeyCode::Tab));
     type_str(&mut p, "dog");
     // ...plus "  Replace: " (11) and "dog".
     assert_eq!(p.cursor(screen), Some(Position::new(23, 3)));
@@ -339,14 +341,19 @@ fn restyling_adopts_the_new_palette() {
 // --- QueryReplace walk ----------------------------------------------------
 
 fn walk() -> QueryReplace {
-    QueryReplace::new(&Theme::default(), "cat".into(), "dog".into())
+    QueryReplace::new(
+        &Theme::default(),
+        &crate::keymap::Keymap::default(),
+        "cat".into(),
+        "dog".into(),
+    )
 }
 
 #[test]
 fn yes_replaces_and_advances_without_ending_the_walk() {
     // The point of a walk is the next question.
     let mut w = walk();
-    assert_eq!(w.handle_key(key('y')), EventResult::Consumed);
+    assert_eq!(send(&mut w, key('y')), EventResult::Consumed);
     assert!(!w.is_finished());
     assert_eq!(
         w.take_commands(),
@@ -366,7 +373,7 @@ fn yes_replaces_and_advances_without_ending_the_walk() {
 #[test]
 fn no_advances_without_replacing() {
     let mut w = walk();
-    w.handle_key(key('n'));
+    send(&mut w, key('n'));
     assert!(!w.is_finished());
     assert_eq!(
         w.take_commands(),
@@ -380,7 +387,7 @@ fn no_advances_without_replacing() {
 #[test]
 fn all_finishes_the_rest_in_one_edit_and_ends_the_walk() {
     let mut w = walk();
-    w.handle_key(key('a'));
+    send(&mut w, key('a'));
     assert!(w.is_finished());
     assert_eq!(
         w.take_commands(),
@@ -393,16 +400,12 @@ fn all_finishes_the_rest_in_one_edit_and_ends_the_walk() {
 
 #[test]
 fn every_other_key_stops_the_walk_having_replaced_nothing() {
-    // The destructive answers are exactly `y` and `a`, so a mistyped key can only
-    // ever end the walk early.
-    for stop in [
-        key('q'),
-        press(KeyCode::Esc),
-        key('z'),
-        press(KeyCode::Enter),
-    ] {
+    // The destructive answers are exactly `y` and `a`, so a mistyped *printable* key
+    // can only ever end the walk early - and so does Esc, which the `replace` context
+    // binds to `cancel` alongside `q`.
+    for stop in [key('q'), press(KeyCode::Esc), key('z'), key('Z')] {
         let mut w = walk();
-        assert_eq!(w.handle_key(stop), EventResult::Consumed);
+        assert_eq!(send(&mut w, stop), EventResult::Consumed);
         assert!(w.is_finished(), "one keypress always answers: {stop:?}");
         assert_eq!(
             w.take_commands(),
@@ -413,16 +416,46 @@ fn every_other_key_stops_the_walk_having_replaced_nothing() {
 }
 
 #[test]
-fn uppercase_answers_count_too() {
-    for (answer, finishes) in [('Y', false), ('N', false), ('A', true)] {
+fn the_walk_is_modal_over_every_key_that_is_not_a_shortcut() {
+    // The regression `Confirm` carries too: "anything else ends the walk" was read as
+    // "anything else *printable*", which sent Enter and Backspace to the context below
+    // - editing the buffer, or committing an overlay buried under the question,
+    // instead of ending the walk. Only a command chord is not the walk's to answer.
+    for key in [
+        press(KeyCode::Enter),
+        press(KeyCode::Backspace),
+        press(KeyCode::Tab),
+        press(KeyCode::Down),
+    ] {
         let mut w = walk();
-        w.handle_key(key(answer));
-        assert_eq!(w.is_finished(), finishes, "{answer}");
-        assert!(
-            w.take_commands()
-                .iter()
-                .any(|c| matches!(c, Command::Editor(_))),
-            "{answer} did nothing"
+        assert_eq!(
+            send(&mut w, key),
+            EventResult::Consumed,
+            "{key:?} escaped the walk"
+        );
+        assert!(w.is_finished(), "{key:?} left the walk open");
+        assert_eq!(
+            w.take_commands(),
+            vec![Command::ClearSearch],
+            "{key:?} edited the buffer"
+        );
+    }
+}
+
+#[test]
+fn a_shifted_answer_is_not_one_of_the_named_keys() {
+    // `shift+y` used to be an alias for `y`. It is not a row any more: the question
+    // renders its chords from the table, so a second row for one answer would decide
+    // what the question *says*. A shifted answer is an unbound printable key, which
+    // ends the walk - the safe direction, and the same as any other stray key.
+    for answer in ['Y', 'N', 'A'] {
+        let mut w = walk();
+        send(&mut w, key(answer));
+        assert!(w.is_finished(), "{answer} should end the walk");
+        assert_eq!(
+            w.take_commands(),
+            vec![Command::ClearSearch],
+            "{answer} edited the buffer"
         );
     }
 }
@@ -443,7 +476,7 @@ fn a_click_never_answers_yes() {
 fn a_ctrl_chord_over_the_walk_is_deferred() {
     let mut w = walk();
     let ctrl_s = KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL);
-    assert_eq!(w.handle_key(ctrl_s), EventResult::Ignored);
+    assert_eq!(send(&mut w, ctrl_s), EventResult::Ignored);
     assert!(!w.is_finished());
     assert!(w.take_commands().is_empty());
 }
@@ -459,7 +492,10 @@ fn the_question_names_both_halves_of_the_replacement() {
     let row = crate::testutil::row_text(&terminal.backend().buffer().clone(), 2);
     assert!(row.contains("`cat`"), "{row:?}");
     assert!(row.contains("`dog`"), "{row:?}");
-    assert!(row.contains("(y)es"), "{row:?}");
+    // The answers are *rendered from the `replace` context*, never spelled out here:
+    // a user who moves one is told the key they moved it to (SPEC §10.5).
+    assert!(row.contains("Y=yes"), "{row:?}");
+    assert!(row.contains("Q=quit"), "{row:?}");
     // A question takes no typing, so it shows no caret.
     assert_eq!(w.cursor(Rect::new(0, 0, 70, 3)), None);
 }

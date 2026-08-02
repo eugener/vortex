@@ -15,9 +15,7 @@
 use std::path::PathBuf;
 
 use ratatui::buffer::Buffer;
-use ratatui::crossterm::event::{
-    KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
-};
+use ratatui::crossterm::event::{KeyEvent, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::layout::{Position, Rect};
 use ratatui::style::Style;
 use unicode_width::UnicodeWidthStr;
@@ -26,6 +24,9 @@ use vortex_core::Action;
 use crate::command::Command;
 use crate::compositor::{EventResult, Layer};
 use crate::config::Theme;
+// The keymap's `Command` is the *binding* side - what a chord names - while this
+// module's `Command` is what a committed choice dispatches (see `picker`).
+use crate::keymap::{Command as Bound, Context, Keymap};
 
 /// Turns the prompt's committed text into the commands to dispatch (SPEC §7.5). An
 /// empty result commits nothing (e.g. blank input) while still closing the prompt.
@@ -84,29 +85,28 @@ impl Layer for Prompt {
         buf.set_stringn(row.x, row.y, &line, row.width as usize, self.style);
     }
 
-    fn handle_key(&mut self, key: KeyEvent) -> EventResult {
-        // A Ctrl/Cmd chord is a keybinding, not prompt input: defer it (Ignored) so
-        // the shortcut runs and the loop dismisses the prompt - the same rule the
-        // picker follows, keeping the keymap the single source of shortcuts (§7.5).
-        if key.modifiers.contains(KeyModifiers::CONTROL)
-            || key.modifiers.contains(KeyModifiers::SUPER)
-        {
-            return EventResult::Ignored;
-        }
-        match key.code {
-            KeyCode::Esc => self.finished = true,
-            KeyCode::Enter => {
+    fn context(&self) -> Context {
+        Context::Prompt
+    }
+
+    fn handle_key(&mut self, key: KeyEvent, bound: Option<Bound>) -> EventResult {
+        match bound {
+            Some(Bound::Cancel) => self.finished = true,
+            Some(Bound::Accept) => {
                 self.outbox.extend((self.submit)(&self.input));
                 self.finished = true;
             }
-            KeyCode::Backspace => {
+            Some(Bound::DeleteBackward) => {
                 self.input.pop();
             }
-            // Alt passes through for composed accented input; Ctrl/Cmd already
-            // returned above.
-            KeyCode::Char(c) => self.input.push(c),
-            // Modal: swallow anything else so it never reaches the editor beneath.
-            _ => {}
+            // `nop`, and anything this context should not have been able to hold.
+            Some(_) => {}
+            // Unbound: a printable key is the input, and anything else falls through
+            // to the context below (SPEC §10.5).
+            None => match crate::keymap::text_key(&key) {
+                Some(c) => self.input.push(c),
+                None => return EventResult::Ignored,
+            },
         }
         EventResult::Consumed
     }
@@ -167,12 +167,30 @@ pub fn save_as(theme: &Theme, current_path: Option<&std::path::Path>) -> Box<dyn
     }))
 }
 
+/// The answer hint a confirmation's question ends with, rendered from the `confirm`
+/// context rather than written out as `(y/N)`.
+///
+/// **Only the committing chord is named.** Every other key declines, so spelling the
+/// no key too would suggest it is the only way to say no; what the reader needs is the
+/// one key that is not safe to press by accident.
+///
+/// Empty when `confirm_yes` is unbound - the question then has no answer that commits,
+/// and advertising a key that does nothing is exactly the drift this rule exists to
+/// stop (SPEC §10.5). The question still closes on any key, so nothing is stuck.
+fn yes_hint(keymap: &Keymap) -> String {
+    keymap
+        .shortcut_for(Bound::ConfirmYes, Context::Confirm)
+        .map(|chord| format!("({chord} to confirm) "))
+        .unwrap_or_default()
+}
+
 /// A yes/no confirmation on the prompt line: a question plus a single keypress.
 ///
 /// The sibling of [`Prompt`] rather than a special case of it - a confirmation is
 /// answered with one key, not typed and submitted, and making the destructive answer
-/// require Enter would be the wrong shape for "are you sure". `y` commits, anything
-/// else (`n`, Esc, a stray key) cancels, so the safe answer is every answer but one.
+/// require Enter would be the wrong shape for "are you sure". `confirm_yes` commits,
+/// anything else (`confirm_no`, `cancel`, a stray printable key) declines, so the safe
+/// answer is every answer but one.
 pub struct Confirm {
     question: String,
     /// Emitted if the user says yes; dropped otherwise.
@@ -203,20 +221,37 @@ impl Layer for Confirm {
         buf.set_stringn(row.x, row.y, &self.question, row.width as usize, self.style);
     }
 
-    fn handle_key(&mut self, key: KeyEvent) -> EventResult {
-        // A Ctrl/Cmd chord is a shortcut, deferred as in `Prompt` so the keymap stays
-        // the single source of bindings.
-        if key.modifiers.contains(KeyModifiers::CONTROL)
-            || key.modifiers.contains(KeyModifiers::SUPER)
-        {
-            return EventResult::Ignored;
+    fn context(&self) -> Context {
+        Context::Confirm
+    }
+
+    fn handle_key(&mut self, key: KeyEvent, bound: Option<Bound>) -> EventResult {
+        match bound {
+            Some(Bound::ConfirmYes) => {
+                self.outbox.append(&mut self.on_yes);
+                self.finished = true;
+            }
+            // Cancel and an explicit no are the same answer, and so is any *unbound*
+            // printable key: the safe answer is every answer but one, which is what
+            // makes a mistyped key harmless. Nothing is swallowed silently into a
+            // "keep asking" state - one keypress always closes the question.
+            Some(Bound::ConfirmNo | Bound::Cancel) => self.finished = true,
+            // `nop`, and anything this context should not have been able to hold.
+            Some(_) => {}
+            None => {
+                if crate::keymap::is_command_chord(&key) {
+                    // Somebody's shortcut, not an answer: the context below gets its
+                    // turn, so Ctrl+S still saves while a question is up (SPEC §10.5).
+                    return EventResult::Ignored;
+                }
+                // Everything else - a letter, Backspace, Tab, an arrow - is a decline.
+                // A question is modal over the keyboard, so the *only* keys that leave
+                // it are the ones that were never its to answer. Deferring by
+                // printability instead would send Backspace to the editor, which
+                // deletes a character behind the question and dismisses it unanswered.
+                self.finished = true;
+            }
         }
-        if matches!(key.code, KeyCode::Char('y') | KeyCode::Char('Y')) {
-            self.outbox.append(&mut self.on_yes);
-        }
-        // Every other key answers no. Nothing is swallowed silently into a "keep
-        // asking" state: one keypress always closes the question.
-        self.finished = true;
         EventResult::Consumed
     }
 
@@ -249,6 +284,7 @@ impl Layer for Confirm {
 /// unforced close precisely so this question gets asked).
 pub fn confirm_close(
     theme: &Theme,
+    keymap: &Keymap,
     id: vortex_core::BufferId,
     path: Option<&std::path::Path>,
 ) -> Box<dyn Layer> {
@@ -259,7 +295,10 @@ pub fn confirm_close(
         |p| crate::layout::buffer_display_name(Some(p), false),
     );
     Box::new(Confirm::new(
-        format!("{name} has unsaved changes. Close anyway? (y/N) "),
+        format!(
+            "{name} has unsaved changes. Close anyway? {}",
+            yes_hint(keymap)
+        ),
         vec![Command::Editor(Action::CloseBuffer { id, force: true })],
         theme.palette,
     ))
@@ -274,6 +313,7 @@ pub fn confirm_close(
 /// saying no, which is why "no" is the default here too.
 pub fn confirm_reload(
     theme: &Theme,
+    keymap: &Keymap,
     id: vortex_core::BufferId,
     path: Option<&std::path::Path>,
 ) -> Box<dyn Layer> {
@@ -282,7 +322,10 @@ pub fn confirm_reload(
         |p| crate::layout::buffer_display_name(Some(p), false),
     );
     Box::new(Confirm::new(
-        format!("{name} changed on disk. Discard your changes and reload? (y/N) "),
+        format!(
+            "{name} changed on disk. Discard your changes and reload? {}",
+            yes_hint(keymap)
+        ),
         vec![Command::Editor(Action::Reload { id, force: true })],
         theme.palette,
     ))
@@ -302,6 +345,7 @@ pub fn confirm_reload(
 /// may have been deleted on purpose.
 pub fn confirm_overwrite(
     theme: &Theme,
+    keymap: &Keymap,
     path: Option<&std::path::Path>,
     removed: bool,
 ) -> Box<dyn Layer> {
@@ -309,10 +353,11 @@ pub fn confirm_overwrite(
         || "this buffer".to_string(),
         |p| crate::layout::buffer_display_name(Some(p), false),
     );
+    let hint = yes_hint(keymap);
     let question = if removed {
-        format!("{name} was deleted. Save it back? (y/N) ")
+        format!("{name} was deleted. Save it back? {hint}")
     } else {
-        format!("{name} changed on disk. Overwrite it with your version? (y/N) ")
+        format!("{name} changed on disk. Overwrite it with your version? {hint}")
     };
     Box::new(Confirm::new(
         question,
@@ -324,8 +369,10 @@ pub fn confirm_overwrite(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::compositor::send;
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
+    use ratatui::crossterm::event::{KeyCode, KeyModifiers};
     use ratatui::style::Color;
 
     fn key(c: char) -> KeyEvent {
@@ -338,7 +385,7 @@ mod tests {
 
     fn type_str(p: &mut Prompt, s: &str) {
         for c in s.chars() {
-            p.handle_key(key(c));
+            send(&mut *p, key(c));
         }
     }
 
@@ -355,11 +402,11 @@ mod tests {
         let mut p = echo_prompt();
         type_str(&mut p, "abc");
         assert_eq!(p.input, "abc");
-        p.handle_key(press(KeyCode::Backspace));
+        send(&mut p, press(KeyCode::Backspace));
         assert_eq!(p.input, "ab");
         // Backspace on an empty input is a harmless no-op, not a panic.
         let mut empty = echo_prompt();
-        empty.handle_key(press(KeyCode::Backspace));
+        send(&mut empty, press(KeyCode::Backspace));
         assert_eq!(empty.input, "");
     }
 
@@ -367,7 +414,7 @@ mod tests {
     fn enter_commits_the_submit_result_and_finishes() {
         let mut p = echo_prompt();
         type_str(&mut p, "hi");
-        assert_eq!(p.handle_key(press(KeyCode::Enter)), EventResult::Consumed);
+        assert_eq!(send(&mut p, press(KeyCode::Enter)), EventResult::Consumed);
         assert!(p.is_finished());
         assert_eq!(
             p.take_commands(),
@@ -379,7 +426,7 @@ mod tests {
     fn esc_cancels_with_no_command() {
         let mut p = echo_prompt();
         type_str(&mut p, "discard me");
-        p.handle_key(press(KeyCode::Esc));
+        send(&mut p, press(KeyCode::Esc));
         assert!(p.is_finished());
         assert!(p.take_commands().is_empty());
     }
@@ -390,15 +437,19 @@ mod tests {
         // runs the binding and dismisses the prompt) and never adds it to the text.
         let mut p = echo_prompt();
         let ctrl_s = KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL);
-        assert_eq!(p.handle_key(ctrl_s), EventResult::Ignored);
+        assert_eq!(send(&mut p, ctrl_s), EventResult::Ignored);
         assert!(p.input.is_empty());
         assert!(!p.is_finished());
     }
 
     #[test]
-    fn other_keys_are_swallowed_so_the_editor_never_sees_them() {
+    fn a_key_the_prompt_context_does_not_bind_falls_through_to_the_editor() {
+        // The prompt binds Enter, Esc, Backspace and Tab, and takes printable keys as
+        // input. Everything else is not its business: it defers rather than swallowing,
+        // which is what stops a config from locking the surface shut (SPEC §10.5) - an
+        // unbound Esc would find `collapse_selections` beneath and close this prompt.
         let mut p = echo_prompt();
-        assert_eq!(p.handle_key(press(KeyCode::Down)), EventResult::Consumed);
+        assert_eq!(send(&mut p, press(KeyCode::Down)), EventResult::Ignored);
         assert!(p.input.is_empty());
         assert!(!p.is_finished());
     }
@@ -409,7 +460,7 @@ mod tests {
         let mut layer = save_as(&theme, Some(std::path::Path::new("dir/file.rs")));
         // Pre-filled: committing straight away saves to the existing path.
         let commands = {
-            layer.handle_key(press(KeyCode::Enter));
+            send(&mut *layer, press(KeyCode::Enter));
             layer.take_commands()
         };
         assert_eq!(
@@ -427,12 +478,12 @@ mod tests {
         // does. Backspace off ".rs" and retype ".md".
         let mut layer = save_as(&theme, Some(std::path::Path::new("a.rs")));
         for _ in 0..2 {
-            layer.handle_key(press(KeyCode::Backspace)); // "rs"
+            send(&mut *layer, press(KeyCode::Backspace)); // "rs"
         }
         for c in "md".chars() {
-            layer.handle_key(key(c));
+            send(&mut *layer, key(c));
         }
-        layer.handle_key(press(KeyCode::Enter));
+        send(&mut *layer, press(KeyCode::Enter));
         assert_eq!(
             layer.take_commands(),
             vec![Command::Editor(Action::SaveAs(PathBuf::from("a.md")))]
@@ -445,7 +496,7 @@ mod tests {
         let mut layer = save_as(&theme, None);
         // Committing an empty prompt saves nothing (no meaningful target) but still
         // closes the prompt.
-        layer.handle_key(press(KeyCode::Enter));
+        send(&mut *layer, press(KeyCode::Enter));
         assert!(layer.is_finished());
         assert!(layer.take_commands().is_empty());
     }
@@ -457,9 +508,9 @@ mod tests {
         // Leading/trailing spaces are trimmed; a path is not silently created with
         // stray whitespace in its name.
         for c in "  spaced.txt  ".chars() {
-            layer.handle_key(key(c));
+            send(&mut *layer, key(c));
         }
-        layer.handle_key(press(KeyCode::Enter));
+        send(&mut *layer, press(KeyCode::Enter));
         assert_eq!(
             layer.take_commands(),
             vec![Command::Editor(Action::SaveAs(PathBuf::from("spaced.txt")))]
@@ -505,6 +556,7 @@ mod tests {
     fn close_confirm() -> Box<dyn Layer> {
         confirm_close(
             &Theme::default(),
+            &Keymap::default(),
             vortex_core::BufferId(7),
             Some(std::path::Path::new("dir/notes.md")),
         )
@@ -513,7 +565,7 @@ mod tests {
     #[test]
     fn confirming_a_close_commits_a_forced_close_for_that_buffer() {
         let mut layer = close_confirm();
-        assert_eq!(layer.handle_key(key('y')), EventResult::Consumed);
+        assert_eq!(send(&mut *layer, key('y')), EventResult::Consumed);
         assert!(layer.is_finished());
         assert_eq!(
             layer.take_commands(),
@@ -525,10 +577,14 @@ mod tests {
     }
 
     #[test]
-    fn an_uppercase_yes_confirms_too() {
+    fn a_shifted_yes_is_not_the_yes_key() {
+        // `shift+y` was an alias for `y` and is not a row any more - the question
+        // renders its chord from the table, so an alias would decide what it says.
+        // Shift+Y is an unbound printable key, which declines like every other.
         let mut layer = close_confirm();
-        layer.handle_key(key('Y'));
-        assert_eq!(layer.take_commands().len(), 1);
+        send(&mut *layer, key('Y'));
+        assert!(layer.is_finished(), "one keypress always answers");
+        assert!(layer.take_commands().is_empty(), "nothing was committed");
     }
 
     /// A left press at a screen cell.
@@ -587,10 +643,11 @@ mod tests {
         // refused the unforced reload precisely so this question gets asked.
         let mut layer = confirm_reload(
             &Theme::default(),
+            &Keymap::default(),
             vortex_core::BufferId(3),
             Some(std::path::Path::new("dir/notes.md")),
         );
-        assert_eq!(layer.handle_key(key('y')), EventResult::Consumed);
+        assert_eq!(send(&mut *layer, key('y')), EventResult::Consumed);
         assert!(layer.is_finished());
         assert_eq!(
             layer.take_commands(),
@@ -617,10 +674,11 @@ mod tests {
         // the user's own.
         let mut layer = confirm_overwrite(
             &Theme::default(),
+            &Keymap::default(),
             Some(std::path::Path::new("dir/shared.txt")),
             false,
         );
-        assert_eq!(layer.handle_key(key('y')), EventResult::Consumed);
+        assert_eq!(send(&mut *layer, key('y')), EventResult::Consumed);
         assert!(layer.is_finished());
         assert_eq!(
             layer.take_commands(),
@@ -632,8 +690,8 @@ mod tests {
     fn declining_an_overwrite_writes_nothing() {
         // Both copies survive a "no": the buffer keeps its edits and the file keeps
         // its own, which is why "no" is the default.
-        let mut layer = confirm_overwrite(&Theme::default(), None, false);
-        layer.handle_key(press(KeyCode::Esc));
+        let mut layer = confirm_overwrite(&Theme::default(), &Keymap::default(), None, false);
+        send(&mut *layer, press(KeyCode::Esc));
         assert!(layer.is_finished());
         assert!(layer.take_commands().is_empty());
     }
@@ -644,11 +702,13 @@ mod tests {
         // usually yes, but is still the user's call.
         let deleted = confirm_overwrite(
             &Theme::default(),
+            &Keymap::default(),
             Some(std::path::Path::new("gone.txt")),
             true,
         );
         let changed = confirm_overwrite(
             &Theme::default(),
+            &Keymap::default(),
             Some(std::path::Path::new("gone.txt")),
             false,
         );
@@ -660,28 +720,56 @@ mod tests {
     fn declining_a_reload_keeps_the_buffer() {
         // Saying no must commit nothing at all - the file's version is still on
         // disk, so declining loses nothing, which is why it is the default.
-        let mut layer = confirm_reload(&Theme::default(), vortex_core::BufferId(3), None);
-        layer.handle_key(press(KeyCode::Esc));
+        let mut layer = confirm_reload(
+            &Theme::default(),
+            &Keymap::default(),
+            vortex_core::BufferId(3),
+            None,
+        );
+        send(&mut *layer, press(KeyCode::Esc));
         assert!(layer.is_finished());
         assert!(layer.take_commands().is_empty());
     }
 
     #[test]
     fn anything_but_yes_cancels_the_close() {
-        // The destructive answer is exactly one key; every other key - the explicit
-        // no, Esc, or a mistyped letter - closes the question having discarded nothing.
-        for cancel in [
-            key('n'),
-            press(KeyCode::Esc),
-            key('q'),
-            press(KeyCode::Enter),
-        ] {
+        // The destructive answer is exactly one key; every other *printable* key - the
+        // explicit no, or a mistyped letter - closes the question having discarded
+        // nothing, and so does Esc, which the `confirm` context binds to `cancel`.
+        for cancel in [key('n'), press(KeyCode::Esc), key('q'), key('Z')] {
             let mut layer = close_confirm();
-            assert_eq!(layer.handle_key(cancel), EventResult::Consumed);
+            assert_eq!(send(&mut *layer, cancel), EventResult::Consumed);
             assert!(layer.is_finished(), "one keypress always answers");
             assert!(
                 layer.take_commands().is_empty(),
                 "no close was committed for {cancel:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_question_is_modal_over_every_key_that_is_not_a_shortcut() {
+        // Regression. "Every other key declines" was read as "every other *printable*
+        // key", which sent Enter, Backspace and Tab to the context below - so Backspace
+        // at "discard your changes?" deleted a character behind the question and
+        // dismissed it unanswered, and Enter committed whatever overlay was buried
+        // under the question. Only a command chord is not this surface's to answer.
+        for key in [
+            press(KeyCode::Enter),
+            press(KeyCode::Backspace),
+            press(KeyCode::Tab),
+            press(KeyCode::Down),
+        ] {
+            let mut layer = close_confirm();
+            assert_eq!(
+                send(&mut *layer, key),
+                EventResult::Consumed,
+                "{key:?} escaped the question"
+            );
+            assert!(layer.is_finished(), "{key:?} left the question open");
+            assert!(
+                layer.take_commands().is_empty(),
+                "{key:?} committed the close"
             );
         }
     }
@@ -692,7 +780,7 @@ mod tests {
         // the single source of bindings.
         let mut layer = close_confirm();
         let ctrl_s = KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL);
-        assert_eq!(layer.handle_key(ctrl_s), EventResult::Ignored);
+        assert_eq!(send(&mut *layer, ctrl_s), EventResult::Ignored);
         assert!(!layer.is_finished());
         assert!(layer.take_commands().is_empty());
     }
@@ -707,14 +795,21 @@ mod tests {
             .unwrap();
         let row = crate::testutil::row_text(&terminal.backend().buffer().clone(), 3);
         assert!(row.contains("notes.md"), "confirm row: {row:?}");
-        assert!(row.contains("y/N"), "confirm row: {row:?}");
+        // Rendered from the `confirm` context rather than written as `(y/N)`, and only
+        // the committing chord is named - every other key declines (SPEC §10.5).
+        assert!(row.contains("(Y to confirm)"), "confirm row: {row:?}");
         // A confirmation takes no text, so it shows no caret.
         assert_eq!(layer.cursor(Rect::new(0, 0, 60, 4)), None);
     }
 
     #[test]
     fn an_unnamed_buffer_still_gets_a_readable_question() {
-        let layer = confirm_close(&Theme::default(), vortex_core::BufferId(1), None);
+        let layer = confirm_close(
+            &Theme::default(),
+            &Keymap::default(),
+            vortex_core::BufferId(1),
+            None,
+        );
         let mut terminal = Terminal::new(TestBackend::new(60, 3)).unwrap();
         terminal
             .draw(|frame| layer.render(frame.area(), frame.buffer_mut()))

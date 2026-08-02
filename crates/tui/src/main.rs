@@ -615,6 +615,8 @@ Config:
     theme = \"undertow\"   tab_width = 4   final_newline = true
     [keys]                 # chord = command, layered over the defaults
     \"ctrl+w\" = \"close_buffer\"   # rebind      \"ctrl+f\" = \"nop\"   # unbind
+    [keys.picker]          # a subtable is a context: picker, prompt, find,
+    \"ctrl+n\" = \"next_item\"      # confirm, replace, macos, linux, windows
 
 ";
 
@@ -644,20 +646,17 @@ const HELP_KEYS: &[(&str, Bindable)] = &[
     ("Next match", Bindable::FindNext),
     ("Previous match", Bindable::FindPrevious),
     (
-        "Find and replace (Tab between the fields)",
+        "Find and replace (two fields, one after the other)",
         Bindable::OpenReplace,
     ),
     (
-        "Search the project (regex; Enter opens the file at the match)",
+        "Search the project (regex, gitignore-aware)",
         Bindable::OpenSearchPicker,
     ),
     ("Put a cursor on every match", Bindable::SelectAllMatches),
+    ("Command palette (type to filter)", Bindable::OpenPalette),
     (
-        "Command palette (type to filter, Enter runs, Esc cancels)",
-        Bindable::OpenPalette,
-    ),
-    (
-        "Theme picker (previews as you move, Esc restores)",
+        "Theme picker (previews as you move)",
         Bindable::OpenThemePicker,
     ),
     ("Buffer picker", Bindable::OpenBufferPicker),
@@ -692,7 +691,7 @@ const HELP_MIN_GAP: usize = 2;
 fn key_help(keymap: &Keymap) -> String {
     let mut out = String::from("Keys:\n");
     for &(label, command) in HELP_KEYS {
-        if let Some(chord) = keymap.shortcut_for(command) {
+        if let Some(chord) = keymap.shortcut_for(command, keymap::Context::Editor) {
             // The column is a preference and the gap is the rule: this renders a
             // *user's* keymap, so a rebind onto a chord longer than the built-ins ever
             // reach must push its label right rather than glue itself to it.
@@ -945,6 +944,7 @@ fn event_loop(
             if let vortex_core::Notification::CloseRejected { buffer_id, path } = &note {
                 overlays.push(prompt::confirm_close(
                     &config.theme,
+                    &config.keymap,
                     *buffer_id,
                     path.as_deref(),
                 ));
@@ -963,6 +963,7 @@ fn event_loop(
             {
                 overlays.push(prompt::confirm_reload(
                     &config.theme,
+                    &config.keymap,
                     *buffer_id,
                     Some(path.as_path()),
                 ));
@@ -976,6 +977,7 @@ fn event_loop(
             if let vortex_core::Notification::SaveRejected { path, removed, .. } = &note {
                 overlays.push(prompt::confirm_overwrite(
                     &config.theme,
+                    &config.keymap,
                     Some(path.as_path()),
                     *removed,
                 ));
@@ -1124,7 +1126,7 @@ fn event_loop(
                     // keys so they stay frontend-local; only a *committed* choice
                     // (e.g. a submitted path) comes back as a `Command` to dispatch.
                     if !overlays.is_empty() {
-                        let (result, commands) = overlays.handle_key(key);
+                        let (result, commands) = overlays.handle_key(key, &config.keymap);
                         needs_redraw = true;
                         for command in commands {
                             let mut ui = Frontend {
@@ -1739,6 +1741,7 @@ fn dispatch_command(command: Command, handle: &vortex_core::CoreHandle, ui: &mut
             if any_match {
                 ui.overlays.push(Box::new(buffersearch::QueryReplace::new(
                     &ui.config.theme,
+                    &ui.config.keymap,
                     pattern,
                     replacement,
                 )));
@@ -4639,6 +4642,33 @@ mod tests {
             "Ctrl+V          Paste"
         };
         assert!(text.contains(paste), "{text}");
+    }
+
+    #[test]
+    fn no_help_label_spells_a_chord_of_its_own() {
+        // The chord column is rendered from the keymap; the *label* beside it must not
+        // smuggle a second one in as prose. Four of them used to - "Tab between the
+        // fields", "Enter runs, Esc cancels" - which was invisible until M9 Stage 2
+        // made Tab, Enter and Esc rows in the `find` and `picker` tables, at which
+        // point a rebind left the help naming keys the config had moved.
+        //
+        // The rule is SPEC §10.5's: no chord reaches the screen as a literal. Those
+        // labels dropped the key names rather than growing a second render step - the
+        // surface's own hint footer is where they belong (M10), and a label is not it.
+        for &(label, _) in HELP_KEYS {
+            for word in label.split(|c: char| !(c.is_alphanumeric() || c == '+')) {
+                // `Alt+Click` is the documented exception: a mouse gesture has no
+                // chord, which is why gestures are deliberately not data (§10.5).
+                if word.is_empty() || word == "Alt+Click" {
+                    continue;
+                }
+                assert!(
+                    !word.contains('+') && !matches!(word, "Tab" | "Enter" | "Esc"),
+                    "help label {label:?} spells the chord {word:?} instead of \
+                     leaving it to the keymap"
+                );
+            }
+        }
     }
 
     #[test]

@@ -21,7 +21,7 @@ cargo clippy --all-targets --all-features -- -D warnings   # 2. lint (warnings a
 cargo build --workspace        # 3. compile
 cargo test --workspace         # 4. tests
 # 5. coverage gates - EVERY file must stay above its crate's floor (SPEC §13).
-#    Ratchet: no regress. Current: core 99.4% lines, tui 92.4%.
+#    Ratchet: no regress. Current: core 99.3% lines, tui 92.6%.
 cargo llvm-cov --package vortex-core --fail-under-file-lines 90 \
   --ignore-filename-regex 'lsp/client\.rs' --summary-only
 cargo llvm-cov --package vortex-tui  --fail-under-file-lines 60 --summary-only
@@ -35,7 +35,7 @@ protocol shell - the first genuinely I/O-bound file in the core, the same shape 
 (`check_encoding`, `outgoing`, `initialize_params`) and covered 100%; the `run` loop
 itself needs a live language server, which `tests/lsp_rust_analyzer.rs` exercises
 (`--ignored`, requires `rust-analyzer` on PATH). With the exemption the rest of the core
-holds 99.4%.
+holds 99.3%.
 
 The gate uses `--fail-under-file-lines` (per-file), not the package aggregate: a per-file
 floor means no single file can slip below its floor while a 100% neighbor masks it in the
@@ -61,6 +61,9 @@ scrollbar's drag state, which lives in the event loop with the rest of the I/O s
 Sticky context is the exception that proves it - the header's *height* is settled inside
 `paint`, so it is asserted through a `TestBackend` render rather than a pure function,
 which is why `paint` now hands back the view state it settled on.
+M9's keymap contexts hold it at 92.6%: the five surfaces stopped matching key codes and
+started matching commands, which moved their branching out of `handle_key` and into a
+table a test can read.
 Requires `cargo-llvm-cov` >=0.8.6 (the release that added `--fail-under-file-lines`) +
 `rustup component add llvm-tools-preview`. Install/upgrade with `cargo install cargo-llvm-cov`.
 

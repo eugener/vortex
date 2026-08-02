@@ -1,4 +1,5 @@
 use super::*;
+use crate::compositor::send;
 
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
@@ -8,7 +9,7 @@ fn press(code: KeyCode) -> KeyEvent {
 
 /// What the picker commits when Enter is pressed on the row it opened on.
 fn commit_on_open(mut layer: Box<dyn Layer>) -> Vec<Command> {
-    layer.handle_key(press(KeyCode::Enter));
+    send(&mut *layer, press(KeyCode::Enter));
     layer.take_commands()
 }
 
@@ -78,8 +79,8 @@ fn the_line_ending_picker_offers_both_and_opens_on_the_current_one() {
 #[test]
 fn moving_off_the_current_row_picks_the_other_terminator() {
     let mut layer = line_ending(&Theme::default(), LineEnding::Lf);
-    layer.handle_key(press(KeyCode::Down));
-    layer.handle_key(press(KeyCode::Enter));
+    send(&mut *layer, press(KeyCode::Down));
+    send(&mut *layer, press(KeyCode::Enter));
     assert_eq!(
         layer.take_commands(),
         vec![Command::Editor(Action::SetLineEnding(LineEnding::Crlf))]
@@ -91,10 +92,10 @@ fn neither_picker_previews() {
     // A preview would cross the seam on every highlight move, and there is nothing
     // to see until the file is written.
     let mut layer = encoding(&Theme::default(), "UTF-8");
-    layer.handle_key(press(KeyCode::Down));
+    send(&mut *layer, press(KeyCode::Down));
     assert!(layer.take_commands().is_empty());
     let mut layer = line_ending(&Theme::default(), LineEnding::Lf);
-    layer.handle_key(press(KeyCode::Down));
+    send(&mut *layer, press(KeyCode::Down));
     assert!(layer.take_commands().is_empty());
 }
 
@@ -104,7 +105,7 @@ fn escaping_either_picker_commits_nothing() {
         encoding(&Theme::default(), "UTF-8"),
         line_ending(&Theme::default(), LineEnding::Lf),
     ] {
-        layer.handle_key(press(KeyCode::Esc));
+        send(&mut *layer, press(KeyCode::Esc));
         assert!(layer.is_finished());
         assert!(layer.take_commands().is_empty());
     }
