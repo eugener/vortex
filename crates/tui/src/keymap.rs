@@ -6,14 +6,12 @@
 //!
 //! The map is **data, not code**: a [`Keymap`] is a set of `(chord -> command)`
 //! bindings, and [`command_for_key`] is a pure lookup over it. Both sides of a binding
-//! parse from strings ([`Chord::parse`], [`Command::parse`]) - the built-in
-//! [`Keymap::default`] is itself built from a table of `("ctrl+s", "save")`-shaped
-//! string pairs, so the default bindings are expressed in the *exact* form a config
-//! file will use. That is the config seam: **no keymap file is read yet** (themes
-//! already load from one, see [`crate::theme`]); M5 points the same `toml` seam at a
-//! `[keymap]` table and calls [`Keymap::from_pairs`] with it, falling back to these
-//! defaults. Everything is a pure function of a key event, so it stays unit-testable
-//! without a terminal (SPEC §13).
+//! parse from strings ([`Chord::parse`], [`Command::parse`]), and the built-in
+//! [`Keymap::default`] is **a file** - `keys.toml`, compiled in with `include_str!`
+//! beside the themes and read through the same loader a user's `[keys]` table goes
+//! through. There is no Rust copy of the defaults to drift from it, and the file is
+//! the reference a user copies a row out of. Everything is a pure function of a key
+//! event, so it stays unit-testable without a terminal (SPEC §13).
 //!
 //! **One vocabulary, one table.** [`Command`] names everything a key can be bound to,
 //! whether it becomes a core `Action` (`save`, `move_left`) or opens a frontend
@@ -29,7 +27,7 @@
 //! Bindings match the **full chord** (modifiers included), so `right` and `shift+right`
 //! are distinct entries - `extend` is baked into the command, not derived at runtime.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fmt;
 
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
@@ -70,9 +68,15 @@ impl Chord {
 
     /// Parse a chord string such as `"ctrl+shift+left"`, `"cmd+z"`, `"s"`, or
     /// `"pageup"`. Modifier tokens (`ctrl`/`control`, `shift`, `alt`/`opt`,
-    /// `cmd`/`super`/`win`) may appear in any order before the key; matching is
+    /// `cmd`/`super`/`win`, `mod`) may appear in any order before the key; matching is
     /// case-insensitive. Returns `None` if the key token is unknown. (A literal `+`
     /// key is not yet expressible - a known limit.)
+    ///
+    /// `mod` is the **platform command modifier** - Cmd on macOS, Ctrl elsewhere -
+    /// resolved here, at parse time, so `"mod+c" = "copy"` is one row that means the
+    /// right thing on both and no table needs a `cfg!` twin. Everything downstream
+    /// sees an ordinary resolved chord, which is what lets [`Chord::display`] name the
+    /// key the user actually presses.
     fn parse(spec: &str) -> Option<Self> {
         let mut chord = Chord {
             code: KeyCode::Null,
@@ -88,6 +92,8 @@ impl Chord {
                 "shift" => chord.shift = true,
                 "alt" | "opt" | "option" => chord.alt = true,
                 "cmd" | "command" | "super" | "win" => chord.cmd = true,
+                "mod" if cfg!(target_os = "macos") => chord.cmd = true,
+                "mod" => chord.ctrl = true,
                 key => {
                     chord.code = parse_key_code(key)?;
                     have_key = true;
@@ -262,6 +268,15 @@ pub enum Command {
     FindPrevious,
     /// Put a cursor on every match of the last pattern (SPEC §12.2).
     SelectAllMatches,
+    /// Do nothing - and, the part that matters, **consume the chord**.
+    ///
+    /// This is how a config unbinds: `"ctrl+f" = "nop"` frees the chord. Leaving the
+    /// row out instead would leave the built-in binding in place, and there is nothing
+    /// else to write - TOML has no null, so the absence of a command has to be spelled
+    /// as one (Helix's `no_op`, Zed's `null`). Consuming is what separates it from an
+    /// unbound key: [`command_for_key`]'s text-entry fallback would otherwise turn a
+    /// freed printable chord back into typing.
+    Nop,
 }
 
 /// A motion with the page size left abstract, so a binding is frame-independent;
@@ -358,42 +373,45 @@ impl Command {
             "find_next" => Command::FindNext,
             "find_previous" => Command::FindPrevious,
             "select_all_matches" => Command::SelectAllMatches,
+            "nop" => Command::Nop,
             _ => return None,
         })
     }
 
     /// Finalize into the dispatchable command for this frame (`page` sizes page
     /// motions). Overlay triggers resolve to a frontend-local command; everything
-    /// else wraps a core [`Action`] for the seam.
-    pub fn resolve(self, page: usize) -> FrontendCommand {
+    /// else wraps a core [`Action`] for the seam. `None` for [`Command::Nop`], which
+    /// is the one command that dispatches nothing.
+    pub fn resolve(self, page: usize) -> Option<FrontendCommand> {
         let action = match self {
-            Command::OpenPalette => return FrontendCommand::OpenPalette,
-            Command::OpenFilePicker => return FrontendCommand::OpenFilePicker,
-            Command::OpenThemePicker => return FrontendCommand::OpenThemePicker,
-            Command::OpenBufferPicker => return FrontendCommand::OpenBufferPicker,
-            Command::OpenSearchPicker => return FrontendCommand::OpenSearchPicker,
-            Command::ToggleLineNumbers => return FrontendCommand::ToggleLineNumbers,
-            Command::ToggleIndentGuides => return FrontendCommand::ToggleIndentGuides,
-            Command::ToggleScrollbar => return FrontendCommand::ToggleScrollbar,
-            Command::ToggleStickyContext => return FrontendCommand::ToggleStickyContext,
-            Command::OpenEncodingPicker => return FrontendCommand::OpenEncodingPicker,
-            Command::OpenLineEndingPicker => return FrontendCommand::OpenLineEndingPicker,
-            Command::SaveAs => return FrontendCommand::OpenSavePrompt,
+            Command::Nop => return None,
+            Command::OpenPalette => return Some(FrontendCommand::OpenPalette),
+            Command::OpenFilePicker => return Some(FrontendCommand::OpenFilePicker),
+            Command::OpenThemePicker => return Some(FrontendCommand::OpenThemePicker),
+            Command::OpenBufferPicker => return Some(FrontendCommand::OpenBufferPicker),
+            Command::OpenSearchPicker => return Some(FrontendCommand::OpenSearchPicker),
+            Command::ToggleLineNumbers => return Some(FrontendCommand::ToggleLineNumbers),
+            Command::ToggleIndentGuides => return Some(FrontendCommand::ToggleIndentGuides),
+            Command::ToggleScrollbar => return Some(FrontendCommand::ToggleScrollbar),
+            Command::ToggleStickyContext => return Some(FrontendCommand::ToggleStickyContext),
+            Command::OpenEncodingPicker => return Some(FrontendCommand::OpenEncodingPicker),
+            Command::OpenLineEndingPicker => return Some(FrontendCommand::OpenLineEndingPicker),
+            Command::SaveAs => return Some(FrontendCommand::OpenSavePrompt),
             // Resolved against the live buffer list at dispatch, where it is known.
-            Command::NextBuffer => return FrontendCommand::NextBuffer,
-            Command::PrevBuffer => return FrontendCommand::PrevBuffer,
-            Command::CloseBuffer => return FrontendCommand::CloseBuffer,
+            Command::NextBuffer => return Some(FrontendCommand::NextBuffer),
+            Command::PrevBuffer => return Some(FrontendCommand::PrevBuffer),
+            Command::CloseBuffer => return Some(FrontendCommand::CloseBuffer),
             // Search, all resolved at dispatch: the prompts are frontend surfaces,
             // and the repeat commands need the pattern only the frontend remembers.
             Command::OpenFind => {
-                return FrontendCommand::OpenFindPrompt { replacing: false };
+                return Some(FrontendCommand::OpenFindPrompt { replacing: false });
             }
             Command::OpenReplace => {
-                return FrontendCommand::OpenFindPrompt { replacing: true };
+                return Some(FrontendCommand::OpenFindPrompt { replacing: true });
             }
-            Command::FindNext => return FrontendCommand::FindNext,
-            Command::FindPrevious => return FrontendCommand::FindPrevious,
-            Command::SelectAllMatches => return FrontendCommand::SelectAllMatches,
+            Command::FindNext => return Some(FrontendCommand::FindNext),
+            Command::FindPrevious => return Some(FrontendCommand::FindPrevious),
+            Command::SelectAllMatches => return Some(FrontendCommand::SelectAllMatches),
             Command::Quit => Action::Quit,
             Command::Save => Action::Save { force: false },
             Command::Undo => Action::Undo,
@@ -413,7 +431,7 @@ impl Command {
                 extend,
             },
         };
-        FrontendCommand::Editor(action)
+        Some(FrontendCommand::Editor(action))
     }
 }
 
@@ -434,117 +452,34 @@ fn parse_move_kind(name: &str) -> Option<MoveKind> {
     })
 }
 
-/// The built-in bindings, in the same `(chord, command)` string form a config file
-/// uses. `extend` is explicit: each motion has a plain and a `shift+`/`select_` pair.
-/// Text entry (printable chars) is a fallback in [`command_for_key`], not listed here.
-const DEFAULT_BINDINGS: &[(&str, &str)] = &[
-    ("ctrl+q", "quit"),
-    ("ctrl+s", "save"),
-    // Save-as opens the prompt line (SPEC §7.5). The shift disambiguation needs the
-    // Kitty protocol (negotiated at startup); a classic terminal that folds shift
-    // away delivers plain Ctrl+S instead, degrading to a safe ordinary save rather
-    // than misfiring - the same "never misfires" stance as the Ctrl+Alt chords below.
-    ("ctrl+shift+s", "save_as"),
-    ("enter", "insert_newline"),
-    ("tab", "insert_tab"),
-    ("backspace", "delete_backward"),
-    ("delete", "delete_forward"),
-    ("left", "move_left"),
-    ("right", "move_right"),
-    ("up", "move_up"),
-    ("down", "move_down"),
-    ("home", "move_line_start"),
-    ("end", "move_line_end"),
-    ("pageup", "move_page_up"),
-    ("pagedown", "move_page_down"),
-    ("shift+left", "select_left"),
-    ("shift+right", "select_right"),
-    ("shift+up", "select_up"),
-    ("shift+down", "select_down"),
-    ("shift+home", "select_line_start"),
-    ("shift+end", "select_line_end"),
-    ("shift+pageup", "select_page_up"),
-    ("shift+pagedown", "select_page_down"),
-    // Multi-cursor (SPEC §2.2). The Ctrl+Alt+Arrow chords need the Kitty protocol's
-    // modifier reporting (negotiated at startup); a classic terminal simply never
-    // matches them rather than misfiring. Esc collapses back to one cursor.
-    ("ctrl+alt+up", "add_cursor_above"),
-    ("ctrl+alt+down", "add_cursor_below"),
-    ("esc", "collapse_selections"),
-    // Overlay triggers (SPEC §7.5). They live in this same table, named like any
-    // other command, so a user config can rebind them - and so `from_pairs` alone
-    // yields a complete keymap. Ctrl+O is the primary "open": the fuzzy file picker.
-    ("ctrl+o", "open_file_picker"),
-    ("ctrl+p", "open_palette"),
-    ("ctrl+t", "open_theme_picker"),
-    // Buffer switching (M7). Ctrl+PageUp/PageDown is the widely shared "next/previous
-    // tab" chord and is reported by classic terminals, unlike the Ctrl+Alt chords
-    // above; the plain and shift+ page keys stay motions, so nothing is shadowed.
-    ("ctrl+pagedown", "next_buffer"),
-    ("ctrl+pageup", "prev_buffer"),
-    ("ctrl+w", "close_buffer"),
-    ("ctrl+b", "open_buffer_picker"),
-    // Search (M7). Ctrl+F is *this buffer*, which is what it means nearly everywhere,
-    // and the project-wide search moved to the conventional "find in files" chord
-    // when in-buffer search landed - the split the global-search binding was written
-    // waiting for.
-    //
-    // Ctrl+Shift+F needs the Kitty protocol's modifier reporting, so **Alt+F is bound
-    // alongside it** rather than leaving project search unreachable by key on a
-    // classic terminal. The cost is that Option+F no longer composes a character on a
-    // Mac terminal configured to send Option as Meta; the palette reaches both
-    // searches for anyone that costs.
-    ("ctrl+f", "find"),
-    ("ctrl+h", "replace"),
-    ("ctrl+shift+f", "open_search_picker"),
-    ("alt+f", "open_search_picker"),
-    // Repeat the last search. F3 is the conventional key and is reported by classic
-    // terminals; Ctrl+G is the Mac-flavored alias for the same thing, and gives
-    // find-next a chord for terminals that swallow the function keys.
-    ("f3", "find_next"),
-    ("ctrl+g", "find_next"),
-    ("shift+f3", "find_previous"),
-    // Multi-cursor over every match (SPEC §12.2) - VS Code's Ctrl+Shift+L, with the
-    // same Kitty caveat and no plain-terminal alias: it is a discovery-surface
-    // command, reachable from the palette, not one worth spending another Alt chord.
-    ("ctrl+shift+l", "select_all_matches"),
-];
-
-/// Bindings on the platform's native command modifier: Cmd on macOS (crossterm
-/// `SUPER`), Ctrl elsewhere. Kept separate from [`DEFAULT_BINDINGS`] so only these
-/// are OS-conditional; the rest of the map is identical everywhere. On macOS the
-/// Cmd chords are delivered only by Kitty-protocol terminals (which report Cmd) - a
-/// documented trade-off for matching each OS's muscle memory. Raw mode delivers the
-/// modified letters as key events, never a suspend/flow signal, so binding them is
-/// safe.
+/// The built-in bindings, compiled in from the file that *is* the default keymap.
 ///
-/// Clipboard follows each OS's convention: Cmd+C/X/V on macOS, Ctrl+C/X/V elsewhere.
-/// This reclaims Ctrl+C from quit on non-mac (quit stays Ctrl+Q); on macOS Ctrl+C
-/// remains quit (see [`MACOS_ONLY_BINDINGS`]) since copy is Cmd+C there.
-#[cfg(target_os = "macos")]
-const COMMAND_MOD_BINDINGS: &[(&str, &str)] = &[
-    ("cmd+z", "undo"),
-    ("cmd+y", "redo"),
-    ("cmd+c", "copy"),
-    ("cmd+x", "cut"),
-    ("cmd+v", "paste"),
-];
-#[cfg(not(target_os = "macos"))]
-const COMMAND_MOD_BINDINGS: &[(&str, &str)] = &[
-    ("ctrl+z", "undo"),
-    ("ctrl+y", "redo"),
-    ("ctrl+c", "copy"),
-    ("ctrl+x", "cut"),
-    ("ctrl+v", "paste"),
-];
+/// A file rather than a Rust table for two reasons. It answers a question the editor
+/// could not answer before - *what are the defaults?* - since it is the reference a
+/// user copies a row out of. And it deletes the possibility of drift: there is no
+/// second copy to keep in step, so no equality test is needed. Unlike
+/// `Theme::default()`, which keeps its hand-written twin because a theme must exist
+/// before any parsing can fail, a keymap has no such bootstrap need - a `keys.toml`
+/// that will not parse is a build-time bug, and [`Keymap::default`]'s own test is what
+/// catches it.
+const BUILTIN_KEYS: &str = include_str!("../keys.toml");
 
-/// Bindings that exist only on macOS: there, Ctrl+C is free (copy is Cmd+C), so it
-/// keeps its terminal-conventional meaning of quit alongside Ctrl+Q. Empty on other
-/// platforms, where Ctrl+C is copy (see [`COMMAND_MOD_BINDINGS`]) and quit is Ctrl+Q.
-#[cfg(target_os = "macos")]
-const MACOS_ONLY_BINDINGS: &[(&str, &str)] = &[("ctrl+c", "quit")];
-#[cfg(not(target_os = "macos"))]
-const MACOS_ONLY_BINDINGS: &[(&str, &str)] = &[];
+/// The macOS-only additions, layered over [`BUILTIN_KEYS`] there (see the file's own
+/// note: `mod` cannot express a chord that is free *because* of what `mod` resolved
+/// to). Compiled in on every platform so the tests parse it everywhere, and chosen at
+/// runtime by [`Keymap::default`].
+const BUILTIN_KEYS_MACOS: &str = include_str!("../keys-macos.toml");
+
+/// Parse a built-in `chord = command` table. The same `toml` shape a user's `[keys]`
+/// table deserializes to, so the defaults reach [`Keymap::from_pairs`] by exactly the
+/// path a config file takes.
+///
+/// Panics on a malformed file, which is a build-time bug in a compiled-in constant
+/// rather than anything a user can cause - the invariant [`Keymap::default`]'s test
+/// proves.
+fn builtin_table(text: &str) -> BTreeMap<String, String> {
+    toml::from_str(text).expect("built-in keymap file must be a valid chord = command table")
+}
 
 /// The resolved key bindings. Opaque so its representation can change (e.g. gain
 /// per-mode maps) without touching call sites; built via [`Keymap::from_pairs`].
@@ -560,7 +495,7 @@ pub struct Keymap {
 
 impl Keymap {
     /// Build a keymap from `(chord, command)` string pairs - the shape a config
-    /// file's `[keymap]` table deserializes to. Later pairs override earlier ones on
+    /// file's `[keys]` table deserializes to. Later pairs override earlier ones on
     /// the same chord (so a user table layered after the defaults wins).
     ///
     /// # Errors
@@ -640,17 +575,21 @@ impl Keymap {
 }
 
 impl Default for Keymap {
-    /// The built-in keymap: the OS-independent [`DEFAULT_BINDINGS`] plus the
-    /// platform's [`COMMAND_MOD_BINDINGS`] and [`MACOS_ONLY_BINDINGS`]. Parsing
-    /// cannot fail - all three tables are compile-time constants covered by a test -
-    /// so the `expect` is invariant-proven. Nothing is added after `from_pairs`, so
-    /// the defaults are reachable by exactly the path a config file takes.
+    /// The built-in keymap: [`BUILTIN_KEYS`], plus [`BUILTIN_KEYS_MACOS`] layered over
+    /// it on a Mac. `mod` carries the rest of the platform split (see [`Chord::parse`]),
+    /// so this `cfg!` is the whole of what is left of it.
+    ///
+    /// Parsing cannot fail - both files are compiled-in constants covered by a test -
+    /// so the `expect` is invariant-proven. Nothing is added after `from_pairs`, so the
+    /// defaults are reachable by exactly the path a config file takes.
     fn default() -> Self {
-        let pairs = DEFAULT_BINDINGS
+        let mut table = builtin_table(BUILTIN_KEYS);
+        if cfg!(target_os = "macos") {
+            table.extend(builtin_table(BUILTIN_KEYS_MACOS));
+        }
+        let pairs = table
             .iter()
-            .chain(COMMAND_MOD_BINDINGS.iter())
-            .chain(MACOS_ONLY_BINDINGS.iter())
-            .copied();
+            .map(|(chord, command)| (chord.as_str(), command.as_str()));
         Self::from_pairs(pairs).expect("built-in default bindings must be valid")
     }
 }
@@ -692,7 +631,11 @@ pub fn command_for_key(keymap: &Keymap, key: KeyEvent, page: usize) -> Option<Fr
 
     let chord = Chord::from_event(&key);
     if let Some(command) = keymap.bindings.get(&chord) {
-        return Some(command.resolve(page));
+        // A bound chord is answered here whatever it resolves to - including `nop`,
+        // which resolves to nothing. Returning is what *consumes* it: falling through
+        // to the text-entry fallback below would turn a freed printable chord back
+        // into typing, which is the opposite of unbinding it.
+        return command.resolve(page);
     }
 
     // Text-entry fallback: an unbound printable char inserts itself. A Ctrl- or
@@ -743,8 +686,127 @@ mod tests {
 
     #[test]
     fn default_keymap_builds_without_panicking() {
-        // Guards the `expect` in `Keymap::default` - proves DEFAULT_BINDINGS parses.
+        // Guards the `expect` in `Keymap::default` - proves keys.toml parses.
         let _ = Keymap::default();
+    }
+
+    #[test]
+    fn every_row_of_both_built_in_files_parses() {
+        // The invariant `Keymap::default`'s `expect` rests on, checked against *both*
+        // files on every platform - the macOS one is compiled in everywhere precisely
+        // so a typo in it cannot wait for a Mac to be found.
+        for (name, text) in [
+            ("keys.toml", BUILTIN_KEYS),
+            ("keys-macos.toml", BUILTIN_KEYS_MACOS),
+        ] {
+            let table = builtin_table(text);
+            assert!(!table.is_empty(), "{name} bound nothing at all");
+            for (chord, command) in &table {
+                assert!(Chord::parse(chord).is_some(), "{name}: bad chord `{chord}`");
+                assert!(
+                    Command::parse(command).is_some(),
+                    "{name}: bad command `{command}`"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn no_two_built_in_rows_resolve_to_the_same_chord() {
+        // Two rows can spell one chord - `mod+c` and `ctrl+c` are the same key off a
+        // Mac - and the loser then vanishes silently, with *which* one loses decided by
+        // the alphabetical order `toml` hands the table back in. That is exactly the
+        // ordering `extend_from_pairs` refuses to depend on, so the built-ins are held
+        // to never needing it: every row must survive into the map.
+        let mut rows = builtin_table(BUILTIN_KEYS);
+        if cfg!(target_os = "macos") {
+            rows.extend(builtin_table(BUILTIN_KEYS_MACOS));
+        }
+        assert_eq!(
+            Keymap::default().bindings.len(),
+            rows.len(),
+            "two built-in rows collapsed onto one chord"
+        );
+    }
+
+    #[test]
+    fn the_macos_only_file_is_layered_only_on_a_mac() {
+        // Its one row keeps Ctrl+C on quit where the clipboard sits on Cmd. Elsewhere
+        // `mod+c` *is* Ctrl+C, so layering it would silently take copy's chord away.
+        let km = Keymap::default();
+        let quit = Chord::parse("ctrl+c").expect("a chord");
+        if cfg!(target_os = "macos") {
+            assert_eq!(km.bindings.get(&quit), Some(&Command::Quit));
+        } else {
+            assert_eq!(km.bindings.get(&quit), Some(&Command::Copy));
+        }
+    }
+
+    #[test]
+    fn mod_is_the_platform_command_modifier() {
+        // One row that means the right thing on both platforms: Cmd on macOS, Ctrl
+        // elsewhere - resolved at parse time, so nothing downstream sees a `mod`.
+        let chord = Chord::parse("mod+c").expect("mod is a modifier token");
+        assert_eq!(chord.code, KeyCode::Char('c'));
+        assert_eq!(
+            (chord.cmd, chord.ctrl),
+            (cfg!(target_os = "macos"), !cfg!(target_os = "macos"))
+        );
+        // And it displays as the key the user actually presses, which is the whole
+        // reason it resolves at parse time rather than at lookup.
+        assert_eq!(
+            chord.display(),
+            if cfg!(target_os = "macos") {
+                "Cmd+C"
+            } else {
+                "Ctrl+C"
+            }
+        );
+        // It composes with the other modifiers, and is not a key of its own.
+        assert_eq!(Chord::parse("mod+shift+f").map(|c| c.shift), Some(true));
+        assert_eq!(Chord::parse("mod"), None);
+    }
+
+    #[test]
+    fn a_mod_binding_from_a_config_fires_on_the_platform_chord() {
+        // The user-facing half of `mod`: a config file writes one row and gets the
+        // native chord, with no per-OS branch of its own.
+        let km = Keymap::from_pairs([("mod+e", "quit")]).unwrap();
+        assert_eq!(
+            act_on(&km, with_mods(KeyCode::Char('e'), CMD_MOD), PAGE),
+            Some(Action::Quit)
+        );
+    }
+
+    #[test]
+    fn nop_unbinds_a_chord_and_consumes_it() {
+        // `nop` frees a chord: Ctrl+F stops opening the find prompt.
+        let km = Keymap::from_pairs([("ctrl+f", "nop"), ("f", "nop")]).unwrap();
+        assert_eq!(
+            command_for_key(
+                &km,
+                with_mods(KeyCode::Char('f'), KeyModifiers::CONTROL),
+                PAGE
+            ),
+            None
+        );
+        // And the part that matters: a *printable* chord bound to nop is consumed,
+        // not handed to the text-entry fallback. Unbinding `f` must not make it type
+        // itself - that would be the opposite of what the user asked for.
+        assert_eq!(command_for_key(&km, press(KeyCode::Char('f')), PAGE), None);
+        // The chord next to it still types, so this is an unbind and not a mute.
+        assert_eq!(
+            command_for_key(&km, press(KeyCode::Char('g')), PAGE),
+            Some(FrontendCommand::Editor(Action::Insert("g".into())))
+        );
+    }
+
+    #[test]
+    fn nop_is_a_command_name_like_any_other() {
+        assert_eq!(Command::parse("nop"), Some(Command::Nop));
+        assert_eq!(Command::Nop.resolve(PAGE), None);
+        // It is never bound by default, so nothing in the built-in map disappears.
+        assert_eq!(Keymap::default().shortcut_for(Command::Nop), None);
     }
 
     #[test]
@@ -1006,7 +1068,7 @@ mod tests {
         );
         assert_eq!(
             Command::ToggleLineNumbers.resolve(PAGE),
-            FrontendCommand::ToggleLineNumbers
+            Some(FrontendCommand::ToggleLineNumbers)
         );
         assert_eq!(km.shortcut_for(Command::ToggleLineNumbers), None);
         // A config file can give it one, and the palette then shows that chord.
@@ -1027,7 +1089,7 @@ mod tests {
         );
         assert_eq!(
             Command::ToggleStickyContext.resolve(PAGE),
-            FrontendCommand::ToggleStickyContext
+            Some(FrontendCommand::ToggleStickyContext)
         );
         assert_eq!(
             Keymap::default().shortcut_for(Command::ToggleStickyContext),
@@ -1237,7 +1299,7 @@ mod tests {
         // They resolve to frontend-local commands, never crossing the core seam.
         assert_eq!(
             Command::OpenPalette.resolve(PAGE),
-            FrontendCommand::OpenPalette
+            Some(FrontendCommand::OpenPalette)
         );
     }
 
@@ -1313,7 +1375,7 @@ mod tests {
         assert_eq!(Command::parse("save_as"), Some(Command::SaveAs));
         assert_eq!(
             Command::SaveAs.resolve(PAGE),
-            FrontendCommand::OpenSavePrompt
+            Some(FrontendCommand::OpenSavePrompt)
         );
         assert_eq!(
             km.shortcut_for(Command::SaveAs).as_deref(),
@@ -1460,5 +1522,63 @@ mod tests {
             act_on(&keymap, press(KeyCode::Esc), PAGE),
             Some(Action::Quit)
         );
+    }
+}
+
+#[cfg(test)]
+mod readme_tests {
+    use super::{Chord, Command, Keymap};
+
+    /// Backticked tokens in the README's key section that the *keymap* does not own,
+    /// each for a reason rather than because it was inconvenient:
+    ///
+    /// - `Alt+Click` is a mouse gesture. A drag has no chord, which is why gestures
+    ///   are deliberately not data (SPEC §10.5) - but leaving it out of the table
+    ///   would hide a real binding from the reader.
+    /// - `Shift` and `mod` are bare modifiers named in prose ("hold `Shift` to
+    ///   select", "`mod` is whichever key the platform commands with"), not chords.
+    /// - `y`/`n`/`a`/`q` are the query-replace walk's own answers. That surface still
+    ///   matches key codes directly; M9 Stage 2's `replace` context is what turns them
+    ///   into bindings, and this list is what should shrink when it does.
+    const NOT_CHORDS: &[&str] = &["Alt+Click", "Shift", "mod", "y", "n", "a", "q"];
+
+    /// A document cannot query a keymap, so the README's key table stays literal -
+    /// and is held to the default keymap by this test instead, the same device the
+    /// theme and config formats already use for their worked examples.
+    ///
+    /// It is the drift that motivated M9: the help had advertised `Ctrl+F  Search the
+    /// project` since M7 moved project search off that chord, and nothing failed
+    /// because nothing connected the sentence to the binding. The help renders its
+    /// chords now; the README is checked.
+    #[test]
+    fn every_chord_the_readme_advertises_is_bound() {
+        let readme = include_str!("../../../README.md");
+        let section = readme
+            .split("\n## Keys\n")
+            .nth(1)
+            .and_then(|rest| rest.split("\n## ").next())
+            .expect("README documents the keys in a `## Keys` section");
+        let keymap = Keymap::default();
+        let mut checked = 0;
+        // Every backticked token in the section, not just the table's first column.
+        // The prose around the table names chords too - `Ctrl+G` sits in a row's
+        // explanation, and the clipboard is described entirely below the table - and a
+        // scan that stopped at the first cell would have left exactly those to drift.
+        for token in section.split('`').skip(1).step_by(2) {
+            if NOT_CHORDS.contains(&token) {
+                continue;
+            }
+            let chord = Chord::parse(token)
+                .unwrap_or_else(|| panic!("README names `{token}`, which is not a chord"));
+            let bound = keymap.bindings.get(&chord);
+            assert!(
+                bound.is_some_and(|command| *command != Command::Nop),
+                "README advertises `{token}`, which the default keymap does not bind"
+            );
+            checked += 1;
+        }
+        // The section names well over two dozen chords; a slicing bug that read none of
+        // them would otherwise pass this test by finding nothing to disagree with.
+        assert!(checked > 25, "only {checked} chords read from the section");
     }
 }

@@ -1,0 +1,108 @@
+# Vortex's built-in key bindings (SPEC §10.5).
+#
+# This file *is* the default keymap - there is no second copy in Rust. Every row is
+# `chord = command`, the exact form a config file's `[keys]` table uses, so a line
+# here can be copied into `config.toml` and changed:
+#
+#     [keys]
+#     "ctrl+e" = "quit"     # rebind
+#     "ctrl+f" = "nop"      # free a chord entirely
+#
+# `mod` is the platform command modifier - Cmd on macOS, Ctrl everywhere else - so
+# one row means the right thing on both. Modifiers are `ctrl`, `shift`, `alt`, `cmd`
+# and `mod`, in any order, before the key.
+#
+# Text entry is a fallback rather than a binding: an unbound printable character with
+# no Ctrl inserts itself, so this file never has to enumerate the alphabet. Bindings
+# match the full chord, so `right` and `shift+right` are separate rows - `extend` is
+# part of the command name (`select_*`), not a runtime modifier.
+
+"ctrl+q" = "quit"
+"ctrl+s" = "save"
+
+# Save-as opens the prompt line (SPEC §7.5). The shift disambiguation needs the Kitty
+# protocol (negotiated at startup); a classic terminal that folds shift away delivers
+# plain Ctrl+S instead, degrading to a safe ordinary save rather than misfiring - the
+# same "never misfires" stance as the Ctrl+Alt chords below.
+"ctrl+shift+s" = "save_as"
+
+"enter" = "insert_newline"
+"tab" = "insert_tab"
+"backspace" = "delete_backward"
+"delete" = "delete_forward"
+
+# Motions, and their selection-extending twins.
+"left" = "move_left"
+"right" = "move_right"
+"up" = "move_up"
+"down" = "move_down"
+"home" = "move_line_start"
+"end" = "move_line_end"
+"pageup" = "move_page_up"
+"pagedown" = "move_page_down"
+"shift+left" = "select_left"
+"shift+right" = "select_right"
+"shift+up" = "select_up"
+"shift+down" = "select_down"
+"shift+home" = "select_line_start"
+"shift+end" = "select_line_end"
+"shift+pageup" = "select_page_up"
+"shift+pagedown" = "select_page_down"
+
+# Undo/redo and the clipboard follow each OS's muscle memory through `mod`: Cmd+Z and
+# Cmd+C/X/V on macOS, Ctrl+ the same keys elsewhere. On macOS the Cmd chords are
+# delivered only by Kitty-protocol terminals (which report Cmd) - a documented
+# trade-off for matching the platform. Raw mode delivers the modified letters as key
+# events, never a suspend/flow signal, so binding them is safe.
+"mod+z" = "undo"
+"mod+y" = "redo"
+"mod+c" = "copy"
+"mod+x" = "cut"
+"mod+v" = "paste"
+
+# Multi-cursor (SPEC §2.2). The Ctrl+Alt+Arrow chords need the Kitty protocol's
+# modifier reporting; a classic terminal simply never matches them rather than
+# misfiring. Esc collapses back to one cursor.
+"ctrl+alt+up" = "add_cursor_above"
+"ctrl+alt+down" = "add_cursor_below"
+"esc" = "collapse_selections"
+
+# Overlay triggers (SPEC §7.5). They live in this same table, named like any other
+# command, so a user config can rebind them. Ctrl+O is the primary "open": the fuzzy
+# file picker.
+"ctrl+o" = "open_file_picker"
+"ctrl+p" = "open_palette"
+"ctrl+t" = "open_theme_picker"
+
+# Buffer switching (M7). Ctrl+PageUp/PageDown is the widely shared "next/previous tab"
+# chord and is reported by classic terminals, unlike the Ctrl+Alt chords above; the
+# plain and shift+ page keys stay motions, so nothing is shadowed.
+"ctrl+pagedown" = "next_buffer"
+"ctrl+pageup" = "prev_buffer"
+"ctrl+w" = "close_buffer"
+"ctrl+b" = "open_buffer_picker"
+
+# Search (M7). Ctrl+F is *this buffer*, which is what it means nearly everywhere, and
+# the project-wide search takes the conventional "find in files" chord.
+#
+# Ctrl+Shift+F needs the Kitty protocol's modifier reporting, so Alt+F is bound
+# alongside it rather than leaving project search unreachable by key on a classic
+# terminal. The cost is that Option+F no longer composes a character on a Mac terminal
+# configured to send Option as Meta; the palette reaches both searches for anyone that
+# costs.
+"ctrl+f" = "find"
+"ctrl+h" = "replace"
+"ctrl+shift+f" = "open_search_picker"
+"alt+f" = "open_search_picker"
+
+# Repeat the last search. F3 is the conventional key and is reported by classic
+# terminals; Ctrl+G is the Mac-flavored alias for the same thing, and gives find-next a
+# chord for terminals that swallow the function keys.
+"f3" = "find_next"
+"ctrl+g" = "find_next"
+"shift+f3" = "find_previous"
+
+# Multi-cursor over every match (SPEC §12.2) - VS Code's Ctrl+Shift+L, with the same
+# Kitty caveat and no plain-terminal alias: it is a discovery-surface command,
+# reachable from the palette, not one worth spending another Alt chord.
+"ctrl+shift+l" = "select_all_matches"
