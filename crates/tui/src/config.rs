@@ -476,6 +476,12 @@ pub struct Theme {
     pub palette: Style,
     /// The palette's highlighted row - an accent fill so the selection is obvious.
     pub palette_selected: Style,
+    /// The characters of a row that the query actually matched (SPEC §7.5, M10).
+    /// Unmarked, a ranked list looks arbitrary - the reader cannot see *why* one row
+    /// beat another. A **foreground and an attribute only, no ground**, so the marks
+    /// survive the selected row's fill instead of punching holes in it: the same rule
+    /// the indent guide follows over a selection wash.
+    pub palette_match: Style,
     /// The four LSP diagnostic severities (SPEC §5). The `fg` colors the underline
     /// under a flagged span and the mark in the gutter; a background, if set, is
     /// ignored for the underline (which paints only the foreground) so a theme need
@@ -631,6 +637,13 @@ impl Default for Theme {
             palette_selected: Style::new()
                 .fg(Color::Rgb(0xee, 0xf1, 0xfa))
                 .bg(Color::Rgb(0x2b, 0x35, 0x57))
+                .add_modifier(Modifier::BOLD),
+            // No ground: the marks paint over whichever row style is underneath, so
+            // they read the same on the highlighted row as on a quiet one. Bold as
+            // well as coloured, because shape has to carry it on a 16-colour terminal
+            // (SPEC §7.5's glyph rule, applied to emphasis).
+            palette_match: Style::new()
+                .fg(Color::Rgb(0x7f, 0xb3, 0xff))
                 .add_modifier(Modifier::BOLD),
             // Diagnostics (SPEC §5): a red error and an amber warning carry the
             // usual severity signal, while information and hint stay quiet - a
