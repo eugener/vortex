@@ -106,15 +106,16 @@ cargo build --release
 | `Ctrl+T` | Theme picker (previews as you move, `Esc` restores) |
 | `Ctrl+B` / `Ctrl+W` | Buffer picker / close the current buffer |
 | `Ctrl+PageUp` / `Ctrl+PageDown` | Previous / next buffer |
-| `Ctrl+Alt+Up/Down` | Add a cursor above/below |
+| `Ctrl+Alt+Up` / `Ctrl+Alt+Down` | Add a cursor above/below |
 | `Alt+Click` | Add a cursor at the pointer |
 | `Esc` | Collapse back to one cursor, and clear the search highlights |
 | Arrows, `Home`/`End`, `PageUp`/`PageDown` | Move; hold `Shift` to select |
 
-Undo/redo and clipboard follow each OS: `Cmd+Z`/`Cmd+Y` and `Cmd+C`/`X`/`V` on macOS,
-`Ctrl+` the same keys elsewhere. On macOS `Ctrl+C` stays quit, since copy is `Cmd+C` there.
+Undo/redo and the clipboard are bound on `mod+z`, `mod+y`, `mod+c`, `mod+x` and `mod+v`,
+where `mod` is whichever key the platform commands with - Cmd on macOS, Ctrl everywhere
+else. On macOS `Ctrl+C` also quits, since copy sits on Cmd there.
 
-The `Ctrl+Alt` and `Ctrl+Shift` chords need a terminal that speaks the [Kitty keyboard
+The Ctrl+Alt and Ctrl+Shift chords need a terminal that speaks the [Kitty keyboard
 protocol](https://sw.kovidgoyal.net/kitty/keyboard-protocol/) (Kitty, Ghostty, WezTerm,
 foot, recent Alacritty). It is negotiated at startup; where it is missing those chords
 simply never fire rather than misfiring. Project search is bound to `Alt+F` as well for
@@ -205,11 +206,20 @@ final_newline = true         # add a trailing newline on save if the file lacks 
 
 [keys]                       # layered over the built-in bindings, not replacing them
 "ctrl+w"      = "close_buffer"
-"ctrl+alt+up" = "add_cursor_above"
+"mod+e"       = "add_cursor_above"   # Cmd on macOS, Ctrl elsewhere
+"ctrl+f"      = "nop"                # free the chord entirely
 ```
 
-Chords are `mod+mod+key` with `ctrl`/`shift`/`alt` in any order; command names are the
-same identifiers the palette lists. Rebinding one chord leaves every other binding alone.
+Chords are `modifier+…+key` with `ctrl`, `shift`, `alt`, `cmd` and `mod` in any order.
+**`mod` is whichever key this platform commands with** - Cmd on a Mac, Ctrl everywhere
+else - so one row means the right thing on both. Command names are the same identifiers
+the palette lists. Rebinding one chord leaves every other binding alone, and **`nop`
+unbinds one**: the chord then does nothing at all, rather than falling back to typing
+itself.
+
+The built-in bindings are a file too - [`crates/tui/keys.toml`](crates/tui/keys.toml),
+in exactly this format. It is the list to copy a row out of, and there is no second copy
+of it in the source to disagree with it.
 
 `line_numbers = "relative"` numbers each row by its distance from the cursor - the count
 you would type before a motion - except the cursor's own row, which shows its absolute

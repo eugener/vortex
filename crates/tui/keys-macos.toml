@@ -1,0 +1,13 @@
+# The built-in bindings that exist only on macOS, layered over `keys.toml` there.
+#
+# One row, and one that `mod` cannot express: `mod` says "whichever modifier this
+# platform commands with", while this says "a chord that is free *because* of what
+# `mod` resolved to". On macOS the clipboard is on Cmd, which leaves Ctrl+C free to
+# keep its terminal-conventional meaning; elsewhere Ctrl+C *is* copy, and quit is
+# Ctrl+Q alone.
+#
+# This file is the residue of the platform split, and the last of it. M9 Stage 2's
+# keymap contexts absorb it into a `[keys.macos]` table alongside the user's own
+# platform rows, at which point there is one table again (SPEC §10.5).
+
+"ctrl+c" = "quit"

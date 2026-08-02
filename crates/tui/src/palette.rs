@@ -58,13 +58,19 @@ const PALETTE_PAGE: usize = 0;
 
 /// Build the palette's items. Each entry's shortcut is looked up from the keymap by
 /// command identity (single source of truth), so it stays right even after a rebind.
+///
+/// A command that resolves to nothing (`nop`) is dropped rather than listed as a row
+/// that does nothing when picked. [`PALETTE`] is curated by hand and holds none, which
+/// `every_curated_row_is_listed` keeps true.
 fn registry(keymap: &Keymap) -> Vec<Item> {
     PALETTE
         .iter()
-        .map(|&(label, bound)| Item {
-            label: label.to_string(),
-            shortcut: keymap.shortcut_for(bound),
-            command: bound.resolve(PALETTE_PAGE),
+        .filter_map(|&(label, bound)| {
+            Some(Item {
+                label: label.to_string(),
+                shortcut: keymap.shortcut_for(bound),
+                command: bound.resolve(PALETTE_PAGE)?,
+            })
         })
         .collect()
 }
@@ -121,6 +127,14 @@ mod tests {
                 item.label
             );
         }
+    }
+
+    #[test]
+    fn every_curated_row_is_listed() {
+        // `registry` drops a command that resolves to nothing, which is right for
+        // `nop` and wrong for everything else - so hold the curated list to having
+        // none, rather than letting a row disappear from the palette unremarked.
+        assert_eq!(registry(&Keymap::default()).len(), PALETTE.len());
     }
 
     #[test]
