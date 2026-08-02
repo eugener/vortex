@@ -1108,7 +1108,7 @@ existed to configure them from:
     their triggers (§11); everything else the table owes is settled in "Every binding is
     data" below.
 
-#### Every binding is data (M9, specified)
+#### Every binding is data (M9 - Stage 1 built, Stage 2 specified)
 
 M0-M8 made the *editor's* bindings data and left everything else in code. Five surfaces
 match key codes directly in a `match key.code` of their own - the pickers, the prompt, the
@@ -1120,7 +1120,9 @@ table row**, and what stays in code is only what a table cannot say (listed at t
 
 Two stages, in order. Stage 1 needs no new machinery and is worth shipping alone.
 
-**Stage 1 - the table gets what every editor's table already has.**
+**Stage 1 - the table gets what every editor's table already has. Built** - the two
+details this design left open (the one macOS-only binding, and which keymap `--help`
+renders against) are recorded with M9 in §14.
 
 - **`mod` is the platform command modifier**: Cmd on macOS (crossterm `SUPER`), Ctrl
   elsewhere, resolved by `Chord::parse` at parse time. `"mod+c" = "copy"` is then one row
@@ -1886,20 +1888,55 @@ Incremental build order so the risky assumptions are validated early, not at the
   caught the follow bug the §7.5 entry records; the unit test that was supposed to cover
   it had asserted the wrong invariant and passed.
 
-- **M9 - Every binding is data.** *(Specified, not started - see §10.5 "Every binding is
-  data" for the full design and the reasoning behind each choice.)* M0-M8 externalized the
+- **M9 - Every binding is data.** *(Stage 1 done; Stage 2 specified, not started - see
+  §10.5 "Every binding is data" for the full design and the reasoning behind each choice.)*
+  M0-M8 externalized the
   *editor's* bindings and left the rest in code: five surfaces match key codes directly, a
   default binding cannot be removed, the platform split lives in `cfg!`, and the defaults
   are a Rust table no user can read. Two stages, in order, each shippable alone.
-  **Stage 1** is the three things every editor's keymap has and this one does not: a `mod`
-  token for the platform command modifier, `nop` to unbind a chord, and the built-in
+  **Stage 1 - DONE.** The three things every editor's keymap has and this one did not: a
+  `mod` token for the platform command modifier, `nop` to unbind a chord, and the built-in
   bindings moved out of Rust into a compiled-in `keys.toml` (the Rust tables deleted, not
   mirrored). No new machinery, and each closes a gap a user meets on the first day. It also
-  takes the first half of "no chord reaches the screen as a literal": `--help`'s key list
+  took the first half of "no chord reaches the screen as a literal": `--help`'s key list
   is rendered per row from `shortcut_for` (deleting its `cfg!` twin, which `mod` makes
   unnecessary) and the README's table is held to the default keymap by a test. That half
-  fixes a live bug rather than preventing a future one - the help has advertised
+  fixed a live bug rather than preventing a future one - the help had advertised
   `Ctrl+F  Search the project` since M7 moved project search off that chord.
+  Two details the design did not settle, decided while building it:
+  - **One macOS-only binding survives the move, as a second file.** `mod` folds away the
+    *command-modifier* split, but not `ctrl+c = quit`, which says "a chord that is free
+    *because* of what `mod` resolved to" - true on a Mac, and on Linux a silent theft of
+    copy's chord. It lives in `keys-macos.toml`, compiled in beside `keys.toml` and
+    layered over it by one `cfg!`, which is the whole of what is left of the platform
+    split and is exactly what Stage 2's `[keys.macos]` absorbs. Written as a row in the
+    same table instead - to be resolved by "later wins" - it would have depended on the
+    `toml` crate handing back a *sorted* table, which is precisely the accident
+    `extend_from_pairs` already refuses to rely on.
+  - **`--help` renders against the resolved config, not the defaults**, so `Args::Help`
+    carries the `--config` path and `-h` no longer returns from argument parsing on the
+    spot (a `--config` written after it still has to be seen). A user who moves a chord is
+    told the chord they moved it to, and a chord they `nop`'d leaves the help entirely.
+  **The review found five defects, and they are one defect.** Each was a place where the
+  change widened what a piece of code has to face and the assumption beside it did not
+  move: the help's chord column was sized for the *built-in* chords while now rendering
+  the *user's* (a rebind onto `Ctrl+Shift+PageDown` glued itself to its label); a config
+  problem was discarded on the `--help` path, so a `--config` that does not exist printed
+  the default key list as if it had been read; `-h` was deferred to the end of argument
+  parsing and `-V` was not, so `-h -V` and `-V -h` disagreed; `Keymap::default` began
+  depending on `toml`'s ordering being *irrelevant* with nothing checking that two rows
+  never spell one chord - the same ordering `extend_from_pairs` explicitly refuses to
+  rely on; and the README test read only the table's first column, leaving the chords
+  named in the prose beside it (`Ctrl+G`, the whole clipboard paragraph) free to drift.
+  The last is the one worth remembering: **a drift test that covers less than it appears
+  to is worse than none**, because it is read as a guarantee. It scans the whole section
+  now, and the clipboard prose was rewritten in terms of `mod` so it is checkable on both
+  platforms at once rather than being a platform-split sentence no test could reach.
+  *Verified:* the loop, plus a pty run against a config binding `g` and `ctrl+f` to `nop`
+  and `mod+e` to the theme picker - `g` did not type itself (the consume rule, which is
+  the whole difference between `nop` and an absent row), `X` beside it still typed, Ctrl+F
+  opened nothing, Cmd+E opened the theme picker, and the saved file read exactly `Xhello`.
+  `--help` under that config drops the find row and renders `Cmd+` on the clipboard rows.
   **Stage 2** is keymap **contexts**: a name per active scope - `editor`, the platform, and
   one per open overlay mirroring the compositor stack - looked up top-down, first match
   wins. The pickers, prompts, the confirmation and the query-replace walk stop matching key
