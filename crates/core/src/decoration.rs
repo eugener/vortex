@@ -96,9 +96,16 @@ pub enum Decoration {
     /// Underline a byte span (a diagnostic's squiggle). Kept separate from a
     /// future `Highlight` so one cell can carry a syntax foreground color *and*
     /// an independent error undercurl at once (SPEC §5).
+    ///
+    /// Carries the server's `message`, because the squiggle alone says only that
+    /// *something* is wrong here. The status bar shows it once the caret has rested
+    /// on the span (SPEC §7.5, M10), and the diagnostics picker lists it. Held as an
+    /// owned `String` on a decoration the producer republishes wholesale, so no
+    /// lifetime crosses the seam.
     Underline {
         range: ByteRange,
         severity: Severity,
+        message: String,
     },
     /// Mark the line containing `offset`. Stored as an offset rather than a line
     /// index so it rides edits with the text: inserting a line above moves the
@@ -262,6 +269,7 @@ impl DecorationSet {
                 Decoration::Underline {
                     range: span,
                     severity,
+                    ..
                 } => {
                     let start = span.start.max(range.start);
                     let end = span.end.min(range.end);
@@ -352,6 +360,30 @@ impl DecorationSet {
                 _ => None,
             })
             .max()
+    }
+
+    /// The diagnostic covering `offset`, most severe first, or `None`.
+    ///
+    /// What the status bar shows once the caret has *rested* on a flagged span
+    /// (SPEC §7.5, M10). Asked about the caret's byte rather than its line, so a
+    /// line carrying two diagnostics reports the one the caret is actually inside
+    /// rather than whichever the producer happened to send first.
+    ///
+    /// Ties break on severity, for the reason [`Self::gutter_mark`] breaks them the
+    /// same way: there is one segment and the worst thing wrong is what to say.
+    pub fn diagnostic_at(&self, offset: usize) -> Option<(Severity, &str)> {
+        self.by_source
+            .values()
+            .flatten()
+            .filter_map(|d| match d {
+                Decoration::Underline {
+                    range,
+                    severity,
+                    message,
+                } if range.contains(&offset) => Some((*severity, message.as_str())),
+                _ => None,
+            })
+            .max_by_key(|(severity, _)| *severity)
     }
 
     /// Move every decoration across a batch of applied edits (SPEC §2.1, §5), so

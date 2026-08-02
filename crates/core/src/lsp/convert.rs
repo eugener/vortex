@@ -83,6 +83,7 @@ pub(crate) fn decorations_for(text: &Text, diagnostics: &[Diagnostic]) -> Vec<De
             out.push(Decoration::Underline {
                 range: start..end,
                 severity: d.severity,
+                message: d.message.clone(),
             });
         }
     }

@@ -28,6 +28,14 @@ pub enum Command {
     /// [`Action::SaveAs`] for the typed path, so the target never crosses the seam
     /// until it is chosen (SPEC §7.5).
     OpenSavePrompt,
+    /// Insert one indent - a tab, or `tab_width` spaces (SPEC §7.5, M10).
+    ///
+    /// Frontend-local *resolution*, like [`Command::NextBuffer`]: what an indent is
+    /// depends on the live `indent_style`, which is this side's setting, so it is
+    /// filled in at dispatch and only the finished `Action::Insert` crosses the seam.
+    /// The core never learns there was a preference - a tab is one byte whatever it
+    /// is painted as (§10.5).
+    InsertIndent,
     /// Focus the next buffer, wrapping at the end of the bufferline. Resolved into an
     /// [`Action::SwitchBuffer`] at dispatch, where the snapshot's ordered buffer list
     /// is in hand: the core has no notion of "next", only of *which* buffer (§7.5).

@@ -198,6 +198,7 @@ optional, so the file can be one line; `--config PATH` reads a different one.
 ```toml
 theme         = "phosphor"   # any built-in or one of your own
 tab_width     = 4            # display width of a tab stop
+indent_style  = "tabs"       # or "spaces" - what the Tab key inserts
 line_numbers  = "absolute"   # or "relative" - see below
 rulers        = [80, 100]    # tint these columns; [] (the default) draws none
 indent_guides = true         # a rule down each indent level; off by default

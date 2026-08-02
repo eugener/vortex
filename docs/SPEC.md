@@ -2004,8 +2004,8 @@ Incremental build order so the risky assumptions are validated early, not at the
   (not typing itself), the query-replace question naming the rebound answers instead of
   `y`/`n`/`a`/`q`, and `--help` naming every chord the config actually resolved.
 
-- **M10 - What the chrome says.** *(Specified, not started - see §7.5 "What the chrome
-  says" for the full design.)* M0-M8 built the surfaces; nothing had ever settled what each
+- **M10 - What the chrome says.** *(In progress - see §7.5 "What the chrome says" for
+  the full design. **Done:** the status-bar audit and `indent_style`.)* M0-M8 built the surfaces; nothing had ever settled what each
   one is *allowed to put on screen*, and the answer had drifted: the head bar's right
   segment holds a line count, the status bar carries an internal document version, and the
   diagnostic count, the server's health and the attached grammar appear nowhere at all.
@@ -2017,12 +2017,24 @@ Incremental build order so the risky assumptions are validated early, not at the
   **Follows M9, and not by preference:** the dialog hint footer, the confirmation's
   answers and the empty state all render chords, and M9 is what makes rendering a chord
   something other than writing a literal (§10.5).
-  Ordered so the cheap half lands first: the status-bar audit, the picker's count / hint
-  footer / match marks / path rows, tab-name disambiguation, the empty state and the glyph
-  profile are small; the head bar's state cluster, the message log, and the gutter
+  Ordered so the cheap half lands first: the status-bar audit (**done**), the picker's
+  count / hint footer / match marks / path rows, tab-name disambiguation, the empty state
+  and the glyph profile are small; the head bar's state cluster, the message log, and the gutter
   diagnostics with their picker are medium. The one piece of **new scope** is an
   `indent_style` setting behind the `spaces:4` readout - a frontend change, since the
   frontend already decides what `insert_tab` inserts.
+  **The status-bar audit, as built.** `insert_tab` stopped resolving to a literal `\t`
+  in the keymap and became `InsertIndent`, filled in at *dispatch* from the live
+  `indent_style` - the pattern `next_buffer` and `find_next` already use, and what keeps
+  the setting off the binding. The caret diagnostic needed the one seam change in the
+  milestone: `Decoration::Underline` carried a severity but not the server's `message`,
+  so the squiggle could say only that *something* was wrong. It carries the message now
+  (the additive-variant growth §5 designed for), and `DecorationSet::diagnostic_at` asks
+  by the caret's **byte** rather than its line, so a line with two diagnostics reports
+  the one the caret is inside. The rest rule turned out to need a *scheduled* repaint,
+  not just a check: a caret that stops moving produces no event, so nothing would have
+  asked for the frame that shows the message - the loop arms exactly one repaint when
+  the deadline passes rather than painting every poll for 150ms.
   *Verify:* driven in a pty at **80 columns**, which is the budget the design is written
   against and the width the first draft failed - a nominal frame carrying tabs and a branch
   and nothing else, then the same file with the server indexing and three errors, with
