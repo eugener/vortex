@@ -48,6 +48,9 @@ use vortex_core::{Action, BufferId, BufferInfo, Core, Granularity, ViewSnapshot}
 
 use vortex_tui::command::{self, Command};
 use vortex_tui::compositor::{Compositor, EventResult};
+// The keymap's bindable-command identity, aliased as the palette aliases it, to keep
+// it distinct from the dispatchable `command::Command` the event loop runs.
+use vortex_tui::keymap::{Command as Bindable, Keymap};
 use vortex_tui::toast::{self, Toasts};
 use vortex_tui::{
     bufferpicker, buffersearch, click, config, filepicker, formatpicker, globalsearch, grammar,
@@ -221,8 +224,24 @@ fn main() -> io::Result<()> {
             eprintln!("vortex: '{flag}' needs a value\n{USAGE}");
             std::process::exit(2);
         }
-        Args::Help => {
-            print!("{HELP}{UNDO_REDO_HELP}");
+        Args::Help { config } => {
+            // Resolved for its keymap, since that is what the key list is drawn from.
+            // A problem reading it is still reported - on stderr, so the help itself
+            // stays pipeable. Swallowing it would print the *default* key list for a
+            // `--config` path that does not exist, which is the drift this whole
+            // change is about: a list of keys the user is not actually running.
+            let asked_for = config.is_some();
+            let keymap = match config.or_else(config::user_path) {
+                Some(path) => {
+                    let (config, problem) = config::load(&path, asked_for);
+                    if let Some(problem) = problem {
+                        eprintln!("vortex: {problem}");
+                    }
+                    config.keymap
+                }
+                None => config::Config::default().keymap,
+            };
+            print!("{HELP}{}", key_help(&keymap));
             return Ok(());
         }
         Args::Version => {
@@ -595,32 +614,100 @@ Config:
   $XDG_CONFIG_HOME/vortex/config.toml, else ~/.config/vortex/config.toml
     theme = \"undertow\"   tab_width = 4   final_newline = true
     [keys]                 # chord = command, layered over the defaults
-    \"ctrl+w\" = \"close_buffer\"
+    \"ctrl+w\" = \"close_buffer\"   # rebind      \"ctrl+f\" = \"nop\"   # unbind
 
-Keys:
-  Ctrl+S           Save        Ctrl+Q            Quit
-  Ctrl+Shift+S     Save as (prompt for a path; needs a Kitty-protocol terminal)
-  Ctrl+O           Open file (fuzzy picker, previewing the highlighted file)
-  Ctrl+F           Search the project (regex; Enter opens the file at the match)
-  Ctrl+P           Command palette (type to filter, Enter runs, Esc cancels)
-  Ctrl+T           Theme picker (previews as you move, Esc restores)
-  Ctrl+Alt+Up/Down Add cursor above/below        Alt+Click  Add cursor
-  Esc              Collapse to one cursor
 ";
 
-/// The OS-conditional key lines of the help - undo/redo and clipboard - on the
-/// platform's command modifier (Cmd on macOS, Ctrl elsewhere), matching [`keymap`]'s
-/// OS-conditional bindings. On macOS Ctrl+C stays Quit (copy is Cmd+C); elsewhere
-/// Ctrl+C is Copy and Quit is Ctrl+Q only. Split out because a `const` string cannot
-/// be built per-OS by concatenation.
-#[cfg(target_os = "macos")]
-const UNDO_REDO_HELP: &str = "  Cmd+Z            Undo        Cmd+Y             Redo
-  Cmd+C / X / V    Copy / Cut / Paste           Ctrl+C     Quit
-";
-#[cfg(not(target_os = "macos"))]
-const UNDO_REDO_HELP: &str = "  Ctrl+Z           Undo        Ctrl+Y            Redo
-  Ctrl+C / X / V   Copy / Cut / Paste
-";
+/// The key rows of `--help`: a label, and the command whose binding fills the chord
+/// beside it. A curated list for a reader, like the palette's own - the two carry
+/// different labels for different audiences, and only the *chord* is generated.
+///
+/// That generation is the point (SPEC §10.5, "no chord reaches the screen as a
+/// literal"). The literal list this replaces had advertised `Ctrl+F  Search the
+/// project` ever since M7 moved project search off that chord, and nothing failed,
+/// because nothing connected the sentence to the binding.
+const HELP_KEYS: &[(&str, Bindable)] = &[
+    ("Save", Bindable::Save),
+    (
+        "Save as (prompt for a path; needs a Kitty-protocol terminal)",
+        Bindable::SaveAs,
+    ),
+    ("Quit", Bindable::Quit),
+    (
+        "Open file (fuzzy picker, previewing the highlighted file)",
+        Bindable::OpenFilePicker,
+    ),
+    (
+        "Find in this buffer (regex; the view follows as you type)",
+        Bindable::OpenFind,
+    ),
+    ("Next match", Bindable::FindNext),
+    ("Previous match", Bindable::FindPrevious),
+    (
+        "Find and replace (Tab between the fields)",
+        Bindable::OpenReplace,
+    ),
+    (
+        "Search the project (regex; Enter opens the file at the match)",
+        Bindable::OpenSearchPicker,
+    ),
+    ("Put a cursor on every match", Bindable::SelectAllMatches),
+    (
+        "Command palette (type to filter, Enter runs, Esc cancels)",
+        Bindable::OpenPalette,
+    ),
+    (
+        "Theme picker (previews as you move, Esc restores)",
+        Bindable::OpenThemePicker,
+    ),
+    ("Buffer picker", Bindable::OpenBufferPicker),
+    ("Close the buffer", Bindable::CloseBuffer),
+    (
+        "Add a cursor above (Alt+Click adds one at the pointer)",
+        Bindable::AddCursorAbove,
+    ),
+    ("Add a cursor below", Bindable::AddCursorBelow),
+    ("Collapse to one cursor", Bindable::CollapseSelections),
+    ("Undo", Bindable::Undo),
+    ("Redo", Bindable::Redo),
+    ("Copy", Bindable::Copy),
+    ("Cut", Bindable::Cut),
+    ("Paste", Bindable::Paste),
+];
+
+/// The column the labels line up in, wide enough for the longest chord the built-in
+/// keymap renders (`Ctrl+PageDown`) plus a gap. A *preferred* width, not a bound - see
+/// [`key_help`], which is rendering the user's keymap rather than the built-in one.
+const HELP_CHORD_WIDTH: usize = 16;
+
+/// The smallest gap between a chord and its label. What keeps a chord wider than
+/// [`HELP_CHORD_WIDTH`] from running straight into the text beside it.
+const HELP_MIN_GAP: usize = 2;
+
+/// Render the `Keys:` block of `--help` against `keymap`, so it names the chords the
+/// user's own config resolved rather than the ones the defaults happen to hold.
+///
+/// A row whose command is **unbound is omitted** rather than printed blank: unbinding
+/// something should take it out of the help, not advertise a key that does nothing.
+fn key_help(keymap: &Keymap) -> String {
+    let mut out = String::from("Keys:\n");
+    for &(label, command) in HELP_KEYS {
+        if let Some(chord) = keymap.shortcut_for(command) {
+            // The column is a preference and the gap is the rule: this renders a
+            // *user's* keymap, so a rebind onto a chord longer than the built-ins ever
+            // reach must push its label right rather than glue itself to it.
+            let gap = HELP_CHORD_WIDTH
+                .saturating_sub(chord.chars().count())
+                .max(HELP_MIN_GAP);
+            out.push_str("  ");
+            out.push_str(&chord);
+            out.push_str(&" ".repeat(gap));
+            out.push_str(label);
+            out.push('\n');
+        }
+    }
+    out
+}
 
 /// The outcome of parsing the command line - what `main` should do next.
 #[derive(Debug, PartialEq, Eq)]
@@ -631,7 +718,12 @@ enum Args {
         file: Option<PathBuf>,
         config: Option<PathBuf>,
     },
-    Help,
+    /// Print the help and exit. Carries the `--config` path because the key list is
+    /// rendered from the *resolved* keymap: a user who moved a chord should be told
+    /// the chord they moved it to.
+    Help {
+        config: Option<PathBuf>,
+    },
     Version,
     /// A flag that takes a value, with none following it.
     MissingValue(&'static str),
@@ -648,6 +740,8 @@ enum Args {
 fn parse_args(args: impl IntoIterator<Item = OsString>) -> Args {
     let mut file: Option<PathBuf> = None;
     let mut config: Option<PathBuf> = None;
+    let mut help = false;
+    let mut version = false;
     let mut flags_done = false;
     let mut args = args.into_iter();
     while let Some(arg) = args.next() {
@@ -657,8 +751,16 @@ fn parse_args(args: impl IntoIterator<Item = OsString>) -> Args {
         }
         match arg.to_str() {
             Some("--") => flags_done = true,
-            Some("-h" | "--help") => return Args::Help,
-            Some("-V" | "--version") => return Args::Version,
+            // Noted rather than returned on the spot: the help's key list is rendered
+            // from the resolved keymap, so a `--config` written *after* `-h` still has
+            // to be seen. Everything else about the line is still parsed, so a typo
+            // beside `--help` is reported instead of being swallowed by it.
+            //
+            // `-V` is deferred with it, though it needs nothing from the rest of the
+            // line. Returning on the spot would have made `-h -V` print the version
+            // and `-V -h` the help - an order dependence with no reason behind it.
+            Some("-h" | "--help") => help = true,
+            Some("-V" | "--version") => version = true,
             // `--config PATH`: the config is read before the first frame, so the
             // flag has to be here rather than being something the editor learns
             // later (SPEC §10.5).
@@ -677,6 +779,14 @@ fn parse_args(args: impl IntoIterator<Item = OsString>) -> Args {
                 file.get_or_insert_with(|| PathBuf::from(&arg));
             }
         }
+    }
+    // Help wins over version when both are asked for: it is the more informative of
+    // the two, and it names the version's flag.
+    if help {
+        return Args::Help { config };
+    }
+    if version {
+        return Args::Version;
     }
     Args::Open { file, config }
 }
@@ -4506,11 +4616,92 @@ mod tests {
     }
 
     #[test]
+    fn the_help_names_the_chord_the_keymap_actually_holds() {
+        // The bug this replaces: the help advertised `Ctrl+F  Search the project`
+        // for a milestone after project search moved off that chord. Nothing failed,
+        // because the sentence and the binding were two separate strings.
+        let text = key_help(&Keymap::default());
+        assert!(
+            text.contains(
+                "Ctrl+F          Find in this buffer (regex; the view follows as you type)"
+            ),
+            "{text}"
+        );
+        assert!(
+            text.contains("Ctrl+Shift+F    Search the project"),
+            "{text}"
+        );
+        // Undo/redo and the clipboard come from `mod`, so the OS-conditional twin
+        // this help used to carry is gone: one row renders per platform.
+        let paste = if cfg!(target_os = "macos") {
+            "Cmd+V           Paste"
+        } else {
+            "Ctrl+V          Paste"
+        };
+        assert!(text.contains(paste), "{text}");
+    }
+
+    #[test]
+    fn a_chord_wider_than_the_column_still_keeps_a_gap() {
+        // The column is sized for the built-in chords, but the keymap rendered is the
+        // user's: a rebind onto a longer chord must push its label right rather than
+        // run into it. `Ctrl+Shift+PageDown` is 19 columns to the width's 16.
+        let rebound =
+            keymap::Keymap::from_pairs([("ctrl+shift+pagedown", "save")]).expect("valid binding");
+        assert!(
+            key_help(&rebound).contains("Ctrl+Shift+PageDown  Save"),
+            "{}",
+            key_help(&rebound)
+        );
+    }
+
+    #[test]
+    fn help_and_version_do_not_depend_on_which_was_written_first() {
+        // Both are deferred to the end of the parse, so neither can win by position.
+        // Help wins, being the more informative of the two.
+        assert_eq!(args(&["-h", "-V"]), Args::Help { config: None });
+        assert_eq!(args(&["-V", "-h"]), Args::Help { config: None });
+        assert_eq!(args(&["-V"]), Args::Version);
+    }
+
+    #[test]
+    fn the_help_follows_a_rebind_and_drops_what_is_unbound() {
+        // A user who moves a key is told the key they moved it to...
+        let rebound =
+            Keymap::from_pairs([("ctrl+e", "quit"), ("ctrl+s", "save")]).expect("valid bindings");
+        let text = key_help(&rebound);
+        assert!(text.contains("Ctrl+E          Quit"), "{text}");
+        // ...and a command with no binding at all is left out rather than printed
+        // with a blank chord, so unbinding something removes it from the help.
+        assert!(!text.contains("Theme picker"), "{text}");
+        assert!(text.contains("Ctrl+S          Save\n"), "{text}");
+    }
+
+    #[test]
     fn parse_args_recognizes_help_and_version() {
-        assert_eq!(args(&["--help"]), Args::Help);
-        assert_eq!(args(&["-h"]), Args::Help);
+        assert_eq!(args(&["--help"]), Args::Help { config: None });
+        assert_eq!(args(&["-h"]), Args::Help { config: None });
         assert_eq!(args(&["--version"]), Args::Version);
         assert_eq!(args(&["-V"]), Args::Version);
+    }
+
+    #[test]
+    fn help_carries_a_config_path_given_on_either_side_of_it() {
+        // The help renders its key list from the resolved keymap, so the flag that
+        // decides which keymap that is has to survive - including when it is written
+        // after `-h`, which an early return would have missed.
+        assert_eq!(
+            args(&["--config", "keys.toml", "--help"]),
+            Args::Help {
+                config: Some(PathBuf::from("keys.toml"))
+            }
+        );
+        assert_eq!(
+            args(&["-h", "--config=keys.toml"]),
+            Args::Help {
+                config: Some(PathBuf::from("keys.toml"))
+            }
+        );
     }
 
     #[test]
