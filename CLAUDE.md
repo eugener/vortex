@@ -22,6 +22,8 @@ cargo build --workspace        # 3. compile
 cargo test --workspace         # 4. tests
 # 5. coverage gates - EVERY file must stay above its crate's floor (SPEC §13).
 #    Ratchet: no regress. Current: core 99.3% lines, tui 92.6%.
+#    NOTE: `cargo llvm-cov clean --workspace` first, or a stale profile reports a
+#    false collapse (core once read 95% when it was 99%).
 cargo llvm-cov --package vortex-core --fail-under-file-lines 90 \
   --ignore-filename-regex 'lsp/client\.rs' --summary-only
 cargo llvm-cov --package vortex-tui  --fail-under-file-lines 60 --summary-only

@@ -143,6 +143,39 @@ fn coalescing(needs_redraw: bool, held_for: Duration, input_waiting: bool) -> bo
     needs_redraw && input_waiting && held_for < COALESCE
 }
 
+/// Whether the caret has been still long enough for its diagnostic to be worth showing
+/// on the status bar, and whether *this* frame is the one that has to say so (SPEC
+/// §7.5, M10).
+///
+/// Split out of the loop for the reason [`coalescing`] is: it is the decision, and the
+/// loop around it is terminal I/O no test can reach. The clock arrives as `now` rather
+/// than being read here, so a test can walk time instead of sleeping through it.
+///
+/// `state` is the caret's byte and when it was last seen to move, plus whether the
+/// rested frame has already been painted. The second flag is what turns the deadline
+/// into **exactly one** repaint: a caret that stops moving produces no further events,
+/// so nothing else would ask for the frame that shows the message - and without the
+/// flag the loop would instead repaint every poll for as long as the caret sat still.
+fn caret_rest(
+    state: &mut (Option<(usize, Instant)>, bool),
+    head: Option<usize>,
+    now: Instant,
+) -> (bool, bool) {
+    let (at, announced) = state;
+    if let Some(head) = head
+        && at.is_none_or(|(previous, _)| previous != head)
+    {
+        *at = Some((head, now));
+        *announced = false;
+    }
+    let rested = at.is_some_and(|(_, since)| now.duration_since(since) >= HIGHLIGHT_WAIT);
+    let repaint = rested && !*announced;
+    if repaint {
+        *announced = true;
+    }
+    (rested, repaint)
+}
+
 /// Whether the next frame should pull the viewport to keep the caret visible, given
 /// what the last frame was showing ([`ViewState::shown`]) and where the caret is now.
 ///
@@ -878,6 +911,14 @@ fn event_loop(
     // file never flashes plain-then-colored. Any input cancels the hold - a keystroke
     // must never wait on highlighting.
     let mut awaiting_highlight: Option<Instant> = None;
+    // The caret's byte and when it last moved, for the status bar's diagnostic
+    // readout (SPEC §7.5, M10). Without the rest rule the diagnostic replaces the
+    // format readout on every keystroke that crosses a flagged line, and a strobing
+    // segment is worse than an absent one.
+    //
+    // The wait is `HIGHLIGHT_WAIT`, reused rather than duplicated: the editor gets
+    // one "the user has stopped" constant, not two.
+    let mut caret_state: (Option<(usize, Instant)>, bool) = (None, false);
     // When the last frame went out, which is what bounds how long a burst of input may
     // postpone the next one (see [`COALESCE`]). Starts now rather than at the epoch so
     // the first frame is not treated as already overdue.
@@ -1038,6 +1079,18 @@ fn event_loop(
                 && since.elapsed() < HIGHLIGHT_WAIT
         });
 
+        // Has the caret moved since the last frame, and if not, has it now been still
+        // long enough for its diagnostic to be worth showing? Derived here rather than
+        // in the paint because it has to schedule the repaint that *shows* it: a caret
+        // that stops moving produces no event, so nothing else would ask for a frame.
+        let caret_head = latest.as_ref().and_then(|snap| {
+            snap.selections
+                .get(snap.primary)
+                .map(|selection| selection.head)
+        });
+        let (caret_rested, rest_repaint) = caret_rest(&mut caret_state, caret_head, Instant::now());
+        needs_redraw |= rest_repaint;
+
         // Let a burst collapse into one frame rather than painting every event in it
         // (see [`COALESCE`]). Asked only of a frame that would otherwise paint, so an
         // idle loop pays no extra poll.
@@ -1092,6 +1145,8 @@ fn event_loop(
                     follow,
                     selected,
                     tab_width: config.tab_width,
+                    indent: &config.indent_style.indent_readout(config.tab_width),
+                    caret_rested,
                     line_numbers: config.line_numbers,
                     rulers: &config.rulers,
                     indent_guides: config.indent_guides,
@@ -1301,6 +1356,8 @@ fn event_loop(
                                 if let Some(target) = status_target_at(
                                     snap,
                                     selected,
+                                    &config.indent_style.indent_readout(config.tab_width),
+                                    caret_rested,
                                     screen.width as usize,
                                     mouse.column as usize,
                                 ) {
@@ -1640,6 +1697,18 @@ fn dispatch_command(command: Command, handle: &vortex_core::CoreHandle, ui: &mut
         Command::OpenSavePrompt => ui
             .overlays
             .push(prompt::save_as(&ui.config.theme, ui.path())),
+        // What one indent *is* is a live setting, so it is filled in here rather than
+        // baked into the binding (SPEC §7.5, M10). Only the finished insert crosses.
+        Command::InsertIndent => {
+            let indent = ui.config.indent_style.indent(ui.config.tab_width);
+            if handle
+                .actions
+                .send_blocking(Action::Insert(indent))
+                .is_err()
+            {
+                return false;
+            }
+        }
         // The buffer commands resolve against the list the snapshot carries and then
         // share one send below, since each is "work out which buffer, then say so".
         // Nothing to say (one buffer open, or no snapshot yet) is a no-op rather than
@@ -1849,6 +1918,11 @@ struct PaintInputs<'a> {
     /// Display width of a tab stop (SPEC §4, §10.5). Carried per frame rather than
     /// read from a constant so a config change takes effect without a restart.
     tab_width: usize,
+    /// What the Tab key inserts, rendered for the status bar (SPEC §7.5, M10).
+    indent: &'a str,
+    /// Whether the caret has sat still for [`HIGHLIGHT_WAIT`], which is when its
+    /// diagnostic is worth putting on the status bar (SPEC §7.5, M10).
+    caret_rested: bool,
     /// How the gutter numbers its rows (SPEC §7.5), carried per frame for the same
     /// reason as `tab_width`.
     line_numbers: config::LineNumbers,
@@ -1887,6 +1961,8 @@ fn paint(frame: &mut Frame, snapshot: &ViewSnapshot, inputs: PaintInputs) -> Vie
         follow,
         selected,
         tab_width,
+        indent,
+        caret_rested,
         line_numbers,
         rulers,
         indent_guides,
@@ -2084,6 +2160,8 @@ fn paint(frame: &mut Frame, snapshot: &ViewSnapshot, inputs: PaintInputs) -> Vie
         status_area,
         snapshot,
         StatusBar {
+            indent,
+            caret_rested,
             cursor_line,
             line_text: &line_text,
             cursor_byte_col,
@@ -2580,21 +2658,60 @@ struct StatusBar<'a> {
     cursor_byte_col: usize,
     /// Grapheme count of the active selection (see [`PaintInputs::selected`]).
     selected: usize,
+    /// What the Tab key inserts, already rendered from the live config.
+    indent: &'a str,
+    /// Whether the caret has sat still long enough for its diagnostic to be worth
+    /// showing (see [`CARET_REST`]). The message itself is looked up here.
+    caret_rested: bool,
     /// Bar fill style (from the active theme).
     style: Style,
 }
 
+/// The status-bar facts for `snapshot`, assembled once so the paint and the click
+/// hit-test cannot describe different bars (the rule `Picker::row_at` and
+/// `on_scrollbar` already follow).
+fn status_info<'a>(
+    snapshot: &'a ViewSnapshot,
+    line: usize,
+    col: usize,
+    selected: usize,
+    indent: &'a str,
+    caret_rested: bool,
+) -> layout::StatusInfo<'a> {
+    let head = snapshot
+        .selections
+        .get(snapshot.primary)
+        .map(|s| s.head)
+        .unwrap_or(0);
+    layout::StatusInfo {
+        line,
+        col,
+        selected,
+        cursors: snapshot.selections.len(),
+        format: snapshot.format,
+        indent,
+        // Only once the caret has stopped. Asked of the decorations rather than
+        // remembered, so a diagnostic that arrives while the caret already sits on
+        // the span appears without the caret having to move again.
+        diagnostic: caret_rested
+            .then(|| snapshot.decorations.diagnostic_at(head))
+            .flatten()
+            .map(|(_, message)| message),
+        read_only: snapshot.read_only,
+    }
+}
+
 fn paint_status_bar(frame: &mut Frame, area: Rect, snapshot: &ViewSnapshot, status: StatusBar) {
     let col = layout::grapheme_column(status.line_text, status.cursor_byte_col);
-    let (left, right) = layout::status_bar(
+    let info = status_info(
+        snapshot,
         status.cursor_line + 1,
         col,
         status.selected,
-        snapshot.text.byte_len(),
-        snapshot.version,
-        snapshot.format,
-        snapshot.read_only,
+        status.indent,
+        status.caret_rested,
     );
+    let (left, right) = layout::status_bar(info);
     let bar = layout::fit_bar(&left, &right, area.width as usize);
     frame.render_widget(Paragraph::new(bar).style(status.style), area);
 }
@@ -2608,6 +2725,8 @@ fn paint_status_bar(frame: &mut Frame, area: Rect, snapshot: &ViewSnapshot, stat
 fn status_target_at(
     snapshot: &ViewSnapshot,
     selected: usize,
+    indent: &str,
+    caret_rested: bool,
     width: usize,
     column: usize,
 ) -> Option<layout::StatusTarget> {
@@ -2618,23 +2737,16 @@ fn status_target_at(
         .unwrap_or(0);
     let (cursor_line, cursor_byte_col, line_text) = layout::cursor_line_col(&snapshot.text, head);
     let col = layout::grapheme_column(&line_text, cursor_byte_col);
-    let (left, _) = layout::status_bar(
+    let info = status_info(
+        snapshot,
         cursor_line + 1,
         col,
         selected,
-        snapshot.text.byte_len(),
-        snapshot.version,
-        snapshot.format,
-        snapshot.read_only,
+        indent,
+        caret_rested,
     );
-    layout::status_target(
-        &left,
-        snapshot.text.byte_len(),
-        snapshot.version,
-        snapshot.format,
-        width,
-        column,
-    )
+    let (left, _) = layout::status_bar(info);
+    layout::status_target(&left, info, width, column)
 }
 
 /// Whether `column`/`row` fall on the scrollbar's reserved column (SPEC §7.5).
@@ -3337,6 +3449,8 @@ mod tests {
             follow: true,
             selected,
             tab_width: config::DEFAULT_TAB_WIDTH,
+            indent: "tabs:4",
+            caret_rested: false,
             line_numbers: config::LineNumbers::default(),
             rulers: &[],
             indent_guides: false,
@@ -4503,6 +4617,42 @@ mod tests {
     }
 
     #[test]
+    fn insert_indent_sends_what_the_live_config_says_an_indent_is() {
+        // The seam claim, checked at the seam: `insert_tab` carries no indent of its
+        // own, so what crosses is whatever the config resolved *at dispatch*. Only
+        // the finished insert reaches the core - it never learns there was a setting.
+        // `run` is held rather than dropped: it owns the receiving end, and a closed
+        // channel would make the send fail for a reason that has nothing to do with
+        // what is being tested.
+        let Core { handle, run: _run } = vortex_core::new(64);
+        let mut overlays = Compositor::new();
+        let mut search = buffersearch::SearchState::default();
+        let mut send = |config: &mut config::Config| {
+            let mut toasts = Toasts::new(config.theme.toast_info, config.theme.toast_error);
+            let mut ui = Frontend {
+                overlays: &mut overlays,
+                config,
+                toasts: &mut toasts,
+                snapshot: None,
+                search: &mut search,
+            };
+            assert!(dispatch_command(Command::InsertIndent, &handle, &mut ui));
+        };
+
+        let mut config = config::Config::default();
+        send(&mut config);
+        config.indent_style = config::IndentStyle::Spaces;
+        config.tab_width = 2;
+        send(&mut config);
+        assert_eq!(handle.actions.len(), 2, "both indents crossed the seam");
+        // *What* each one carried is `IndentStyle::indent`'s own contract, checked in
+        // `config`'s tests; reading it back here would need the actor running. What
+        // this pins is the wiring: the command resolves against the **live** config at
+        // dispatch rather than against anything baked into the binding.
+        assert_eq!(config.indent_style.indent(config.tab_width), "  ");
+    }
+
+    #[test]
     fn toggling_the_scrollbar_flips_the_live_config_both_ways() {
         let Core { handle, run: _ } = vortex_core::new(64);
         let mut config = config::Config::default();
@@ -4947,26 +5097,22 @@ mod tests {
         // that decides whether the right segment fits at all.
         let snap = gesture_snapshot();
         let width = 80;
-        let (_, right) = layout::status_bar(
-            1,
-            1,
-            0,
-            snap.text.byte_len(),
-            snap.version,
-            snap.format,
-            snap.read_only,
-        );
+        let (_, right) = layout::status_bar(status_info(&snap, 1, 1, 0, INDENT, false));
         let start = width - right.width();
         assert_eq!(
-            status_target_at(&snap, 0, width, start),
+            status_target_at(&snap, 0, INDENT, false, width, start),
             Some(layout::StatusTarget::Encoding)
         );
         assert_eq!(
-            status_target_at(&snap, 0, width, start + right.width() - 2),
+            status_target_at(&snap, 0, INDENT, false, width, start + right.width() - 2),
             None,
-            "the version is a readout, not a control"
+            "the indent readout is a readout, not a control"
         );
     }
+
+    /// The rendered indent style the status-bar tests pass; its content does not
+    /// matter to them, only that the segment is the shape the paint produces.
+    const INDENT: &str = "tabs:4";
 
     #[test]
     fn a_terminal_too_narrow_for_the_metrics_offers_nothing_to_click() {
@@ -4975,7 +5121,7 @@ mod tests {
         let snap = gesture_snapshot();
         for column in 0..24 {
             assert_eq!(
-                status_target_at(&snap, 1234, 24, column),
+                status_target_at(&snap, 1234, INDENT, false, 24, column),
                 None,
                 "column {column} on a crowded 24-cell bar"
             );
@@ -5105,14 +5251,119 @@ mod tests {
     }
 
     #[test]
+    fn a_caret_rests_once_and_asks_for_exactly_one_frame() {
+        // The deadline has to *schedule* the repaint, not merely answer a question:
+        // a caret that stops moving produces no further events, so without this the
+        // message would wait for an unrelated keystroke to appear.
+        let start = Instant::now();
+        let mut state = (None, false);
+        // Freshly placed: nothing has been still yet.
+        assert_eq!(caret_rest(&mut state, Some(10), start), (false, false));
+        assert_eq!(
+            caret_rest(&mut state, Some(10), start + HIGHLIGHT_WAIT / 2),
+            (false, false),
+            "still moving inside the window"
+        );
+        // The deadline: rested, and this frame is the one that has to say so.
+        assert_eq!(
+            caret_rest(&mut state, Some(10), start + HIGHLIGHT_WAIT),
+            (true, true)
+        );
+        // ...and only that frame. A poll every 16ms must not each ask to repaint.
+        for tick in 1..5 {
+            assert_eq!(
+                caret_rest(&mut state, Some(10), start + HIGHLIGHT_WAIT * (1 + tick)),
+                (true, false),
+                "tick {tick} asked for a second frame"
+            );
+        }
+        // Moving again restarts the wait and re-arms the announcement.
+        assert_eq!(
+            caret_rest(&mut state, Some(11), start + HIGHLIGHT_WAIT * 5),
+            (false, false)
+        );
+        assert_eq!(
+            caret_rest(&mut state, Some(11), start + HIGHLIGHT_WAIT * 6),
+            (true, true)
+        );
+    }
+
+    #[test]
+    fn a_caret_that_has_not_arrived_yet_never_rests() {
+        // Before the first snapshot there is no caret to have stopped, and reporting
+        // one as rested would put a diagnostic on screen for a buffer with no text.
+        let mut state = (None, false);
+        let start = Instant::now();
+        assert_eq!(caret_rest(&mut state, None, start), (false, false));
+        assert_eq!(
+            caret_rest(&mut state, None, start + HIGHLIGHT_WAIT * 3),
+            (false, false)
+        );
+    }
+
+    #[test]
+    fn a_rested_caret_puts_its_diagnostic_on_the_bar_and_a_moving_one_does_not() {
+        // The rest rule is not a refinement (SPEC §7.5, M10): without it the
+        // diagnostic replaces the format readout on every keystroke that crosses a
+        // flagged line, and a strobing segment is worse than an absent one.
+        let mut snap = snapshot_after(&[Action::Insert("let x = 1;\n".into())]);
+        let mut decorations = vortex_core::DecorationSet::new();
+        decorations.replace(
+            vortex_core::DecorationSource::Lsp,
+            vec![vortex_core::Decoration::Underline {
+                range: 4..5,
+                severity: vortex_core::Severity::Warning,
+                message: "unused variable `x`".to_string(),
+            }],
+        );
+        snap.decorations = std::sync::Arc::new(decorations);
+        // The caret sits at the end of the insert, off the flagged span.
+        let moving = render_with(&snap, 60, 6, paint_inputs(0));
+        assert!(
+            row_text(&moving, 5).contains("UTF-8"),
+            "the format readout was displaced while the caret was elsewhere"
+        );
+
+        // Put the caret inside the span. Still moving: the bar must not have changed.
+        snap.selections = std::sync::Arc::from(vec![vortex_core::Selection::cursor(4)]);
+        let crossing = render_with(&snap, 60, 6, paint_inputs(0));
+        assert!(
+            row_text(&crossing, 5).contains("UTF-8"),
+            "a caret merely crossing the span took the segment"
+        );
+
+        // Rested, and only now does it speak.
+        let rested = render_with(
+            &snap,
+            60,
+            6,
+            PaintInputs {
+                caret_rested: true,
+                ..paint_inputs(0)
+            },
+        );
+        let bar = row_text(&rested, 5);
+        assert!(bar.contains("unused variable `x`"), "{bar:?}");
+        assert!(
+            !bar.contains("UTF-8"),
+            "it takes the segment, not a slice: {bar:?}"
+        );
+    }
+
+    #[test]
     fn status_bar_shows_cursor_position_on_bottom_row() {
         // Insert two lines, leaving the cursor at the end of line 2 (Ln 2, Col 4).
         let snap = snapshot_after(&[Action::Insert("ab\ncde".into())]);
         let buf = render(&snap, 40, 10);
         let status = row_text(&buf, 9); // bottom row
         assert!(status.contains("Ln 2, Col 4"), "status: {status:?}");
-        assert!(status.contains("6B"), "status (byte count): {status:?}");
-        assert!(status.contains("v1"), "status (version): {status:?}");
+        // What the bar no longer spends cells on (SPEC §7.5, M10): the filesystem
+        // answers the byte size, and the document version was instrumentation.
+        assert!(!status.contains("6B"), "status still sizes: {status:?}");
+        assert!(!status.contains("v1"), "status still versions: {status:?}");
+        // What it spends them on instead - the thing that silently decides what Tab
+        // inserts, which nothing else on screen says.
+        assert!(status.contains("tabs:4"), "status (indent): {status:?}");
         let status_bg = config::Theme::default().status_bar.bg;
         assert_eq!(buf.cell((0, 9)).unwrap().bg, status_bg.unwrap());
     }

@@ -2,7 +2,20 @@ use super::*;
 use crate::buffer::{Buffer, RopeBuffer};
 
 fn underline(range: ByteRange, severity: Severity) -> Decoration {
-    Decoration::Underline { range, severity }
+    Decoration::Underline {
+        range,
+        severity,
+        message: String::new(),
+    }
+}
+
+/// An underline that carries a message, for the readout `diagnostic_at` feeds.
+fn flagged(range: ByteRange, severity: Severity, message: &str) -> Decoration {
+    Decoration::Underline {
+        range,
+        severity,
+        message: message.to_string(),
+    }
 }
 
 fn set(decorations: Vec<Decoration>) -> DecorationSet {
@@ -471,4 +484,43 @@ fn a_scope_rides_edits_with_the_shift_dont_grow_bias() {
     assert_eq!(only_scope_at(&s, 30), 10..95);
     s.transform_through(&[edit(10, 10, 2)]); // 2 bytes just before the start
     assert_eq!(only_scope_at(&s, 30), 12..97);
+}
+
+#[test]
+fn diagnostic_at_reports_the_worst_thing_covering_the_caret() {
+    // What the status bar shows once the caret has rested (SPEC §7.5, M10). Asked
+    // about the caret's *byte*, so a line carrying two diagnostics reports the one
+    // the caret is inside rather than whichever arrived first.
+    let set = set(vec![
+        flagged(0..5, Severity::Warning, "unused variable `x`"),
+        flagged(10..20, Severity::Error, "cannot find value `y`"),
+    ]);
+    assert_eq!(
+        set.diagnostic_at(2),
+        Some((Severity::Warning, "unused variable `x`"))
+    );
+    assert_eq!(
+        set.diagnostic_at(15),
+        Some((Severity::Error, "cannot find value `y`"))
+    );
+    // Between the two spans there is nothing to say, which is what keeps the format
+    // readout on screen for the rest of the line.
+    assert_eq!(set.diagnostic_at(7), None);
+    // The end is exclusive, like every other range on this channel.
+    assert_eq!(set.diagnostic_at(20), None);
+}
+
+#[test]
+fn overlapping_diagnostics_break_the_tie_on_severity() {
+    // One segment, so the worst wins - the rule `gutter_mark` already follows for
+    // the one cell it has.
+    let set = set(vec![
+        flagged(0..10, Severity::Hint, "consider borrowing"),
+        flagged(0..10, Severity::Error, "mismatched types"),
+        flagged(0..10, Severity::Warning, "unused"),
+    ]);
+    assert_eq!(
+        set.diagnostic_at(5),
+        Some((Severity::Error, "mismatched types"))
+    );
 }

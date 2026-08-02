@@ -54,6 +54,49 @@ pub enum LineNumbers {
     Relative,
 }
 
+/// What the Tab key inserts (SPEC §7.5, M10).
+///
+/// A **frontend** setting, and the seam is why: `insert_tab` is a frontend command
+/// that resolves to an `Action::Insert`, so what it inserts is already this side's
+/// decision - a tab is one byte whatever it is painted as (§10.5). The core never
+/// learns there was a preference.
+///
+/// Distinct from [`Config::tab_width`], which is how wide an *existing* tab paints.
+/// A file can be indented with spaces and still contain tabs to render.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum IndentStyle {
+    /// Insert one `\t`. The default, because it is what the editor did before the
+    /// setting existed and a default that changes what a key types is not a default.
+    #[default]
+    Tabs,
+    /// Insert [`Config::tab_width`] spaces.
+    Spaces,
+}
+
+impl IndentStyle {
+    /// What one press of the Tab key inserts.
+    pub fn indent(self, tab_width: usize) -> String {
+        match self {
+            IndentStyle::Tabs => "\t".to_string(),
+            IndentStyle::Spaces => " ".repeat(tab_width),
+        }
+    }
+
+    /// The status bar's readout: the style and the width it counts in.
+    ///
+    /// Both halves, because neither answers alone - `spaces` does not say how many,
+    /// and `4` does not say of what. This is the one thing on the bar that silently
+    /// decides what a keystroke does, which is why it earns a cell at all.
+    pub fn indent_readout(self, tab_width: usize) -> String {
+        let name = match self {
+            IndentStyle::Tabs => "tabs",
+            IndentStyle::Spaces => "spaces",
+        };
+        format!("{name}:{tab_width}")
+    }
+}
+
 /// All user-configurable settings, resolved once at startup and threaded into the
 /// render and input paths. Grows as configurable surfaces land, so it is passed as
 /// a whole rather than field-by-field (SPEC §10.5).
@@ -70,6 +113,10 @@ pub struct Config {
     /// Display width of a tab stop (SPEC §4). Frontend-owned because a tab's width
     /// is a rendering question - the buffer holds one byte either way.
     pub tab_width: usize,
+    /// What the Tab key inserts (SPEC §7.5, M10). Frontend-owned like
+    /// [`Self::tab_width`], and for a sharper reason: the frontend is what turns
+    /// `insert_tab` into an `Action::Insert`, so the core never sees the choice.
+    pub indent_style: IndentStyle,
     /// How the gutter numbers its rows (SPEC §7.5). Frontend-owned for the same
     /// reason the gutter itself is: the core has no idea a margin exists.
     pub line_numbers: LineNumbers,
@@ -115,6 +162,7 @@ impl Default for Config {
             theme_name: crate::theme::DEFAULT.to_string(),
             keymap: Keymap::default(),
             tab_width: DEFAULT_TAB_WIDTH,
+            indent_style: IndentStyle::default(),
             line_numbers: LineNumbers::default(),
             rulers: Vec::new(),
             indent_guides: false,
@@ -149,6 +197,7 @@ impl Config {
 struct ConfigFile {
     theme: Option<String>,
     tab_width: Option<usize>,
+    indent_style: Option<IndentStyle>,
     line_numbers: Option<LineNumbers>,
     rulers: Option<Vec<usize>>,
     indent_guides: Option<bool>,
@@ -265,6 +314,9 @@ fn parse(text: &str) -> (Config, Option<String>) {
         } else {
             config.tab_width = width;
         }
+    }
+    if let Some(style) = file.indent_style {
+        config.indent_style = style;
     }
     if let Some(mode) = file.line_numbers {
         config.line_numbers = mode;
@@ -788,6 +840,27 @@ mod tests {
             command_for_key(&config.keymap, ctrl_s, 10),
             Some(Command::Editor(vortex_core::Action::Save { force: false }))
         );
+    }
+
+    #[test]
+    fn indent_style_decides_what_tab_inserts_and_what_the_bar_says() {
+        // The one piece of new scope in M10, and a frontend one: `insert_tab` is a
+        // frontend command, so what it inserts never crosses the seam (SPEC §7.5).
+        assert_eq!(IndentStyle::Tabs.indent(4), "\t");
+        assert_eq!(IndentStyle::Spaces.indent(4), "    ");
+        assert_eq!(IndentStyle::Spaces.indent(2), "  ");
+        // Both halves of the readout, because neither answers alone.
+        assert_eq!(IndentStyle::Tabs.indent_readout(8), "tabs:8");
+        assert_eq!(IndentStyle::Spaces.indent_readout(2), "spaces:2");
+        // Tabs by default: a default that changes what a key types is not a default.
+        assert_eq!(Config::default().indent_style, IndentStyle::Tabs);
+        let (config, problem) = parse("indent_style = \"spaces\"\ntab_width = 2\n");
+        assert_eq!(problem, None);
+        assert_eq!(config.indent_style.indent(config.tab_width), "  ");
+        // Unknown values are reported like every other bad setting (SPEC §8).
+        let (fallback, problem) = parse("indent_style = \"elastic\"\n");
+        assert!(problem.is_some(), "an unknown style must be reported");
+        assert_eq!(fallback.indent_style, IndentStyle::Tabs);
     }
 
     #[test]

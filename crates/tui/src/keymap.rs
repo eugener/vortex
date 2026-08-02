@@ -622,6 +622,9 @@ impl Command {
             Command::FindNext => return Some(FrontendCommand::FindNext),
             Command::FindPrevious => return Some(FrontendCommand::FindPrevious),
             Command::SelectAllMatches => return Some(FrontendCommand::SelectAllMatches),
+            // What an indent *is* depends on the live `indent_style`, so it is
+            // resolved at dispatch like the buffer and search commands above.
+            Command::InsertTab => return Some(FrontendCommand::InsertIndent),
             Command::Quit => Action::Quit,
             Command::Save => Action::Save { force: false },
             Command::Undo => Action::Undo,
@@ -629,7 +632,7 @@ impl Command {
             Command::DeleteBackward => Action::DeleteBackward,
             Command::DeleteForward => Action::DeleteForward,
             Command::InsertNewline => Action::Insert("\n".to_string()),
-            Command::InsertTab => Action::Insert("\t".to_string()),
+
             Command::AddCursorAbove => Action::AddCursorAbove,
             Command::AddCursorBelow => Action::AddCursorBelow,
             Command::CollapseSelections => Action::CollapseSelections,
@@ -1271,12 +1274,19 @@ mod tests {
     }
 
     #[test]
-    fn enter_and_tab_insert_whitespace() {
+    fn enter_inserts_a_newline_and_tab_defers_to_the_live_indent_style() {
         assert_eq!(
             act(press(KeyCode::Enter)),
             Some(Action::Insert("\n".into()))
         );
-        assert_eq!(act(press(KeyCode::Tab)), Some(Action::Insert("\t".into())));
+        // Tab does *not* resolve to an action here: what one indent is depends on a
+        // frontend setting, so it is filled in at dispatch like `next_buffer` is
+        // (SPEC §7.5, M10). Baking `\t` into the binding would make `indent_style`
+        // unreachable from the key that needs it.
+        assert_eq!(
+            command_for_key(&Keymap::default(), press(KeyCode::Tab), PAGE),
+            Some(FrontendCommand::InsertIndent)
+        );
     }
 
     #[test]

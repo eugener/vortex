@@ -1141,41 +1141,63 @@ pub fn human_size(bytes: usize) -> String {
     format!("{size:.1}{}", UNITS[unit])
 }
 
-/// Status-bar segments `(left, right)` = (cursor position, buffer metrics). File
-/// open/save results no longer hijack this bar - they surface in the toast area
-/// ([`crate::toast`], SPEC §7.5) - so the position is always shown. `line`/`col` are
-/// 1-based for display; a non-zero `selected` (grapheme count of the active
-/// selection) is appended so the size of a selection is visible while it is held.
-/// `bytes` is the buffer size (rendered via [`human_size`]) and `version` the
-/// document version (SPEC §5), surfaced while the delta/version model is young.
+/// What the status bar is told about the frame it is describing.
 ///
-/// `format` is the file's on-disk encoding and line terminator (SPEC §10.1). It is
-/// shown because it is otherwise invisible: the buffer holds UTF-8 with LF
-/// terminators whatever the file holds, so without this readout there is nothing to
-/// tell a user that opening a CRLF latin-1 file preserved it - or that a new buffer
-/// will not.
+/// A struct rather than eight positional arguments: the bar answers one question
+/// (*where am I, and how is this written?*) out of several unrelated facts, and a
+/// call site that passes them in the wrong order still compiles when they are all
+/// `usize`.
+#[derive(Debug, Clone, Copy)]
+pub struct StatusInfo<'a> {
+    /// 1-based caret line and column, for display.
+    pub line: usize,
+    pub col: usize,
+    /// Grapheme count of the active selection; `0` when nothing is selected.
+    pub selected: usize,
+    /// How many carets there are. Shown above one, because the position readout
+    /// describes the *primary* as though cursors were singular (SPEC §2.2).
+    pub cursors: usize,
+    /// The file's on-disk encoding and line terminator (SPEC §10.1).
+    pub format: FileFormat,
+    /// What the Tab key inserts, already rendered (`spaces:4`).
+    pub indent: &'a str,
+    /// The diagnostic under a *rested* caret, if any - it takes the right segment
+    /// over the format readout. `None` while the caret is moving, which is what
+    /// stops the segment strobing.
+    pub diagnostic: Option<&'a str>,
+    pub read_only: bool,
+}
+
+/// Status-bar segments `(left, right)` = (*where am I*, *how is this written*).
+///
+/// **What is not here is the design** (SPEC §7.5, M10): a chrome cell is spent on
+/// what the user cannot otherwise learn. The buffer's byte size went, because the
+/// filesystem answers it and it is never the question mid-edit; the document version
+/// went, because it was instrumentation that §5 scoped to "while the delta model is
+/// young" and it is no longer young. What stays is unlearnable from the screen -
+/// the format, because the buffer holds UTF-8 with LF whatever the file holds, so
+/// nothing else can tell you a CRLF latin-1 file was preserved; and the indent
+/// style, because it silently decides what the Tab key inserts.
+///
+/// The cursor count and the selection size obey the **presence rule**: absent at
+/// nominal, present when they have something to say. A segment reading `1 cursor`
+/// forever teaches the eye to skip the place the interesting number will appear.
 ///
 /// `read_only` leads the **left** segment, ahead of the cursor position. Placement
 /// is the whole point: [`fit_bar`] drops the right segment first and then truncates
 /// the left from its *end*, so the front of the left segment is the only spot that
 /// survives any width - and of everything on this bar, "your edits will be refused"
 /// is what a user must not have to widen the terminal to discover.
-pub fn status_bar(
-    line: usize,
-    col: usize,
-    selected: usize,
-    bytes: usize,
-    version: u64,
-    format: FileFormat,
-    read_only: bool,
-) -> (String, String) {
-    let lock = if read_only { " [read-only] " } else { "" };
-    let left = if selected > 0 {
-        format!("{lock} Ln {line}, Col {col}  ({selected} selected)")
-    } else {
-        format!("{lock} Ln {line}, Col {col}")
-    };
-    (left, status_right(bytes, version, format).0)
+pub fn status_bar(info: StatusInfo<'_>) -> (String, String) {
+    let lock = if info.read_only { " [read-only] " } else { "" };
+    let mut left = format!("{lock} Ln {}, Col {}", info.line, info.col);
+    if info.selected > 0 {
+        left.push_str(&format!("  ({} selected)", info.selected));
+    }
+    if info.cursors > 1 {
+        left.push_str(&format!("  {} cursors", info.cursors));
+    }
+    (left, status_right(info).0)
 }
 
 /// Something on the status bar that can be clicked (SPEC §7.5).
@@ -1196,15 +1218,24 @@ pub enum StatusTarget {
 /// than the one painted - the same rule the picker's rows and the toast stack
 /// follow. Absolute columns are the caller's to work out, because only the caller
 /// knows where [`fit_bar`] put the segment.
-fn status_right(
-    bytes: usize,
-    version: u64,
-    format: FileFormat,
-) -> (String, [(Range<usize>, StatusTarget); 2]) {
-    let bom = if format.bom { " BOM" } else { "" };
-    let encoding = format!("{}{bom}", format.encoding_name());
-    let eol = format.eol.name();
-    let text = format!("{encoding} · {eol} · {} · v{version} ", human_size(bytes),);
+fn status_right(info: StatusInfo<'_>) -> (String, [(Range<usize>, StatusTarget); 2]) {
+    // A rested caret's diagnostic takes the whole segment. Nothing in it is
+    // clickable then - the format words are not painted, and a span that described
+    // where they *would* be is exactly the disagreement this function exists to
+    // prevent, so the ranges collapse to empty.
+    if let Some(message) = info.diagnostic {
+        return (
+            format!("{message} "),
+            [
+                (0..0, StatusTarget::Encoding),
+                (0..0, StatusTarget::LineEnding),
+            ],
+        );
+    }
+    let bom = if info.format.bom { " BOM" } else { "" };
+    let encoding = format!("{}{bom}", info.format.encoding_name());
+    let eol = info.format.eol.name();
+    let text = format!("{encoding} · {eol} · {} ", info.indent);
     // Both words sit at the front, separated by " · " (three display columns).
     let encoding_span = 0..encoding.width();
     let eol_start = encoding_span.end + SEPARATOR_WIDTH;
@@ -1225,19 +1256,17 @@ const SEPARATOR_WIDTH: usize = 3;
 
 /// Which clickable part of the status bar display column `column` falls on, if any.
 ///
-/// Returns `None` for the position readout, the size, the version, the gaps - and
-/// for every column when the bar is too narrow to have shown the right segment at
-/// all, since [`fit_bar`] drops it there and nothing that is not painted can be
-/// clicked.
+/// Returns `None` for the position readout, the indent readout, the gaps - for every
+/// column while a rested diagnostic has taken the segment - and for every column when
+/// the bar is too narrow to have shown the right segment at all, since [`fit_bar`]
+/// drops it there and nothing that is not painted can be clicked.
 pub fn status_target(
     left: &str,
-    bytes: usize,
-    version: u64,
-    format: FileFormat,
+    info: StatusInfo<'_>,
     width: usize,
     column: usize,
 ) -> Option<StatusTarget> {
-    let (right, spans) = status_right(bytes, version, format);
+    let (right, spans) = status_right(info);
     let start = right_placement(left, &right, width)?;
     let within = column.checked_sub(start)?;
     spans
@@ -2405,30 +2434,94 @@ mod tests {
         assert!(strip[0].is_active(), "fell back to marking the first tab");
     }
 
+    /// A [`StatusInfo`] with the nominal values, so a test names only what it is
+    /// about. `..` on the literal would work too, but a helper keeps the presence
+    /// rule's baseline (one cursor, nothing selected, no rested diagnostic) in one
+    /// place - it is what "nominal" means for this bar.
+    fn info(line: usize, col: usize) -> StatusInfo<'static> {
+        StatusInfo {
+            line,
+            col,
+            selected: 0,
+            cursors: 1,
+            format: FileFormat::default(),
+            indent: "tabs:4",
+            diagnostic: None,
+            read_only: false,
+        }
+    }
+
     #[test]
-    fn status_bar_composes_position_and_metrics() {
-        let (left, right) = status_bar(2, 5, 0, 38, 7, FileFormat::default(), false);
+    fn status_bar_composes_position_and_format() {
+        let (left, right) = status_bar(info(2, 5));
         assert_eq!(left, " Ln 2, Col 5");
-        assert_eq!(right, "UTF-8 · LF · 38B · v7 ");
+        // No byte size and no version: the filesystem answers the first and the
+        // second was instrumentation (SPEC §7.5, M10). What is left is what the
+        // screen cannot otherwise tell you.
+        assert_eq!(right, "UTF-8 · LF · tabs:4 ");
     }
 
     #[test]
     fn status_bar_appends_selection_count_when_active() {
         // A held selection surfaces its size next to the position; an empty one
         // (count 0) leaves the position untouched.
-        let (left, _) = status_bar(2, 5, 12, 38, 7, FileFormat::default(), false);
+        let (left, _) = status_bar(StatusInfo {
+            selected: 12,
+            ..info(2, 5)
+        });
         assert_eq!(left, " Ln 2, Col 5  (12 selected)");
     }
 
     #[test]
+    fn status_bar_counts_cursors_only_above_one() {
+        // The presence rule: the position readout describes the *primary* as though
+        // cursors were singular, so the count is worth a cell exactly when it
+        // contradicts that. A permanent `1 cursor` would teach the eye to skip it.
+        let (left, _) = status_bar(info(2, 5));
+        assert!(!left.contains("cursor"), "{left:?}");
+        let (left, _) = status_bar(StatusInfo {
+            cursors: 3,
+            ..info(2, 5)
+        });
+        assert_eq!(left, " Ln 2, Col 5  3 cursors");
+    }
+
+    #[test]
+    fn a_rested_caret_diagnostic_takes_the_whole_right_segment() {
+        // It replaces the format readout rather than crowding in beside it: at 80
+        // columns there is no room for both, and the message is the more urgent.
+        let (_, right) = status_bar(StatusInfo {
+            diagnostic: Some("cannot find value `x` in this scope"),
+            ..info(2, 5)
+        });
+        assert_eq!(right, "cannot find value `x` in this scope ");
+        // And nothing in it is clickable, because the format words are not painted.
+        let with_diagnostic = StatusInfo {
+            diagnostic: Some("mismatched types"),
+            ..info(1, 1)
+        };
+        let (left, right) = status_bar(with_diagnostic);
+        let width = 60;
+        let start = width - right.width();
+        assert_eq!(status_target(&left, with_diagnostic, width, start), None);
+    }
+
+    #[test]
     fn status_bar_marks_a_read_only_buffer_where_truncation_cannot_reach_it() {
-        let (left, _) = status_bar(2, 5, 0, 38, 7, FileFormat::default(), true);
+        let (left, _) = status_bar(StatusInfo {
+            read_only: true,
+            ..info(2, 5)
+        });
         assert_eq!(left, " [read-only]  Ln 2, Col 5");
-        let (left, _) = status_bar(2, 5, 3, 38, 7, FileFormat::default(), true);
+        let (left, _) = status_bar(StatusInfo {
+            selected: 3,
+            read_only: true,
+            ..info(2, 5)
+        });
         assert_eq!(left, " [read-only]  Ln 2, Col 5  (3 selected)");
-        // A 20-cell bar has room for neither the metrics nor the whole position -
+        // A 20-cell bar has room for neither the format nor the whole position -
         // the marker is at the front, so it is what is left.
-        assert!(fit_bar(&left, "UTF-8 · LF · 38B · v7 ", 20).contains("[read-only]"));
+        assert!(fit_bar(&left, "UTF-8 · LF · tabs:4 ", 20).contains("[read-only]"));
     }
 
     #[test]
@@ -2438,8 +2531,11 @@ mod tests {
         let mut format = FileFormat::default();
         format.eol = vortex_core::LineEnding::Crlf;
         format.bom = true;
-        let (_, right) = status_bar(1, 1, 0, 4, 0, format, false);
-        assert_eq!(right, "UTF-8 BOM · CRLF · 4B · v0 ");
+        let (_, right) = status_bar(StatusInfo {
+            format,
+            ..info(1, 1)
+        });
+        assert_eq!(right, "UTF-8 BOM · CRLF · tabs:4 ");
     }
 
     #[test]
@@ -2460,14 +2556,14 @@ mod tests {
     fn the_status_bars_encoding_and_terminator_are_clickable() {
         // The bar shows what the detector guessed; clicking the guess is how it gets
         // corrected, so the words have to map back to a target (SPEC §7.5, §10.1).
-        let format = FileFormat::default();
-        let (left, right) = status_bar(1, 1, 0, 38, 7, format, false);
-        assert_eq!(right, "UTF-8 · LF · 38B · v7 ");
+        let nominal = info(1, 1);
+        let (left, right) = status_bar(nominal);
+        assert_eq!(right, "UTF-8 · LF · tabs:4 ");
         let width = 60;
         let start = width - right.width();
         // "UTF-8" occupies the first five columns of the segment, "LF" the two after
         // the separator.
-        let target = |column| status_target(&left, 38, 7, format, width, column);
+        let target = |column| status_target(&left, nominal, width, column);
         assert_eq!(target(start), Some(StatusTarget::Encoding));
         assert_eq!(target(start + 4), Some(StatusTarget::Encoding));
         assert_eq!(target(start + 5), None, "the separator is not a target");
@@ -2487,17 +2583,21 @@ mod tests {
         // word's hit region too - otherwise its last four columns do nothing.
         let mut format = FileFormat::default();
         format.bom = true;
-        let (left, right) = status_bar(1, 1, 0, 4, 0, format, false);
+        let bommed = StatusInfo {
+            format,
+            ..info(1, 1)
+        };
+        let (left, right) = status_bar(bommed);
         assert!(right.starts_with("UTF-8 BOM ·"));
         let width = 60;
         let start = width - right.width();
         assert_eq!(
-            status_target(&left, 4, 0, format, width, start + 8),
+            status_target(&left, bommed, width, start + 8),
             Some(StatusTarget::Encoding),
             "the M of BOM"
         );
         assert_eq!(
-            status_target(&left, 4, 0, format, width, start + 12),
+            status_target(&left, bommed, width, start + 12),
             Some(StatusTarget::LineEnding)
         );
     }
@@ -2506,13 +2606,13 @@ mod tests {
     fn nothing_on_a_bar_too_narrow_to_show_the_segment_is_clickable() {
         // `fit_bar` drops the right segment when it will not fit; a hit test that
         // still reported targets would open a picker from a blank cell.
-        let format = FileFormat::default();
-        let (left, right) = status_bar(1, 1, 0, 38, 7, format, false);
+        let nominal = info(1, 1);
+        let (left, right) = status_bar(nominal);
         let width = left.width() + right.width(); // one column short of a gap
         assert!(!fit_bar(&left, &right, width).contains("UTF-8"));
         for column in 0..width {
             assert_eq!(
-                status_target(&left, 38, 7, format, width, column),
+                status_target(&left, nominal, width, column),
                 None,
                 "column {column} on a bar with no segment"
             );
@@ -2525,24 +2625,22 @@ mod tests {
         // name shifts the line-ending target rather than leaving it where UTF-8 put
         // it - the bug a hardcoded offset would have.
         let format = FileFormat::default().with_encoding("windows-1252").unwrap();
-        let (left, right) = status_bar(1, 1, 0, 4, 0, format, false);
+        let wide = StatusInfo {
+            format,
+            ..info(1, 1)
+        };
+        let (left, right) = status_bar(wide);
         let width = 60;
         let start = width - right.width();
         assert_eq!(
-            status_target(&left, 4, 0, format, width, start + 11),
+            status_target(&left, wide, width, start + 11),
             Some(StatusTarget::Encoding),
             "windows-1252 is twelve columns"
         );
         assert_eq!(
-            status_target(&left, 4, 0, format, width, start + 15),
+            status_target(&left, wide, width, start + 15),
             Some(StatusTarget::LineEnding)
         );
-    }
-
-    #[test]
-    fn status_bar_renders_large_sizes_in_scaled_units() {
-        let (_, right) = status_bar(1, 1, 0, 2 * 1024 * 1024, 3, FileFormat::default(), false);
-        assert_eq!(right, "UTF-8 · LF · 2.0MB · v3 ");
     }
 
     #[test]
