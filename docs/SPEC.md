@@ -600,7 +600,9 @@ still true and already shown.
 
 Tabs keep the left, as M7 built them, plus one fix: **colliding names take the shortest
 parent that separates them** (`tui/layout.rs` beside `core/layout.rs`), never two tabs both
-reading `layout.rs`. The right becomes a state cluster, and the *presence* rule is what
+reading `layout.rs`. Only the colliding group grows, so disambiguating one pair does not
+lengthen the whole strip; and the growth stops when a path runs out rather than looping,
+which is what the same file opened twice, and two unnamed buffers, both need. The right becomes a state cluster, and the *presence* rule is what
 decides each member - this is where the design first went wrong and was corrected, so the
 reasoning is recorded rather than the outcome alone:
 
@@ -2024,7 +2026,7 @@ Incremental build order so the risky assumptions are validated early, not at the
   something other than writing a literal (§10.5).
   Ordered so the cheap half lands first: the status-bar audit (**done**), the picker's
   count (**done**) / hint footer / match marks (**done**) / path rows, tab-name
-  disambiguation, the empty state and the glyph profile are small; the head bar's state cluster, the message log, and the gutter
+  disambiguation (**done**), the empty state and the glyph profile are small; the head bar's state cluster, the message log, and the gutter
   diagnostics with their picker are medium. The one piece of **new scope** is an
   `indent_style` setting behind the `spaces:4` readout - a frontend change, since the
   frontend already decides what `insert_tab` inserts.

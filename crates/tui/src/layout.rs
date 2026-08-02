@@ -11,6 +11,7 @@
 //! round-trips to the core** (the anti-Xi rule, SPEC §5).
 
 use std::borrow::Cow;
+use std::collections::BTreeMap;
 use std::ops::Range;
 use std::path::Path;
 
@@ -997,9 +998,11 @@ pub fn bufferline(buffers: &[BufferInfo], active: BufferId, width: usize) -> Vec
     // One `String` per tab, built once and moved into the strip. Everything else in
     // the strip is `&'static str`, so a repaint allocates per *buffer*, not per
     // segment.
+    let names = disambiguated(buffers);
     let labels: Vec<String> = buffers
         .iter()
-        .map(|info| tab_label(info.path.as_deref(), info.modified))
+        .zip(&names)
+        .map(|(info, name)| tab_label(name, info.modified))
         .collect();
     let widths: Vec<usize> = labels.iter().map(|l| l.width()).collect();
     let separator = TAB_SEPARATOR.width();
@@ -1080,11 +1083,78 @@ pub fn bufferline(buffers: &[BufferInfo], active: BufferId, width: usize) -> Vec
     strip
 }
 
+/// A name per buffer that no two tabs share (SPEC §7.5, M10).
+///
+/// A file name alone is the right label almost always, and useless in the case that
+/// matters: `tui/layout.rs` open beside `core/layout.rs` gives two tabs both reading
+/// `layout.rs`, so the strip stops telling you which one you are in - the one question
+/// the head bar exists to answer.
+///
+/// **The shortest parent that separates them**, not the full path. A colliding pair
+/// grows one directory at a time until the group is distinct or the paths run out;
+/// every *other* tab keeps its bare file name, so disambiguating one pair does not
+/// lengthen the whole strip. Paths that are equal all the way up (the same file opened
+/// twice) stop when they run out rather than looping.
+///
+/// Returns names without the modified marker - that is [`with_modified_marker`]'s job,
+/// and applying it here would make the collision test compare decorated strings.
+fn disambiguated(buffers: &[BufferInfo]) -> Vec<String> {
+    // How many trailing path components each label shows. Grown only for the tabs
+    // that need it.
+    let mut depth = vec![1usize; buffers.len()];
+    let label = |index: usize, depth: usize| -> String {
+        match buffers[index].path.as_deref() {
+            None => NO_NAME.to_string(),
+            Some(path) => tail(path, depth),
+        }
+    };
+    loop {
+        // Group by the label as it currently stands; any group above one is still
+        // ambiguous. Unnamed buffers are excluded - they are all `[No Name]` and no
+        // amount of path can separate them, which is what the `None` arm above says.
+        let mut groups: BTreeMap<String, Vec<usize>> = BTreeMap::new();
+        for index in 0..buffers.len() {
+            if buffers[index].path.is_some() {
+                groups
+                    .entry(label(index, depth[index]))
+                    .or_default()
+                    .push(index);
+            }
+        }
+        let mut grew = false;
+        for (_, members) in groups.iter().filter(|(_, m)| m.len() > 1) {
+            for &index in members {
+                // Only a path with more left to show can grow; one that has run out
+                // stays as it is, so an identical pair terminates instead of looping.
+                let path = buffers[index].path.as_deref();
+                if path.is_some_and(|p| p.components().count() > depth[index]) {
+                    depth[index] += 1;
+                    grew = true;
+                }
+            }
+        }
+        if !grew {
+            return (0..buffers.len()).map(|i| label(i, depth[i])).collect();
+        }
+    }
+}
+
+/// The last `depth` components of `path`, joined the way the platform writes them.
+fn tail(path: &Path, depth: usize) -> String {
+    let components: Vec<_> = path.components().collect();
+    let start = components.len().saturating_sub(depth.max(1));
+    components[start..]
+        .iter()
+        .map(|c| c.as_os_str().to_string_lossy())
+        .collect::<Vec<_>>()
+        .join(std::path::MAIN_SEPARATOR_STR)
+}
+
 /// A tab's painted label: the buffer's display name with one cell of padding either
 /// side. Uniform padding on purpose - widening the active tab would reflow the whole
 /// strip sideways on every switch.
-fn tab_label(path: Option<&Path>, modified: bool) -> String {
-    let name = buffer_display_name(path, modified);
+fn tab_label(name: &str, modified: bool) -> String {
+    let name = with_modified_marker(name, modified);
     let mut label = String::with_capacity(name.len() + 2);
     label.push(' ');
     label.push_str(&name);
@@ -2449,6 +2519,84 @@ mod tests {
             diagnostic: None,
             read_only: false,
         }
+    }
+
+    #[test]
+    fn colliding_tab_names_grow_the_shortest_parent_that_separates_them() {
+        // Two tabs both reading `layout.rs` stop telling you which one you are in,
+        // which is the one question the head bar exists to answer (SPEC §7.5, M10).
+        let list = buffers(&[
+            (1, Some("crates/tui/src/layout.rs"), false),
+            (2, Some("crates/core/src/layout.rs"), false),
+            (3, Some("README.md"), false),
+        ]);
+        let strip = bufferline(&list, BufferId(1), 120);
+        let labels: Vec<&str> = strip.iter().map(|t| t.label.as_ref()).collect();
+        let joined = labels.join("");
+        assert!(joined.contains("tui/src/layout.rs"), "{labels:?}");
+        assert!(joined.contains("core/src/layout.rs"), "{labels:?}");
+        // The *shortest* parent that separates them - `src/layout.rs` would still
+        // collide, and the full path is longer than it needs to be.
+        assert!(
+            !joined.contains("crates/tui"),
+            "grew further than it had to"
+        );
+        // And the tab that never collided keeps its bare name, so disambiguating one
+        // pair does not lengthen the whole strip.
+        assert!(joined.contains(" README.md "), "{labels:?}");
+    }
+
+    #[test]
+    fn a_name_that_does_not_collide_stays_a_bare_file_name() {
+        let list = buffers(&[
+            (1, Some("src/main.rs"), false),
+            (2, Some("docs/SPEC.md"), false),
+        ]);
+        let labels: Vec<String> = bufferline(&list, BufferId(1), 120)
+            .iter()
+            .map(|t| t.label.to_string())
+            .collect();
+        assert!(labels.iter().any(|l| l == " main.rs "), "{labels:?}");
+        assert!(labels.iter().any(|l| l == " SPEC.md "), "{labels:?}");
+    }
+
+    #[test]
+    fn identical_paths_stop_growing_instead_of_looping() {
+        // The same file open twice cannot be separated by any amount of path. The
+        // walk has to notice it has run out rather than spin.
+        let list = buffers(&[(1, Some("a/b/c.rs"), false), (2, Some("a/b/c.rs"), false)]);
+        let labels: Vec<String> = bufferline(&list, BufferId(1), 120)
+            .iter()
+            .map(|t| t.label.to_string())
+            .collect();
+        assert_eq!(labels.iter().filter(|l| l.contains("c.rs")).count(), 2);
+        // Unnamed buffers are the same case and must not drive the walk either.
+        let unnamed = buffers(&[(1, None, false), (2, None, false)]);
+        let labels: Vec<String> = bufferline(&unnamed, BufferId(1), 120)
+            .iter()
+            .map(|t| t.label.to_string())
+            .collect();
+        assert_eq!(labels.iter().filter(|l| l.contains(NO_NAME)).count(), 2);
+    }
+
+    #[test]
+    fn a_disambiguated_tab_still_carries_its_modified_marker() {
+        // The marker is applied after the name is chosen, so growing a path cannot
+        // drop it - and the collision test compares undecorated names.
+        let list = buffers(&[
+            (1, Some("tui/layout.rs"), true),
+            (2, Some("core/layout.rs"), false),
+        ]);
+        let labels: Vec<String> = bufferline(&list, BufferId(1), 120)
+            .iter()
+            .map(|t| t.label.to_string())
+            .collect();
+        assert!(
+            labels
+                .iter()
+                .any(|l| l.contains(MODIFIED_MARKER) && l.contains("tui/layout.rs")),
+            "{labels:?}"
+        );
     }
 
     #[test]
