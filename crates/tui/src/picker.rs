@@ -20,7 +20,7 @@
 //! them. They are independent: a picker can arm either, both, or neither.
 
 use nucleo_matcher::pattern::{CaseMatching, Normalization, Pattern};
-use nucleo_matcher::{Config, Matcher};
+use nucleo_matcher::{Config, Matcher, Utf32Str};
 use ratatui::buffer::Buffer;
 use ratatui::crossterm::event::{KeyEvent, MouseButton, MouseEvent, MouseEventKind};
 use std::borrow::Cow;
@@ -28,8 +28,9 @@ use std::path::Path;
 
 use ratatui::layout::{Position, Rect};
 use ratatui::style::Style;
+use ratatui::text::Line;
 use ratatui::widgets::{Block, Clear, StatefulWidget, Widget};
-use unicode_width::UnicodeWidthStr;
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::command::Command;
 use crate::compositor::{EventResult, Layer};
@@ -153,11 +154,21 @@ pub struct Picker {
     query: String,
     /// Indices into `items`, ranked by `query` (all, in order, when empty).
     filtered: Vec<usize>,
+    /// Which **character** positions of each filtered row the query matched, aligned
+    /// with `filtered`. Empty while the query is, and empty for a source-driven
+    /// picker, whose rows are search hits rather than fuzzy matches.
+    ///
+    /// Held rather than derived at paint time because `Pattern::indices` needs the
+    /// matcher mutably and `render` takes `&self` - and because it must come from the
+    /// same `Pattern` that did the ranking, which only `refilter` has.
+    marks: Vec<Vec<u32>>,
     /// Row into `filtered` that is highlighted.
     selected: usize,
     matcher: Matcher,
     style: Style,
     selected_style: Style,
+    /// The characters the query matched (SPEC §7.5, M10).
+    match_style: Style,
     /// The scrollbar's two halves, same slots the body's bar reads (SPEC §7.5) - a
     /// second pair for overlays would be two ways to say the same thing in a theme.
     track_style: Style,
@@ -213,10 +224,12 @@ impl Picker {
             items,
             query: String::new(),
             filtered,
+            marks: Vec::new(),
             selected: 0,
             matcher: Matcher::new(config),
             style: theme.palette,
             selected_style: theme.palette_selected,
+            match_style: theme.palette_match,
             track_style: theme.scrollbar_track,
             thumb_style: theme.scrollbar_thumb,
             finished: false,
@@ -325,21 +338,102 @@ impl Picker {
             self.selected = 0;
             return;
         }
+        self.marks.clear();
         self.filtered = if self.query.is_empty() {
+            // Nothing was matched, so nothing is marked: an unfiltered list is not a
+            // ranked one, and marking every character would say the opposite.
             (0..self.items.len()).collect()
         } else {
-            let ranked = Pattern::parse(&self.query, CaseMatching::Ignore, Normalization::Smart)
-                .match_list(
-                    self.items.iter().enumerate().map(|(idx, item)| Ranked {
-                        idx,
-                        label: &item.label,
-                    }),
-                    &mut self.matcher,
-                );
-            ranked.into_iter().map(|(r, _score)| r.idx).collect()
+            let pattern = Pattern::parse(&self.query, CaseMatching::Ignore, Normalization::Smart);
+            let ranked = pattern.match_list(
+                self.items.iter().enumerate().map(|(idx, item)| Ranked {
+                    idx,
+                    label: &item.label,
+                }),
+                &mut self.matcher,
+            );
+            let ordered: Vec<usize> = ranked.into_iter().map(|(r, _score)| r.idx).collect();
+            // Which characters earned each row its place (SPEC §7.5, M10). Asked of
+            // the same `Pattern` that ranked them, so the marks cannot disagree with
+            // the order: a second pattern built from the same string would still be a
+            // second answer to the question.
+            let mut buffer = Vec::new();
+            self.marks = ordered
+                .iter()
+                .map(|&idx| {
+                    buffer.clear();
+                    let mut haystack = Vec::new();
+                    let text = Utf32Str::new(&self.items[idx].label, &mut haystack);
+                    pattern.indices(text, &mut self.matcher, &mut buffer);
+                    // The crate's own contract: the indices come back per atom, in
+                    // whatever order the atoms matched, and with repeats.
+                    buffer.sort_unstable();
+                    buffer.dedup();
+                    buffer.clone()
+                })
+                .collect();
+            ordered
         };
         // Keep the highlight in range as the list shrinks.
         self.selected = self.selected.min(self.filtered.len().saturating_sub(1));
+    }
+
+    /// The `9 of 240` the border carries, or `None` when there is nothing useful to
+    /// say - an empty picker, where `0 of 0` is noise over a box that is visibly
+    /// empty already.
+    ///
+    /// Shows the plain total while the query is empty, since "9 of 9" answers a
+    /// question nobody asked; the moment a query narrows the list, both halves are
+    /// what matters.
+    fn count(&self) -> Option<String> {
+        let total = if self.source.is_some() {
+            self.filtered.len()
+        } else {
+            self.items.len()
+        };
+        if total == 0 && self.filtered.is_empty() {
+            return None;
+        }
+        if self.filtered.len() == total {
+            Some(format!("{total}"))
+        } else {
+            Some(format!("{} of {total}", self.filtered.len()))
+        }
+    }
+
+    /// Re-style the cells of a painted row that the query matched.
+    ///
+    /// `marks` are **character** positions in `label` - what `Pattern::indices`
+    /// returns, since it matches over a `Utf32Str` - so the walk counts chars and
+    /// accumulates *display* width as it goes. A row holding a wide glyph or a
+    /// zero-width combining mark would otherwise drift a cell per character, which
+    /// is the whole reason §4 keeps byte, char and column spaces apart.
+    fn mark_row(
+        &self,
+        rows: Rect,
+        y: u16,
+        label: &str,
+        marks: &[u32],
+        row_style: Style,
+        buf: &mut Buffer,
+    ) {
+        // The two-space indent every row is painted with.
+        const INDENT: usize = 2;
+        let mut column = INDENT;
+        for (char_index, ch) in label.chars().enumerate() {
+            let width = UnicodeWidthChar::width(ch).unwrap_or(0);
+            if marks.contains(&(char_index as u32)) {
+                let x = rows.x as usize + column;
+                if column + width <= rows.width as usize
+                    && let Some(cell) = buf.cell_mut((x as u16, y))
+                {
+                    // The row's ground, the mark's ink: `patch` keeps whichever
+                    // background the row already laid down.
+                    cell.set_style(row_style.patch(self.match_style));
+                }
+            }
+            column += width;
+        }
     }
 
     /// The centered box the picker occupies, clamped to the screen. Wider when it is
@@ -534,9 +628,17 @@ impl Layer for Picker {
         };
         let area = self.area(screen);
         Clear.render(area, buf);
-        let block = Block::bordered()
+        // Title and count both ride the border, which costs no row of the list
+        // (SPEC §7.5, M10). The count is what tells a reader whether to keep typing
+        // or start arrowing, and it is the one number a picker cannot be read
+        // without: a screenful of rows looks the same whether it is all of them or
+        // nine of two hundred and forty.
+        let mut block = Block::bordered()
             .title(format!(" {} ", self.title))
             .style(self.style);
+        if let Some(count) = self.count() {
+            block = block.title_top(Line::from(format!(" {count} ")).right_aligned());
+        }
         block.render(area, buf);
         // Query row at the top of the interior.
         let query_line = format!("> {}", self.query);
@@ -594,6 +696,12 @@ impl Layer for Picker {
                 rows.width as usize,
                 style,
             );
+            // Then re-style just the cells the query earned. Painted *over* the row
+            // rather than as part of it, so the mark keeps the row's own ground -
+            // the highlighted row stays one unbroken band (SPEC §7.5, M10).
+            if let Some(marks) = self.marks.get(row) {
+                self.mark_row(rows, y, &item.label, marks, style, buf);
+            }
             // The shortcut (if any) is drawn right-aligned, one cell in from the
             // border. Labels are short, so it does not collide with them.
             if let Some(shortcut) = &item.shortcut {
@@ -739,6 +847,7 @@ impl Layer for Picker {
     fn restyle(&mut self, theme: &Theme) {
         self.style = theme.palette;
         self.selected_style = theme.palette_selected;
+        self.match_style = theme.palette_match;
         self.track_style = theme.scrollbar_track;
         self.thumb_style = theme.scrollbar_thumb;
     }
@@ -1050,6 +1159,114 @@ mod tests {
             !p.is_finished(),
             "deferring does not close the picker itself"
         );
+    }
+
+    /// Every cell of `buf` whose foreground is the match style, in reading order -
+    /// the marks, wherever the centred box happened to land.
+    fn marked_text(buf: &Buffer) -> String {
+        let area = *buf.area();
+        (0..area.height)
+            .flat_map(|y| (0..area.width).map(move |x| (x, y)))
+            .filter_map(|(x, y)| buf.cell((x, y)))
+            .filter(|cell| cell.style().fg == Theme::default().palette_match.fg)
+            .map(|cell| cell.symbol().to_string())
+            .collect()
+    }
+
+    /// The whole buffer as one string, for "does the frame say this anywhere".
+    fn all_text(buf: &Buffer) -> String {
+        let area = *buf.area();
+        (0..area.height)
+            .map(|y| crate::testutil::row_text(buf, y))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn the_border_carries_the_count_and_narrows_it_as_the_query_does() {
+        // The number that tells a reader whether to keep typing or start arrowing,
+        // and it costs no row of the list (SPEC §7.5, M10).
+        let mut p = picker();
+        let total = p.items.len();
+        let frame = all_text(&painted(&p, Rect::new(0, 0, 60, 12)));
+        assert!(
+            frame.contains(&format!(" {total} ")),
+            "no total on the border: {frame}"
+        );
+        assert!(
+            !frame.contains(" of "),
+            "an unfiltered list is not `9 of 9`: {frame}"
+        );
+        // Narrowed, both halves matter.
+        type_str(&mut p, "cop");
+        let shown = p.filtered.len();
+        assert!(shown < total, "the query narrowed nothing");
+        let frame = all_text(&painted(&p, Rect::new(0, 0, 60, 12)));
+        assert!(
+            frame.contains(&format!("{shown} of {total}")),
+            "frame: {frame}"
+        );
+    }
+
+    #[test]
+    fn the_query_marks_the_characters_it_matched() {
+        // Unmarked, a ranked list looks arbitrary - the reader cannot see why one row
+        // beat another (SPEC §7.5, M10). Every visible row is marked, so the marks
+        // are the query's characters once per row that matched.
+        let mut p = picker();
+        type_str(&mut p, "cop");
+        let marked = marked_text(&painted(&p, Rect::new(0, 0, 60, 12)));
+        // Case-insensitively, because the matcher is: typing `cop` marks the `Cop`
+        // of `Copy`, which is the point - the mark shows what the *query* earned,
+        // not what it was spelled as.
+        assert_eq!(
+            marked.to_lowercase(),
+            "cop",
+            "the marked cells were not the query's: {marked:?}"
+        );
+        // ...and an unfiltered list marks nothing: it was not ranked.
+        let quiet = marked_text(&painted(&picker(), Rect::new(0, 0, 60, 12)));
+        assert!(quiet.is_empty(), "an unranked list was marked: {quiet:?}");
+    }
+
+    #[test]
+    fn a_mark_keeps_the_row_it_sits_on_rather_than_punching_through_it() {
+        // The marks set a foreground only, so the highlighted row stays one unbroken
+        // band - the rule the indent guide follows over a selection wash.
+        let mut p = picker();
+        type_str(&mut p, "cop");
+        let buf = painted(&p, Rect::new(0, 0, 60, 12));
+        let area = *buf.area();
+        let selected_bg = Theme::default().palette_selected.bg;
+        let marked_on_selected: Vec<_> = (0..area.height)
+            .flat_map(|y| (0..area.width).map(move |x| (x, y)))
+            .filter_map(|(x, y)| buf.cell((x, y)))
+            .filter(|cell| cell.style().fg == Theme::default().palette_match.fg)
+            .map(|cell| cell.bg)
+            .collect();
+        assert!(!marked_on_selected.is_empty(), "nothing was marked");
+        // Whatever ground each mark sits on, it is a *row* ground - never the match
+        // style's own, because the match style sets none.
+        assert!(
+            marked_on_selected.iter().any(|bg| Some(*bg) == selected_bg),
+            "the highlighted row carried no mark: {marked_on_selected:?}"
+        );
+    }
+
+    #[test]
+    fn marks_count_display_columns_not_characters() {
+        // The indices are char positions; the cells they name are display columns. A
+        // wide glyph before the match would drift every mark after it by a cell, and
+        // the marks would land on the wrong letters.
+        let items = vec![Item {
+            label: "世界 zig".to_string(),
+            shortcut: None,
+            command: Command::Editor(Action::Quit),
+        }];
+        let mut p = Picker::new("Wide", items, false, &Theme::default());
+        type_str(&mut p, "zig");
+        let marked = marked_text(&painted(&p, Rect::new(0, 0, 40, 10)));
+        assert_eq!(marked, "zig", "the marks drifted past the wide glyphs");
     }
 
     #[test]

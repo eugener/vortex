@@ -662,9 +662,14 @@ in the border** (free real estate - it costs no row), a query row, rows that sho
 they ranked, an optional preview pane, and a hint footer. Three of the four are new:
 
 - **The count** (`9 of 240`) is what tells you whether to keep typing or start arrowing.
-- **Matched characters are marked.** `nucleo_matcher::Matcher::fuzzy_indices` returns the
-  positions beside the score, so this is a call, not a second pass. Unmarked, a ranked list
-  looks arbitrary.
+- **Matched characters are marked.** `Pattern::indices` returns the positions beside the
+  score, so this is a call, not a second pass. Unmarked, a ranked list looks arbitrary.
+  Two details it costs, both found by building it: the indices are **char** positions in
+  a `Utf32Str`, so the paint walks chars while accumulating *display* width - a row with
+  a wide glyph would otherwise drift a cell per character past it. And `palette_match`
+  sets a foreground and no ground, so a mark keeps whichever row style is underneath and
+  the highlighted row stays one unbroken band - the rule the indent guide already follows
+  over a selection wash.
 - **Path rows read as paths** - directory dimmed, file name in full ink.
 - **The hint footer is generated from the keymap**, never written as a literal. That is the
   §10.5 rule M9 establishes, and it is why M10 follows M9 rather than preceding it.
@@ -2018,8 +2023,8 @@ Incremental build order so the risky assumptions are validated early, not at the
   answers and the empty state all render chords, and M9 is what makes rendering a chord
   something other than writing a literal (§10.5).
   Ordered so the cheap half lands first: the status-bar audit (**done**), the picker's
-  count / hint footer / match marks / path rows, tab-name disambiguation, the empty state
-  and the glyph profile are small; the head bar's state cluster, the message log, and the gutter
+  count (**done**) / hint footer / match marks (**done**) / path rows, tab-name
+  disambiguation, the empty state and the glyph profile are small; the head bar's state cluster, the message log, and the gutter
   diagnostics with their picker are medium. The one piece of **new scope** is an
   `indent_style` setting behind the `spaces:4` readout - a frontend change, since the
   frontend already decides what `insert_tab` inserts.
