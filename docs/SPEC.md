@@ -771,7 +771,26 @@ never move the spans without moving the number that describes them.
 
 Almost nothing: it is the part that already works. **Severity glyphs in the gutter**, which
 the decoration channel has produced since M2 (`GutterMark`) and the painter has never
-drawn. Inline end-of-line diagnostic text stays deferred - it wants the `VirtualText`
+drawn.
+
+**How the gutter spends its columns** (decided 2026-08-03, because git signs and severity
+marks arrived together and both wanted the same cell). Four things claim this margin -
+line numbers, severity, git signs, and fold marks later - and a line can easily be both
+modified and flagged. The answer costs **one** column:
+
+- **A git sign takes the separator the gutter already reserves.** `gutter_width` is a
+  digit field plus a trailing space; that space is the sign's cell, so signs cost nothing.
+  When there is no sign it is the space it always was.
+- **A severity mark takes one new column**, between the sign and the text.
+- So both show at once, and neither hides the other.
+
+*Rejected, and the reason is a house rule rather than taste:* painting the sign as a
+**ground tint** on the number field. It would cost zero columns, but §7.5's own glyph rule
+is that shape carries the meaning and colour reinforces it - and Instrument is achromatic,
+spending its single hue on errors alone, so a colour-only sign is invisible there. Also
+rejected: **one shared column with severity winning it**, which is cheapest but drops the
+sign on exactly the lines you are editing and breaking, and that is the common case while
+typing. Inline end-of-line diagnostic text stays deferred - it wants the `VirtualText`
 decoration §11 already names.
 
 **Deliberately not designed here:** the completion popup and the hover panel. Those are LSP

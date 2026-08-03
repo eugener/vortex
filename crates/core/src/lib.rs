@@ -22,7 +22,7 @@ pub mod watch;
 pub use action::{Action, CoreOptions, Granularity};
 pub use buffer::{Buffer, ByteRange, EditError, Position, RopeBuffer, Text, Utf16Position};
 pub use decoration::{
-    Decoration, DecorationSet, DecorationSource, GutterKind, HighlightKind, Severity,
+    Decoration, DecorationSet, DecorationSource, GitSign, GutterKind, HighlightKind, Severity,
 };
 pub use editor::{Core, CoreHandle, new, with_lsp};
 pub use file::{FileFormat, LineEnding};
