@@ -32,6 +32,10 @@ palette_selected = { fg = "#eef2f4", bg = "#2f383e", bold = true }
 # Quiet ink for a path's directory and the hint footer. Achromatic like the rest
 # of the theme: it separates by brightness, which is all it needs to do.
 palette_dim      = { fg = "#78838a" }
+# Achromatic, like everything but an error: the marks separate from the row by
+# brightness and weight, never by taking a second hue this theme does not spend.
+palette_match    = { fg = "#eef2f4", bold = true }
+empty_hint       = { fg = "#78838a" }
 
 # Diagnostics stay achromatic except for the one permitted hue: an error takes the
 # signal red (what is wrong), and the quieter severities separate by brightness

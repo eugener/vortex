@@ -1177,6 +1177,11 @@ fn event_loop(
             awaiting_highlight = None;
             match input {
                 Event::Key(key) => {
+                    // Retiring the first-screen hints is a repaint in its own right.
+                    // An *unbound* key resolves to no command and reaches the core,
+                    // so on an empty unnamed buffer nothing else would ask for the
+                    // frame that takes the signposts down (SPEC §7.5, M10).
+                    needs_redraw |= !hints_dismissed;
                     hints_dismissed = true;
                     // Ignore key *releases* (the Kitty protocol reports them, SPEC
                     // §9): acting on press and release would double-fire, the same
@@ -1982,9 +1987,12 @@ fn paint_empty_hints(frame: &mut Frame, body: Rect, keymap: &Keymap, style: Styl
         })
         .collect();
     for (x, y, line) in layout::empty_hints(body, &rows) {
+        // Display columns, not bytes: `set_stringn`'s budget is cells, and a chord
+        // that renders a non-ASCII key name would otherwise be given a budget wider
+        // than the block `empty_hints` measured (SPEC §4).
         frame
             .buffer_mut()
-            .set_stringn(x, y, &line, line.len(), style);
+            .set_stringn(x, y, &line, line.width(), style);
     }
 }
 

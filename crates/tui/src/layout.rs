@@ -996,9 +996,12 @@ pub fn bufferline(
     if width == 0 || buffers.is_empty() {
         return Vec::new();
     }
-    // One `String` per tab, built once and moved into the strip. Everything else in
-    // the strip is `&'static str`, so a repaint allocates per *buffer*, not per
-    // segment.
+    // One `String` per tab, built once and moved into the strip; everything else in
+    // it is `&'static str`, so a repaint allocates per *buffer*, not per segment.
+    // `disambiguated` is the exception and is deliberately not cached: it is a
+    // function of the buffer list alone, but caching it means invalidating on open,
+    // close, save-as and reload, and the list is short enough that the walk is
+    // cheaper than the fifth place that could forget to invalidate it.
     let names = disambiguated(buffers);
     let labels: Vec<String> = buffers
         .iter()
@@ -1141,14 +1144,19 @@ fn disambiguated(buffers: &[BufferInfo]) -> Vec<String> {
 }
 
 /// The last `depth` components of `path`, joined the way the platform writes them.
+///
+/// Joined with [`PathBuf::push`] rather than by putting a separator between the
+/// components' text: a root (`/`) and a Windows prefix (`C:\\`) *are* their own
+/// separator, so string-joining them doubles it - `/a.rs` grown to two components
+/// read `//a.rs` on the head bar.
 fn tail(path: &Path, depth: usize) -> String {
     let components: Vec<_> = path.components().collect();
     let start = components.len().saturating_sub(depth.max(1));
-    components[start..]
-        .iter()
-        .map(|c| c.as_os_str().to_string_lossy())
-        .collect::<Vec<_>>()
-        .join(std::path::MAIN_SEPARATOR_STR)
+    let mut out = std::path::PathBuf::new();
+    for component in &components[start..] {
+        out.push(component);
+    }
+    out.to_string_lossy().into_owned()
 }
 
 /// The three lines an empty, unnamed buffer shows, centred in `body` (SPEC §7.5, M10).
@@ -2917,6 +2925,19 @@ mod tests {
         // …and an unmodified one is exactly its name, marker column and all: the
         // mark is a prefix, not a reserved cell every row pays for.
         assert_eq!(with_modified_marker("a.txt", false, GLYPHS), "a.txt");
+    }
+
+    #[test]
+    fn a_file_at_the_root_grows_without_doubling_the_separator() {
+        // A root component *is* a separator, so joining the components' text puts a
+        // second one in: `/a.rs` grown to two components read `//a.rs`.
+        let list = buffers(&[(1, Some("/a.rs"), false), (2, Some("/b/a.rs"), false)]);
+        let labels: Vec<String> = bufferline(&list, BufferId(1), 120, GLYPHS)
+            .iter()
+            .filter(|t| t.id().is_some())
+            .map(|t| t.label.trim().to_string())
+            .collect();
+        assert_eq!(labels, vec!["/a.rs", "b/a.rs"]);
     }
 
     #[test]

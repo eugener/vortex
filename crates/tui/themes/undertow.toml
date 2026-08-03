@@ -34,6 +34,11 @@ palette_selected = { fg = "#eef1fa", bg = "#2b3557", bold = true }
 # The picker's quiet ink: a path row's directory, and the hint footer. Foreground
 # only, so it paints over the highlighted row without breaking its band.
 palette_dim      = { fg = "#6b748f" }
+# The characters a query earned. Foreground and bold only, no ground, so the marks
+# survive the highlighted row's fill instead of punching holes in it.
+palette_match    = { fg = "#7fb3ff", bold = true }
+# The first screen's three signposts: present, and plainly not the text.
+empty_hint       = { fg = "#5b6480" }
 
 # Diagnostics (SPEC §5): red error and amber warning carry the signal; info and
 # hint stay quiet so a wall of hints never shouts over a real error.
