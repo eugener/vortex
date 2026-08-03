@@ -196,6 +196,7 @@ held-lock-across-`.await` deadlocks. Instead:
 | Frame atomicity | crossterm `BeginSynchronizedUpdate` / `EndSynchronizedUpdate` | anti-tearing (§7) |
 | Fuzzy match | **`nucleo-matcher`** | palette/picker ranking (Helix's matcher); on-thread for small lists (§7.5) |
 | Search patterns | **`regex`** | both searches (M7). Reached `vortex-tui` first, since cross-file search is filesystem work and so frontend-owned, and joined `vortex-core` with the in-buffer one (§11) - **one engine, two crates**, so the two searches cannot diverge on what a pattern means, and the frontend's live preview compiles through the core's own `search::compile` rather than a second copy |
+| Git state | **`git2`** (libgit2 bindings) | The head bar's branch segment (§7.5) and the gutter's diff signs. **Chosen over `gix` on 2026-08-03, and the reasoning matters more than the verdict.** Read-only, and only two questions: what branch am I on, and which of this buffer's lines differ from HEAD. The signs must diff the **buffer**, not the file on disk - an edit is marked as you type it - which `Patch::from_blob_and_buffer` answers in one call where `gix` offers the primitives (`InternedInput`, `HunkIter`) and leaves the tokenization to us. `gix`'s own `crate-status.md` still files the `gix` entrypoint under "initial development", and this is code we write once and touch rarely, so API churn is pure cost. The argument that would normally decide it for `gix` in this stack - pure Rust, no C toolchain - **is already moot**: `tree-sitter` puts `cc` in this workspace's build graph, so a C compiler is required to build Vortex either way. Default features off (0.21's default set is empty regardless): no `https`, no `ssh`, and none of the OpenSSL they pull onto non-macOS Unix. *Reopen if* a static-musl or wasm build is ever wanted - that favours `gix` decisively, but it would also mean dropping tree-sitter's C, which is the whole syntax engine |
 | Project walk | **`ignore`** | gitignore-aware walker (ripgrep's). Global search respects a project's own `.gitignore` rather than a hardcoded skip list |
 | Config | **`toml` + `serde`** | Helix-style; in `vortex-tui` now, carrying theme files (§10.5) |
 | Encoding | `encoding_rs` | detect on load; edit as UTF-8 internally (§10.1) |
@@ -1923,8 +1924,8 @@ Incremental build order so the risky assumptions are validated early, not at the
   in-terminal.
 - **M8 - Chrome + polish.** *(in progress.)* **Landed:** relative line numbers, rulers,
   indent guides, the scrollbar, sticky context. **Left:** git diff signs (a git-diff task
-  feeding `GutterMark`s; its git source - `gix` / `git2` - is a §3 stack addition to
-  raise), cursor-shape-per-mode. Unlike the earlier milestones these are
+  feeding `GutterMark`s; **its git source is settled - `git2`, see §3, decided
+  2026-08-03**), cursor-shape-per-mode. Unlike the earlier milestones these are
   **independent items sharing one shape** rather than an arc: each reads data the snapshot
   or decoration channel already carries, each is a config key over a theme slot (§7.5), and
   none needs a seam change - so they land one at a time and in any order, and the milestone

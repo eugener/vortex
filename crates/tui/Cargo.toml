@@ -20,6 +20,18 @@ async-channel = "2.5.0"
 # Frontend-side with the rest of the search, and it is what makes the walk respect
 # a project's own .gitignore instead of the file picker's hardcoded skip list.
 ignore = "0.4.31"
+# Git state (SPEC §3, M8/M10): the head bar's branch segment and the gutter's diff
+# signs. `git2` over `gix` - verified 2026-08-03 and recorded in §3. Both read what
+# we need; the deciding points were that the signs must diff the *buffer* against
+# HEAD, which `Patch::from_blob_and_buffer` does in one call where gix offers the
+# primitives; that gix's own crate-status still calls the `gix` entrypoint "initial
+# development"; and that the usual clinching argument for gix - no C toolchain - is
+# already moot here, since `tree-sitter` puts `cc` in this workspace's build graph.
+#
+# No default features, and 0.21's default set is empty anyway: we read local
+# repositories and never talk to a remote, so `https`/`ssh` (and the OpenSSL they
+# drag onto non-macOS Unix) stay off.
+git2 = { version = "0.21.0", default-features = false }
 # Load grammar libraries at runtime (M4): the frontend `dlopen`s a `grammar-*`
 # cdylib and resolves its `vortex_grammar` entry point. This is the "genuinely
 # dynamic" half of syntax highlighting - grammars are config-driven runtime data,
