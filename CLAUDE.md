@@ -85,7 +85,12 @@ on the new, and read criterion's per-benchmark delta yourself.
 
 `vortex-core/benches/hot_paths.rs` covers the per-keystroke motion paths (the line-copy
 §10.4 flags); `vortex-tui/benches/layout.rs` covers the display-column paint paths
-(`render_line`/`style_at`, and the sorted-span column walk). The tui benches are why the
+(`render_line`/`style_at`, and the sorted-span column walk); `vortex-tui/benches/picker.rs`
+covers the picker's per-keystroke filter, and exists because a review asked whether
+resolving match marks for the whole ranked list (rather than the sixteen rows on screen)
+justified a `Layer` seam change. Measured: it does not - the second pass is ~2.6x the
+unavoidable ranking cost but only ~190 µs at the file picker's 10k ceiling, under 2% of a
+frame, once per keystroke. The bench stays as the tripwire that would reopen it. The tui benches are why the
 frontend's logic lives in a **library target** (`crates/tui/src/lib.rs`): a `[[bench]]` can
 only link a lib, so the pure paint math had to move out of the binary. `main.rs` is now the
 thin I/O shell it always claimed to be and depends on the lib; `testutil.rs` backs both a
