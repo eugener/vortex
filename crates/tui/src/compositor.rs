@@ -587,11 +587,11 @@ mod tests {
         // deferred Enter, the compositor offered the key to the layer below - resolved
         // in *that* layer's context, where Enter is `accept` - and the picker the user
         // could not see committed its highlighted row while they answered the question.
-        use crate::config::Theme;
+        use crate::config::{Config, Theme};
         use crate::keymap::Keymap;
         let keymap = Keymap::default();
         let mut c = Compositor::new();
-        c.push(crate::palette::open(&Theme::default(), &keymap));
+        c.push(crate::palette::open(&Config::default()));
         c.push(crate::prompt::confirm_close(
             &Theme::default(),
             &keymap,

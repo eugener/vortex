@@ -43,7 +43,12 @@ use std::ops::Range;
 use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 use ratatui::style::{Color, Style};
 use vortex_core::{BufferId, BufferInfo};
+use vortex_tui::config::Glyphs;
 use vortex_tui::layout::{self, ColumnWalker};
+
+/// The marks the chrome paints by default; the bench measures the paint, not the
+/// profile, and both profiles are one cell per mark.
+const GLYPHS: Glyphs = Glyphs::UNICODE;
 
 fn render_line_overlays(c: &mut Criterion) {
     let mut group = c.benchmark_group("render_line_overlays");
@@ -141,7 +146,7 @@ fn indent_guides(c: &mut Criterion) {
         // anything steeper means the membership cursor has regressed to a scan.
         group.bench_with_input(BenchmarkId::new("raw", indent), &indent, |b, _| {
             b.iter(|| {
-                let out = layout::with_indent_guides(black_box(&line), black_box(&columns));
+                let out = layout::with_indent_guides(black_box(&line), black_box(&columns), GLYPHS);
                 black_box(out.len())
             })
         });
@@ -152,7 +157,7 @@ fn indent_guides(c: &mut Criterion) {
         group.bench_with_input(BenchmarkId::new("clipped", indent), &indent, |b, _| {
             b.iter(|| {
                 let visible = layout::guides_in_window(black_box(&columns), 0, window);
-                let out = layout::with_indent_guides(black_box(&line), visible);
+                let out = layout::with_indent_guides(black_box(&line), visible, GLYPHS);
                 black_box(out.len())
             })
         });
@@ -178,10 +183,10 @@ fn bufferline(c: &mut Criterion) {
         let active = BufferId((n / 2) as u64);
 
         group.bench_with_input(BenchmarkId::new("fits", n), &n, |b, _| {
-            b.iter(|| black_box(layout::bufferline(black_box(&buffers), active, 400)))
+            b.iter(|| black_box(layout::bufferline(black_box(&buffers), active, 400, GLYPHS)))
         });
         group.bench_with_input(BenchmarkId::new("windowed", n), &n, |b, _| {
-            b.iter(|| black_box(layout::bufferline(black_box(&buffers), active, 60)))
+            b.iter(|| black_box(layout::bufferline(black_box(&buffers), active, 60, GLYPHS)))
         });
     }
     group.finish();

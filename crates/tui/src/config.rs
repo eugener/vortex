@@ -21,6 +21,7 @@
 use std::path::{Path, PathBuf};
 
 use ratatui::style::{Color, Modifier, Style};
+use ratatui::symbols;
 use serde::Deserialize;
 use vortex_core::action::CoreOptions;
 
@@ -97,6 +98,116 @@ impl IndentStyle {
     }
 }
 
+/// Which set of marks the chrome paints (SPEC §7.5, M10).
+///
+/// Not a taste setting. A glyph a terminal's font does not have is drawn as a
+/// replacement box, and the box is frequently *two* cells - so one missing mark
+/// shifts every cell after it on that row. This is the one switch that answers the
+/// whole class, rather than leaving a user to work out which mark broke the row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum GlyphProfile {
+    /// The marks the design is drawn with. The default: a terminal that can show
+    /// them is the common case, and the editor should not look like 1989 to
+    /// everybody because some fonts are thin.
+    Unicode,
+    /// A full replacement set inside ASCII, for a font (or an encoding) that cannot
+    /// carry the first.
+    Ascii,
+}
+
+impl GlyphProfile {
+    /// The marks to paint under this profile.
+    fn glyphs(self) -> Glyphs {
+        match self {
+            GlyphProfile::Unicode => Glyphs::UNICODE,
+            GlyphProfile::Ascii => Glyphs::ASCII,
+        }
+    }
+}
+
+/// Every mark the chrome paints, as one value resolved from a [`GlyphProfile`].
+///
+/// **A whole set, never a per-mark fallback.** A row that mixes `│` with `|` reads
+/// as a rendering bug, and a per-mark switch would mean discovering the profile one
+/// broken glyph at a time - which is the state this replaces.
+///
+/// **Every member is one cell wide**, in both profiles: the same width discipline
+/// §4 imposes on the buffer. A two-cell substitute would move the text under it,
+/// which is the failure the ASCII profile exists to prevent, so it must not be the
+/// cure as well as the disease.
+///
+/// The *words* the chrome writes are not here - a label reading `Find File…` keeps
+/// its ellipsis. This is the furniture: the marks that stand in a fixed cell, where
+/// a wrong width is a shifted row rather than a shorter word.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Glyphs {
+    /// The unsaved-work mark, before a buffer's name.
+    pub modified: &'static str,
+    /// The rule down each indent level (SPEC §7.5). Deliberately a different mark
+    /// from [`Self::scroll_track`] **in both profiles**: the two are both full-height
+    /// vertical rules, and a reader should not have to work out which one is the
+    /// margin. That constraint is what picks the ASCII track, not the other way
+    /// round - the guide keeps the rule shape, so the track gives it up.
+    pub indent_guide: &'static str,
+    /// Between two tabs on the head bar.
+    pub tab_separator: &'static str,
+    /// The head bar's "the strip continues this way" markers.
+    pub overflow_left: &'static str,
+    pub overflow_right: &'static str,
+    /// Between the status bar's right-hand fields (`UTF-8 · LF · tabs:4`).
+    pub field_separator: &'static str,
+    /// The scrollbar's two halves, body and picker alike.
+    pub scroll_track: &'static str,
+    pub scroll_thumb: &'static str,
+    /// A picker's box. Ratatui's own set is the Unicode one; the ASCII profile draws
+    /// the corners as `+`, which is what a box looks like without box drawing.
+    pub border: symbols::border::Set<'static>,
+}
+
+impl Glyphs {
+    /// The marks the design is drawn with.
+    pub const UNICODE: Self = Self {
+        modified: "●",
+        indent_guide: symbols::line::VERTICAL,
+        tab_separator: symbols::line::VERTICAL,
+        overflow_left: "‹",
+        overflow_right: "›",
+        field_separator: "·",
+        // Ratatui's own scrollbar default, named rather than copied: `Scrollbar`
+        // is built from this pair, so `layout::scrollbar` restating it as a literal
+        // is how the two would drift.
+        scroll_track: symbols::line::DOUBLE_VERTICAL,
+        scroll_thumb: symbols::block::FULL,
+        border: symbols::border::PLAIN,
+    };
+
+    /// The same set inside ASCII. Shape still carries the meaning (SPEC §7.5): the
+    /// marks stay distinguishable from each other, not merely present - `*` for
+    /// unsaved work reads as a mark rather than as punctuation, and the two overflow
+    /// arrows stay a pair.
+    pub const ASCII: Self = Self {
+        modified: "*",
+        indent_guide: "|",
+        tab_separator: "|",
+        overflow_left: "<",
+        overflow_right: ">",
+        field_separator: "-",
+        scroll_track: ":",
+        scroll_thumb: "#",
+        border: symbols::border::Set {
+            top_left: "+",
+            top_right: "+",
+            bottom_left: "+",
+            bottom_right: "+",
+            vertical_left: "|",
+            vertical_right: "|",
+            horizontal_top: "-",
+            horizontal_bottom: "-",
+        },
+    };
+}
+
 /// All user-configurable settings, resolved once at startup and threaded into the
 /// render and input paths. Grows as configurable surfaces land, so it is passed as
 /// a whole rather than field-by-field (SPEC §10.5).
@@ -153,6 +264,10 @@ pub struct Config {
     /// Held here because this is where the user's file is read, and handed to the
     /// core, which is what acts on it.
     pub final_newline: bool,
+    /// The marks the chrome paints (SPEC §7.5). Resolved from the file's
+    /// `glyphs = "unicode" | "ascii"` at startup, so nothing downstream carries the
+    /// profile around and asks about it per paint.
+    pub glyphs: Glyphs,
 }
 
 impl Default for Config {
@@ -169,6 +284,7 @@ impl Default for Config {
             scrollbar: true,
             sticky_context: false,
             final_newline: CoreOptions::default().final_newline,
+            glyphs: Glyphs::UNICODE,
         }
     }
 }
@@ -204,6 +320,7 @@ struct ConfigFile {
     scrollbar: Option<bool>,
     sticky_context: Option<bool>,
     final_newline: Option<bool>,
+    glyphs: Option<GlyphProfile>,
     /// The keys table, merged over the built-in bindings rather than replacing them:
     /// a user who binds one key keeps the other fifty. Binding a chord that already
     /// exists overrides it, which is the whole point.
@@ -335,6 +452,9 @@ fn parse(text: &str) -> (Config, Option<String>) {
     }
     if let Some(final_newline) = file.final_newline {
         config.final_newline = final_newline;
+    }
+    if let Some(profile) = file.glyphs {
+        config.glyphs = profile.glyphs();
     }
     if let Some(name) = file.theme {
         // A theme that will not load leaves the built-in one in place: a bad color
@@ -486,6 +606,13 @@ pub struct Theme {
     /// survive the selected row's fill instead of punching holes in it: the same rule
     /// the indent guide follows over a selection wash.
     pub palette_match: Style,
+    /// A picker's quiet ink: the directory part of a path row, and the hint footer
+    /// under its box (SPEC §7.5, M10). One slot, because both say the same thing -
+    /// *present, but not what you are reading*.
+    /// **A foreground and attributes only, no ground**, for the reason
+    /// [`Self::palette_match`] has none - it paints over whichever row style is
+    /// underneath, so the highlighted row stays one unbroken band.
+    pub palette_dim: Style,
     /// The four LSP diagnostic severities (SPEC §5). The `fg` colors the underline
     /// under a flagged span and the mark in the gutter; a background, if set, is
     /// ignored for the underline (which paints only the foreground) so a theme need
@@ -650,6 +777,10 @@ impl Default for Theme {
             palette_match: Style::new()
                 .fg(Color::Rgb(0x7f, 0xb3, 0xff))
                 .add_modifier(Modifier::BOLD),
+            // No ground either, and for the same reason. A muted foreground rather
+            // than `Modifier::DIM`, which several terminals decline to render at all
+            // - a distinction the whole point of which is that it is visible.
+            palette_dim: Style::new().fg(Color::Rgb(0x6b, 0x74, 0x8f)),
             // Diagnostics (SPEC §5): a red error and an amber warning carry the
             // usual severity signal, while information and hint stay quiet - a
             // desaturated blue and a muted grey - so a wall of hints never shouts
@@ -722,6 +853,66 @@ mod tests {
         assert_eq!(problem, None);
         assert_eq!(config.line_numbers, LineNumbers::Relative);
         assert_eq!(config.tab_width, DEFAULT_TAB_WIDTH);
+    }
+
+    #[test]
+    fn the_glyph_profile_is_unicode_unless_the_file_asks_otherwise() {
+        assert_eq!(Config::default().glyphs, Glyphs::UNICODE);
+
+        let (config, problem) = parse(r#"glyphs = "ascii""#);
+        assert_eq!(problem, None);
+        assert_eq!(config.glyphs, Glyphs::ASCII);
+        assert_eq!(config.tab_width, DEFAULT_TAB_WIDTH, "untouched keys stand");
+
+        let (config, problem) = parse(r#"glyphs = "unicode""#);
+        assert_eq!(problem, None);
+        assert_eq!(config.glyphs, Glyphs::UNICODE);
+
+        // A profile that is not one of the two is a typo, and reported as one rather
+        // than silently leaving the marks the user was trying to replace.
+        let (config, problem) = parse(r#"glyphs = "utf8""#);
+        assert_eq!(config.glyphs, Glyphs::UNICODE, "still starts");
+        assert!(problem.is_some(), "an unknown profile is reported");
+    }
+
+    #[test]
+    fn every_mark_is_one_cell_wide_in_both_profiles() {
+        use unicode_width::UnicodeWidthStr;
+
+        // The property the whole feature rests on: a substitute wider than the mark
+        // it replaces moves the text under it, which is the failure being cured.
+        for glyphs in [Glyphs::UNICODE, Glyphs::ASCII] {
+            let marks = [
+                glyphs.modified,
+                glyphs.indent_guide,
+                glyphs.tab_separator,
+                glyphs.overflow_left,
+                glyphs.overflow_right,
+                glyphs.field_separator,
+                glyphs.scroll_track,
+                glyphs.scroll_thumb,
+            ];
+            for mark in marks {
+                assert_eq!(mark.width(), 1, "{mark:?} is not one cell");
+                // No mark may be a path separator. The buffer picker asks
+                // `dir_columns` about a label the marker is already on the front of,
+                // which is only the name's own directory if no mark can be mistaken
+                // for one.
+                assert!(
+                    !mark.contains(std::path::is_separator),
+                    "{mark:?} reads as a path separator"
+                );
+            }
+        }
+        // The ASCII profile is ASCII, borders included - a set that is only mostly
+        // replaced still leaves a box a thin font cannot draw.
+        let ascii = Glyphs::ASCII;
+        assert!(ascii.modified.is_ascii() && ascii.scroll_thumb.is_ascii());
+        assert!(ascii.border.top_left.is_ascii() && ascii.border.vertical_left.is_ascii());
+        // The margin's rule and the scrollbar's track stay distinguishable in both,
+        // which is what stops a reader having to work out which one is the margin.
+        assert_ne!(Glyphs::UNICODE.indent_guide, Glyphs::UNICODE.scroll_track);
+        assert_ne!(ascii.indent_guide, ascii.scroll_track);
     }
 
     #[test]

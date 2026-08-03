@@ -18,8 +18,8 @@ use vortex_core::Action;
 
 use crate::command::Command;
 use crate::compositor::Layer;
-use crate::config::Theme;
-use crate::picker::{Item, Picker, PreviewSource};
+use crate::config::Config;
+use crate::picker::{Item, Picker, PreviewSource, dir_columns};
 
 /// Cap on files collected, so a pathological tree cannot stall the walk or the
 /// on-thread fuzzy match. Typical projects are far under this; a huge corpus wants
@@ -87,10 +87,14 @@ fn collect_files(root: &Path) -> Vec<PathBuf> {
 fn items(root: &Path) -> Vec<Item> {
     collect_files(root)
         .into_iter()
-        .map(|rel| Item {
-            label: rel.to_string_lossy().into_owned(),
-            shortcut: None,
-            command: Command::Editor(Action::Open(root.join(rel))),
+        .map(|rel| {
+            let label = rel.to_string_lossy().into_owned();
+            Item {
+                dim_columns: dir_columns(&label),
+                label,
+                shortcut: None,
+                command: Command::Editor(Action::Open(root.join(rel))),
+            }
         })
         .collect()
 }
@@ -185,13 +189,13 @@ fn clean(line: &str) -> String {
 }
 
 /// Open the file picker over `root`, styled from the theme.
-pub fn open(theme: &Theme, root: &Path) -> Box<dyn Layer> {
+pub fn open(config: &Config, root: &Path) -> Box<dyn Layer> {
     Box::new(
         Picker::new(
             "Open File",
             items(root),
             true, // path-aware fuzzy matching
-            theme,
+            config,
         )
         .with_preview_pane(preview_source()),
     )
@@ -346,6 +350,7 @@ mod tests {
         // A row that opens nothing has nothing to show, rather than a guess at one.
         let other = Item {
             label: "src/main.rs".to_string(),
+            dim_columns: 0,
             shortcut: None,
             command: Command::OpenPalette,
         };
@@ -406,7 +411,7 @@ mod tests {
         // the source would silently be the old list-only one.
         let t = TempDir::new();
         t.file("a.rs", "fn main() {}\n");
-        let mut layer = open(&Theme::default(), &t.path);
+        let mut layer = open(&Config::default(), &t.path);
         let screen = ratatui::layout::Rect::new(0, 0, 100, 24);
         let mut buf = ratatui::buffer::Buffer::empty(screen);
         layer.render(screen, &mut buf);

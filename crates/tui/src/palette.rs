@@ -8,7 +8,7 @@
 //! [`Command`] dispatch a bound key uses.
 
 use crate::compositor::Layer;
-use crate::config::Theme;
+use crate::config::Config;
 // The keymap's bindable-command identity, as distinct from the dispatchable
 // `crate::command::Command` the picker items carry.
 use crate::keymap::{Command as Bindable, Context, Keymap};
@@ -68,6 +68,7 @@ fn registry(keymap: &Keymap) -> Vec<Item> {
         .filter_map(|&(label, bound)| {
             Some(Item {
                 label: label.to_string(),
+                dim_columns: 0,
                 // In the editor's context, and only there: the palette lists what is
                 // runnable from the buffer, and a surface command is unrunnable from
                 // the one place its surface is not open (SPEC §10.5).
@@ -78,9 +79,14 @@ fn registry(keymap: &Keymap) -> Vec<Item> {
         .collect()
 }
 
-/// Open the command palette, styled from the theme, with shortcuts from the keymap.
-pub fn open(theme: &Theme, keymap: &Keymap) -> Box<dyn Layer> {
-    Box::new(Picker::new("Commands", registry(keymap), false, theme))
+/// Open the command palette, with its shortcuts read from the config's keymap.
+pub fn open(config: &Config) -> Box<dyn Layer> {
+    Box::new(Picker::new(
+        "Commands",
+        registry(&config.keymap),
+        false,
+        config,
+    ))
 }
 
 #[cfg(test)]

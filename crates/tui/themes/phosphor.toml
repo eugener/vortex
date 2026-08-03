@@ -26,6 +26,8 @@ toast_info       = { fg = "#150f06", bg = "#c48700" }
 toast_error      = { fg = "#150f06", bg = "#ffd980", bold = true }
 palette          = { fg = "#ffb000", bg = "#150f06" }
 palette_selected = { fg = "#150f06", bg = "#ffb000", bold = true }
+# Quiet ink for a path's directory and the hint footer: the one hue, dimmed.
+palette_dim      = { fg = "#a97600" }
 
 # One hue, so diagnostics separate by intensity like everything else: a bright
 # amber error down to a dim hint. The underline shape does the rest.

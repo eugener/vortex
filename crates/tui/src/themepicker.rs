@@ -14,7 +14,7 @@
 
 use crate::command::Command;
 use crate::compositor::Layer;
-use crate::config::Theme;
+use crate::config::Config;
 use crate::picker::{Item, Picker};
 use crate::theme::{self, Origin};
 
@@ -27,6 +27,7 @@ fn registry(entries: Vec<theme::Entry>) -> Vec<Item> {
     entries
         .into_iter()
         .map(|entry| Item {
+            dim_columns: 0,
             shortcut: matches!(entry.origin, Origin::User(_)).then(|| USER_THEME.to_string()),
             command: Command::SetTheme(entry.name.clone()),
             label: entry.name,
@@ -35,7 +36,7 @@ fn registry(entries: Vec<theme::Entry>) -> Vec<Item> {
 }
 
 /// Open the theme picker, highlighting `current` and previewing as you move.
-pub fn open(theme: &Theme, current: &str) -> Box<dyn Layer> {
+pub fn open(config: &Config, current: &str) -> Box<dyn Layer> {
     let entries = theme::discover();
     // Restoring means naming the theme in use; if it is somehow not in the list
     // (a user file deleted while the editor ran), the highlight falls on the first
@@ -43,7 +44,7 @@ pub fn open(theme: &Theme, current: &str) -> Box<dyn Layer> {
     // rather than leaving the preview silently applied.
     let selected = entries.iter().position(|e| e.name == current).unwrap_or(0);
     Box::new(
-        Picker::new("Themes", registry(entries), false, theme)
+        Picker::new("Themes", registry(entries), false, config)
             .with_selected(selected)
             .previewing(Command::SetTheme(current.to_string())),
     )
@@ -89,7 +90,7 @@ mod tests {
     #[test]
     fn it_opens_on_the_theme_in_use_and_previews_nothing() {
         // Opening the picker must not change what you are looking at.
-        let mut picker = open(&Theme::default(), "phosphor");
+        let mut picker = open(&Config::default(), "phosphor");
         assert!(picker.take_commands().is_empty());
         // The highlight is on the current theme, so committing straight away is a
         // no-op rather than a jump to whatever sorted first.
@@ -100,7 +101,7 @@ mod tests {
 
     #[test]
     fn moving_previews_and_escaping_restores() {
-        let mut picker = open(&Theme::default(), theme::DEFAULT);
+        let mut picker = open(&Config::default(), theme::DEFAULT);
         assert_eq!(
             send(&mut *picker, press(KeyCode::Up)),
             EventResult::Consumed
@@ -127,7 +128,7 @@ mod tests {
     fn a_filter_that_moves_the_highlight_previews_too() {
         // Preview follows the highlight, however it moved - typing re-ranks the list
         // under it, which is a move even though no arrow key was pressed.
-        let mut picker = open(&Theme::default(), theme::DEFAULT);
+        let mut picker = open(&Config::default(), theme::DEFAULT);
         for c in "phos".chars() {
             send(
                 &mut *picker,

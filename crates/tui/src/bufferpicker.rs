@@ -13,46 +13,57 @@ use vortex_core::{Action, BufferId, BufferInfo};
 
 use crate::command::Command;
 use crate::compositor::Layer;
-use crate::config::Theme;
+use crate::config::{Config, Glyphs};
 use crate::layout::{buffer_display_name, with_modified_marker};
-use crate::picker::{Item, Picker, display_path};
+use crate::picker::{Item, Picker, dir_columns, display_path};
 
 /// One row per open buffer. The label is the file's *full* path where it has one
 /// (not just the file name, which the bufferline shows): the picker is where you go
 /// when several buffers share a name, so the thing you filter on has to be the thing
-/// that tells them apart. The modified marker rides along from
-/// [`buffer_display_name`], so a dirty buffer is as obvious here as on its tab.
-fn items(buffers: &[BufferInfo], active: BufferId) -> Vec<Item> {
+/// that tells them apart. It carries the modified marker too, so a dirty buffer is
+/// as obvious here as on its tab.
+fn items(buffers: &[BufferInfo], active: BufferId, glyphs: Glyphs) -> Vec<Item> {
     // Resolved once for the whole list rather than per row (see `display_path`).
     let cwd = std::env::current_dir().ok();
     buffers
         .iter()
-        .map(|info| Item {
-            label: label_for(info, cwd.as_deref()),
-            // The active buffer is marked where a shortcut would go: picking it is a
-            // no-op, and saying so beats leaving the current buffer unidentifiable.
-            shortcut: (info.id == active).then(|| "current".to_string()),
-            command: Command::Editor(Action::SwitchBuffer { id: info.id }),
+        .map(|info| {
+            let label = label_for(info, cwd.as_deref(), glyphs);
+            Item {
+                dim_columns: dir_columns(&label),
+                label,
+                // The active buffer is marked where a shortcut would go: picking it is a
+                // no-op, and saying so beats leaving the current buffer unidentifiable.
+                shortcut: (info.id == active).then(|| "current".to_string()),
+                command: Command::Editor(Action::SwitchBuffer { id: info.id }),
+            }
         })
         .collect()
 }
 
 /// A buffer's picker label: its path when it has one, otherwise the unnamed-buffer
-/// placeholder, with any modified marker.
-fn label_for(info: &BufferInfo, cwd: Option<&Path>) -> String {
-    let Some(path) = info.path.as_deref() else {
-        return buffer_display_name(None, info.modified);
+/// placeholder, with any modified marker in front.
+///
+/// The caller asks [`dir_columns`] about the *whole* label rather than about the path
+/// inside it, which is right because no mark in a [`Glyphs`] set is a path separator:
+/// the label's last separator is the name's, shifted by the marker, and a row with no
+/// directory has none either way. `every_mark_is_one_cell_wide_in_both_profiles` pins
+/// that.
+fn label_for(info: &BufferInfo, cwd: Option<&Path>, glyphs: Glyphs) -> String {
+    let name = match info.path.as_deref() {
+        Some(path) => display_path(path, cwd),
+        None => buffer_display_name(None),
     };
-    with_modified_marker(&display_path(path, cwd), info.modified)
+    with_modified_marker(&name, info.modified, glyphs)
 }
 
 /// Open the buffer picker over the snapshot's buffer list.
-pub fn open(theme: &Theme, buffers: &[BufferInfo], active: BufferId) -> Box<dyn Layer> {
+pub fn open(config: &Config, buffers: &[BufferInfo], active: BufferId) -> Box<dyn Layer> {
     Box::new(Picker::new(
         "Switch Buffer",
-        items(buffers, active),
+        items(buffers, active, config.glyphs),
         true, // path-aware fuzzy matching: the labels are paths
-        theme,
+        config,
     ))
 }
 
@@ -60,6 +71,7 @@ pub fn open(theme: &Theme, buffers: &[BufferInfo], active: BufferId) -> Box<dyn 
 mod tests {
     use super::*;
     use std::path::PathBuf;
+    use unicode_width::UnicodeWidthStr;
 
     fn info(id: u64, path: Option<&str>, modified: bool) -> BufferInfo {
         BufferInfo {
@@ -72,7 +84,7 @@ mod tests {
     #[test]
     fn each_buffer_becomes_a_row_that_switches_to_it() {
         let list = [info(1, Some("/tmp/a.rs"), false), info(2, None, false)];
-        let items = items(&list, BufferId(1));
+        let items = items(&list, BufferId(1), Glyphs::UNICODE);
         assert_eq!(items.len(), 2);
         assert_eq!(
             items[0].command,
@@ -90,7 +102,7 @@ mod tests {
             info(1, Some("/tmp/a.rs"), false),
             info(2, Some("/b.rs"), false),
         ];
-        let items = items(&list, BufferId(2));
+        let items = items(&list, BufferId(2), Glyphs::UNICODE);
         assert_eq!(items[0].shortcut, None);
         assert_eq!(items[1].shortcut, Some("current".to_string()));
     }
@@ -98,16 +110,26 @@ mod tests {
     #[test]
     fn a_modified_buffer_carries_its_marker() {
         let list = [info(1, Some("/tmp/dirty.rs"), true)];
-        assert!(items(&list, BufferId(9))[0].label.starts_with("● "));
+        assert!(
+            items(&list, BufferId(9), Glyphs::UNICODE)[0]
+                .label
+                .starts_with("● ")
+        );
     }
 
     #[test]
     fn an_unnamed_buffer_gets_the_placeholder_name() {
         let list = [info(1, None, false)];
-        assert_eq!(items(&list, BufferId(1))[0].label, "[No Name]");
+        assert_eq!(
+            items(&list, BufferId(1), Glyphs::UNICODE)[0].label,
+            "[No Name]"
+        );
         // …and still shows it is unsaved when it is.
         let dirty = [info(1, None, true)];
-        assert_eq!(items(&dirty, BufferId(1))[0].label, "● [No Name]");
+        assert_eq!(
+            items(&dirty, BufferId(1), Glyphs::UNICODE)[0].label,
+            "● [No Name]"
+        );
     }
 
     #[test]
@@ -119,11 +141,34 @@ mod tests {
         let cwd = std::env::current_dir().unwrap();
         let nested = cwd.join("src/deep/thing.rs");
         let list = [info(1, Some(nested.to_str().unwrap()), false)];
-        assert_eq!(items(&list, BufferId(1))[0].label, "src/deep/thing.rs");
+        assert_eq!(
+            items(&list, BufferId(1), Glyphs::UNICODE)[0].label,
+            "src/deep/thing.rs"
+        );
+    }
+
+    #[test]
+    fn the_quiet_part_of_a_row_covers_the_marker_and_the_directory() {
+        // The modified marker sits *before* the path, so the quiet run has to reach
+        // over it: a row that dimmed only from `src/` would leave the marker and the
+        // space after it loud, which reads as a stray highlight (SPEC §7.5, M10).
+        let cwd = std::env::current_dir().unwrap();
+        let nested = cwd.join("src/deep/thing.rs");
+        let dirty = [info(1, Some(nested.to_str().unwrap()), true)];
+        let row = &items(&dirty, BufferId(1), Glyphs::UNICODE)[0];
+        assert_eq!(row.label, "● src/deep/thing.rs");
+        assert_eq!(row.dim_columns, "* src/deep/".width());
+
+        // A buffer with no path has no directory to quiet, marker or not.
+        let unnamed = [info(1, None, true)];
+        assert_eq!(
+            items(&unnamed, BufferId(1), Glyphs::UNICODE)[0].dim_columns,
+            0
+        );
     }
 
     #[test]
     fn an_empty_buffer_list_yields_no_rows() {
-        assert!(items(&[], BufferId(1)).is_empty());
+        assert!(items(&[], BufferId(1), Glyphs::UNICODE).is_empty());
     }
 }

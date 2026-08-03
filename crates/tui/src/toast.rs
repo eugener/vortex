@@ -43,7 +43,7 @@ pub fn toast_for(note: &Notification) -> Option<(String, Level)> {
     use crate::layout::buffer_display_name;
     match note {
         Notification::FileOpened { path, existed, .. } => {
-            let name = buffer_display_name(Some(path), false);
+            let name = buffer_display_name(Some(path));
             let text = if *existed {
                 format!("Opened {name}")
             } else {
@@ -52,7 +52,7 @@ pub fn toast_for(note: &Notification) -> Option<(String, Level)> {
             Some((text, Level::Info))
         }
         Notification::FileSaved { path, .. } => Some((
-            format!("Saved {}", buffer_display_name(Some(path), false)),
+            format!("Saved {}", buffer_display_name(Some(path))),
             Level::Info,
         )),
         Notification::FileError { message, .. } => {
@@ -62,7 +62,7 @@ pub fn toast_for(note: &Notification) -> Option<(String, Level)> {
             Some((format!("Edit rejected: {message}"), Level::Error))
         }
         Notification::FileReloaded { path, .. } => Some((
-            format!("Reloaded {}", buffer_display_name(Some(path), false)),
+            format!("Reloaded {}", buffer_display_name(Some(path))),
             Level::Info,
         )),
         // The conflict prompt is the *answer* to an external change (see
@@ -71,7 +71,7 @@ pub fn toast_for(note: &Notification) -> Option<(String, Level)> {
         // reload from. An error either way: both mean the buffer and its file no
         // longer agree, which is not a calm state to leave a user in (SPEC §8).
         Notification::ExternalChange { path, removed, .. } => {
-            let name = buffer_display_name(Some(path), false);
+            let name = buffer_display_name(Some(path));
             let text = if *removed {
                 format!("{name} was removed on disk")
             } else {
@@ -80,10 +80,7 @@ pub fn toast_for(note: &Notification) -> Option<(String, Level)> {
             Some((text, Level::Error))
         }
         Notification::ReloadRejected { path, .. } => Some((
-            format!(
-                "{} has unsaved changes",
-                buffer_display_name(Some(path), false)
-            ),
+            format!("{} has unsaved changes", buffer_display_name(Some(path))),
             Level::Error,
         )),
         // The refusal that stands between a save and someone else's work. The
@@ -91,7 +88,7 @@ pub fn toast_for(note: &Notification) -> Option<(String, Level)> {
         // once that is dismissed, because a buffer whose file has moved out from
         // under it is not a calm state to leave a user in (SPEC §8).
         Notification::SaveRejected { path, removed, .. } => {
-            let name = buffer_display_name(Some(path), false);
+            let name = buffer_display_name(Some(path));
             let text = if *removed {
                 format!("{name} was deleted; not saved")
             } else {

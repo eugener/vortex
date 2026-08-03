@@ -1145,6 +1145,7 @@ fn event_loop(
                 PaintInputs {
                     viewport,
                     theme: config.theme,
+                    glyphs: config.glyphs,
                     follow,
                     selected,
                     tab_width: config.tab_width,
@@ -1337,6 +1338,7 @@ fn event_loop(
                                     snap.buffer_id,
                                     count_width,
                                     screen.width as usize,
+                                    config.glyphs,
                                 );
                                 // A click on an overflow marker, the padding, or the line
                                 // count selects nothing and is simply swallowed.
@@ -1362,10 +1364,10 @@ fn event_loop(
                                 if let Some(target) = status_target_at(
                                     snap,
                                     selected,
-                                    &config.indent_style.indent_readout(config.tab_width),
                                     caret_rested,
                                     screen.width as usize,
                                     mouse.column as usize,
+                                    &config,
                                 ) {
                                     let command = match target {
                                         layout::StatusTarget::Encoding => {
@@ -1618,18 +1620,15 @@ fn dispatch_command(command: Command, handle: &vortex_core::CoreHandle, ui: &mut
             }
         }
         // The palette shows each command's shortcut, so it needs the keymap too.
-        Command::OpenPalette => ui
-            .overlays
-            .push(palette::open(&ui.config.theme, &ui.config.keymap)),
+        Command::OpenPalette => ui.overlays.push(palette::open(ui.config)),
         Command::OpenFilePicker => {
             // Walk the working directory. If it cannot be read, fall back to ".".
             let root = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-            ui.overlays.push(filepicker::open(&ui.config.theme, &root));
+            ui.overlays.push(filepicker::open(ui.config, &root));
         }
         Command::OpenSearchPicker => {
             let root = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-            ui.overlays
-                .push(globalsearch::open(&ui.config.theme, &root));
+            ui.overlays.push(globalsearch::open(ui.config, &root));
         }
         // A hit is an arrival, not just an open: the two actions go down the same
         // channel in order, so the jump resolves against the buffer the open just
@@ -1658,7 +1657,7 @@ fn dispatch_command(command: Command, handle: &vortex_core::CoreHandle, ui: &mut
         }
         Command::OpenThemePicker => ui
             .overlays
-            .push(themepicker::open(&ui.config.theme, &ui.config.theme_name)),
+            .push(themepicker::open(ui.config, &ui.config.theme_name)),
         // Mutating the live config is what a theme pick already does (SPEC §10.5):
         // the resolved value *is* the running setting, and the file only says what
         // it starts as. Nothing to restyle - the gutter reads the mode each frame.
@@ -1677,7 +1676,7 @@ fn dispatch_command(command: Command, handle: &vortex_core::CoreHandle, ui: &mut
             if let Some(active) = ui.active() {
                 let buffers = ui.buffers();
                 ui.overlays
-                    .push(bufferpicker::open(&ui.config.theme, buffers, active));
+                    .push(bufferpicker::open(ui.config, buffers, active));
             }
         }
         // Both format pickers open on what the buffer currently is, which they read
@@ -1686,16 +1685,14 @@ fn dispatch_command(command: Command, handle: &vortex_core::CoreHandle, ui: &mut
         // change, so they do not open.
         Command::OpenEncodingPicker => {
             if let Some(format) = ui.snapshot.map(|s| s.format) {
-                ui.overlays.push(formatpicker::encoding(
-                    &ui.config.theme,
-                    format.encoding_name(),
-                ));
+                ui.overlays
+                    .push(formatpicker::encoding(ui.config, format.encoding_name()));
             }
         }
         Command::OpenLineEndingPicker => {
             if let Some(format) = ui.snapshot.map(|s| s.format) {
                 ui.overlays
-                    .push(formatpicker::line_ending(&ui.config.theme, format.eol));
+                    .push(formatpicker::line_ending(ui.config, format.eol));
             }
         }
         // The save-as prompt pre-fills the current path (if any) so a save-as is a
@@ -1949,6 +1946,9 @@ struct PaintInputs<'a> {
     /// Pin the enclosing scopes above the text (SPEC §7.5), carried per frame for the
     /// same reason as `tab_width`.
     sticky_context: bool,
+    /// The marks the chrome paints (SPEC §7.5, M10), carried per frame for the same
+    /// reason as `tab_width`: it is a config value, and the config is live.
+    glyphs: config::Glyphs,
     /// The live search (SPEC §11), borrowed rather than copied so the highlights can
     /// never be a frame behind what the prompt is showing.
     ///
@@ -1997,6 +1997,7 @@ fn paint(frame: &mut Frame, snapshot: &ViewSnapshot, inputs: PaintInputs) -> Vie
     let PaintInputs {
         viewport,
         theme,
+        glyphs,
         follow,
         selected,
         tab_width,
@@ -2166,6 +2167,7 @@ fn paint(frame: &mut Frame, snapshot: &ViewSnapshot, inputs: PaintInputs) -> Vie
             .collect(),
         reserved: usize::from(scrollbar),
         indent_guides,
+        glyphs,
         // Only the lines about to be painted are searched, which is the whole
         // reason `matches_in` takes a line range (SPEC §10.4).
         matches: search
@@ -2174,7 +2176,7 @@ fn paint(frame: &mut Frame, snapshot: &ViewSnapshot, inputs: PaintInputs) -> Vie
             .unwrap_or_default(),
         current: preview,
     };
-    paint_head_bar(frame, head_area, snapshot, &theme);
+    paint_head_bar(frame, head_area, snapshot, &theme, glyphs);
     paint_body(frame, text_area, snapshot, &body);
     paint_sticky_context(frame, context_area, snapshot, &body, &header);
     // The first screen, over the (empty) body: three signposts on a buffer with
@@ -2198,6 +2200,7 @@ fn paint(frame: &mut Frame, snapshot: &ViewSnapshot, inputs: PaintInputs) -> Vie
             text_height,
             theme.scrollbar_track,
             theme.scrollbar_thumb,
+            glyphs,
         );
         frame.render_stateful_widget(bar, text_area, &mut state);
     }
@@ -2206,6 +2209,7 @@ fn paint(frame: &mut Frame, snapshot: &ViewSnapshot, inputs: PaintInputs) -> Vie
         status_area,
         snapshot,
         StatusBar {
+            glyphs,
             indent,
             caret_rested,
             cursor_line,
@@ -2248,13 +2252,25 @@ fn paint(frame: &mut Frame, snapshot: &ViewSnapshot, inputs: PaintInputs) -> Vie
 /// Paint the top head bar (buffer name left, line count right) as one filled row.
 /// The name is the bound file's name plus a modified marker (SPEC §8, §10), read
 /// straight from the snapshot so painting needs no core round-trip (SPEC §5).
-fn paint_head_bar(frame: &mut Frame, area: Rect, snapshot: &ViewSnapshot, theme: &config::Theme) {
+fn paint_head_bar(
+    frame: &mut Frame,
+    area: Rect,
+    snapshot: &ViewSnapshot,
+    theme: &config::Theme,
+    glyphs: config::Glyphs,
+) {
     let width = area.width as usize;
     // The line count keeps the right end; the tab strip gets what is left. With one
     // buffer open that reads exactly as the pre-bufferline head bar did.
     let count = layout::line_count_label(layout::display_line_count(&snapshot.text));
     let count_width = count.width();
-    let tabs = layout::head_bar_tabs(&snapshot.buffers, snapshot.buffer_id, count_width, width);
+    let tabs = layout::head_bar_tabs(
+        &snapshot.buffers,
+        snapshot.buffer_id,
+        count_width,
+        width,
+        glyphs,
+    );
 
     let mut spans: Vec<Span> = Vec::with_capacity(tabs.len() + 2);
     let mut used = 0;
@@ -2335,6 +2351,9 @@ struct Body {
     /// line's own indentation, so they are computed for the window in [`paint_body`],
     /// where the visible lines have already been fetched.
     indent_guides: bool,
+    /// The marks this paints with: the indent guide, and the scrollbar's two halves
+    /// (SPEC §7.5).
+    glyphs: config::Glyphs,
 }
 
 /// Paint the text body with a line-number gutter. Each visible row is a gutter
@@ -2539,7 +2558,7 @@ fn paint_body(frame: &mut Frame, area: Rect, snapshot: &ViewSnapshot, body: &Bod
                 gutter_style,
             )];
             spans.extend(layout::render_line(
-                &layout::with_indent_guides(line.display(), columns),
+                &layout::with_indent_guides(line.display(), columns, body.glyphs),
                 body.h_scroll,
                 body.text_width,
                 base,
@@ -2698,6 +2717,8 @@ fn paint_sticky_context(
 struct StatusBar<'a> {
     /// 0-based cursor line (displayed 1-based).
     cursor_line: usize,
+    /// The marks the bar joins its fields with (SPEC §7.5, M10).
+    glyphs: config::Glyphs,
     /// The cursor's line text, for the grapheme-column readout.
     line_text: &'a str,
     /// Byte column of the cursor within `line_text`.
@@ -2723,6 +2744,7 @@ fn status_info<'a>(
     selected: usize,
     indent: &'a str,
     caret_rested: bool,
+    glyphs: config::Glyphs,
 ) -> layout::StatusInfo<'a> {
     let head = snapshot
         .selections
@@ -2736,6 +2758,7 @@ fn status_info<'a>(
         cursors: snapshot.selections.len(),
         format: snapshot.format,
         indent,
+        glyphs,
         // Only once the caret has stopped. Asked of the decorations rather than
         // remembered, so a diagnostic that arrives while the caret already sits on
         // the span appears without the caret having to move again.
@@ -2756,6 +2779,7 @@ fn paint_status_bar(frame: &mut Frame, area: Rect, snapshot: &ViewSnapshot, stat
         status.selected,
         status.indent,
         status.caret_rested,
+        status.glyphs,
     );
     let (left, right) = layout::status_bar(info);
     let bar = layout::fit_bar(&left, &right, area.width as usize);
@@ -2771,11 +2795,14 @@ fn paint_status_bar(frame: &mut Frame, area: Rect, snapshot: &ViewSnapshot, stat
 fn status_target_at(
     snapshot: &ViewSnapshot,
     selected: usize,
-    indent: &str,
     caret_rested: bool,
     width: usize,
     column: usize,
+    config: &config::Config,
 ) -> Option<layout::StatusTarget> {
+    // Taken whole rather than as the three values read off it, the same bargain
+    // `Picker::new` makes: a positional list of them is a swap waiting to happen.
+    let indent = config.indent_style.indent_readout(config.tab_width);
     let head = snapshot
         .selections
         .get(snapshot.primary)
@@ -2788,8 +2815,9 @@ fn status_target_at(
         cursor_line + 1,
         col,
         selected,
-        indent,
+        &indent,
         caret_rested,
+        config.glyphs,
     );
     let (left, _) = layout::status_bar(info);
     layout::status_target(&left, info, width, column)
@@ -3493,6 +3521,7 @@ mod tests {
         PaintInputs {
             viewport: ViewState::default(),
             theme: config::Theme::default(),
+            glyphs: config::Glyphs::UNICODE,
             follow: true,
             selected,
             tab_width: config::DEFAULT_TAB_WIDTH,
@@ -5146,14 +5175,29 @@ mod tests {
         // that decides whether the right segment fits at all.
         let snap = gesture_snapshot();
         let width = 80;
-        let (_, right) = layout::status_bar(status_info(&snap, 1, 1, 0, INDENT, false));
+        let (_, right) = layout::status_bar(status_info(
+            &snap,
+            1,
+            1,
+            0,
+            INDENT,
+            false,
+            config::Glyphs::UNICODE,
+        ));
         let start = width - right.width();
         assert_eq!(
-            status_target_at(&snap, 0, INDENT, false, width, start),
+            status_target_at(&snap, 0, false, width, start, &config::Config::default()),
             Some(layout::StatusTarget::Encoding)
         );
         assert_eq!(
-            status_target_at(&snap, 0, INDENT, false, width, start + right.width() - 2),
+            status_target_at(
+                &snap,
+                0,
+                false,
+                width,
+                start + right.width() - 2,
+                &config::Config::default()
+            ),
             None,
             "the indent readout is a readout, not a control"
         );
@@ -5170,7 +5214,7 @@ mod tests {
         let snap = gesture_snapshot();
         for column in 0..24 {
             assert_eq!(
-                status_target_at(&snap, 1234, INDENT, false, 24, column),
+                status_target_at(&snap, 1234, false, 24, column, &config::Config::default()),
                 None,
                 "column {column} on a crowded 24-cell bar"
             );
