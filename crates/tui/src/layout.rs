@@ -23,7 +23,7 @@ use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 use vortex_core::{BufferId, BufferInfo, FileFormat, Selection, Text};
 
-use crate::config::LineNumbers;
+use crate::config::{Glyphs, LineNumbers};
 
 /// Shown in the head bar when the buffer has no bound file (SPEC §10 lifecycle).
 pub const NO_NAME: &str = "[No Name]";
@@ -204,17 +204,6 @@ pub fn visible_lines(
         .collect()
 }
 
-/// The glyph an indent guide paints (SPEC §7.5). A *character*, unlike a ruler's
-/// ground tint, because the two markers want different cells: a ruler's cell is the
-/// one a long line is already using, while a guide's is by construction whitespace,
-/// so a guide can occupy its cell without displacing anything. It is one cell wide,
-/// so it stands in for the space it replaces without shifting the columns after it.
-///
-/// Deliberately not the same glyph as the scrollbar's track (`║`): the two are both
-/// full-height vertical rules, and a reader should not have to work out which of
-/// them is in the margin.
-const INDENT_GUIDE: &str = "│";
-
 /// How far **past the window** [`indent_guides`] will look for a blank line's indent
 /// before giving up. Bounded because nothing off the viewport may scan the whole buffer
 /// (SPEC §10.4); a blank row whose nearest non-blank neighbour is further away than this
@@ -363,11 +352,16 @@ pub fn guides_in_window(columns: &[usize], h_scroll: usize, width: usize) -> &[u
 /// micro-optimization here. This runs per visible row per frame, and the length it
 /// walks is a line's *indentation* - a number the file chooses, not the viewport - so
 /// searching per cell makes the paint quadratic in something an input controls.
-pub fn with_indent_guides<'a>(line: &'a str, columns: &[usize]) -> Cow<'a, str> {
+///
+/// The guide is a *character*, unlike a ruler's ground tint, because the two markers
+/// want different cells - and it is one cell wide in either glyph profile
+/// ([`Glyphs`]), which is what lets it stand in for the space it replaces.
+pub fn with_indent_guides<'a>(line: &'a str, columns: &[usize], glyphs: Glyphs) -> Cow<'a, str> {
+    let guide = glyphs.indent_guide;
     let Some(&deepest) = columns.iter().max() else {
         return Cow::Borrowed(line);
     };
-    let mut out = String::with_capacity(line.len() + columns.len() * INDENT_GUIDE.len());
+    let mut out = String::with_capacity(line.len() + columns.len() * guide.len());
     let mut col = 0;
     // The cursor, shared by both loops: `col` only grows across the two, so `next`
     // never has to walk back.
@@ -391,7 +385,7 @@ pub fn with_indent_guides<'a>(line: &'a str, columns: &[usize]) -> Cow<'a, str> 
         // of its caller: a column list of someone else's devising recolors nothing it
         // could not also replace.
         if g == " " && columns.get(next) == Some(&col) {
-            out.push_str(INDENT_GUIDE);
+            out.push_str(guide);
         } else {
             out.push_str(g);
         }
@@ -407,7 +401,7 @@ pub fn with_indent_guides<'a>(line: &'a str, columns: &[usize]) -> Cow<'a, str> 
             next += 1;
         }
         out.push_str(if columns.get(next) == Some(&col) {
-            INDENT_GUIDE
+            guide
         } else {
             " "
         });
@@ -487,11 +481,17 @@ pub fn scrollbar(
     viewport: usize,
     track: Style,
     thumb: Style,
+    glyphs: Glyphs,
 ) -> (Scrollbar<'static>, ScrollbarState) {
     let state = ScrollbarState::new(max_scroll + 1)
         .position(scroll)
         .viewport_content_length(viewport);
     let bar = Scrollbar::new(ScrollbarOrientation::VerticalRight)
+        // Ratatui's own symbols are the Unicode profile's, named here rather than
+        // left as the widget's default: the ASCII profile has to be able to replace
+        // them, and a default is not something a profile can replace.
+        .track_symbol(Some(glyphs.scroll_track))
+        .thumb_symbol(glyphs.scroll_thumb)
         // No arrow heads: they would eat two of the track's rows to offer a line-step
         // this editor already binds to a key and a wheel, and neither a short body nor
         // an eighteen-row picker has two rows to spare.
@@ -873,35 +873,36 @@ pub fn grapheme_column(line: &str, byte_col: usize) -> usize {
     line[..end].graphemes(true).count() + 1
 }
 
-/// The buffer's display name for the head bar: the file name of `path` (not the
-/// full path, to keep the bar short), or [`NO_NAME`] when unnamed. A modified
-/// buffer is prefixed with `● ` so unsaved work is visible at a glance (SPEC §8,
-/// §10). A path ending in `..`/`/` (no file name component) falls back to its
-/// lossy full form rather than the placeholder.
-pub fn buffer_display_name(path: Option<&Path>, modified: bool) -> String {
-    let name = match path {
+/// The buffer's display name: the file name of `path` (not the full path, to keep a
+/// bar or a message short), or [`NO_NAME`] when unnamed. A path ending in `..`/`/`
+/// (no file name component) falls back to its lossy full form rather than the
+/// placeholder.
+///
+/// The unsaved-work mark is **not** applied here - that is
+/// [`with_modified_marker`]'s job, asked for by the two surfaces that show one. Most
+/// callers are messages ("Saved x", "Discard changes to x?"), which name a file and
+/// never mark it, and folding the mark in meant every one of them passing a `false`
+/// and a glyph set to say so.
+pub fn buffer_display_name(path: Option<&Path>) -> String {
+    match path {
         None => NO_NAME.to_string(),
         Some(p) => p
             .file_name()
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_else(|| p.to_string_lossy().into_owned()),
-    };
-    with_modified_marker(&name, modified)
+    }
 }
 
 /// The unsaved-work marker, prefixed to a buffer's name wherever one is shown.
-/// One home for the glyph so the bufferline and the buffer picker cannot disagree
+/// One home for the mark so the bufferline and the buffer picker cannot disagree
 /// about it - they label differently (file name vs full path) but mark identically.
-pub fn with_modified_marker(name: &str, modified: bool) -> String {
+pub fn with_modified_marker(name: &str, modified: bool, glyphs: Glyphs) -> String {
     if modified {
-        format!("{MODIFIED_MARKER} {name}")
+        format!("{} {name}", glyphs.modified)
     } else {
         name.to_string()
     }
 }
-
-/// Shown before the name of a buffer with unsaved edits (SPEC §8, §10).
-pub const MODIFIED_MARKER: &str = "●";
 
 /// The head bar's right-hand segment: the buffer's display line count (see
 /// [`display_line_count`], always >= 1). The `.max(1)` is a defensive floor so a
@@ -912,14 +913,6 @@ pub fn line_count_label(line_count: usize) -> String {
         n => format!("{n} lines "),
     }
 }
-
-/// Marker shown where the tab strip continues past the visible window.
-const TAB_OVERFLOW: &str = "›";
-/// …and on the left-hand side.
-const TAB_OVERFLOW_LEFT: &str = "‹";
-/// Divider painted between adjacent tabs. One cell, so it costs a column per gap;
-/// padding alone was not enough to keep adjacent names from reading as one string.
-const TAB_SEPARATOR: &str = "│";
 
 /// What a bufferline segment *is*, which decides both how it paints and whether a
 /// pointer landing on it selects anything.
@@ -977,7 +970,9 @@ impl Tab {
 }
 
 /// The bufferline's tab strip fitted to `width` display cells, in buffer order,
-/// with a [`TAB_SEPARATOR`] between adjacent tabs (SPEC §7.5 head/tab bar).
+/// with a separator between adjacent tabs (SPEC §7.5 head/tab bar). The separator
+/// costs a column per gap; padding alone was not enough to keep adjacent names from
+/// reading as one string.
 ///
 /// Every tab is shown when they all fit. When they do not, the strip is windowed
 /// **around the active tab** - which is the only tab guaranteed to be worth seeing -
@@ -992,7 +987,12 @@ impl Tab {
 /// Widths are display cells throughout (SPEC §4), so CJK names and emoji in
 /// filenames account for the columns they really occupy. The returned labels,
 /// separators and markers never sum past `width`.
-pub fn bufferline(buffers: &[BufferInfo], active: BufferId, width: usize) -> Vec<Tab> {
+pub fn bufferline(
+    buffers: &[BufferInfo],
+    active: BufferId,
+    width: usize,
+    glyphs: Glyphs,
+) -> Vec<Tab> {
     if width == 0 || buffers.is_empty() {
         return Vec::new();
     }
@@ -1003,10 +1003,10 @@ pub fn bufferline(buffers: &[BufferInfo], active: BufferId, width: usize) -> Vec
     let labels: Vec<String> = buffers
         .iter()
         .zip(&names)
-        .map(|(info, name)| tab_label(name, info.modified))
+        .map(|(info, name)| tab_label(name, info.modified, glyphs))
         .collect();
     let widths: Vec<usize> = labels.iter().map(|l| l.width()).collect();
-    let separator = TAB_SEPARATOR.width();
+    let separator = glyphs.tab_separator.width();
     // An `active` not in the list (a snapshot older than a close) falls back to the
     // first tab rather than panicking or showing nothing.
     let active_index = buffers.iter().position(|b| b.id == active).unwrap_or(0);
@@ -1026,7 +1026,7 @@ pub fn bufferline(buffers: &[BufferInfo], active: BufferId, width: usize) -> Vec
         let mut strip = Vec::with_capacity(buffers.len() * 2);
         for (index, label) in labels.into_iter().enumerate() {
             if index > 0 {
-                strip.push(Tab::chrome(TAB_SEPARATOR));
+                strip.push(Tab::chrome(glyphs.tab_separator));
             }
             let cells = widths[index];
             strip.push(tab(index, label, cells));
@@ -1060,7 +1060,7 @@ pub fn bufferline(buffers: &[BufferInfo], active: BufferId, width: usize) -> Vec
     let markers = usize::from(first > 0) + usize::from(last + 1 < buffers.len());
     let mut strip = Vec::with_capacity((last - first) * 2 + 3);
     if first > 0 {
-        strip.push(Tab::chrome(TAB_OVERFLOW_LEFT));
+        strip.push(Tab::chrome(glyphs.overflow_left));
     }
     if first == last {
         let (text, cells) = truncate_to_cells(&labels[first], width.saturating_sub(markers));
@@ -1070,7 +1070,7 @@ pub fn bufferline(buffers: &[BufferInfo], active: BufferId, width: usize) -> Vec
     } else {
         for index in first..=last {
             if index > first {
-                strip.push(Tab::chrome(TAB_SEPARATOR));
+                strip.push(Tab::chrome(glyphs.tab_separator));
             }
             let cells = widths[index];
             strip.push(tab(index, labels[index].clone(), cells));
@@ -1079,7 +1079,7 @@ pub fn bufferline(buffers: &[BufferInfo], active: BufferId, width: usize) -> Vec
     // The trailing marker is only dropped when the leading one already took the bar's
     // single column.
     if last + 1 < buffers.len() && width > usize::from(first > 0) {
-        strip.push(Tab::chrome(TAB_OVERFLOW));
+        strip.push(Tab::chrome(glyphs.overflow_right));
     }
     strip
 }
@@ -1197,8 +1197,8 @@ pub fn empty_hints(body: Rect, rows: &[(String, &str)]) -> Vec<(u16, u16, String
 /// A tab's painted label: the buffer's display name with one cell of padding either
 /// side. Uniform padding on purpose - widening the active tab would reflow the whole
 /// strip sideways on every switch.
-fn tab_label(name: &str, modified: bool) -> String {
-    let name = with_modified_marker(name, modified);
+fn tab_label(name: &str, modified: bool, glyphs: Glyphs) -> String {
+    let name = with_modified_marker(name, modified, glyphs);
     let mut label = String::with_capacity(name.len() + 2);
     label.push(' ');
     label.push_str(&name);
@@ -1217,8 +1217,9 @@ pub fn head_bar_tabs(
     active: BufferId,
     count_width: usize,
     width: usize,
+    glyphs: Glyphs,
 ) -> Vec<Tab> {
-    bufferline(buffers, active, width.saturating_sub(count_width))
+    bufferline(buffers, active, width.saturating_sub(count_width), glyphs)
 }
 
 /// The buffer whose tab covers display `column` of the head bar, or `None` for a
@@ -1280,6 +1281,9 @@ pub struct StatusInfo<'a> {
     /// stops the segment strobing.
     pub diagnostic: Option<&'a str>,
     pub read_only: bool,
+    /// The marks the chrome paints - here, the one that joins the right segment's
+    /// fields (SPEC §7.5).
+    pub glyphs: Glyphs,
 }
 
 /// Status-bar segments `(left, right)` = (*where am I*, *how is this written*).
@@ -1349,10 +1353,15 @@ fn status_right(info: StatusInfo<'_>) -> (String, [(Range<usize>, StatusTarget);
     let bom = if info.format.bom { " BOM" } else { "" };
     let encoding = format!("{}{bom}", info.format.encoding_name());
     let eol = info.format.eol.name();
-    let text = format!("{encoding} · {eol} · {} ", info.indent);
-    // Both words sit at the front, separated by " · " (three display columns).
+    // The joiner's width is taken from the mark that is interpolated, not from a
+    // constant beside it: a profile whose mark was two cells wide would otherwise
+    // move every click span on the bar without moving the number that describes them.
+    let sep = info.glyphs.field_separator;
+    let text = format!("{encoding} {sep} {eol} {sep} {} ", info.indent);
+    // Both words sit at the front, separated by the joiner above - the mark and the
+    // space either side of it.
     let encoding_span = 0..encoding.width();
-    let eol_start = encoding_span.end + SEPARATOR_WIDTH;
+    let eol_start = encoding_span.end + sep.width() + 2;
     let eol_span = eol_start..eol_start + eol.width();
     (
         text,
@@ -1362,11 +1371,6 @@ fn status_right(info: StatusInfo<'_>) -> (String, [(Range<usize>, StatusTarget);
         ],
     )
 }
-
-/// Display width of the `" · "` the status bar's right segment joins its fields
-/// with. Named because the click spans have to step over it in exactly the width it
-/// paints - the middle dot is one column, not the three bytes it takes to store.
-const SEPARATOR_WIDTH: usize = 3;
 
 /// Which clickable part of the status bar display column `column` falls on, if any.
 ///
@@ -1459,6 +1463,10 @@ fn truncate_to_cells(s: &str, max_cells: usize) -> (String, usize) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The profile the chrome paints in by default. Named once so a test that is
+    /// *about* the marks (`the_ascii_profile_...`) reads as the exception it is.
+    const GLYPHS: Glyphs = Glyphs::UNICODE;
 
     #[test]
     fn ascii_display_column_is_byte_column() {
@@ -2118,10 +2126,13 @@ mod tests {
     #[test]
     fn a_guide_stands_in_for_the_space_it_replaces() {
         // One cell for one cell, so nothing after the indent moves.
-        assert_eq!(with_indent_guides("        x", &[0, 4]), "│   │   x");
+        assert_eq!(
+            with_indent_guides("        x", &[0, 4], GLYPHS),
+            "│   │   x"
+        );
         // No columns is the untouched line, borrowed rather than rebuilt.
         assert!(matches!(
-            with_indent_guides("        x", &[]),
+            with_indent_guides("        x", &[], GLYPHS),
             Cow::Borrowed(_)
         ));
     }
@@ -2130,8 +2141,8 @@ mod tests {
     fn an_inherited_guide_pads_out_past_a_blank_line_s_end() {
         // A blank line has no cells for its inherited guides to replace, so the tail
         // grows to reach them - the guide marks a column the line has not reached.
-        assert_eq!(with_indent_guides("", &[0, 4]), "│   │");
-        assert_eq!(with_indent_guides("  ", &[0, 4]), "│   │");
+        assert_eq!(with_indent_guides("", &[0, 4], GLYPHS), "│   │");
+        assert_eq!(with_indent_guides("  ", &[0, 4], GLYPHS), "│   │");
     }
 
     #[test]
@@ -2172,6 +2183,7 @@ mod tests {
                 viewport,
                 Style::default(),
                 Style::default(),
+                GLYPHS,
             );
             let mut buf = Buffer::empty(area);
             StatefulWidget::render(bar, area, &mut buf, &mut state);
@@ -2304,7 +2316,7 @@ mod tests {
     #[test]
     fn every_tab_shows_when_they_all_fit() {
         let list = buffers(&[(1, Some("a.rs"), false), (2, Some("b.rs"), false)]);
-        let strip = bufferline(&list, BufferId(2), 40);
+        let strip = bufferline(&list, BufferId(2), 40, GLYPHS);
         assert_eq!(strip_labels(&strip), vec![" a.rs ", "\u{2502}", " b.rs "]);
         assert_eq!(strip[0].id(), Some(BufferId(1)));
         assert_eq!(strip[1].id(), None, "the divider selects nothing");
@@ -2326,7 +2338,7 @@ mod tests {
             (2, Some("b.rs"), false),
             (3, Some("c.rs"), false),
         ]);
-        let flags: Vec<bool> = bufferline(&list, BufferId(2), 40)
+        let flags: Vec<bool> = bufferline(&list, BufferId(2), 40, GLYPHS)
             .into_iter()
             .filter(|tab| tab.id().is_some())
             .map(|tab| tab.is_active())
@@ -2337,20 +2349,26 @@ mod tests {
     #[test]
     fn a_modified_buffer_shows_its_marker_on_its_tab() {
         let list = buffers(&[(1, Some("a.rs"), true)]);
-        assert_eq!(bufferline(&list, BufferId(1), 40)[0].label, " ● a.rs ");
+        assert_eq!(
+            bufferline(&list, BufferId(1), 40, GLYPHS)[0].label,
+            " ● a.rs "
+        );
     }
 
     #[test]
     fn an_unnamed_buffer_gets_the_placeholder_tab() {
         let list = buffers(&[(1, None, false)]);
-        assert_eq!(bufferline(&list, BufferId(1), 40)[0].label, " [No Name] ");
+        assert_eq!(
+            bufferline(&list, BufferId(1), 40, GLYPHS)[0].label,
+            " [No Name] "
+        );
     }
 
     #[test]
     fn a_lone_buffer_gets_no_separator() {
         // Nothing to divide it from, so the divider would be noise.
         let list = buffers(&[(1, Some("only.rs"), false)]);
-        let strip = bufferline(&list, BufferId(1), 40);
+        let strip = bufferline(&list, BufferId(1), 40, GLYPHS);
         assert_eq!(strip.len(), 1);
         assert!(strip[0].id().is_some());
     }
@@ -2362,7 +2380,7 @@ mod tests {
             (2, Some("b.rs"), false),
             (3, Some("c.rs"), false),
         ]);
-        let strip = bufferline(&list, BufferId(1), 60);
+        let strip = bufferline(&list, BufferId(1), 60, GLYPHS);
         // tab, sep, tab, sep, tab - never two dividers running together, and never a
         // leading or trailing one.
         assert_eq!(
@@ -2380,7 +2398,7 @@ mod tests {
             (1..=6).map(|i| (i, Some("file.rs"), false)).collect();
         let list = buffers(&specs);
         for width in 8..60 {
-            let strip = bufferline(&list, BufferId(3), width);
+            let strip = bufferline(&list, BufferId(3), width, GLYPHS);
             assert!(
                 strip_width(&strip) <= width,
                 "width {width} overflowed: {:?}",
@@ -2396,7 +2414,7 @@ mod tests {
             (1..=8).map(|i| (i, Some("file.rs"), false)).collect();
         let list = buffers(&specs);
         for width in 6..40 {
-            let strip = bufferline(&list, BufferId(4), width);
+            let strip = bufferline(&list, BufferId(4), width, GLYPHS);
             if let Some(last) = strip.last() {
                 assert_ne!(
                     last.label,
@@ -2415,7 +2433,7 @@ mod tests {
         let specs: Vec<(u64, Option<&str>, bool)> =
             (1..=8).map(|i| (i, Some("file.rs"), false)).collect();
         let list = buffers(&specs);
-        let strip = bufferline(&list, BufferId(6), 24);
+        let strip = bufferline(&list, BufferId(6), 24, GLYPHS);
         assert!(
             strip.iter().any(|tab| tab.is_active()),
             "the active tab must be in the window: {strip:?}"
@@ -2429,12 +2447,12 @@ mod tests {
             (1..=8).map(|i| (i, Some("file.rs"), false)).collect();
         let list = buffers(&specs);
         // Active in the middle: the strip continues in both directions.
-        let strip = bufferline(&list, BufferId(4), 24);
+        let strip = bufferline(&list, BufferId(4), 24, GLYPHS);
         assert_eq!(strip.first().map(|t| &*t.label), Some("‹"));
         assert_eq!(strip.last().map(|t| &*t.label), Some("›"));
 
         // Active at the very start: nothing precedes it, so no leading marker.
-        let strip = bufferline(&list, BufferId(1), 24);
+        let strip = bufferline(&list, BufferId(1), 24, GLYPHS);
         assert_ne!(strip.first().map(|t| &*t.label), Some("‹"));
         assert_eq!(strip.last().map(|t| &*t.label), Some("›"));
     }
@@ -2442,7 +2460,7 @@ mod tests {
     #[test]
     fn a_tab_wider_than_the_bar_is_truncated_not_overflowed() {
         let list = buffers(&[(1, Some("an-extremely-long-file-name.rs"), false)]);
-        let strip = bufferline(&list, BufferId(1), 10);
+        let strip = bufferline(&list, BufferId(1), 10, GLYPHS);
         assert!(strip_width(&strip) <= 10, "overflowed: {strip:?}");
     }
 
@@ -2451,15 +2469,15 @@ mod tests {
         // CJK names occupy two cells each (SPEC §4); measuring in chars would let the
         // strip overrun the bar.
         let list = buffers(&[(1, Some("日本語.rs"), false), (2, Some("한글.rs"), false)]);
-        let strip = bufferline(&list, BufferId(1), 14);
+        let strip = bufferline(&list, BufferId(1), 14, GLYPHS);
         assert!(strip_width(&strip) <= 14, "overflowed: {strip:?}");
     }
 
     #[test]
     fn a_zero_width_bar_or_empty_session_draws_nothing() {
         let list = buffers(&[(1, Some("a.rs"), false)]);
-        assert!(bufferline(&list, BufferId(1), 0).is_empty());
-        assert!(bufferline(&[], BufferId(1), 40).is_empty());
+        assert!(bufferline(&list, BufferId(1), 0, GLYPHS).is_empty());
+        assert!(bufferline(&[], BufferId(1), 40, GLYPHS).is_empty());
     }
 
     #[test]
@@ -2467,7 +2485,7 @@ mod tests {
         // Clicking a tab selects that buffer, so every cell of a tab - including its
         // padding - has to resolve to it, and the boundary must not be off by one.
         let list = buffers(&[(1, Some("a.rs"), false), (2, Some("b.rs"), false)]);
-        let strip = bufferline(&list, BufferId(1), 40);
+        let strip = bufferline(&list, BufferId(1), 40, GLYPHS);
         // " a.rs " is columns 0..6, the divider is column 6, " b.rs " is 7..13.
         assert_eq!(tab_at_column(&strip, 0), Some(BufferId(1)));
         assert_eq!(tab_at_column(&strip, 3), Some(BufferId(1)));
@@ -2491,7 +2509,7 @@ mod tests {
         let specs: Vec<(u64, Option<&str>, bool)> =
             (1..=8).map(|i| (i, Some("file.rs"), false)).collect();
         let list = buffers(&specs);
-        let strip = bufferline(&list, BufferId(4), 24);
+        let strip = bufferline(&list, BufferId(4), 24, GLYPHS);
         assert_eq!(&*strip[0].label, "‹");
         assert_eq!(tab_at_column(&strip, 0), None);
         let last = strip_width(&strip) - 1;
@@ -2504,7 +2522,7 @@ mod tests {
         // Cells, not characters: a CJK name occupies two columns per glyph, and a
         // click on its second cell must still land on that tab.
         let list = buffers(&[(1, Some("日本.rs"), false), (2, Some("b.rs"), false)]);
-        let strip = bufferline(&list, BufferId(1), 40);
+        let strip = bufferline(&list, BufferId(1), 40, GLYPHS);
         let first_width = strip[0].cells;
         assert_eq!(tab_at_column(&strip, first_width - 1), Some(BufferId(1)));
         assert_eq!(tab_at_column(&strip, first_width), None, "the divider");
@@ -2522,8 +2540,8 @@ mod tests {
         // live in one place: a strip fitted to the full width would put every tab a
         // few cells right of where a click resolves it.
         let list = buffers(&[(1, Some("a.rs"), false), (2, Some("b.rs"), false)]);
-        let full = bufferline(&list, BufferId(1), 40);
-        let reserved = head_bar_tabs(&list, BufferId(1), 7, 40);
+        let full = bufferline(&list, BufferId(1), 40, GLYPHS);
+        let reserved = head_bar_tabs(&list, BufferId(1), 7, 40, GLYPHS);
         // Both fit here, so the strips match; the difference shows when they cannot.
         assert_eq!(full, reserved);
 
@@ -2531,7 +2549,7 @@ mod tests {
             (1..=8).map(|i| (i, Some("file.rs"), false)).collect();
         let many = buffers(&specs);
         let count_cells = line_count_label(7).width();
-        let strip = head_bar_tabs(&many, BufferId(1), 7, 40);
+        let strip = head_bar_tabs(&many, BufferId(1), 7, 40, GLYPHS);
         assert!(
             strip_width(&strip) <= 40 - count_cells,
             "the tab strip must not run under the line count: {strip:?}"
@@ -2543,7 +2561,7 @@ mod tests {
         // A snapshot older than a close can name a buffer no longer listed; the strip
         // falls back to the first tab rather than panicking or blanking.
         let list = buffers(&[(1, Some("a.rs"), false), (2, Some("b.rs"), false)]);
-        let strip = bufferline(&list, BufferId(99), 40);
+        let strip = bufferline(&list, BufferId(99), 40, GLYPHS);
         assert_eq!(strip.iter().filter(|t| t.id().is_some()).count(), 2);
         assert!(strip[0].is_active(), "fell back to marking the first tab");
     }
@@ -2562,6 +2580,7 @@ mod tests {
             indent: "tabs:4",
             diagnostic: None,
             read_only: false,
+            glyphs: GLYPHS,
         }
     }
 
@@ -2617,7 +2636,7 @@ mod tests {
             (2, Some("crates/core/src/layout.rs"), false),
             (3, Some("README.md"), false),
         ]);
-        let strip = bufferline(&list, BufferId(1), 120);
+        let strip = bufferline(&list, BufferId(1), 120, GLYPHS);
         let labels: Vec<&str> = strip.iter().map(|t| t.label.as_ref()).collect();
         let joined = labels.join("");
         assert!(joined.contains("tui/src/layout.rs"), "{labels:?}");
@@ -2639,7 +2658,7 @@ mod tests {
             (1, Some("src/main.rs"), false),
             (2, Some("docs/SPEC.md"), false),
         ]);
-        let labels: Vec<String> = bufferline(&list, BufferId(1), 120)
+        let labels: Vec<String> = bufferline(&list, BufferId(1), 120, GLYPHS)
             .iter()
             .map(|t| t.label.to_string())
             .collect();
@@ -2652,14 +2671,14 @@ mod tests {
         // The same file open twice cannot be separated by any amount of path. The
         // walk has to notice it has run out rather than spin.
         let list = buffers(&[(1, Some("a/b/c.rs"), false), (2, Some("a/b/c.rs"), false)]);
-        let labels: Vec<String> = bufferline(&list, BufferId(1), 120)
+        let labels: Vec<String> = bufferline(&list, BufferId(1), 120, GLYPHS)
             .iter()
             .map(|t| t.label.to_string())
             .collect();
         assert_eq!(labels.iter().filter(|l| l.contains("c.rs")).count(), 2);
         // Unnamed buffers are the same case and must not drive the walk either.
         let unnamed = buffers(&[(1, None, false), (2, None, false)]);
-        let labels: Vec<String> = bufferline(&unnamed, BufferId(1), 120)
+        let labels: Vec<String> = bufferline(&unnamed, BufferId(1), 120, GLYPHS)
             .iter()
             .map(|t| t.label.to_string())
             .collect();
@@ -2674,14 +2693,14 @@ mod tests {
             (1, Some("tui/layout.rs"), true),
             (2, Some("core/layout.rs"), false),
         ]);
-        let labels: Vec<String> = bufferline(&list, BufferId(1), 120)
+        let labels: Vec<String> = bufferline(&list, BufferId(1), 120, GLYPHS)
             .iter()
             .map(|t| t.label.to_string())
             .collect();
         assert!(
             labels
                 .iter()
-                .any(|l| l.contains(MODIFIED_MARKER) && l.contains("tui/layout.rs")),
+                .any(|l| l.contains(GLYPHS.modified) && l.contains("tui/layout.rs")),
             "{labels:?}"
         );
     }
@@ -2881,30 +2900,88 @@ mod tests {
     #[test]
     fn buffer_display_name_uses_file_name_not_full_path() {
         assert_eq!(
-            buffer_display_name(Some(Path::new("/home/user/src/main.rs")), false),
+            buffer_display_name(Some(Path::new("/home/user/src/main.rs"))),
             "main.rs"
         );
     }
 
     #[test]
     fn buffer_display_name_unnamed_buffer_is_placeholder() {
-        assert_eq!(buffer_display_name(None, false), NO_NAME);
+        assert_eq!(buffer_display_name(None), NO_NAME);
     }
 
     #[test]
-    fn buffer_display_name_marks_modified_with_dot() {
+    fn a_modified_buffer_is_marked_before_its_name() {
+        assert_eq!(with_modified_marker("a.txt", true, GLYPHS), "● a.txt");
+        assert_eq!(with_modified_marker(NO_NAME, true, GLYPHS), "● [No Name]");
+        // …and an unmodified one is exactly its name, marker column and all: the
+        // mark is a prefix, not a reserved cell every row pays for.
+        assert_eq!(with_modified_marker("a.txt", false, GLYPHS), "a.txt");
+    }
+
+    #[test]
+    fn the_ascii_profile_leaves_no_wide_mark_on_a_bar_or_a_row() {
+        // The milestone's own verify: the whole frame under `glyphs = "ascii"` with
+        // no row misaligned (SPEC §7.5, M10). Alignment is the claim, so each pair is
+        // checked for equal width rather than merely for being ASCII.
+        let list = buffers(&[(1, Some("a.rs"), true), (2, Some("b.rs"), false)]);
+        let unicode = bufferline(&list, BufferId(1), 12, GLYPHS);
+        let ascii = bufferline(&list, BufferId(1), 12, Glyphs::ASCII);
+        let strip = |tabs: &[Tab]| tabs.iter().map(|t| t.label.to_string()).collect::<String>();
+        assert!(strip(&ascii).is_ascii(), "{:?}", strip(&ascii));
+        assert_eq!(strip(&ascii).width(), strip(&unicode).width());
+        // The strip is windowed here, so the overflow markers are in it too.
+        assert!(strip(&ascii).contains('>'), "{:?}", strip(&ascii));
+
+        let nominal = info(3, 7);
+        let (_, right) = status_bar(StatusInfo {
+            glyphs: Glyphs::ASCII,
+            ..nominal
+        });
+        assert!(right.is_ascii(), "{right:?}");
+        assert_eq!(right.width(), status_bar(nominal).1.width());
+
+        // The click spans step over the joiner, so they have to be measured from the
+        // string that is painted rather than from a constant beside it.
+        let ascii = StatusInfo {
+            glyphs: Glyphs::ASCII,
+            ..nominal
+        };
+        let (left, right) = status_bar(ascii);
+        let at = |column| status_target(&left, ascii, 80, column);
+        let start = 80 - right.width();
+        assert_eq!(at(start), Some(StatusTarget::Encoding));
         assert_eq!(
-            buffer_display_name(Some(Path::new("a.txt")), true),
-            "● a.txt"
+            at(start + right.find(nominal.format.eol.name()).unwrap()),
+            Some(StatusTarget::LineEnding),
         );
-        assert_eq!(buffer_display_name(None, true), "● [No Name]");
+
+        let guided = with_indent_guides("        x", &[0, 4], Glyphs::ASCII);
+        assert_eq!(guided, "|   |   x");
+        assert_eq!(
+            guided.width(),
+            with_indent_guides("        x", &[0, 4], GLYPHS).width()
+        );
+    }
+
+    #[test]
+    fn the_ascii_profile_marks_unsaved_work_without_leaving_ascii() {
+        let marked = with_modified_marker("a.txt", true, Glyphs::ASCII);
+        assert_eq!(marked, "* a.txt");
+        assert!(marked.is_ascii(), "the ascii profile emitted {marked:?}");
+        // The substitute takes exactly the cells the mark it replaces took, which is
+        // the property the whole profile exists for.
+        assert_eq!(
+            marked.width(),
+            with_modified_marker("a.txt", true, GLYPHS).width()
+        );
     }
 
     #[test]
     fn buffer_display_name_falls_back_when_no_file_name_component() {
         // A path ending in "/" or ".." has no file_name; use the lossy full form
         // rather than the unnamed placeholder.
-        assert_eq!(buffer_display_name(Some(Path::new("..")), false), "..");
+        assert_eq!(buffer_display_name(Some(Path::new(".."))), "..");
     }
 
     #[test]

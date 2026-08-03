@@ -672,9 +672,23 @@ they ranked, an optional preview pane, and a hint footer. Three of the four are 
   sets a foreground and no ground, so a mark keeps whichever row style is underneath and
   the highlighted row stays one unbroken band - the rule the indent guide already follows
   over a selection wash.
-- **Path rows read as paths** - directory dimmed, file name in full ink.
+- **Path rows read as paths** - directory dimmed, file name in full ink, over the shared
+  `palette_dim` slot (foreground only, so the highlighted row stays one band). The
+  dimmed run is a **column count the row's builder works out**, not a separator the paint
+  goes looking for: the project-search label is `path:line  text` and the text is code,
+  so a rule that took the last `/` would dim a row as far as a division sign in the
+  match it found. **Columns, not bytes**, because columns are what the paint restyles -
+  a byte count would be walked back into columns per row per frame, and an offset
+  landing inside a character would be a panic in the render loop rather than a cell too
+  few. The count covers the modified marker as well as the directory, since a row that
+  went quiet only from `src/` would leave the marker as a stray bright mark.
 - **The hint footer is generated from the keymap**, never written as a literal. That is the
-  §10.5 rule M9 establishes, and it is why M10 follows M9 rather than preceding it.
+  §10.5 rule M9 establishes, and it is why M10 follows M9 rather than preceding it. It
+  rides the **bottom** border for the reason the count rides the top - it costs no row -
+  and it is **dropped rather than clipped** on a box too narrow for it, since a hint
+  ending mid-chord names a key that is not there. A pair whose commands are all unbound
+  (`up` and `down` both `nop`'d) leaves the footer; a pair with one of them left names
+  the one that answers. Half a hint is still true, which is the property a hint needs.
 
 *Rejected:* a **frameless panel on a dimmed backdrop** - handsomer, but it needs a dimming
 slot in all four themes and collapses to nothing on a 16-colour terminal, and Phosphor has
@@ -728,6 +742,29 @@ missing glyph renders as a box that misaligns every cell after it. A `glyphs =
 "unicode" | "ascii"` config selects a full replacement set (`●`→`*`, `✗`→`E`, `⚠`→`W`,
 `◐`→`~`, `⎇`→`git:`), every substitute **one cell wide**, since a two-cell fallback would
 move the text under it - the same width discipline §4 imposes on the buffer.
+
+`⎇`→`git:` is the one entry that is not one cell, and the rule it does not break is worth
+stating before the head bar is built: **the one-cell rule binds a mark that stands in a
+cell over or beside text**, where a wrong width shifts what follows it. `git:` is a
+segment *label* on the head bar's own state cluster - the segment reflows and the drop
+order (§7.5 width budget) already handles a narrow terminal, so nothing downstream moves.
+Marks live in `Glyphs` and are held to one cell by test; a label substitute belongs to
+the segment that writes it.
+
+*Built (M10), and three things it settled.* **The profile is a whole set, resolved once
+into a `Glyphs` value on the config, never a per-mark fallback**: a box mixing `+`
+corners with a `│` divider reads as a rendering bug, and a per-mark switch would mean
+discovering the profile one broken glyph at a time. The set covers every mark the chrome
+paints - the modified marker, the indent guide, the tab separator and its two overflow
+arrows, the status bar's field joiner, the picker's pane divider and border, and the
+scrollbar's track and thumb - and stops at the *words*: a label reading `Find File…`
+keeps its ellipsis, because a wrong width there is a shorter word, not a shifted row.
+**A constraint survives into ASCII rather than being spent there**: the indent guide and
+the scrollbar track are both full-height vertical rules and must stay distinguishable,
+which is what makes the ASCII track `:` - the guide keeps the rule shape, so the track is
+the one that gives it up. And the status bar's **click spans are measured from the string
+that is painted**, not from a constant beside it, so a joiner of a different width could
+never move the spans without moving the number that describes them.
 
 #### The body
 
@@ -2018,7 +2055,9 @@ Incremental build order so the risky assumptions are validated early, not at the
   `y`/`n`/`a`/`q`, and `--help` naming every chord the config actually resolved.
 
 - **M10 - What the chrome says.** *(In progress - see §7.5 "What the chrome says" for
-  the full design. **Done:** the status-bar audit and `indent_style`.)* M0-M8 built the surfaces; nothing had ever settled what each
+  the full design. **Done:** the status-bar audit and `indent_style`, the picker's count,
+  match marks, path rows and hint footer, tab-name disambiguation, the empty state, and
+  the glyph profile.)* M0-M8 built the surfaces; nothing had ever settled what each
   one is *allowed to put on screen*, and the answer had drifted: the head bar's right
   segment holds a line count, the status bar carries an internal document version, and the
   diagnostic count, the server's health and the attached grammar appear nowhere at all.
@@ -2030,10 +2069,10 @@ Incremental build order so the risky assumptions are validated early, not at the
   **Follows M9, and not by preference:** the dialog hint footer, the confirmation's
   answers and the empty state all render chords, and M9 is what makes rendering a chord
   something other than writing a literal (§10.5).
-  Ordered so the cheap half lands first: the status-bar audit (**done**), the picker's
-  count (**done**) / hint footer / match marks (**done**) / path rows, tab-name
-  disambiguation (**done**), the empty state (**done**) and the glyph profile are small; the head bar's state cluster, the message log, and the gutter
-  diagnostics with their picker are medium. The one piece of **new scope** is an
+  Ordered so the cheap half lands first: the status-bar audit, the picker's
+  count / hint footer / match marks / path rows, tab-name disambiguation, the empty state
+  and the glyph profile were small and are **all done**; the head bar's state cluster, the
+  message log, and the gutter diagnostics with their picker are medium and remain. The one piece of **new scope** is an
   `indent_style` setting behind the `spaces:4` readout - a frontend change, since the
   frontend already decides what `insert_tab` inserts.
   **The status-bar audit, as built.** `insert_tab` stopped resolving to a literal `\t`
@@ -2048,6 +2087,18 @@ Incremental build order so the risky assumptions are validated early, not at the
   not just a check: a caret that stops moving produces no event, so nothing would have
   asked for the frame that shows the message - the loop arms exactly one repaint when
   the deadline passes rather than painting every poll for 150ms.
+  **The cheap half, as built.** The three that landed together are one change and read as
+  one: a picker now takes the whole `Config` rather than a `Theme`, because it draws from
+  five style slots, a glyph profile *and* the keymap - and a positional list of those is a
+  swap waiting to happen. Three seams moved under them. `buffer_display_name` stopped
+  applying the modified marker, because every caller but two is a *message* ("Saved x",
+  "Discard changes to x?") that names a file and never marks it, and folding the mark in
+  meant each of them passing a `false` and a glyph set to say so; the mark is
+  `with_modified_marker`'s, asked for by the two surfaces that show one. And the status
+  bar's field joiner stopped being a `const SEPARATOR_WIDTH` beside the string it
+  describes and became a measurement of the mark it interpolates. And the picker's pane
+  divider is not a mark of its own: it is the box's `border.vertical_left`, so the
+  divider cannot disagree with the box it lines up with.
   *Verify:* driven in a pty at **80 columns**, which is the budget the design is written
   against and the width the first draft failed - a nominal frame carrying tabs and a branch
   and nothing else, then the same file with the server indexing and three errors, with
@@ -2055,6 +2106,14 @@ Incremental build order so the risky assumptions are validated early, not at the
   walked across a flagged line without the encoding readout strobing; `✗3` clicked to the
   diagnostics picker and back to the hit; a message read out of the log after its toast
   expired; and the whole run repeated under `glyphs = "ascii"` with no row misaligned.
+  The cheap half was verified this way already: a file picker whose rows dim to
+  `#6b748f` at `src/deep/` and return to full ink at `thing.rs`, a footer reading
+  `Up/Down move · Enter select · Esc close` on the bottom border, and the same session
+  under `glyphs = "ascii"` carrying **no non-ASCII byte in any frame it painted** - box,
+  guides, bars, tab strip and picker - with `UTF-8 - LF` starting in the column
+  `UTF-8 · LF` started in. Not every surface was on screen in that run: the words a
+  profile deliberately does not touch (`searching…`) were not exercised, and are the
+  documented boundary rather than a gap - an ellipsis is one cell, so nothing shifts.
 
 Extensibility (§12.1) sits after the M0-M10 build order and is gated on that decision.
 

@@ -20,7 +20,7 @@
 //! them. They are independent: a picker can arm either, both, or neither.
 
 use nucleo_matcher::pattern::{CaseMatching, Normalization, Pattern};
-use nucleo_matcher::{Config, Matcher, Utf32Str};
+use nucleo_matcher::{Config as MatcherConfig, Matcher, Utf32Str};
 use ratatui::buffer::Buffer;
 use ratatui::crossterm::event::{KeyEvent, MouseButton, MouseEvent, MouseEventKind};
 use std::borrow::Cow;
@@ -34,11 +34,11 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::command::Command;
 use crate::compositor::{EventResult, Layer};
-use crate::config::Theme;
+use crate::config::{Config, Glyphs, Theme};
 // The keymap's `Command` is the *binding* side - what a chord names - while this
 // module's `Command` is what a committed choice dispatches. Aliased rather than
 // qualified because the two appear a line apart in `handle_key`.
-use crate::keymap::{Command as Bound, Context};
+use crate::keymap::{Command as Bound, Context, Keymap};
 
 /// Rows the box is at most tall, and at most wide - with and without a preview
 /// pane, which is the whole reason the wider one exists.
@@ -70,6 +70,42 @@ pub fn display_path(path: &Path, cwd: Option<&Path>) -> String {
         .into_owned()
 }
 
+/// The indent every row's text is painted with, which every cell-level restyle over
+/// a row has to step past to land on the character it means.
+const ROW_INDENT: usize = 2;
+
+/// What the picker's footer says it can do, in the order it says it (SPEC §7.5, M10).
+///
+/// The labels are this module's; the **chords are not written anywhere** - they are
+/// looked up per binding, which is the §10.5 rule and the reason M10 follows M9. A
+/// rebind moves what the footer says; a `nop` takes that pair off it rather than
+/// advertising a key that does nothing.
+const HINTS: [(&[Bound], &str); 3] = [
+    (&[Bound::PreviousItem, Bound::NextItem], "move"),
+    (&[Bound::Accept], "select"),
+    (&[Bound::Cancel], "close"),
+];
+
+/// The footer line for a picker under `keymap`, or `None` when nothing in the
+/// surface is bound at all.
+///
+/// A pair whose commands are all unbound is dropped; a pair with *some* bound (Up
+/// rebound, Down `nop`'d) names the ones that are, joined by `/`. Half a hint is
+/// still true, which is the property a hint has to have.
+fn hint_footer(keymap: &Keymap, glyphs: Glyphs) -> Option<String> {
+    let hints: Vec<String> = HINTS
+        .iter()
+        .filter_map(|(commands, label)| {
+            let chords: Vec<String> = commands
+                .iter()
+                .filter_map(|&c| keymap.shortcut_for(c, Context::Picker))
+                .collect();
+            (!chords.is_empty()).then(|| format!("{} {label}", chords.join("/")))
+        })
+        .collect();
+    (!hints.is_empty()).then(|| hints.join(&format!(" {} ", glyphs.field_separator)))
+}
+
 /// Lines a preview source is asked for: what the tallest possible pane can show
 /// (the interior, which the pane fills - unlike the list it has no query row).
 const PREVIEW_LINES: usize = (MAX_HEIGHT - 2) as usize;
@@ -80,6 +116,30 @@ pub struct Item {
     pub label: String,
     pub shortcut: Option<String>,
     pub command: Command,
+    /// How many **display columns** at the front of `label` are context rather than
+    /// identity - the directory part of a path row, which paints quiet (SPEC §7.5,
+    /// M10). `0` for a row that is all identity, which is every non-path picker.
+    ///
+    /// Columns, not bytes, because columns are what the paint restyles: a byte count
+    /// would have to be walked back into columns per row per frame, and an offset
+    /// landing inside a character would be a panic in the render loop rather than a
+    /// cell too few.
+    ///
+    /// Carried per row rather than worked out from the label at paint time, and that
+    /// is not fussiness: the project-search picker's label is `path:line  text`, and
+    /// the *text* is code, which contains slashes. A picker that looked for the last
+    /// separator would dim a row as far as a division sign in the match it found.
+    pub dim_columns: usize,
+}
+
+/// Display columns of `path` that are its directory part, separator included - what
+/// an [`Item::dim_columns`] wants for a row that is exactly a path. `0` when there is
+/// no directory in it, which is a file in the current one.
+pub fn dir_columns(path: &str) -> usize {
+    // A separator is `/` or `\`, so it is one ASCII byte and one column - which is
+    // what makes `at + 1` a character boundary and the `+ 1` below its width.
+    path.rfind(std::path::is_separator)
+        .map_or(0, |at| path[..at].width() + 1)
 }
 
 /// Fills a preview pane: given the highlighted item and how many lines the pane can
@@ -169,10 +229,21 @@ pub struct Picker {
     selected_style: Style,
     /// The characters the query matched (SPEC §7.5, M10).
     match_style: Style,
+    /// The picker's quiet ink: a path row's directory, and the hint footer
+    /// (SPEC §7.5, M10).
+    dim_style: Style,
+    /// What the box says it can do, already resolved against the keymap
+    /// ([`hint_footer`]). Held rather than looked up per frame: the bindings cannot
+    /// change while a picker is open, and this is a walk of every binding in the map.
+    hints: Option<String>,
     /// The scrollbar's two halves, same slots the body's bar reads (SPEC §7.5) - a
     /// second pair for overlays would be two ways to say the same thing in a theme.
     track_style: Style,
     thumb_style: Style,
+    /// The marks this box is drawn with: its border, its pane divider, its bar
+    /// (SPEC §7.5). Held rather than read per paint because the profile is settled
+    /// at startup, while the theme behind it can change under a live picker.
+    glyphs: Glyphs,
     finished: bool,
     /// Commands the picker has committed, drained by [`Layer::take_commands`].
     /// A list, not a single slot, because a previewing picker emits as you move.
@@ -204,19 +275,21 @@ impl Picker {
     /// A picker titled `title` over `items`. `match_paths` tunes the matcher for
     /// path-shaped haystacks (a file picker) versus plain labels (a command palette).
     ///
-    /// Takes the whole theme rather than the handful of styles it reads, as
-    /// [`Layer::restyle`] already does: the picker draws from four slots now, and a
-    /// positional list of them is a swap waiting to happen.
+    /// Takes the whole config rather than the handful of values it reads, for the
+    /// reason [`Layer::restyle`] takes the whole theme: the picker draws from five
+    /// style slots, a glyph profile and a keymap now, and a positional list of them
+    /// is a swap waiting to happen.
     pub fn new(
         title: impl Into<String>,
         items: Vec<Item>,
         match_paths: bool,
-        theme: &Theme,
+        config: &Config,
     ) -> Self {
-        let config = if match_paths {
-            Config::DEFAULT.match_paths()
+        let theme = &config.theme;
+        let matching = if match_paths {
+            MatcherConfig::DEFAULT.match_paths()
         } else {
-            Config::DEFAULT
+            MatcherConfig::DEFAULT
         };
         let filtered = (0..items.len()).collect();
         Self {
@@ -226,12 +299,15 @@ impl Picker {
             filtered,
             marks: Vec::new(),
             selected: 0,
-            matcher: Matcher::new(config),
+            matcher: Matcher::new(matching),
             style: theme.palette,
             selected_style: theme.palette_selected,
             match_style: theme.palette_match,
+            dim_style: theme.palette_dim,
+            hints: hint_footer(&config.keymap, config.glyphs),
             track_style: theme.scrollbar_track,
             thumb_style: theme.scrollbar_thumb,
+            glyphs: config.glyphs,
             finished: false,
             outbox: Vec::new(),
             cancel: None,
@@ -401,6 +477,21 @@ impl Picker {
         }
     }
 
+    /// Paint a row's directory part quiet, so the eye reads down the file names
+    /// instead of down the prefixes they share (SPEC §7.5, M10).
+    ///
+    /// Applied **before** the marks and not after: both set a foreground over the
+    /// row's own ground, and a matched character is why the row is in the list at
+    /// all, so it wins the cell even inside a dimmed directory.
+    fn dim_row(&self, rows: Rect, y: u16, columns: usize, row_style: Style, buf: &mut Buffer) {
+        let quiet = row_style.patch(self.dim_style);
+        for column in ROW_INDENT..(ROW_INDENT + columns).min(rows.width as usize) {
+            if let Some(cell) = buf.cell_mut((rows.x + column as u16, y)) {
+                cell.set_style(quiet);
+            }
+        }
+    }
+
     /// Re-style the cells of a painted row that the query matched.
     ///
     /// `marks` are **character** positions in `label` - what `Pattern::indices`
@@ -417,9 +508,7 @@ impl Picker {
         row_style: Style,
         buf: &mut Buffer,
     ) {
-        // The two-space indent every row is painted with.
-        const INDENT: usize = 2;
-        let mut column = INDENT;
+        let mut column = ROW_INDENT;
         for (char_index, ch) in label.chars().enumerate() {
             let width = UnicodeWidthChar::width(ch).unwrap_or(0);
             if marks.contains(&(char_index as u32)) {
@@ -584,7 +673,7 @@ impl Picker {
         if screen.width < 10 || screen.height < 4 {
             return None;
         }
-        let inner = Block::bordered().inner(self.area(screen));
+        let inner = self.block().inner(self.area(screen));
         if inner.width == 0 || inner.height == 0 {
             return None;
         }
@@ -602,12 +691,26 @@ impl Picker {
         Some((list, Some(pane)))
     }
 
+    /// The box itself, in the profile's marks (SPEC §7.5). Asked for here rather
+    /// than built at each of the three places that need it, because [`Self::columns`]
+    /// measures the interior with it and the paint draws it: a border set applied to
+    /// one and not the other would place every row a cell away from its own box.
+    fn block(&self) -> Block<'static> {
+        Block::bordered().border_set(self.glyphs.border)
+    }
+
     /// The preview pane: a divider against the list, then the fetched lines, each
     /// clipped to the pane rather than wrapped - wrapped code reads as a different
     /// file than the one you are about to open.
     fn render_pane(&self, state: &Pane, pane: Rect, buf: &mut Buffer) {
         for y in pane.y..pane.bottom() {
-            buf.set_stringn(pane.x - 1, y, "│", 1, self.style);
+            buf.set_stringn(
+                pane.x - 1,
+                y,
+                self.glyphs.border.vertical_left,
+                1,
+                self.style,
+            );
         }
         for (row, line) in state.lines.iter().take(pane.height as usize).enumerate() {
             buf.set_stringn(
@@ -633,11 +736,24 @@ impl Layer for Picker {
         // or start arrowing, and it is the one number a picker cannot be read
         // without: a screenful of rows looks the same whether it is all of them or
         // nine of two hundred and forty.
-        let mut block = Block::bordered()
+        let mut block = self
+            .block()
             .title(format!(" {} ", self.title))
             .style(self.style);
         if let Some(count) = self.count() {
             block = block.title_top(Line::from(format!(" {count} ")).right_aligned());
+        }
+        // The footer rides the bottom border for the reason the count rides the top:
+        // it costs no row of the list. Dropped rather than clipped on a box too
+        // narrow for it - half a hint ending mid-chord names a key that is not there.
+        if let Some(hints) = self.hints.as_deref()
+            && hints.width() + 2 <= area.width as usize
+        {
+            block = block.title_bottom(
+                Line::from(format!(" {hints} "))
+                    .right_aligned()
+                    .style(self.style.patch(self.dim_style)),
+            );
         }
         block.render(area, buf);
         // Query row at the top of the interior.
@@ -696,6 +812,10 @@ impl Layer for Picker {
                 rows.width as usize,
                 style,
             );
+            // A path row's directory reads quiet, so the names line up as the thing
+            // being read rather than the prefixes they hang off (SPEC §7.5, M10).
+            // Unguarded, like the marks below it: zero columns is an empty loop.
+            self.dim_row(rows, y, item.dim_columns, style, buf);
             // Then re-style just the cells the query earned. Painted *over* the row
             // rather than as part of it, so the mark keeps the row's own ground -
             // the highlighted row stays one unbroken band (SPEC §7.5, M10).
@@ -724,6 +844,7 @@ impl Layer for Picker {
                 list_h,
                 self.track_style,
                 self.thumb_style,
+                self.glyphs,
             );
             StatefulWidget::render(widget, bar, buf, &mut state);
         }
@@ -848,6 +969,7 @@ impl Layer for Picker {
         self.style = theme.palette;
         self.selected_style = theme.palette_selected;
         self.match_style = theme.palette_match;
+        self.dim_style = theme.palette_dim;
         self.track_style = theme.scrollbar_track;
         self.thumb_style = theme.scrollbar_thumb;
     }
@@ -917,6 +1039,7 @@ mod tests {
         ]
         .into_iter()
         .map(|(label, shortcut, command)| Item {
+            dim_columns: 0,
             label: label.to_string(),
             shortcut: shortcut.map(str::to_string),
             command,
@@ -925,7 +1048,7 @@ mod tests {
     }
 
     fn picker() -> Picker {
-        Picker::new("Test", items(), false, &Theme::default())
+        Picker::new("Test", items(), false, &Config::default())
     }
 
     fn key(c: char) -> KeyEvent {
@@ -1161,16 +1284,27 @@ mod tests {
         );
     }
 
-    /// Every cell of `buf` whose foreground is the match style, in reading order -
-    /// the marks, wherever the centred box happened to land.
-    fn marked_text(buf: &Buffer) -> String {
+    /// Every cell of `buf` painted in `ink`, in reading order - wherever the centred
+    /// box happened to land. The two inks worth asking about are the match style and
+    /// the quiet one, so the colour is the parameter rather than the walk.
+    fn text_in_ink(buf: &Buffer, ink: Style) -> String {
         let area = *buf.area();
         (0..area.height)
             .flat_map(|y| (0..area.width).map(move |x| (x, y)))
             .filter_map(|(x, y)| buf.cell((x, y)))
-            .filter(|cell| cell.style().fg == Theme::default().palette_match.fg)
+            .filter(|cell| cell.style().fg == ink.fg)
             .map(|cell| cell.symbol().to_string())
             .collect()
+    }
+
+    /// The cells the query earned.
+    fn marked_text(buf: &Buffer) -> String {
+        text_in_ink(buf, Theme::default().palette_match)
+    }
+
+    /// The cells that read as context: a path's directory, and the hint footer.
+    fn dimmed_text(buf: &Buffer) -> String {
+        text_in_ink(buf, Theme::default().palette_dim)
     }
 
     /// The whole buffer as one string, for "does the frame say this anywhere".
@@ -1205,6 +1339,145 @@ mod tests {
         assert!(
             frame.contains(&format!("{shown} of {total}")),
             "frame: {frame}"
+        );
+    }
+
+    /// A picker over path rows, the shape the file and buffer pickers build.
+    fn paths() -> Picker {
+        let items = ["src/deep/thing.rs", "README.md"]
+            .into_iter()
+            .map(|label| Item {
+                dim_columns: dir_columns(label),
+                label: label.to_string(),
+                shortcut: None,
+                command: Command::OpenPalette,
+            })
+            .collect();
+        Picker::new("Files", items, true, &Config::default())
+    }
+
+    #[test]
+    fn a_path_rows_directory_reads_quiet_and_its_file_name_does_not() {
+        // A ranked list of paths is mostly repeated directory; dimming the front is
+        // what lets the eye read down the names (SPEC §7.5, M10).
+        let painted = painted(&paths(), Rect::new(0, 0, 60, 12));
+        let dimmed = dimmed_text(&painted);
+        assert!(
+            dimmed.contains("src/deep/"),
+            "the directory stayed at full ink: {dimmed:?}"
+        );
+        assert!(
+            !dimmed.contains("thing.rs"),
+            "the file name was dimmed too: {dimmed:?}"
+        );
+        // A row with no directory in it dims nothing, rather than dimming as far as
+        // some other row's separator.
+        assert!(!dimmed.contains("README"), "{dimmed:?}");
+    }
+
+    #[test]
+    fn a_matched_character_keeps_its_mark_inside_a_dimmed_directory() {
+        // Both paint a foreground over the row's own ground, so their order decides
+        // the cell. A mark is *why* the row is in the list, so it wins.
+        let mut p = paths();
+        type_str(&mut p, "deep");
+        let painted = painted(&p, Rect::new(0, 0, 60, 12));
+        assert_eq!(
+            marked_text(&painted).to_lowercase(),
+            "deep",
+            "the dim swallowed the marks"
+        );
+    }
+
+    #[test]
+    fn a_dim_run_longer_than_the_row_clips_instead_of_running_off_it() {
+        // `Item::dim_columns` is a number on a public struct, so nothing stops a
+        // count longer than the row reaching the paint. It has to clip: writing past
+        // the box would be a panic in the render loop, which is the one place this
+        // editor must not have one (SPEC §8).
+        let items = vec![Item {
+            label: "a/b.rs".to_string(),
+            dim_columns: 999,
+            shortcut: None,
+            command: Command::OpenPalette,
+        }];
+        let p = Picker::new("Wide", items, false, &Config::default());
+        assert!(all_text(&painted(&p, Rect::new(0, 0, 60, 12))).contains("a/b.rs"));
+    }
+
+    #[test]
+    fn dir_columns_is_the_directory_and_nothing_else() {
+        assert_eq!(dir_columns("src/deep/thing.rs"), "src/deep/".width());
+        assert_eq!(dir_columns("README.md"), 0);
+        assert_eq!(dir_columns(""), 0);
+        // Columns, not bytes: a wide directory name is worth two cells a character,
+        // and the paint restyles cells.
+        assert_eq!(dir_columns("日本/x.rs"), 5);
+        // Deliberately the *last* separator, and deliberately asked only about a
+        // path. A project-search label is `path:line  text` and the text is code:
+        // asked about the whole label this would answer as far as a division sign in
+        // the match. That is why the row carries the count its builder worked out
+        // rather than the paint looking for one.
+        assert_eq!(dir_columns("src/main.rs:42  let r = a / b;"), 27);
+    }
+
+    #[test]
+    fn the_footer_names_what_the_surface_does_with_the_keys_it_is_bound_to() {
+        // Generated from the keymap, never written as a literal - the §10.5 rule
+        // that is why M10 follows M9 (SPEC §7.5, M10).
+        let keymap = Keymap::default();
+        let footer = hint_footer(&keymap, Glyphs::UNICODE).unwrap();
+        assert_eq!(footer, "Up/Down move · Enter select · Esc close");
+        let frame = all_text(&painted(&picker(), Rect::new(0, 0, 60, 12)));
+        assert!(frame.contains(&footer), "not on the box: {frame}");
+    }
+
+    #[test]
+    fn a_rebound_surface_gets_a_footer_that_says_so() {
+        // The whole point of generating it: a rebind moves what the box says, and a
+        // `nop` takes the pair off it rather than advertising a dead key.
+        let mut config = Config::default();
+        let rejected = config.keymap.extend_from_table(&toml::toml! { picker = {
+            "ctrl+j" = "next_item",
+            "up" = "nop",
+            "down" = "nop",
+            "esc" = "nop",
+        } });
+        assert!(rejected.is_empty(), "{rejected:?}");
+        let footer = hint_footer(&config.keymap, Glyphs::UNICODE).unwrap();
+        assert!(footer.starts_with("Ctrl+J move"), "{footer}");
+        assert!(
+            !footer.contains("close"),
+            "a nop'd cancel is not offered: {footer}"
+        );
+    }
+
+    #[test]
+    fn a_box_too_narrow_for_the_footer_goes_without_one() {
+        // Clipped, it would end mid-chord and name a key that is not there.
+        let footer = hint_footer(&Keymap::default(), Glyphs::UNICODE).unwrap();
+        let frame = all_text(&painted(&picker(), Rect::new(0, 0, 20, 12)));
+        assert!(!frame.contains(&footer), "{frame}");
+        assert!(
+            frame.contains("Test"),
+            "the box itself still paints: {frame}"
+        );
+    }
+
+    #[test]
+    fn the_ascii_profile_draws_the_whole_box_inside_ascii() {
+        // The profile is a *set*: a box mixing `+` corners with a `│` divider reads
+        // as a rendering bug (SPEC §7.5, M10).
+        let config = Config {
+            glyphs: Glyphs::ASCII,
+            ..Config::default()
+        };
+        let picker = Picker::new("Test", items(), false, &config)
+            .with_preview_pane(Box::new(|_: &Item, _: usize| vec!["preview".to_string()]));
+        let frame = all_text(&painted(&picker, Rect::new(0, 0, 100, 12)));
+        assert!(
+            frame.is_ascii(),
+            "the ascii profile left a wide glyph on the box: {frame}"
         );
     }
 
@@ -1259,11 +1532,12 @@ mod tests {
         // wide glyph before the match would drift every mark after it by a cell, and
         // the marks would land on the wrong letters.
         let items = vec![Item {
+            dim_columns: 0,
             label: "世界 zig".to_string(),
             shortcut: None,
             command: Command::Editor(Action::Quit),
         }];
-        let mut p = Picker::new("Wide", items, false, &Theme::default());
+        let mut p = Picker::new("Wide", items, false, &Config::default());
         type_str(&mut p, "zig");
         let marked = marked_text(&painted(&p, Rect::new(0, 0, 40, 10)));
         assert_eq!(marked, "zig", "the marks drifted past the wide glyphs");
@@ -1667,6 +1941,7 @@ mod tests {
 
     fn item(label: &str) -> Item {
         Item {
+            dim_columns: 0,
             label: label.to_string(),
             shortcut: None,
             command: Command::Editor(Action::Insert(label.to_string())),
@@ -1690,7 +1965,7 @@ mod tests {
             pending: Rc::clone(&pending),
             status: Status::default(),
         };
-        let p = Picker::new("Search", Vec::new(), false, &Theme::default())
+        let p = Picker::new("Search", Vec::new(), false, &Config::default())
             .with_item_source(Box::new(source));
         (p, asked, pending)
     }
@@ -1766,7 +2041,7 @@ mod tests {
             status: Rc::new(RefCell::new(Some("searching…".to_string()))),
             ..Fake::default()
         };
-        let p = Picker::new("Search", Vec::new(), false, &Theme::default())
+        let p = Picker::new("Search", Vec::new(), false, &Config::default())
             .with_item_source(Box::new(source));
         let buf = painted(&p, SCREEN);
         let (list, _) = p.columns(SCREEN).unwrap();
@@ -1799,7 +2074,7 @@ mod tests {
             status: Rc::clone(&status),
             ..Fake::default()
         };
-        let mut p = Picker::new("Search", Vec::new(), false, &Theme::default())
+        let mut p = Picker::new("Search", Vec::new(), false, &Config::default())
             .with_item_source(Box::new(source));
         assert!(!p.tick(), "nothing arrived and nothing was restated");
         *status.borrow_mut() = Some("searching…".to_string());
@@ -1836,12 +2111,13 @@ mod tests {
     fn long() -> Picker {
         let items = (0..40)
             .map(|k| Item {
+                dim_columns: 0,
                 label: format!("item-{k:02}"),
                 shortcut: None,
                 command: Command::Editor(Action::Insert(format!("{k}"))),
             })
             .collect();
-        Picker::new("Many", items, false, &Theme::default())
+        Picker::new("Many", items, false, &Config::default())
     }
 
     /// The rows and the bar's column, as [`Layer::render`] would place them.
@@ -2089,12 +2365,13 @@ mod tests {
         // rather than as a long one.
         let items = (0..40)
             .map(|k| Item {
+                dim_columns: 0,
                 label: "x".repeat(200),
                 shortcut: Some("y".repeat(200)),
                 command: Command::Editor(Action::Insert(format!("{k}"))),
             })
             .collect();
-        let p = Picker::new("Wide", items, false, &Theme::default());
+        let p = Picker::new("Wide", items, false, &Config::default());
         let column = bar_column(&p, SCREEN);
         assert!(
             column.chars().all(|c| c == '█' || c == '║'),

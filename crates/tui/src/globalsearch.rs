@@ -32,8 +32,8 @@ use vortex_core::Position;
 
 use crate::command::Command;
 use crate::compositor::Layer;
-use crate::config::Theme;
-use crate::picker::{Item, ItemSource, Picker, PreviewSource, display_path};
+use crate::config::Config;
+use crate::picker::{Item, ItemSource, Picker, PreviewSource, dir_columns, display_path};
 use crate::search::{self, Hit, Search};
 
 /// Lines of context shown above the matched line in the preview pane. A match with
@@ -163,10 +163,11 @@ impl ItemSource for Matches {
 /// and the part that tells two hits apart is the end of the path, not the machine
 /// it is on.
 fn row(hit: &Hit, cwd: Option<&Path>) -> Item {
+    let path = display_path(&hit.path, cwd);
     Item {
+        dim_columns: dir_columns(&path),
         label: format!(
-            "{}:{}  {}",
-            display_path(&hit.path, cwd),
+            "{path}:{}  {}",
             hit.line + 1, // 1-based for the eye; the Position stays 0-based
             hit.text
         ),
@@ -203,7 +204,7 @@ fn preview_source() -> PreviewSource {
 }
 
 /// Open the global-search picker over `root`.
-pub fn open(theme: &Theme, root: &Path) -> Box<dyn Layer> {
+pub fn open(config: &Config, root: &Path) -> Box<dyn Layer> {
     let matches = Matches {
         root: root.to_path_buf(),
         cwd: std::env::current_dir().ok(),
@@ -216,7 +217,7 @@ pub fn open(theme: &Theme, root: &Path) -> Box<dyn Layer> {
             "Search Project",
             Vec::new(), // every row arrives from the source
             false,      // the query is a regex, not a fuzzy pattern - no path tuning
-            theme,
+            config,
         )
         .with_item_source(Box::new(matches))
         .with_preview_pane(preview_source()),
@@ -471,6 +472,7 @@ mod tests {
     fn a_row_that_is_not_a_jump_previews_nothing() {
         let item = Item {
             label: "x".to_string(),
+            dim_columns: 0,
             shortcut: None,
             command: Command::OpenPalette,
         };
@@ -481,7 +483,7 @@ mod tests {
     fn the_picker_opens_with_a_pane_and_no_rows() {
         let t = TempDir::new();
         t.file("a.rs", "needle\n");
-        let layer = open(&Theme::default(), &t.path);
+        let layer = open(&Config::default(), &t.path);
         let mut buf = ratatui::buffer::Buffer::empty(SCREEN);
         layer.render(SCREEN, &mut buf);
         let shown: String = buf.content().iter().map(|c| c.symbol()).collect();

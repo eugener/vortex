@@ -14,17 +14,18 @@
 
 use crate::command::Command;
 use crate::compositor::Layer;
-use crate::config::Theme;
+use crate::config::Config;
 use crate::picker::{Item, Picker};
 use vortex_core::{Action, LineEnding, file::OFFERED_ENCODINGS};
 
 /// The encodings a save can use, opening on the one in use so the picker says what
 /// the file currently *is* as well as what it could be.
-pub fn encoding(theme: &Theme, current: &str) -> Box<dyn Layer> {
+pub fn encoding(config: &Config, current: &str) -> Box<dyn Layer> {
     let items = OFFERED_ENCODINGS
         .iter()
         .map(|&name| Item {
             label: name.to_string(),
+            dim_columns: 0,
             // The current encoding is marked rather than reordered: a list that
             // moves under you is harder to learn than one that does not.
             shortcut: (name == current).then(|| "current".to_string()),
@@ -32,7 +33,7 @@ pub fn encoding(theme: &Theme, current: &str) -> Box<dyn Layer> {
         })
         .collect();
     let selected = OFFERED_ENCODINGS.iter().position(|&n| n == current);
-    let picker = Picker::new("Encoding", items, false, theme);
+    let picker = Picker::new("Encoding", items, false, config);
     Box::new(match selected {
         Some(index) => picker.with_selected(index),
         // An encoding the list does not offer - nothing stops a file being loaded
@@ -42,18 +43,19 @@ pub fn encoding(theme: &Theme, current: &str) -> Box<dyn Layer> {
 }
 
 /// The two line terminators (SPEC §10.1), named the way the status bar names them.
-pub fn line_ending(theme: &Theme, current: LineEnding) -> Box<dyn Layer> {
+pub fn line_ending(config: &Config, current: LineEnding) -> Box<dyn Layer> {
     let choices = [LineEnding::Lf, LineEnding::Crlf];
     let items = choices
         .iter()
         .map(|&eol| Item {
             label: format!("{} ({})", eol.name(), description(eol)),
+            dim_columns: 0,
             shortcut: (eol == current).then(|| "current".to_string()),
             command: Command::Editor(Action::SetLineEnding(eol)),
         })
         .collect();
     let selected = choices.iter().position(|&eol| eol == current).unwrap_or(0);
-    Box::new(Picker::new("Line endings", items, false, theme).with_selected(selected))
+    Box::new(Picker::new("Line endings", items, false, config).with_selected(selected))
 }
 
 /// What a terminator is called outside a status bar, so the row means something to

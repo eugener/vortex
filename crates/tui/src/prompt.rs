@@ -292,7 +292,7 @@ pub fn confirm_close(
     // because this is a sentence rather than a label.
     let name = path.map_or_else(
         || "this buffer".to_string(),
-        |p| crate::layout::buffer_display_name(Some(p), false),
+        |p| crate::layout::buffer_display_name(Some(p)),
     );
     Box::new(Confirm::new(
         format!(
@@ -319,7 +319,7 @@ pub fn confirm_reload(
 ) -> Box<dyn Layer> {
     let name = path.map_or_else(
         || "this buffer".to_string(),
-        |p| crate::layout::buffer_display_name(Some(p), false),
+        |p| crate::layout::buffer_display_name(Some(p)),
     );
     Box::new(Confirm::new(
         format!(
@@ -351,7 +351,7 @@ pub fn confirm_overwrite(
 ) -> Box<dyn Layer> {
     let name = path.map_or_else(
         || "this buffer".to_string(),
-        |p| crate::layout::buffer_display_name(Some(p), false),
+        |p| crate::layout::buffer_display_name(Some(p)),
     );
     let hint = yes_hint(keymap);
     let question = if removed {

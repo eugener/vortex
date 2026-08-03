@@ -21,7 +21,7 @@ cargo clippy --all-targets --all-features -- -D warnings   # 2. lint (warnings a
 cargo build --workspace        # 3. compile
 cargo test --workspace         # 4. tests
 # 5. coverage gates - EVERY file must stay above its crate's floor (SPEC §13).
-#    Ratchet: no regress. Current: core 99.3% lines, tui 92.6%.
+#    Ratchet: no regress. Current: core 99.3% lines, tui 93.1%.
 #    NOTE: `cargo llvm-cov clean --workspace` first, or a stale profile reports a
 #    false collapse (core once read 95% when it was 99%).
 cargo llvm-cov --package vortex-core --fail-under-file-lines 90 \
@@ -66,6 +66,11 @@ which is why `paint` now hands back the view state it settled on.
 M9's keymap contexts hold it at 92.6%: the five surfaces stopped matching key codes and
 started matching commands, which moved their branching out of `handle_key` and into a
 table a test can read.
+M10's cheap half lifts it to 93.1% for the same reason M7's search did: the glyph
+profile, a path row's dim prefix and the picker's hint footer are pure resolution -
+config in, marks out; keymap in, footer out - so the tests are calls rather than
+renders, and the one part that must be seen (the dim landing on the directory and not
+on the file name) is a `TestBackend` frame.
 Requires `cargo-llvm-cov` >=0.8.6 (the release that added `--fail-under-file-lines`) +
 `rustup component add llvm-tools-preview`. Install/upgrade with `cargo install cargo-llvm-cov`.
 

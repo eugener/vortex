@@ -248,6 +248,7 @@ struct ThemeFile {
     palette: Option<StyleSpec>,
     palette_selected: Option<StyleSpec>,
     palette_match: Option<StyleSpec>,
+    palette_dim: Option<StyleSpec>,
     diagnostic_error: Option<StyleSpec>,
     diagnostic_warning: Option<StyleSpec>,
     diagnostic_information: Option<StyleSpec>,
@@ -320,6 +321,7 @@ impl ThemeFile {
                 base.palette_selected,
             )?,
             palette_match: slot("palette_match", self.palette_match, base.palette_match)?,
+            palette_dim: slot("palette_dim", self.palette_dim, base.palette_dim)?,
             diagnostic_error: slot(
                 "diagnostic_error",
                 self.diagnostic_error,
