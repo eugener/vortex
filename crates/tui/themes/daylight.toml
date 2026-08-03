@@ -29,6 +29,10 @@ palette_selected = { fg = "#1f2422", bg = "#f6dc86", bold = true }
 # Quiet ink for a path's directory and the hint footer - a muted moss, the same
 # grey-green the status bar and the hints are set in.
 palette_dim      = { fg = "#7c847e" }
+# Marks in the proofing palette's navy - the default's pale blue is a wash on this
+# theme's paper ground, and a mark nobody can see is the feature not shipping.
+palette_match    = { fg = "#2f4a72", bold = true }
+empty_hint       = { fg = "#7c847e" }
 
 # Diagnostics in the proofing palette, dark enough to read on paper: oxblood for
 # errors, a burnt amber for warnings, navy for information, a muted moss for hints.

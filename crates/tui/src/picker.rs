@@ -433,12 +433,16 @@ impl Picker {
             // the same `Pattern` that ranked them, so the marks cannot disagree with
             // the order: a second pattern built from the same string would still be a
             // second answer to the question.
+            // Both scratch buffers are hoisted out of the walk and reused: a file
+            // picker ranks up to `filepicker::MAX_FILES` rows, and a `Vec` per row
+            // per keystroke is an allocation count the corpus decides.
             let mut buffer = Vec::new();
+            let mut haystack = Vec::new();
             self.marks = ordered
                 .iter()
                 .map(|&idx| {
                     buffer.clear();
-                    let mut haystack = Vec::new();
+                    haystack.clear();
                     let text = Utf32Str::new(&self.items[idx].label, &mut haystack);
                     pattern.indices(text, &mut self.matcher, &mut buffer);
                     // The crate's own contract: the indices come back per atom, in
@@ -462,12 +466,11 @@ impl Picker {
     /// question nobody asked; the moment a query narrows the list, both halves are
     /// what matters.
     fn count(&self) -> Option<String> {
-        let total = if self.source.is_some() {
-            self.filtered.len()
-        } else {
-            self.items.len()
-        };
-        if total == 0 && self.filtered.is_empty() {
+        // `items` is the whole corpus for a filtering picker and, for a
+        // source-driven one, everything that has arrived - `refilter` clears both
+        // together and `tick` extends both together, so one number serves both.
+        let total = self.items.len();
+        if total == 0 {
             return None;
         }
         if self.filtered.len() == total {
@@ -510,8 +513,15 @@ impl Picker {
     ) {
         let mut column = ROW_INDENT;
         for (char_index, ch) in label.chars().enumerate() {
+            // The tail of a long label has no cells to restyle - a project-search
+            // row carries a whole source line past the width the box can show.
+            if column >= rows.width as usize {
+                return;
+            }
             let width = UnicodeWidthChar::width(ch).unwrap_or(0);
-            if marks.contains(&(char_index as u32)) {
+            // `refilter` leaves `marks` sorted and deduped, so the question is a
+            // bisection rather than a scan of every mark per character.
+            if marks.binary_search(&(char_index as u32)).is_ok() {
                 let x = rows.x as usize + column;
                 if column + width <= rows.width as usize
                     && let Some(cell) = buf.cell_mut((x as u16, y))
@@ -736,24 +746,32 @@ impl Layer for Picker {
         // or start arrowing, and it is the one number a picker cannot be read
         // without: a screenful of rows looks the same whether it is all of them or
         // nine of two hundred and forty.
-        let mut block = self
-            .block()
-            .title(format!(" {} ", self.title))
-            .style(self.style);
+        let title = format!(" {} ", self.title);
+        let mut block = self.block().title(title.clone()).style(self.style);
+        // Both border titles obey one rule, and it is not "does it fit the box":
+        // ratatui lays them out in the *title area*, which is the box less its two
+        // corners, and it paints the right-aligned one over the left-aligned one
+        // rather than reserving room. So each is admitted only if it fits beside
+        // what is already there. Dropped rather than clipped: a count overwriting
+        // the title's tail, or a hint ending mid-chord, says something untrue.
+        let border_room = (area.width as usize).saturating_sub(2);
         if let Some(count) = self.count() {
-            block = block.title_top(Line::from(format!(" {count} ")).right_aligned());
+            let count = format!(" {count} ");
+            if title.width() + count.width() <= border_room {
+                block = block.title_top(Line::from(count).right_aligned());
+            }
         }
         // The footer rides the bottom border for the reason the count rides the top:
-        // it costs no row of the list. Dropped rather than clipped on a box too
-        // narrow for it - half a hint ending mid-chord names a key that is not there.
-        if let Some(hints) = self.hints.as_deref()
-            && hints.width() + 2 <= area.width as usize
-        {
-            block = block.title_bottom(
-                Line::from(format!(" {hints} "))
-                    .right_aligned()
-                    .style(self.style.patch(self.dim_style)),
-            );
+        // it costs no row of the list. It has that border to itself.
+        if let Some(hints) = self.hints.as_deref() {
+            let hints = format!(" {hints} ");
+            if hints.width() <= border_room {
+                block = block.title_bottom(
+                    Line::from(hints)
+                        .right_aligned()
+                        .style(self.style.patch(self.dim_style)),
+                );
+            }
         }
         block.render(area, buf);
         // Query row at the top of the interior.
@@ -1462,6 +1480,47 @@ mod tests {
             frame.contains("Test"),
             "the box itself still paints: {frame}"
         );
+    }
+
+    #[test]
+    fn the_footer_is_admitted_only_at_the_width_it_paints_whole_at() {
+        // The room a border title has is the box less its two corners, and the
+        // string is the hints plus a space either side. Comparing the unpadded hints
+        // against the whole box admits it two columns early, where ratatui truncates
+        // it - which is the clipped, lying footer the guard exists to prevent.
+        let footer = hint_footer(&Keymap::default(), Glyphs::UNICODE).unwrap();
+        let needed = footer.width() + 4;
+        for width in [needed - 2, needed - 1] {
+            let frame = all_text(&painted(&picker(), Rect::new(0, 0, width as u16, 12)));
+            assert!(!frame.contains(&footer), "clipped at {width}: {frame}");
+        }
+        let frame = all_text(&painted(&picker(), Rect::new(0, 0, needed as u16, 12)));
+        assert!(frame.contains(&footer), "not shown at {needed}: {frame}");
+    }
+
+    #[test]
+    fn a_count_that_would_overwrite_the_title_is_dropped_instead() {
+        // Ratatui paints a right-aligned title *over* a left-aligned one rather than
+        // reserving room for it, so on a narrow box an unguarded count garbles the
+        // header it is meant to annotate.
+        let items = (0..20_000)
+            .map(|k| Item {
+                dim_columns: 0,
+                label: format!("row-{k}"),
+                shortcut: None,
+                command: Command::OpenPalette,
+            })
+            .collect();
+        let p = Picker::new("Search Project", items, false, &Config::default());
+        let frame = all_text(&painted(&p, Rect::new(0, 0, 24, 12)));
+        assert!(frame.contains("Search"), "the title lost cells: {frame}");
+        assert!(
+            !frame.contains("20000"),
+            "the count garbled the title: {frame}"
+        );
+        // …and on a box with room for both, the count is still there.
+        let wide = all_text(&painted(&p, Rect::new(0, 0, 60, 12)));
+        assert!(wide.contains("20000"), "{wide}");
     }
 
     #[test]

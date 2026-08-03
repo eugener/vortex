@@ -28,6 +28,10 @@ palette          = { fg = "#ffb000", bg = "#150f06" }
 palette_selected = { fg = "#150f06", bg = "#ffb000", bold = true }
 # Quiet ink for a path's directory and the hint footer: the one hue, dimmed.
 palette_dim      = { fg = "#a97600" }
+# One hue, so the marks come forward by intensity: the brightest amber on the
+# tube. Inheriting the default's blue would break the theme's only rule.
+palette_match    = { fg = "#ffd980", bold = true }
+empty_hint       = { fg = "#a97600" }
 
 # One hue, so diagnostics separate by intensity like everything else: a bright
 # amber error down to a dim hint. The underline shape does the rest.
