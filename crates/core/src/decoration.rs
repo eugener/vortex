@@ -43,14 +43,36 @@ pub enum Severity {
     Error,
 }
 
-/// What a gutter mark means. Diagnostics fill this in M2; git add/change/remove
-/// signs join as further variants in M8 - the reason this is an enum wrapping
-/// [`Severity`] rather than a bare severity.
+/// What a gutter mark means. Diagnostics filled this in M2 and git signs joined in
+/// M8 - the reason it was an enum wrapping [`Severity`] from the start rather than a
+/// bare severity.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[non_exhaustive]
 pub enum GutterKind {
     /// An LSP diagnostic starts on this line.
     Diagnostic(Severity),
+    /// This line differs from the file's committed state (M8).
+    Git(GitSign),
+}
+
+/// How a line differs from HEAD (M8) - a semantic tag the theme maps to a glyph and
+/// a color, never either itself, exactly like [`Severity`].
+///
+/// The producer is the **frontend**, because reading a repository is filesystem work
+/// (SPEC §3) - only the vocabulary lives here. It rides the decoration channel rather
+/// than being painted from a list the frontend keeps, so a sign moves with the text
+/// it marks: [`Decoration::GutterMark`] stores an offset, so inserting a line above a
+/// changed one shifts its sign down without recomputing the diff.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[non_exhaustive]
+pub enum GitSign {
+    /// The line is new since HEAD.
+    Added,
+    /// The line existed and its content changed.
+    Modified,
+    /// One or more lines were deleted *at* this line. Marked on the survivor rather
+    /// than on nothing: a deletion has no line of its own to sit on.
+    Removed,
 }
 
 /// The semantic category of a syntax-highlighted span (M4) - a tag the theme
@@ -157,6 +179,10 @@ pub enum DecorationSource {
     /// sorted-and-non-overlapping invariant highlights have. Mixing the two would
     /// misplace the highlight search rather than merely slow it.
     Scope,
+    /// The git-diff task (M8): [`GutterKind::Git`] marks. Its own bucket for the
+    /// reason every bucket is one - a diff finishing must not wipe the diagnostics
+    /// standing beside it in the same gutter, and the two producers run independently.
+    Git,
 }
 
 /// Every decoration currently attached to a buffer, bucketed by producer.

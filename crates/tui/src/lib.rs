@@ -24,6 +24,7 @@ pub mod compositor;
 pub mod config;
 pub mod filepicker;
 pub mod formatpicker;
+pub mod git;
 pub mod globalsearch;
 pub mod grammar;
 pub mod keymap;
