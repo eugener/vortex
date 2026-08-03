@@ -71,3 +71,9 @@ criterion = { version = "0.8.2", default-features = false, features = [
 [[bench]]
 name = "layout"
 harness = false
+
+# The picker's per-keystroke filter path: is resolving match marks for the whole
+# ranked list, rather than for the sixteen rows on screen, worth a seam change?
+[[bench]]
+name = "picker"
+harness = false
