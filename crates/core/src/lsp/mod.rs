@@ -28,11 +28,6 @@ use crate::decoration::Severity;
 
 pub use client::{LspError, LspHandle, client};
 
-/// The language-server loop the frontend spawns, resolving to why it stopped
-/// (SPEC §8). A named alias so the frontend does not spell out the boxed-future
-/// type - and so the core still names no executor.
-pub type BoxLspLoop = crate::editor::BoxFuture<Result<(), LspError>>;
-
 /// One diagnostic, in the core's own vocabulary rather than `lsp_types`'.
 ///
 /// Deliberately not `lsp_types::Diagnostic`: keeping the wire type inside this

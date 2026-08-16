@@ -50,11 +50,6 @@ use crate::view::BufferId;
 
 pub use engine::{SyntaxError, SyntaxHandle, highlighter};
 
-/// The loop the frontend spawns, resolving to why it stopped (SPEC §8). A named
-/// alias so the frontend does not spell out the boxed-future type, matching
-/// [`crate::lsp::BoxLspLoop`].
-pub type BoxSyntaxLoop = crate::editor::BoxFuture<Result<(), SyntaxError>>;
-
 /// editor -> highlighter: the buffer text to reparse, and which buffer at which
 /// version it is (SPEC §5). Full-document, for the "cannot desync" reason in the
 /// module doc; the identity rides along so a highlight batch is recognizable as

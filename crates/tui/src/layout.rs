@@ -962,11 +962,6 @@ impl Tab {
             Segment::Chrome => None,
         }
     }
-
-    /// Whether this is the tab of the buffer currently on screen.
-    pub fn is_active(&self) -> bool {
-        matches!(self.kind, Segment::Tab { active: true, .. })
-    }
 }
 
 /// The bufferline's tab strip fitted to `width` display cells, in buffer order,
@@ -1243,25 +1238,6 @@ pub fn tab_at_column(tabs: &[Tab], column: usize) -> Option<BufferId> {
         start = end;
     }
     None
-}
-
-/// A byte count as a compact human-readable size: plain bytes under 1 KB, then
-/// `KB`/`MB`/`GB` (1024-based) with one decimal, so the status bar stays short for
-/// large buffers (`12_345_678` -> `11.8MB`). No space before the unit, matching the
-/// other status metrics. `GB` is the ceiling - a text buffer never realistically
-/// exceeds it, and Tier-3 huge-file handling is future work (SPEC §10.4).
-pub fn human_size(bytes: usize) -> String {
-    const UNITS: [&str; 3] = ["KB", "MB", "GB"];
-    if bytes < 1024 {
-        return format!("{bytes}B");
-    }
-    let mut size = bytes as f64 / 1024.0;
-    let mut unit = 0;
-    while size >= 1024.0 && unit < UNITS.len() - 1 {
-        size /= 1024.0;
-        unit += 1;
-    }
-    format!("{size:.1}{}", UNITS[unit])
 }
 
 /// What the status bar is told about the frame it is describing.
@@ -2321,6 +2297,13 @@ mod tests {
         strip.iter().map(|tab| &*tab.label).collect()
     }
 
+    /// Whether a segment is the tab of the buffer on screen. The paint reads the
+    /// flag by matching `Segment::Tab { active: true, .. }` inline, so this stays a
+    /// test helper rather than an accessor no painted frame would call.
+    fn is_active(tab: &Tab) -> bool {
+        matches!(tab.kind, Segment::Tab { active: true, .. })
+    }
+
     #[test]
     fn every_tab_shows_when_they_all_fit() {
         let list = buffers(&[(1, Some("a.rs"), false), (2, Some("b.rs"), false)]);
@@ -2331,9 +2314,9 @@ mod tests {
         assert_eq!(strip[2].id(), Some(BufferId(2)));
         assert_eq!(
             (
-                strip[0].is_active(),
-                strip[1].is_active(),
-                strip[2].is_active()
+                is_active(&strip[0]),
+                is_active(&strip[1]),
+                is_active(&strip[2])
             ),
             (false, false, true)
         );
@@ -2349,7 +2332,7 @@ mod tests {
         let flags: Vec<bool> = bufferline(&list, BufferId(2), 40, GLYPHS)
             .into_iter()
             .filter(|tab| tab.id().is_some())
-            .map(|tab| tab.is_active())
+            .map(|tab| is_active(&tab))
             .collect();
         assert_eq!(flags, vec![false, true, false]);
     }
@@ -2443,7 +2426,7 @@ mod tests {
         let list = buffers(&specs);
         let strip = bufferline(&list, BufferId(6), 24, GLYPHS);
         assert!(
-            strip.iter().any(|tab| tab.is_active()),
+            strip.iter().any(is_active),
             "the active tab must be in the window: {strip:?}"
         );
         assert!(strip_width(&strip) <= 24, "overflowed the bar: {strip:?}");
@@ -2571,7 +2554,7 @@ mod tests {
         let list = buffers(&[(1, Some("a.rs"), false), (2, Some("b.rs"), false)]);
         let strip = bufferline(&list, BufferId(99), 40, GLYPHS);
         assert_eq!(strip.iter().filter(|t| t.id().is_some()).count(), 2);
-        assert!(strip[0].is_active(), "fell back to marking the first tab");
+        assert!(is_active(&strip[0]), "fell back to marking the first tab");
     }
 
     /// A [`StatusInfo`] with the nominal values, so a test names only what it is
@@ -2798,20 +2781,6 @@ mod tests {
             ..info(1, 1)
         });
         assert_eq!(right, "UTF-8 BOM · CRLF · tabs:4 ");
-    }
-
-    #[test]
-    fn human_size_scales_at_each_1024_mark() {
-        // Whole bytes below 1 KB, then KB/MB/GB with one decimal at each boundary.
-        assert_eq!(human_size(0), "0B");
-        assert_eq!(human_size(1023), "1023B");
-        assert_eq!(human_size(1024), "1.0KB");
-        assert_eq!(human_size(1536), "1.5KB");
-        assert_eq!(human_size(1024 * 1024 - 1), "1024.0KB"); // just under 1 MB
-        assert_eq!(human_size(1024 * 1024), "1.0MB");
-        assert_eq!(human_size(3 * 1024 * 1024 + 512 * 1024), "3.5MB");
-        assert_eq!(human_size(1024 * 1024 * 1024), "1.0GB");
-        assert_eq!(human_size(5 * 1024 * 1024 * 1024), "5.0GB"); // caps at GB
     }
 
     #[test]
